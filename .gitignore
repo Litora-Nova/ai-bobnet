@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.secret*
+.env
+.env.*
+/_dev_team/
