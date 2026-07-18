@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# ai-bobnet — fail-closed launcher. Kills ambient-env foreign-routing (the #1 field bug).
+# Usage: run-agent <agent_uid> -- <cmd...>
+#   1. Scrub inherited routing env (STANDUP_DIR, INBOX*, MUX*, BOOT_*, PROJECT_*, AIBOBNET_*).
+#   2. Resolve + validate the target context from the registry (authority; env-independent).
+#   3. Export the clean, validated context, then exec the command.
+# A leaked ambient variable must NEVER route an agent into a foreign project.
+set -euo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+# shellcheck source=lib/aibobnet.sh
+. "$REPO_ROOT/lib/aibobnet.sh"
+
+agent="${1:-}"
+[ -n "$agent" ] || aib_die 64 "usage: run-agent <agent_uid> -- <cmd...>"
+shift
+[ "${1:-}" = "--" ] || aib_die 64 "usage: run-agent <agent_uid> -- <cmd...> (missing '--')"
+shift
+[ "$#" -ge 1 ] || aib_die 64 "run-agent: no command given after '--'"
+
+aib_check_registry
+
+# --- resolve + validate the TARGET context (from the registry, not the env) ---
+aib_split_agent "$agent"                       # -> AIB_PROJECT_UID, AIB_TASK
+proj="$AIB_PROJECT_UID"
+task="$AIB_TASK"
+home="$(aib_project_field "$proj" home)"
+standup_dir="$(aib_project_field "$proj" standup_dir)"
+mux_session="$(aib_project_field "$proj" mux_session)"
+inbox_path="${standup_dir}/inbox/${agent}.md"
+
+# --- scrub inherited routing env ---------------------------------------------
+for _v in $(compgen -v); do
+  case "$_v" in
+    STANDUP_DIR|STANDUP_DIR_*|INBOX*|MUX*|BOOT_*|PROJECT_*|AIBOBNET_*)
+      unset "$_v" 2>/dev/null || true
+      ;;
+  esac
+done
+
+# --- export the clean, validated context, then exec --------------------------
+export AIBOBNET_PROJECT_UID="$proj"
+export AIBOBNET_TASK="$task"
+export AIBOBNET_AGENT_UID="$agent"
+export AIBOBNET_HOME="$home"
+export AIBOBNET_STANDUP_DIR="$standup_dir"
+export AIBOBNET_MUX_SESSION="$mux_session"
+export AIBOBNET_INBOX_PATH="$inbox_path"
+export STANDUP_DIR="$standup_dir"   # validated value, for ported tools that read it
+
+exec "$@"
