@@ -22,6 +22,7 @@
 #   fail <id> ["<reason>"]               append FAILED to own journal
 #   state <id>                           print current folded state of a message in own journal
 #   dlq                                  list own dead-lettered (FAILED) messages
+#   pending <to_uid>                     read-only: list a recipient's PERSISTED (un-notified) ids (for bin/wakeup)
 set -euo pipefail
 
 # --- locate engine root (symlink-safe) ---------------------------------------
@@ -85,6 +86,10 @@ END {
     }
     exit 0
   }
+  if (mode=="persisted") {          # ids still awaiting a wakeup (PERSISTED, not yet NOTIFIED)
+    for (k=1;k<=n;k++) { id=order[k]; if (st[id]=="PERSISTED") print id }
+    exit 0
+  }
   exit 9
 }'
 
@@ -134,7 +139,7 @@ _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 aib_check_registry
 
 sub="${1:-}"
-[ -n "$sub" ] || aib_die 64 "usage: message <send|notify|inbox|replay|seen|done|fail|state|dlq> ..."
+[ -n "$sub" ] || aib_die 64 "usage: message <send|notify|inbox|replay|seen|done|fail|state|dlq|pending> ..."
 shift
 
 case "$sub" in
@@ -252,7 +257,18 @@ case "$sub" in
     _fold dlq "$_own_inbox"
     ;;
 
+  # -------------------------------------------------------------------------- #
+  # pending <to_uid>: read-only — list a recipient's message ids still in PERSISTED
+  # (awaiting a wakeup/NOTIFIED). Same fold as every other read; used by bin/wakeup.
+  pending)
+    to="${1:-}"
+    [ -n "$to" ] || aib_die 64 "usage: message pending <to_uid>"
+    _load_own_context
+    to_path="$("$REPO_ROOT/bin/inbox" "$to")"     # P0 resolver (fail-closed on unknown recipient)
+    _fold persisted "$to_path"
+    ;;
+
   *)
-    aib_die 64 "unknown subcommand '$sub' (send|notify|inbox|replay|seen|done|fail|state|dlq)"
+    aib_die 64 "unknown subcommand '$sub' (send|notify|inbox|replay|seen|done|fail|state|dlq|pending)"
     ;;
 esac

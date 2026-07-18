@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# ai-bobnet — wakeup notifier (P2). See docs/CONTRACT-adapter.md §1.
+#
+# Wakeup is a PROMPT, not a delivery-proof. For a target agent it:
+#   1. finds messages still in PERSISTED (not yet NOTIFIED) — via `bin/message pending`,
+#   2. pings the target's mux_session through a configurable hook,
+#   3. on a successful ping appends NOTIFIED — via `bin/message notify` (P1 semantics),
+#   4. on a failed ping records a bounded retry; after N failures the message is
+#      dead-lettered (FAILED, visible in `bin/message dlq`), never re-pinged forever.
+# Proof of SEEN/PROCESSED stays the recipient's own P1 receipt — wakeup NEVER infers
+# delivery from heartbeat line-counts or re-nudge heuristics.
+#
+# Usage: wakeup [<agent_uid>]        (target defaults to the calling agent = self-wake)
+#
+# Actor identity: the calling agent (from bin/context) is the `by:` of every event it
+# appends; launch via bin/run-agent so the context is resolvable and fail-closed.
+#
+# Config (read from this process's own env; under run-agent set it on the wakeup command
+# itself — run-agent scrubs the ambient AIBOBNET_* routing namespace by design):
+#   AIBOBNET_WAKEUP_HOOK          command to ping a session; invoked as:
+#                                   <hook> <target_agent_uid> <mux_session> <msg_id>
+#                                 exit 0 = ping delivered; non-zero = ping failed.
+#                                 Default: a best-effort tmux send (see _default_hook).
+#   AIBOBNET_WAKEUP_MAX_ATTEMPTS  failed-ping budget before dead-letter (default 3).
+set -euo pipefail
+
+# --- locate engine root (symlink-safe) ---------------------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+# shellcheck source=lib/aibobnet.sh
+. "$REPO_ROOT/lib/aibobnet.sh"
+
+MSG="$REPO_ROOT/bin/message"
+_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- default wakeup hook: best-effort mux (tmux) send ------------------------
+# Overridable via AIBOBNET_WAKEUP_HOOK. Fail-closed: if no reachable session, exit
+# non-zero so the message stays PERSISTED and the bounded retry/dead-letter kicks in.
+_default_hook() {
+  local target="$1" session="$2" id="$3"
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux has-session -t "$session" >/dev/null 2>&1 || return 1
+  tmux send-keys -t "$session" \
+    "# ai-bobnet wakeup: new mail ($id) for $target — run: bin/message inbox" Enter >/dev/null 2>&1
+}
+
+# --- run the configured hook -------------------------------------------------
+_ping() {
+  local target="$1" session="$2" id="$3"
+  if [ -n "${AIBOBNET_WAKEUP_HOOK:-}" ]; then
+    "$AIBOBNET_WAKEUP_HOOK" "$target" "$session" "$id"
+  else
+    _default_hook "$target" "$session" "$id"
+  fi
+}
+
+aib_check_registry
+
+# --- resolve the calling agent (actor / `by:` of appended events) ------------
+_own_agent=""
+_ctx="$("$REPO_ROOT/bin/context")" || aib_die 6 "cannot resolve own context (launch via bin/run-agent)"
+while IFS= read -r _line; do
+  case "$_line" in agent_uid=*) _own_agent="${_line#agent_uid=}";; esac
+done <<EOF
+$_ctx
+EOF
+[ -n "$_own_agent" ] || aib_die 6 "own context missing agent_uid"
+
+# --- resolve the target (defaults to self) + its mux_session -----------------
+target="${1:-$_own_agent}"
+aib_split_agent "$target"                                   # -> AIB_PROJECT_UID (fail-closed)
+mux_session="$(aib_project_field "$AIB_PROJECT_UID" mux_session)"
+to_path="$("$REPO_ROOT/bin/inbox" "$target")"               # recipient journal (fail-closed)
+
+max="${AIBOBNET_WAKEUP_MAX_ATTEMPTS:-3}"
+case "$max" in ''|*[!0-9]*) aib_die 64 "AIBOBNET_WAKEUP_MAX_ATTEMPTS must be a positive integer";; esac
+[ "$max" -ge 1 ] || aib_die 64 "AIBOBNET_WAKEUP_MAX_ATTEMPTS must be >= 1"
+
+# count prior failed-ping markers for an id (journal-recorded, restart-safe;
+# markers carry NO `id:`/`event:` field so the P1 fold ignores them entirely).
+_attempts() { grep -cF "| wakeattempt:$1 |" "$to_path" 2>/dev/null || true; }
+
+woke=0; notified=0; deadlettered=0
+# List candidates once (fold of the target journal); process each.
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
+  woke=$((woke+1))
+  if _ping "$target" "$mux_session" "$id"; then
+    # Ping delivered -> record NOTIFIED via P1 semantics (idempotent; no divergent logic).
+    "$MSG" notify "$target" "$id" >/dev/null
+    notified=$((notified+1))
+  else
+    # Ping failed -> bounded retry. Record the attempt, then dead-letter if exhausted.
+    printf '%s | wakeattempt:%s | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$to_path"
+    n="$(_attempts "$id")"; n="${n:-0}"
+    if [ "$n" -ge "$max" ]; then
+      # Dead-letter: append FAILED in the exact P1 event format (visible in `message dlq`).
+      printf '%s | id:%s | event:FAILED | by:%s | reason:%s\n' \
+        "$(_now)" "$id" "$_own_agent" "wakeup exhausted after $n attempts (no mux ack)" >> "$to_path"
+      deadlettered=$((deadlettered+1))
+    fi
+  fi
+done < <("$MSG" pending "$target")
+
+printf 'wakeup %s: %d candidate(s), %d notified, %d dead-lettered\n' \
+  "$target" "$woke" "$notified" "$deadlettered" >&2
