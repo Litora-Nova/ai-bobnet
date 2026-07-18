@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# ai-bobnet — durable, provable message delivery (P1). See docs/CONTRACT-delivery.md.
+#
+# The recipient's per-agent inbox journal (P0: <standup_dir>/inbox/<agent_uid>.md) is the
+# append-only, human-readable audit journal. Messages and state transitions are appended as
+# event lines; a message's current state = the fold (LAST event) over its id.
+#
+#   Message line: TS | id:<id> | from:<uid> | to:<uid> | state:PERSISTED | <body>
+#   Event line:   TS | id:<id> | event:<NOTIFIED|SEEN|PROCESSED|FAILED> | by:<uid>
+#                 (fail may append a trailing " | reason:<reason>")
+#
+# State machine (observable, never inferred): PERSISTED -> NOTIFIED -> SEEN -> PROCESSED | FAILED.
+# Pure bash + awk, no external deps (no jq, no sqlite). Fail-closed / fail-loud per P0.
+#
+# Commands:
+#   send <to_uid> "<body>" [--id <id>]   append PERSISTED to recipient's journal, print id (idempotent)
+#   notify <to_uid> <id>                 append NOTIFIED to recipient's journal (wakeup receipt)
+#   inbox                                list own OPEN messages (state not terminal), in order
+#   replay                               list own unprocessed messages, in order (restart catch-up)
+#   seen <id>                            append SEEN to own journal (by = own agent_uid)
+#   done <id>                            append PROCESSED to own journal
+#   fail <id> ["<reason>"]               append FAILED to own journal
+#   state <id>                           print current folded state of a message in own journal
+#   dlq                                  list own dead-lettered (FAILED) messages
+set -euo pipefail
+
+# --- locate engine root (symlink-safe) ---------------------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+# shellcheck source=lib/aibobnet.sh
+. "$REPO_ROOT/lib/aibobnet.sh"
+
+# --- journal fold (pure awk; last-event-wins per CONTRACT §2) ------------------
+# Multi-char FS " | " is a regex, so the pipe is escaped. Structured fields never
+# contain " | "; free-text body/reason are reconstructed from the raw record.
+_AIB_MSG_AWK='
+BEGIN { FS=" \\| " }
+{
+  raw=$0
+  id=""; from=""; to=""; ismsg=0; isev=0; ev=""; by=""
+  for (i=2;i<=NF;i++) {
+    f=$i
+    if      (f ~ /^id:/)            { id=substr(f,4) }
+    else if (f ~ /^from:/)          { from=substr(f,6) }
+    else if (f ~ /^to:/)            { to=substr(f,4) }
+    else if (f=="state:PERSISTED")  { ismsg=1 }
+    else if (f ~ /^event:/)         { ev=substr(f,7); isev=1 }
+    else if (f ~ /^by:/)            { by=substr(f,4) }
+  }
+  if (id=="") next                       # not a P1 line (e.g. a P0 plain line) -> ignore
+  if (!(id in known)) { known[id]=1; order[++n]=id }
+  if (ismsg) {
+    msgexists[id]=1
+    fromm[id]=from; tom[id]=to; st[id]="PERSISTED"
+    m=index(raw," | state:PERSISTED | ")
+    if (m>0) body[id]=substr(raw,m+length(" | state:PERSISTED | ")); else body[id]=""
+  } else if (isev) {
+    st[id]=ev                            # last-event-wins fold
+    if (ev=="FAILED") {
+      r=index(raw," | reason:")
+      if (r>0) reason[id]=substr(raw,r+length(" | reason:")); else reason[id]=""
+    }
+  }
+}
+END {
+  if (mode=="state")  { if (want in known) { print st[want]; exit 0 } exit 3 }
+  if (mode=="exists") { if (want in msgexists) exit 0; exit 3 }
+  if (mode=="open") {
+    for (k=1;k<=n;k++) { id=order[k]; s=st[id]
+      if (s!="PROCESSED" && s!="FAILED")
+        printf "id:%s | state:%s | from:%s | %s\n", id, s, fromm[id], body[id]
+    }
+    exit 0
+  }
+  if (mode=="dlq") {
+    for (k=1;k<=n;k++) { id=order[k]; s=st[id]
+      if (s=="FAILED")
+        printf "id:%s | state:FAILED | from:%s | reason:%s | %s\n", id, fromm[id], reason[id], body[id]
+    }
+    exit 0
+  }
+  exit 9
+}'
+
+# _fold <mode> <file> [want_id] -> runs the fold; missing file == empty journal.
+_fold() {
+  local mode="$1" file="$2" want="${3:-}"
+  if [ -f "$file" ]; then
+    awk -v mode="$mode" -v want="$want" "$_AIB_MSG_AWK" "$file"
+  else
+    awk -v mode="$mode" -v want="$want" "$_AIB_MSG_AWK" /dev/null
+  fi
+}
+
+# current folded state of <id> in <file>; empty string + rc!=0 if absent.
+_state_of() { _fold state "$2" "$1"; }
+
+# --- resolve OWN context via P0 bin/context (never env-guessed) ----------------
+_own_agent=""; _own_inbox=""
+_load_own_context() {
+  local ctx line
+  ctx="$("$REPO_ROOT/bin/context")" || aib_die 6 "cannot resolve own context (launch via bin/run-agent)"
+  while IFS= read -r line; do
+    case "$line" in
+      agent_uid=*)  _own_agent="${line#agent_uid=}";;
+      inbox_path=*) _own_inbox="${line#inbox_path=}";;
+    esac
+  done <<EOF
+$ctx
+EOF
+  [ -n "$_own_agent" ] && [ -n "$_own_inbox" ] || aib_die 6 "own context missing agent_uid/inbox_path"
+}
+
+# --- validate a message id token (routing/journal safe) -----------------------
+_validate_id() {
+  local id="$1"
+  [ -n "$id" ] || aib_die 4 "message id is empty"
+  case "$id" in
+    *[!A-Za-z0-9._-]*) aib_die 4 "invalid message id '$id' (allowed: letters, digits, . _ -)";;
+  esac
+}
+
+# strip newlines (single-line journal invariant); pipes in body are tolerated.
+_sanitize_line() { local s="$1"; printf '%s' "${s//$'\n'/ }"; }
+
+_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+aib_check_registry
+
+sub="${1:-}"
+[ -n "$sub" ] || aib_die 64 "usage: message <send|notify|inbox|replay|seen|done|fail|state|dlq> ..."
+shift
+
+case "$sub" in
+
+  # -------------------------------------------------------------------------- #
+  send)
+    to="${1:-}"; body="${2:-}"; id=""
+    [ -n "$to" ]   || aib_die 64 'usage: message send <to_uid> "<body>" [--id <id>]'
+    [ -n "$body" ] || aib_die 64 'usage: message send <to_uid> "<body>" [--id <id>]'
+    shift 2
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --id) id="${2:-}"; [ -n "$id" ] || aib_die 64 "--id needs a value"; shift 2;;
+        *)    aib_die 64 "send: unexpected arg '$1'";;
+      esac
+    done
+
+    _load_own_context
+    to_path="$("$REPO_ROOT/bin/inbox" "$to")"     # P0 resolver (fail-closed on unknown recipient)
+
+    if [ -n "$id" ]; then
+      _validate_id "$id"
+      if _fold exists "$to_path" "$id" >/dev/null 2>&1; then
+        printf '%s\n' "$id"                        # idempotent: id already persisted -> no-op
+        exit 0
+      fi
+    else
+      id="msg-$(_now | tr -d ':-')-$$-${RANDOM}${RANDOM}"
+    fi
+
+    body="$(_sanitize_line "$body")"
+    mkdir -p "$(dirname "$to_path")" || aib_die 2 "cannot create inbox dir for $to"
+    printf '%s | id:%s | from:%s | to:%s | state:PERSISTED | %s\n' \
+      "$(_now)" "$id" "$_own_agent" "$to" "$body" >> "$to_path"
+    printf '%s\n' "$id"
+    ;;
+
+  # -------------------------------------------------------------------------- #
+  notify)
+    to="${1:-}"; id="${2:-}"
+    [ -n "$to" ] && [ -n "$id" ] || aib_die 64 "usage: message notify <to_uid> <id>"
+    _validate_id "$id"
+    _load_own_context
+    to_path="$("$REPO_ROOT/bin/inbox" "$to")"
+    cur="$(_state_of "$id" "$to_path" 2>/dev/null || true)"
+    [ -n "$cur" ] || aib_die 3 "notify: unknown message id '$id' for $to"
+    if [ "$cur" != "PERSISTED" ]; then
+      printf 'message: id %s already %s (notify no-op)\n' "$id" "$cur" >&2
+      exit 0
+    fi
+    printf '%s | id:%s | event:NOTIFIED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$to_path"
+    ;;
+
+  # -------------------------------------------------------------------------- #
+  seen|done|fail)
+    id="${1:-}"
+    if [ -z "$id" ]; then
+      [ "$sub" = "fail" ] && aib_die 64 'usage: message fail <id> ["<reason>"]'
+      aib_die 64 "usage: message $sub <id>"
+    fi
+    _validate_id "$id"
+    reason=""
+    [ "$sub" = "fail" ] && reason="${2:-}"
+    _load_own_context
+    cur="$(_state_of "$id" "$_own_inbox" 2>/dev/null || true)"
+    [ -n "$cur" ] || aib_die 3 "$sub: unknown message id '$id' in own inbox"
+
+    case "$sub" in
+      seen)
+        case "$cur" in
+          PERSISTED|NOTIFIED)
+            printf '%s | id:%s | event:SEEN | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox";;
+          *) printf 'message: id %s already %s (seen no-op)\n' "$id" "$cur" >&2;;
+        esac;;
+      done)
+        case "$cur" in
+          PROCESSED|FAILED) printf 'message: id %s already %s (done no-op)\n' "$id" "$cur" >&2;;
+          *) printf '%s | id:%s | event:PROCESSED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox";;
+        esac;;
+      fail)
+        case "$cur" in
+          PROCESSED|FAILED) printf 'message: id %s already %s (fail no-op)\n' "$id" "$cur" >&2;;
+          *)
+            if [ -n "$reason" ]; then
+              reason="$(_sanitize_line "$reason")"
+              printf '%s | id:%s | event:FAILED | by:%s | reason:%s\n' \
+                "$(_now)" "$id" "$_own_agent" "$reason" >> "$_own_inbox"
+            else
+              printf '%s | id:%s | event:FAILED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox"
+            fi;;
+        esac;;
+    esac
+    ;;
+
+  # -------------------------------------------------------------------------- #
+  inbox|replay)
+    _load_own_context
+    _fold open "$_own_inbox"
+    ;;
+
+  # -------------------------------------------------------------------------- #
+  state)
+    id="${1:-}"
+    [ -n "$id" ] || aib_die 64 "usage: message state <id>"
+    _validate_id "$id"
+    _load_own_context
+    s="$(_state_of "$id" "$_own_inbox" 2>/dev/null || true)"
+    [ -n "$s" ] || aib_die 3 "state: unknown message id '$id' in own inbox"
+    printf '%s\n' "$s"
+    ;;
+
+  # -------------------------------------------------------------------------- #
+  dlq)
+    _load_own_context
+    _fold dlq "$_own_inbox"
+    ;;
+
+  *)
+    aib_die 64 "unknown subcommand '$sub' (send|notify|inbox|replay|seen|done|fail|state|dlq)"
+    ;;
+esac
