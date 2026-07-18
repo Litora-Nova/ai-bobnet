@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# ai-bobnet — resolve the CURRENT agent's context from validated env + the registry.
+# Usage: context [--json]
+#   Inputs (set by the launcher / bin/run-agent): AIBOBNET_PROJECT_UID + AIBOBNET_TASK.
+#   Output: agent_uid project_uid task home standup_dir inbox_path mux_session.
+# Fail-closed: missing/unknown/inconsistent context -> non-zero exit + clear error.
+set -euo pipefail
+
+# --- locate engine root (symlink-safe) ---------------------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+# shellcheck source=lib/aibobnet.sh
+. "$REPO_ROOT/lib/aibobnet.sh"
+
+json=0
+case "${1:-}" in
+  --json) json=1;;
+  "")     : ;;
+  *)      aib_die 64 "usage: context [--json]";;
+esac
+
+aib_check_registry
+
+proj="${AIBOBNET_PROJECT_UID:-}"
+task="${AIBOBNET_TASK:-}"
+[ -n "$proj" ] || aib_die 6 "AIBOBNET_PROJECT_UID not set — cannot resolve context (launch via bin/run-agent)"
+[ -n "$task" ] || aib_die 6 "AIBOBNET_TASK not set — cannot resolve context (launch via bin/run-agent)"
+aib_validate_token "$proj" project_uid
+aib_validate_token "$task" task
+aib_require_project "$proj"
+
+agent="${proj}-${task}"
+
+# Consistency: a launcher-provided agent_uid must match the derived one.
+if [ -n "${AIBOBNET_AGENT_UID:-}" ] && [ "${AIBOBNET_AGENT_UID}" != "$agent" ]; then
+  aib_die 5 "inconsistent context: AIBOBNET_AGENT_UID='${AIBOBNET_AGENT_UID}' != derived '$agent'"
+fi
+
+home="$(aib_project_field "$proj" home)"
+standup_dir="$(aib_project_field "$proj" standup_dir)"
+mux_session="$(aib_project_field "$proj" mux_session)"
+inbox_path="${standup_dir}/inbox/${agent}.md"
+
+if [ "$json" -eq 1 ]; then
+  printf '{'
+  printf '"agent_uid":%s,'   "$(aib_json "$agent")"
+  printf '"project_uid":%s,' "$(aib_json "$proj")"
+  printf '"task":%s,'        "$(aib_json "$task")"
+  printf '"home":%s,'        "$(aib_json "$home")"
+  printf '"standup_dir":%s,' "$(aib_json "$standup_dir")"
+  printf '"inbox_path":%s,'  "$(aib_json "$inbox_path")"
+  printf '"mux_session":%s'  "$(aib_json "$mux_session")"
+  printf '}\n'
+else
+  printf 'agent_uid=%s\n'   "$agent"
+  printf 'project_uid=%s\n' "$proj"
+  printf 'task=%s\n'        "$task"
+  printf 'home=%s\n'        "$home"
+  printf 'standup_dir=%s\n' "$standup_dir"
+  printf 'inbox_path=%s\n'  "$inbox_path"
+  printf 'mux_session=%s\n' "$mux_session"
+fi

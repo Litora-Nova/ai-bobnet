@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# ai-bobnet — print a RECIPIENT's inbox path (deterministic; used when writing TO another agent).
+# Usage: inbox <agent_uid>
+# Canon: write to the recipient's own inbox; read only your own (via context -> inbox_path).
+# Fail-closed on unknown/ambiguous project or malformed agent_uid.
+set -euo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+# shellcheck source=lib/aibobnet.sh
+. "$REPO_ROOT/lib/aibobnet.sh"
+
+agent="${1:-}"
+[ -n "$agent" ] || aib_die 64 "usage: inbox <agent_uid>"
+
+aib_check_registry
+aib_inbox_path "$agent"
