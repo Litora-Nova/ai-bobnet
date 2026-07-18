@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+# ai-bobnet — localhost message-bus adapter (P2). See docs/CONTRACT-adapter.md §2-3.
+#
+# A thin, HARDENED HTTP accelerator over the P1 CLI (bin/message). It is NOT authoritative:
+# every request shells out to `bin/message`, so the append-only journal stays the single
+# source of truth and the semantics are byte-identical to the CLI. Adapter down => the P1
+# CLI still fully works (journal authority).
+#
+# The daemon acts AS its launching agent (resolved via bin/context) — /send is "from" that
+# agent; /inbox /seen /done /fail /state /dlq operate on that agent's own journal — exactly
+# like invoking bin/message in that context.
+#
+# Endpoints (all require the auth token):
+#   POST /send        {"to","body","id"?}        -> {"ok","id",...}   (== message send)
+#   GET  /inbox                                    -> {"ok","messages"} (== message inbox)
+#   POST /seen        {"id"}                       -> {"ok",...}        (== message seen)
+#   POST /done        {"id"}                       -> {"ok",...}        (== message done)
+#   POST /fail        {"id","reason"?}            -> {"ok",...}        (== message fail)
+#   GET  /state/<id>                               -> {"ok","state"}    (== message state)
+#   GET  /dlq                                       -> {"ok","messages"} (== message dlq)
+#
+# HARDENING (non-negotiable):
+#   * binds 127.0.0.1 ONLY (never a wildcard/all-interfaces bind) — no external interface.
+#   * requires an auth token from env AIBOBNET_BUS_TOKEN — NO default; refuses to start if
+#     unset/empty; every request must present it (header X-Aibobnet-Token) or be rejected 401.
+#   * no network egress — the process only accepts local requests and shells to bin/message.
+#
+# Usage: bus start | stop | status        (start prints the bound port)
+# Config: AIBOBNET_BUS_TOKEN (required), AIBOBNET_BUS_PORT (optional; default ephemeral).
+# stdlib only — no pip.
+
+import hmac
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOST = "127.0.0.1"                       # loopback only — hardening invariant
+MAX_BODY = 64 * 1024                     # reject oversized request bodies
+TOKEN_HEADER = "X-Aibobnet-Token"
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+MESSAGE = os.path.join(REPO_ROOT, "bin", "message")
+CONTEXT = os.path.join(REPO_ROOT, "bin", "context")
+
+
+def die(code, msg):
+    sys.stderr.write("ai-bobnet bus: %s\n" % msg)
+    sys.exit(code)
+
+
+def resolve_context():
+    """agent_uid + standup_dir for THIS agent (fail-closed, via P0 bin/context)."""
+    try:
+        out = subprocess.run([CONTEXT, "--json"], capture_output=True, text=True)
+    except OSError as e:
+        die(6, "cannot run bin/context: %s" % e)
+    if out.returncode != 0:
+        die(6, "cannot resolve own context (launch via bin/run-agent): %s" % out.stderr.strip())
+    ctx = json.loads(out.stdout)
+    return ctx["agent_uid"], ctx["standup_dir"]
+
+
+def runtime_path(standup_dir, agent_uid):
+    return os.path.join(standup_dir, ".bus", "%s.json" % agent_uid)
+
+
+def read_runtime(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# --- request handler: auth, then mirror bin/message --------------------------
+def make_handler(token, env):
+    def message(*args):
+        """Run bin/message in this agent's context; return (rc, stdout, stderr)."""
+        p = subprocess.run([MESSAGE, *args], capture_output=True, text=True, env=env)
+        return p.returncode, p.stdout, p.stderr
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "aibobnet-bus"
+
+        def log_message(self, *a):          # silence default stderr access log
+            pass
+
+        def _reply(self, status, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authed(self):
+            supplied = self.headers.get(TOKEN_HEADER, "")
+            if not supplied or not hmac.compare_digest(supplied, token):
+                self._reply(401, {"ok": False, "error": "unauthorized"})
+                return False
+            return True
+
+        def _read_json(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n > MAX_BODY:
+                self._reply(413, {"ok": False, "error": "body too large"})
+                return None
+            raw = self.rfile.read(n) if n else b""
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw)
+            except ValueError:
+                self._reply(400, {"ok": False, "error": "invalid JSON"})
+                return None
+
+        def _run_reply(self, args, extra_key=None):
+            rc, out, err = message(*args)
+            resp = {"ok": rc == 0, "code": rc, "out": out, "err": err.strip()}
+            if extra_key and rc == 0:
+                resp[extra_key] = out.strip()
+            self._reply(200 if rc == 0 else 400, resp)
+
+        def do_GET(self):
+            if not self._authed():
+                return
+            path = self.path.split("?", 1)[0]
+            if path == "/inbox":
+                rc, out, err = message("inbox")
+                self._reply(200 if rc == 0 else 400,
+                            {"ok": rc == 0, "code": rc,
+                             "messages": out.splitlines(), "err": err.strip()})
+            elif path == "/dlq":
+                rc, out, err = message("dlq")
+                self._reply(200 if rc == 0 else 400,
+                            {"ok": rc == 0, "code": rc,
+                             "messages": out.splitlines(), "err": err.strip()})
+            elif path.startswith("/state/"):
+                mid = path[len("/state/"):]
+                self._run_reply(["state", mid], extra_key="state")
+            else:
+                self._reply(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            if not self._authed():
+                return
+            path = self.path.split("?", 1)[0]
+            data = self._read_json()
+            if data is None:
+                return
+            if path == "/send":
+                to, body = data.get("to"), data.get("body")
+                if not to or not body:
+                    self._reply(400, {"ok": False, "error": "send requires 'to' and 'body'"})
+                    return
+                args = ["send", to, body]
+                if data.get("id"):
+                    args += ["--id", data["id"]]
+                self._run_reply(args, extra_key="id")
+            elif path in ("/seen", "/done"):
+                mid = data.get("id")
+                if not mid:
+                    self._reply(400, {"ok": False, "error": "requires 'id'"})
+                    return
+                self._run_reply([path[1:], mid])
+            elif path == "/fail":
+                mid = data.get("id")
+                if not mid:
+                    self._reply(400, {"ok": False, "error": "fail requires 'id'"})
+                    return
+                args = ["fail", mid]
+                if data.get("reason"):
+                    args.append(data["reason"])
+                self._run_reply(args)
+            else:
+                self._reply(404, {"ok": False, "error": "not found"})
+
+    return Handler
+
+
+# --- lifecycle ---------------------------------------------------------------
+def cmd_start():
+    token = os.environ.get("AIBOBNET_BUS_TOKEN", "")
+    if not token:
+        die(2, "AIBOBNET_BUS_TOKEN is required (no default) — refusing to start")
+
+    agent_uid, standup_dir = resolve_context()
+    rt = runtime_path(standup_dir, agent_uid)
+
+    existing = read_runtime(rt)
+    if existing and pid_alive(existing.get("pid", -1)):
+        print(existing["port"])                 # already running -> idempotent
+        return
+
+    port = int(os.environ.get("AIBOBNET_BUS_PORT", "0") or "0")
+    env = dict(os.environ)                       # inherit resolved context for bin/message
+    handler = make_handler(token, env)
+    httpd = ThreadingHTTPServer((HOST, port), handler)   # binds 127.0.0.1 ONLY
+    bound_port = httpd.server_address[1]
+
+    os.makedirs(os.path.dirname(rt), exist_ok=True)
+    pid = os.fork()
+    if pid == 0:                                 # child: detach + serve forever
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        try:
+            httpd.serve_forever()
+        finally:
+            httpd.server_close()
+        os._exit(0)
+
+    # parent: record runtime, print port, exit without touching the shared socket further
+    with open(rt, "w") as f:
+        json.dump({"pid": pid, "host": HOST, "port": bound_port}, f)
+    print(bound_port)
+
+
+def cmd_stop():
+    agent_uid, standup_dir = resolve_context()
+    rt = runtime_path(standup_dir, agent_uid)
+    info = read_runtime(rt)
+    if not info:
+        print("bus: not running")
+        return
+    pid = info.get("pid", -1)
+    if pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(50):                      # up to ~5s for a clean exit
+            if not pid_alive(pid):
+                break
+            time.sleep(0.1)
+        if pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        os.remove(rt)
+    except OSError:
+        pass
+    print("bus: stopped")
+
+
+def cmd_status():
+    agent_uid, standup_dir = resolve_context()
+    info = read_runtime(runtime_path(standup_dir, agent_uid))
+    if info and pid_alive(info.get("pid", -1)):
+        print("running host=%s port=%s pid=%s" % (info["host"], info["port"], info["pid"]))
+    else:
+        die(1, "not running")
+
+
+def main():
+    if len(sys.argv) < 2:
+        die(64, "usage: bus <start|stop|status>")
+    sub = sys.argv[1]
+    if sub == "start":
+        cmd_start()
+    elif sub == "stop":
+        cmd_stop()
+    elif sub == "status":
+        cmd_status()
+    else:
+        die(64, "unknown subcommand '%s' (start|stop|status)" % sub)
+
+
+if __name__ == "__main__":
+    main()
