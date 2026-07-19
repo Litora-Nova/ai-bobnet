@@ -132,6 +132,22 @@ mem acme-bob review p3-note reject "nope | event:PROMOTED" >/dev/null
 assert_streq "injection: note event-spoof does NOT promote a rejected id" "$(mem acme-bob state p3-note)" "REVIEWED_REJECT"
 assert_ngrep "injection: spoof-rejected id is not recallable as trusted" "$(mem acme-third recall --scope project)" "id:p3-note"
 
+# ============================================================================ #
+# 8. Cross-review follow-ups: rendered-state fidelity (#2) + global id uniqueness (#3)
+# ============================================================================ #
+# #2: the rendered state: field must be per-record, not the eligibility loop's last value.
+mem acme-core propose --scope project "promoted-one" --id p3-lbl-a >/dev/null
+mem acme-reviewer review p3-lbl-a accept >/dev/null
+mem acme-reviewer promote p3-lbl-a >/dev/null
+mem acme-core propose --scope project "candidate-two" --id p3-lbl-b >/dev/null
+lbl_out="$(mem acme-core recall --scope project)"
+assert_grep "render-state: promoted id shows state:PROMOTED" "$lbl_out" "id:p3-lbl-a | scope:project | author:acme-core | key: | state:PROMOTED"
+assert_grep "render-state: candidate shows its OWN state:PROPOSED (not stale)" "$lbl_out" "id:p3-lbl-b | scope:project | author:acme-core | key: | state:PROPOSED"
+# #3: an id is globally unique across journals — a cross-journal collision must not brick the id.
+mem acme-core propose --scope project "proj body" --id p3-uniq >/dev/null
+assert_fail "id-unique: reusing an id in another scope is refused" mem acme-core propose --scope shared "shared body" --id p3-uniq
+assert_streq "id-unique: original id still resolves after a rejected collision" "$(mem acme-core state p3-uniq)" "PROPOSED"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]

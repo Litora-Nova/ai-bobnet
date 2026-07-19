@@ -75,7 +75,7 @@ END {
       for (i=1;i<=n;i++) if (eligible[i] && !used[i])
         if (best==0 || rts[order[i]]>rts[order[best]] || (rts[order[i]]==rts[order[best]] && i>best)) best=i
       if (best==0) break
-      used[best]=1; jk=order[best]
+      used[best]=1; jk=order[best]; cur=state[jk]     # per-record state, not the eligibility-loop stale value
       line=rts[jk] " | id:" substr(jk,index(jk,SUBSEP)+1) " | scope:" rscope[jk] " | author:" rauthor[jk] " | key:" rkey[jk] " | state:" cur " | " rbody[jk]
       if (list_mode=="recall") print "advisory: " line; else print line
     }
@@ -122,7 +122,7 @@ _validate_id() {
   local id="$1"; [ -n "$id" ] || aib_die 4 "memory id is empty"
   case "$id" in *[!A-Za-z0-9._-]*) aib_die 4 "invalid memory id '$id' (allowed: letters, digits, . _ -)";; esac
 }
-_sanitize_line() { local s="$1"; printf '%s' "${s//$'\n'/ }"; }
+_sanitize_line() { local s="$1"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"; printf '%s' "$s"; }
 _validate_scope() {
   local scope="$1"; aib_validate_token "$scope" memory_scope
   case "$scope" in agent|project|shared) ;; *) aib_die 4 "invalid memory scope '$scope'";; esac
@@ -231,12 +231,25 @@ case "$sub" in
     _validate_scope "$scope"; [ -n "$id" ] && _validate_id "$id"
     key="$(_sanitize_line "$key")"; case "$key" in *' | '*) aib_die 4 "memory key must not contain ' | '";; esac
     body="$(_sanitize_line "$body")"; _journal_for_scope "$scope"; _ensure_journal_dir
-    if [ -n "$id" ] && meta="$(_journal_meta "$id" "$_journal" 2>/dev/null)"; then
-      IFS=$'\t' read -r _old_scope _old_author _old_state <<EOF
+    if [ -n "$id" ]; then
+      # ids must be globally unique across ALL reachable journals. Re-propose is idempotent only
+      # in the SAME journal while still PROPOSED; a collision in a DIFFERENT journal is refused —
+      # else _locate_* would go permanently ambiguous (a cross-journal id-collision DoS).
+      _sd="$(_shared_dir_optional)"
+      _jrnls=("$_own_standup/memory/agent/$_own_agent.md" "$_own_standup/memory/project.md")
+      [ -n "$_sd" ] && _jrnls+=("$_sd/shared.md")
+      for _j in "${_jrnls[@]}"; do
+        meta="$(_journal_meta "$id" "$_j" 2>/dev/null)" || continue
+        if [ "$_j" = "$_journal" ]; then
+          IFS=$'\t' read -r _old_scope _old_author _old_state <<EOF
 $meta
 EOF
-      [ "$_old_state" = PROPOSED ] && { printf '%s\n' "$id"; exit 0; }
-      aib_die 5 "memory id '$id' already exists with state $_old_state"
+          [ "$_old_state" = PROPOSED ] && { printf '%s\n' "$id"; exit 0; }
+          aib_die 5 "memory id '$id' already exists with state $_old_state"
+        else
+          aib_die 5 "memory id '$id' already exists in another journal (ids must be globally unique)"
+        fi
+      done
     fi
     if [ -z "$id" ]; then stamp="$(_now)"; stamp="${stamp//:/}"; stamp="${stamp//-/}"; id="mem-${stamp}-$$-$RANDOM$RANDOM"; fi
     printf '%s | id:%s | scope:%s | author:%s | key:%s | state:PROPOSED | %s\n' "$(_now)" "$id" "$scope" "$_own_agent" "$key" "$body" >> "$_journal"
