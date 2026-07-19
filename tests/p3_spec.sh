@@ -9,13 +9,25 @@ ENGINE="$WORK/engine"; STATE="$WORK/state"
 mkdir -p "$ENGINE" "$STATE/acme" "$STATE/beta"
 cp -R "$SRC_ROOT/bin" "$SRC_ROOT/scripts" "$SRC_ROOT/lib" "$ENGINE/"
 
+# Since P0.5 an Agent is a registry object: every uid driven below must be declared here.
 cat > "$ENGINE/registry.json" <<JSON
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "shared_memory_dir": "$STATE/shared",
   "projects": {
     "acme": { "home": "$STATE/acme", "standup_dir": "$STATE/acme/standup", "mux_session": "acme" },
     "beta": { "home": "$STATE/beta", "standup_dir": "$STATE/beta/standup", "mux_session": "beta" }
+  },
+  "agents": {
+    "acme-core":     { "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "acme-tests":    { "project": "acme", "profile": "tests",      "clearance": "t1" },
+    "acme-review":   { "project": "acme", "profile": "review",     "clearance": "t1" },
+    "acme-reviewer": { "project": "acme", "profile": "review",     "clearance": "t1" },
+    "acme-evil":     { "project": "acme", "profile": "engine-dev", "clearance": "t1" },
+    "acme-alice":    { "project": "acme", "profile": "engine-dev", "clearance": "t1" },
+    "acme-bob":      { "project": "acme", "profile": "review",     "clearance": "t1" },
+    "acme-third":    { "project": "acme", "profile": "engine-dev", "clearance": "t1" },
+    "beta-core":     { "project": "beta", "profile": "engine-dev", "clearance": "t2" }
   }
 }
 JSON
@@ -76,9 +88,14 @@ assert_grep "shared: bare beta recall includes promoted shared memory" "$(mem be
 NO_SHARED="$WORK/no-shared-registry.json"
 cat > "$NO_SHARED" <<JSON
 {
+  "schema_version": 2,
   "projects": {
     "acme": { "home": "$STATE/acme", "standup_dir": "$STATE/acme/standup", "mux_session": "acme" },
     "beta": { "home": "$STATE/beta", "standup_dir": "$STATE/beta/standup", "mux_session": "beta" }
+  },
+  "agents": {
+    "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "beta-core": { "project": "beta", "profile": "engine-dev", "clearance": "t2" }
   }
 }
 JSON

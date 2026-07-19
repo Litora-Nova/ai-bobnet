@@ -22,11 +22,18 @@ mkdir -p "$ENGINE" "$STATE/acme" "$STATE/beta"
 # Copy the engine tree so registry discovery is fully path-based (no env override).
 cp -R "$SRC_ROOT/bin" "$SRC_ROOT/scripts" "$SRC_ROOT/lib" "$ENGINE/"
 
+# Since P0.5 an Agent is a registry object: every uid driven below must be declared here.
 cat > "$ENGINE/registry.json" <<JSON
 {
+  "schema_version": 2,
   "projects": {
     "acme": { "home": "$STATE/acme", "standup_dir": "$STATE/acme/standup", "mux_session": "acme" },
     "beta": { "home": "$STATE/beta", "standup_dir": "$STATE/beta/standup", "mux_session": "beta" }
+  },
+  "agents": {
+    "acme-core":   { "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "acme-watch":  { "project": "acme", "profile": "watch",      "clearance": "t1" },
+    "beta-review": { "project": "beta", "profile": "review",     "clearance": "t1" }
   }
 }
 JSON

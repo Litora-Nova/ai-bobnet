@@ -24,11 +24,20 @@ mkdir -p "$ENGINE" "$STATE/acme" "$STATE/beta"
 cp -R "$SRC_ROOT/bin" "$SRC_ROOT/scripts" "$SRC_ROOT/lib" "$ENGINE/"
 
 # Synthetic white-label registry (two projects: acme, beta).
+# Since P0.5 an Agent is a registry object: every uid driven below must be declared here.
 cat > "$ENGINE/registry.json" <<JSON
 {
+  "schema_version": 2,
   "projects": {
     "acme": { "home": "$STATE/acme", "standup_dir": "$STATE/acme/standup", "mux_session": "acme" },
     "beta": { "home": "$STATE/beta", "standup_dir": "$STATE/beta/standup", "mux_session": "beta" }
+  },
+  "agents": {
+    "acme-core":   { "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "beta-review": { "project": "beta", "profile": "review",     "clearance": "t1" },
+    "beta-replay": { "project": "beta", "profile": "review",     "clearance": "t1" },
+    "beta-dlq":    { "project": "beta", "profile": "review",     "clearance": "t1" },
+    "beta-down":   { "project": "beta", "profile": "review",     "clearance": "t1" }
   }
 }
 JSON
@@ -159,7 +168,7 @@ assert_fail "failclosed: state of unknown id -> non-zero"       m beta-review st
 assert_fail "failclosed: seen of unknown id -> non-zero"        m beta-review seen no-such-id
 # context must come from the resolver, never a leaked ambient var (P0 canon):
 assert_fail "failclosed: message without resolvable context -> non-zero" \
-  env -u AIBOBNET_PROJECT_UID -u AIBOBNET_TASK "$MSG" inbox
+  env -u AIBOBNET_PROJECT_UID -u AIBOBNET_AGENT_KEY "$MSG" inbox
 
 # ============================================================================ #
 # summary
