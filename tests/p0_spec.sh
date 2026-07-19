@@ -476,8 +476,21 @@ assert_fail "array-entry: a list under agents does not resolve as an agent" \
 arr_err="$(AIBOBNET_REGISTRY="$arrreg" "$INBOX" acme-list 2>&1 >/dev/null)"
 assert_grep "array-entry: refused as an unknown agent, not silently resolved" \
   "$arr_err" "unknown agent_uid 'acme-list'"
+# The clearance claim needs an observable that EXISTS when the attack succeeds. stderr
+# alone is empty on a silent success, so an ngrep on it is green exactly when the leak
+# happens. Drive run-agent instead — it exports the clearance — with the prepared file
+# at the ENGINE ROOT, because run-agent scrubs AIBOBNET_REGISTRY by design. stdout and
+# stderr are captured together so a silent success cannot slip through either.
+cp "$ENGINE/registry.json" "$WORK/registry.bak"
+cp "$arrreg" "$ENGINE/registry.json"
+arr_run="$("$RUN" acme-list -- sh -c 'echo CLEAR=$AIBOBNET_CLEARANCE' 2>&1)"
+cp "$WORK/registry.bak" "$ENGINE/registry.json"
 assert_ngrep "array-entry: the array's clearance never leaks into the resolution" \
-  "$arr_err" "t4"
+  "$arr_run" "t4"
+assert_ngrep "array-entry: the list never reaches a launched command at all" \
+  "$arr_run" "CLEAR="
+assert_grep "array-entry: run-agent refuses the list by name" \
+  "$arr_run" "unknown agent_uid 'acme-list'"
 # a sibling real agent in the same section still resolves — the fix is not a blanket refusal
 assert_streq "array-entry: a real sibling agent still resolves normally" \
   "$(AIBOBNET_REGISTRY="$arrreg" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"

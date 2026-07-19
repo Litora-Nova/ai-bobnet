@@ -172,11 +172,15 @@ END {
     if (sdepth==1 && ty[j]=="S" && tok[j]==sect && ty[j+1]=="P" && tok[j+1]==":" && ty[j+2]=="P" && tok[j+2]=="{") { pstart=j+2; break }
   }
   if (pstart==0) { exit 3 }
-  # Arrays MUST count towards depth here. Counting only {} put an object nested inside
-  # an array back at depth 2, so its fields were attributed to the enclosing key — a
-  # list entry then resolved as a full agent (with its own clearance!) while jq and
-  # python see a list and no agent at all. Same divergence class as the grammar check,
-  # one level up: enforcement view and audit view must not disagree.
+  # Depth counts [] as well as {}. Nothing can currently reach a case where this
+  # matters: the object requirement below already rejects any section entry that is
+  # not an object, so no array can place content at depth 2. This is unreachable
+  # redundancy and NOT the defence against MED-2 — the object requirement is; do not
+  # cite this line as protection. It is kept for one reason: it makes `depth` mean
+  # what its name says. Previously [] were ignored symmetrically, so the count
+  # balanced by accident rather than by construction, and a refactor that relaxes the
+  # object requirement would silently re-open the hole. No test covers it, because no
+  # black-box input can distinguish it from its absence.
   depth=0; cur=""; nuid=0
   for (j=pstart; j<=ntok; j++) {
     if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { depth++; continue }
@@ -188,8 +192,12 @@ END {
     }
     if (ty[j]=="S" && ty[j+1]=="P" && tok[j+1]==":") {
       if (depth==1) {
-        # A section entry MUST be an object. An array/string/number is not an agent or
-        # a project, so it is not registered and its contents are attributed to nothing.
+        # THIS is the defence against MED-2. A section entry MUST be an object: an
+        # array/string/number is not an agent or a project, so it is not registered and
+        # its contents are attributed to nothing. Without it an object nested in an array
+        # resolved as a full agent carrying its OWN clearance, while jq and python saw a
+        # list and no agent at all — enforcement view and audit view disagreeing about
+        # clearance. Covered by tests/p0_spec.sh (section 14i).
         if (ty[j+2]=="P" && tok[j+2]=="{") { cur=tok[j]; nuid++; uids[nuid]=cur; hasuid[cur]=1 }
         else cur=""
       }
