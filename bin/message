@@ -7,7 +7,8 @@
 #
 #   Message line: TS | id:<id> | from:<uid> | to:<uid> | state:PERSISTED | <body>
 #   Event line:   TS | id:<id> | event:<NOTIFIED|SEEN|PROCESSED|FAILED> | by:<uid>
-#                 (optionally " | actor:<label>"; fail may append a trailing " | reason:<reason>")
+#                 (both may carry " | actor:<label>" before the free-text tail;
+#                  fail may append a trailing " | reason:<reason>")
 #
 # `by:`/`from:`/`to:` are the ROUTING key (always an agent_uid, never an actor label).
 # When AIBOBNET_ACTOR is set (run-agent --as), an encoded `actor:<label>` field is
@@ -208,8 +209,11 @@ case "$sub" in
 
     body="$(_sanitize_line "$body")"
     mkdir -p "$(dirname "$to_path")" || aib_die 2 "cannot create inbox dir for $to"
-    printf '%s | id:%s | from:%s | to:%s | state:PERSISTED | %s\n' \
-      "$(_now)" "$id" "$_own_agent" "$to" "$body" >> "$to_path"
+    # `send` records who acted via from:, so it carries actor: too — otherwise the audit
+    # chain has a gap at exactly the action that creates work for another agent. It sits
+    # after to: and before the state marker, because the body runs to end of line.
+    printf '%s | id:%s | from:%s | to:%s%s | state:PERSISTED | %s\n' \
+      "$(_now)" "$id" "$_own_agent" "$to" "$AIB_ACTOR_FIELD" "$body" >> "$to_path"
     printf '%s\n' "$id"
     ;;
 

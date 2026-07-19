@@ -242,6 +242,20 @@ m acme-core send beta-review "for a real actor" --id inj-real >/dev/null
 assert_file_has "injection: a genuine actor label is still a real field before reason:" \
   "$beta_inbox" "event:FAILED | by:beta-review | actor:helper | reason:plain reason"
 
+# (e2) `send` records who acted (via from:), so it must carry actor: too — otherwise the
+# audit chain breaks at exactly the action that creates work for ANOTHER agent.
+"$RUN" --as helper2 acme-core -- "$MSG" send beta-review "sent on behalf" --id inj-sendactor >/dev/null
+assert_file_has "actor: a send carries the actor label as a real field" \
+  "$beta_inbox" "from:acme-core | to:beta-review | actor:helper2 | state:PERSISTED |"
+assert_grep "actor: the send still routes by from:, not by the label" \
+  "$(m beta-review inbox)" "id:inj-sendactor | state:PERSISTED | from:acme-core"
+assert_streq "actor: the labelled send is a normal message" \
+  "$(m beta-review state inj-sendactor)" "PERSISTED"
+# an unlabelled send stays byte-identical to before (no empty actor field)
+m acme-core send beta-review "plain send" --id inj-plainsend >/dev/null
+assert_file_has "actor: an unlabelled send is unchanged" \
+  "$beta_inbox" "from:acme-core | to:beta-review | state:PERSISTED | plain send"
+
 # (e) the victim still completes normally — the journal is intact, not just unflipped
 m beta-review seen inj-victim >/dev/null
 m beta-review done inj-victim >/dev/null

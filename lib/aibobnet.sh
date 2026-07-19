@@ -46,6 +46,7 @@ aib_check_registry() {
     0) ;;
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
     7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
+    10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
     *) aib_die 2 "registry failed validation (code $rc): $reg";;
   esac
 }
@@ -82,6 +83,9 @@ function p_object(   myid, key) {
   if (ty[pos]=="P" && tok[pos]=="}") { pos++; return 1 }
   while (1) {
     if (ty[pos]!="S") return 0                           # a key must be a JSON string
+    # A KEY is always identity-relevant, so an undecodable one is refused up front —
+    # unlike a value, which is only refused where it is consumed.
+    if (tund[pos]) { badkey=1; return 0 }
     key = tok[pos]
     if ((myid SUBSEP key) in kseen) { dupkey=1; return 0 }
     kseen[myid SUBSEP key] = 1
@@ -112,7 +116,7 @@ END {
     if (c==" "||c=="\t"||c=="\r"||c=="\n") { i++; continue }
     if (c=="{"||c=="}"||c=="["||c=="]"||c==":"||c==",") { ntok++; tok[ntok]=c; ty[ntok]="P"; i++; continue }
     if (c=="\"") {
-      s=""; i++; term=0
+      s=""; i++; term=0; und=0
       while (i<=n) {
         d=substr(data,i,1)
         if (d=="\\") {
@@ -120,11 +124,15 @@ END {
           if(e=="n")s=s"\n"; else if(e=="t")s=s"\t"; else if(e=="r")s=s"\r";
           else if(e=="b")s=s"\b"; else if(e=="f")s=s"\f";
           else if(e=="\"")s=s"\""; else if(e=="\\")s=s"\\"; else if(e=="/")s=s"/";
-          # Anything else is not a JSON escape. Accepting it (old behaviour: take the
-          # char verbatim) silently produced a DIFFERENT value than a strict reader —
-          # at the identity authority that is a divergence, so refuse. \u is included
-          # deliberately: this parser does not decode it, and mis-decoding it to
-          # "u0041" would be worse than saying so. Raw UTF-8 needs no escape.
+          # \u is VALID JSON that this parser cannot decode. Rejecting the whole file
+          # for it would break every registry written by a tool using json.dump(), which
+          # escapes non-ASCII by default — and CONTRACT.md explicitly invites unicode in
+          # display_name, a field nothing ever reads. So mark the token undecodable and
+          # defer: it only kills where it is actually read (as a key, or as a consumed
+          # field). Same shape as the value-type rule. Fail-closed stays where it counts.
+          else if(e=="u") { und=1 }
+          # Anything else is not a JSON escape at all. Taking the char verbatim silently
+          # produced a DIFFERENT value than a strict reader, so the document is refused.
           else { exit 6 }
           i+=2; continue
         }
@@ -134,7 +142,7 @@ END {
       # An unterminated string silently swallowed the rest of the file (a torn write).
       # Accepting it would let a half-written registry hand out identity and clearance.
       if (!term) { exit 6 }
-      ntok++; tok[ntok]=s; ty[ntok]="S"; continue
+      ntok++; tok[ntok]=s; ty[ntok]="S"; tund[ntok]=und; continue
     }
     s=""
     while (i<=n) {
@@ -149,8 +157,8 @@ END {
   # file must never resolve. The whole document must parse as JSON: exactly ONE
   # top-level value, no trailing data, and no duplicate key within the same object
   # (last-write-wins would let key ORDER decide routing, clearance and memory scope).
-  pos = 1; nobj = 0; dupkey = 0
-  if (!p_value()) { if (dupkey) exit 7; exit 6 }
+  pos = 1; nobj = 0; dupkey = 0; badkey = 0
+  if (!p_value()) { if (dupkey) exit 7; if (badkey) exit 10; exit 6 }
   if (pos <= ntok) exit 6                      # trailing data after the top-level value
   if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
   if (op=="validate") { exit 0 }
@@ -164,17 +172,34 @@ END {
     if (sdepth==1 && ty[j]=="S" && tok[j]==sect && ty[j+1]=="P" && tok[j+1]==":" && ty[j+2]=="P" && tok[j+2]=="{") { pstart=j+2; break }
   }
   if (pstart==0) { exit 3 }
+  # Arrays MUST count towards depth here. Counting only {} put an object nested inside
+  # an array back at depth 2, so its fields were attributed to the enclosing key — a
+  # list entry then resolved as a full agent (with its own clearance!) while jq and
+  # python see a list and no agent at all. Same divergence class as the grammar check,
+  # one level up: enforcement view and audit view must not disagree.
   depth=0; cur=""; nuid=0
   for (j=pstart; j<=ntok; j++) {
-    if (ty[j]=="P" && tok[j]=="{") { depth++; continue }
-    if (ty[j]=="P" && tok[j]=="}") { depth--; if(depth==0) break; if(depth==1) cur=""; continue }
+    if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { depth++; continue }
+    if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) {
+      depth--
+      if (depth==0) break
+      if (depth==1) cur=""
+      continue
+    }
     if (ty[j]=="S" && ty[j+1]=="P" && tok[j+1]==":") {
-      if (depth==1) { cur=tok[j]; nuid++; uids[nuid]=cur; hasuid[cur]=1 }
+      if (depth==1) {
+        # A section entry MUST be an object. An array/string/number is not an agent or
+        # a project, so it is not registered and its contents are attributed to nothing.
+        if (ty[j+2]=="P" && tok[j+2]=="{") { cur=tok[j]; nuid++; uids[nuid]=cur; hasuid[cur]=1 }
+        else cur=""
+      }
       else if (depth==2 && cur!="") {
-        # Keep the value AND its token type. The type is enforced only where a field
-        # is actually consumed, so an unknown nested/array field stays forward-compatible.
-        store[cur SUBSEP tok[j]]   = tok[j+2]
-        storety[cur SUBSEP tok[j]] = ty[j+2]
+        # Keep the value, its token type AND whether it decoded. Both are enforced only
+        # where a field is actually consumed, so an unknown nested/array field — or a
+        # \u escape in a field nobody reads — stays forward-compatible.
+        store[cur SUBSEP tok[j]]    = tok[j+2]
+        storety[cur SUBSEP tok[j]]  = ty[j+2]
+        storeund[cur SUBSEP tok[j]] = tund[j+2]
       }
     }
   }
@@ -185,6 +210,7 @@ END {
     key = uid SUBSEP field
     if (!(key in store)) exit 4
     if (storety[key] != "S") exit 8          # consumed fields MUST be JSON strings
+    if (storeund[key]) exit 10               # ...and MUST be fully decodable
     print store[key]; exit 0
   }
   exit 9
@@ -209,7 +235,8 @@ aib_require_project() {
 aib_project_field() {
   local p="$1" f="$2" v rc=0
   v="$(aib_registry_query projects field "$p" "$f")" || rc=$?
-  [ "$rc" -ne 8 ] || aib_die 2 "registry: project '$p' field '$f' is not a JSON string"
+  [ "$rc" -ne 8 ]  || aib_die 2 "registry: project '$p' field '$f' is not a JSON string"
+  [ "$rc" -ne 10 ] || aib_die 2 "registry: project '$p' field '$f' uses a \\u escape this parser cannot decode — write it as raw UTF-8 (refusing to act on a half-decoded value)"
   if [ "$rc" -ne 0 ] || [ -z "$v" ]; then
     aib_die 3 "registry: project '$p' has no usable field '$f'"
   fi
@@ -220,7 +247,8 @@ aib_project_field() {
 aib_agent_field() {
   local a="$1" f="$2" v rc=0
   v="$(aib_registry_query agents field "$a" "$f")" || rc=$?
-  [ "$rc" -ne 8 ] || aib_die 2 "registry: agent '$a' field '$f' is not a JSON string"
+  [ "$rc" -ne 8 ]  || aib_die 2 "registry: agent '$a' field '$f' is not a JSON string"
+  [ "$rc" -ne 10 ] || aib_die 2 "registry: agent '$a' field '$f' uses a \\u escape this parser cannot decode — write it as raw UTF-8 (refusing to act on a half-decoded value)"
   if [ "$rc" -ne 0 ] || [ -z "$v" ]; then
     aib_die 3 "registry: agent '$a' has no usable field '$f'"
   fi

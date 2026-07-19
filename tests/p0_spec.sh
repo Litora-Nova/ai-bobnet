@@ -398,8 +398,15 @@ dupclear="$(bad_reg dupclear "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
   \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"clearance\": \"t4\" } } }")"
 assert_fail "malformed: a duplicate clearance key is refused (no silent privilege gain)" \
   env AIBOBNET_REGISTRY="$dupclear" "$INBOX" acme-core
-assert_ngrep "malformed: the refused registry never yields the higher clearance" \
-  "$(AIBOBNET_REGISTRY="$dupclear" "$RUN" acme-core -- sh -c 'echo CLEAR=$AIBOBNET_CLEARANCE' 2>&1)" "CLEAR=t4"
+dupclear_err="$(AIBOBNET_REGISTRY="$dupclear" "$INBOX" acme-core 2>&1 >/dev/null)"
+assert_grep "malformed: duplicate clearance is refused AS a duplicate key" \
+  "$dupclear_err" "duplicate key"
+# ...and the refusal is caused by the DUPLICATION, not by the shape or by t4 itself:
+# the same registry with the duplicate removed resolves normally.
+assert_streq "malformed: the same registry without the duplicate resolves fine" \
+  "$(AIBOBNET_REGISTRY="$(bad_reg dupclear_ok "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+    \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t4\" } } }")" \
+    "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
 # a duplicated agent_uid in the same section is caught too
 assert_fail "malformed: a duplicate agent_uid is refused" \
   env AIBOBNET_REGISTRY="$(bad_reg dupagent "{ $GOOD_PROJ, \"agents\": {
@@ -439,14 +446,78 @@ assert_fail "malformed: a missing comma between pairs is refused" \
 assert_fail "malformed: an invalid escape (\\m) is refused, not taken verbatim" \
   env AIBOBNET_REGISTRY="$(bad_reg badesc "{ \"projects\": { \"acme\": {
     \"home\": \"/h\", \"standup_dir\": \"/s\", \"\\mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
-assert_fail "malformed: an undecodable \\u escape is refused, not mis-decoded" \
-  env AIBOBNET_REGISTRY="$(bad_reg uesc "{ \"projects\": { \"acme\": {
-    \"home\": \"/\\u0041\", \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
+# \u is deferred to the point of use, so the SAME registry is fine for a consumer that
+# does not read the affected field and fail-closed for one that does. `home` is read by
+# bin/context but not by bin/inbox — a precise pair, and the whole point of deferring.
+uhome="$(bad_reg uesc "{ \"projects\": { \"acme\": {
+  \"home\": \"/\\u0041\", \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")"
+assert_streq "u-escape: a consumer that never reads the field still resolves" \
+  "$(AIBOBNET_REGISTRY="$uhome" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+assert_fail "u-escape: a consumer that DOES read the field is fail-closed" \
+  env AIBOBNET_REGISTRY="$uhome" AIBOBNET_PROJECT_UID=acme AIBOBNET_AGENT_KEY=core "$CTX"
+assert_grep "u-escape: and it says the value could not be decoded" \
+  "$(AIBOBNET_REGISTRY="$uhome" AIBOBNET_PROJECT_UID=acme AIBOBNET_AGENT_KEY=core "$CTX" 2>&1 >/dev/null)" \
+  "cannot decode"
 # valid escapes still decode
 assert_streq "malformed: a VALID escape still decodes normally" \
   "$(AIBOBNET_REGISTRY="$(bad_reg okesc "{ \"projects\": { \"acme\": {
     \"home\": \"/h\", \"standup_dir\": \"\\/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" \
     "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+
+# (i) an ARRAY entry is not an agent. Counting only {} for depth put an object nested in
+#     an array back at "field" level, so a list resolved as a full agent WITH ITS OWN
+#     CLEARANCE, while jq and python see a list and no agent at all. Enforcement view and
+#     audit view must not disagree — least of all about clearance.
+arrreg="$(bad_reg arrsect "{ $GOOD_PROJ, \"agents\": {
+  \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\" },
+  \"acme-list\": [ { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t4\" } ] } }")"
+assert_fail "array-entry: a list under agents does not resolve as an agent" \
+  env AIBOBNET_REGISTRY="$arrreg" "$INBOX" acme-list
+arr_err="$(AIBOBNET_REGISTRY="$arrreg" "$INBOX" acme-list 2>&1 >/dev/null)"
+assert_grep "array-entry: refused as an unknown agent, not silently resolved" \
+  "$arr_err" "unknown agent_uid 'acme-list'"
+assert_ngrep "array-entry: the array's clearance never leaks into the resolution" \
+  "$arr_err" "t4"
+# a sibling real agent in the same section still resolves — the fix is not a blanket refusal
+assert_streq "array-entry: a real sibling agent still resolves normally" \
+  "$(AIBOBNET_REGISTRY="$arrreg" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+# the same shape one level down (an array as a FIELD value) stays forward-compatible
+assert_streq "array-entry: an array as a field value is still ignored, not fatal" \
+  "$(AIBOBNET_REGISTRY="$(bad_reg arrfield "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+    \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
+    \"scopes\": [ { \"clearance\": \"t4\" } ] } } }")" "$INBOX" acme-core 2>/dev/null)" \
+  "/s/inbox/acme-core.md"
+
+# (j) \u is VALID JSON this parser cannot decode. Rejecting the file outright would break
+#     every registry written with json.dump() (which escapes non-ASCII by default) because
+#     of display_name — a field nothing reads. So it is deferred to the point of use.
+ureg="{ $GOOD_PROJ, \"agents\": { \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\",
+  \"clearance\": \"t1\", \"display_name\": \"B\\u00f6b\" } } }"
+assert_streq "u-escape: \\u in an UNREAD field does not break resolution" \
+  "$(AIBOBNET_REGISTRY="$(bad_reg uunread "$ureg")" "$INBOX" acme-core 2>/dev/null)" \
+  "/s/inbox/acme-core.md"
+# ...but a CONSUMED field with \u is fail-closed, with its own honest message
+uconsumed="$(bad_reg uconsumed "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"\\u0074\\u0031\" } } }")"
+assert_fail "u-escape: \\u in a CONSUMED field is refused" \
+  env AIBOBNET_REGISTRY="$uconsumed" "$INBOX" acme-core
+uerr="$(AIBOBNET_REGISTRY="$uconsumed" "$INBOX" acme-core 2>&1 >/dev/null)"
+assert_grep "u-escape: the message names the real cause, not a syntax error" \
+  "$uerr" "cannot decode"
+assert_ngrep "u-escape: it is NOT reported as invalid JSON (the file is valid)" \
+  "$uerr" "not valid JSON"
+# ...and a \u in an object KEY is refused up front: a key is always identity-relevant
+ukey="$(bad_reg ukey "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"\\u0078\": \"y\" } } }")"
+assert_fail "u-escape: \\u in an object KEY is refused up front" \
+  env AIBOBNET_REGISTRY="$ukey" "$INBOX" acme-core
+assert_grep "u-escape: the key case says it is about a key" \
+  "$(AIBOBNET_REGISTRY="$ukey" "$INBOX" acme-core 2>&1 >/dev/null)" "OBJECT KEY"
+# a genuinely invalid escape stays a hard JSON error (parity with a strict reader)
+assert_grep "u-escape: an invalid escape is still reported as invalid JSON" \
+  "$(AIBOBNET_REGISTRY="$(bad_reg badesc2 "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+    \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"x\": \"a\\mb\" } } }")" \
+    "$INBOX" acme-core 2>&1 >/dev/null)" "not valid JSON"
 
 # (h) forward compatibility survives all of it: unknown nested/array fields are ignored,
 #     never load-bearing — the type rule applies only where a field is consumed.

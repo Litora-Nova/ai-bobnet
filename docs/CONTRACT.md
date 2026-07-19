@@ -49,8 +49,19 @@ the whole document must parse as JSON (balance checking alone is not enough — 
 quote can re-synchronise on the next one and silently change a value), exactly one top-level value
 with no trailing data, no duplicate key in one object (key order must never decide routing or
 clearance), and every *consumed* field must be a JSON string. Unknown nested or array fields stay
-ignored, so forward compatibility is unaffected. `\u` escapes are refused rather than mis-decoded —
-raw UTF-8 needs no escape.
+ignored, so forward compatibility is unaffected.
+
+A **section entry must be an object**: a list under `agents` is not an agent. (Counting only `{}`
+for depth once let an object nested in an array resolve as a full agent *with its own clearance*,
+while `jq` and `python` saw a list and no agent — enforcement view and audit view must never
+disagree, least of all about clearance.)
+
+`\u` escapes are **valid JSON this parser cannot decode**, so they are deferred rather than fatal:
+a `\u` in an object **key**, or in a field that is actually **consumed**, fails closed with its own
+message; anywhere else it is ignored. Without that deferral every registry written by a tool using
+`json.dump()` — which escapes non-ASCII by default — would break every entrypoint over a
+`display_name` nothing ever reads. Prefer raw UTF-8; a genuinely invalid escape (`\m`) stays a hard
+JSON error.
 
 ## 2. Resolver — one place, no guessing
 
@@ -73,6 +84,8 @@ raw UTF-8 needs no escape.
 - **Line grammar:** structured fields first, then at most **one** free-text tail, introduced by a
   known marker (`state:PERSISTED | <body>`, or `reason:<reason>`) and running to end of line.
   Unknown structured fields are ignored (forward-compatible).
+- `send` carries `actor:` as well: it records who acted via `from:`, so omitting the label there
+  would break the audit chain at exactly the action that creates work for another agent.
 - **Free text is encoded on write:** line breaks collapse to a space and every `|` becomes `%7C`,
   so a body, reason or note can never contain the field separator. This is what makes the line
   *unambiguously encoded* (DOMAIN §5) for readers this engine does not control — a dashboard, a
