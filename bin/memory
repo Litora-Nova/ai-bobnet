@@ -24,25 +24,28 @@ function journal(    x) {
   return ""
 }
 {
-  raw=$0; id=""; scope=""; author=""; key=""; event=""; record=0; isevent=0; iskey=0
+  raw=$0; id=""; scope=""; author=""; key=""; event=""; record=0
+  isid=0; isscope=0; isauthor=0; iskey=0; isevent=0
   # Structured fields are a FIXED prefix; everything after the state/by marker is
   # opaque free text (body/note) and MUST NOT be re-parsed for structured markers —
   # otherwise a crafted body could spoof author (bypassing the two-actor gate) or a
   # crafted note could spoof event:PROMOTED. Break out before the free-text tail.
-  # EVERY structured field takes its FIRST occurrence, never last-wins — the same
-  # defence in depth as the bin/message fold (docs/CONTRACT.md §3): a hand-edited or
-  # foreign-writer line with a field repeated in its structured prefix (no free-text
-  # marker at all, so the break above cannot help) must fold deterministically
-  # instead of order-dependently. This matters most for `author:` — it is the field
-  # the two-actor gate compares against (`rauthor[jk]==caller` in the review
-  # self-review check); a crafted second `author:` would let the real (first) author
-  # make their own proposal look authored by someone else, then self-review it.
+  # EVERY structured field additionally takes its FIRST occurrence via an explicit
+  # isX flag — never a last-wins assignment, and never an empty-string sentinel (a
+  # field can be legitimately empty, e.g. key: with no --key; a sentinel would
+  # silently disable the guard exactly there). This makes a hand-edited or
+  # foreign-writer line with a repeated field fold deterministically instead of
+  # order-dependently. It does NOT make `author:` attacker-resistant on its own: the
+  # journal is a plain file any project agent may append to (`propose` is not the
+  # only way a line gets written), so a single, un-repeated `author:` already passes
+  # the two-actor gate for whoever it names. Field repetition is one variant of that
+  # gap, not the gap itself — a trust-boundary question for the PO, out of scope here.
   for (i=2;i<=NF;i++) {
     f=$i
-    if (f ~ /^id:/) { if (id=="") id=substr(f,4) }
-    else if (f ~ /^scope:/) { if (scope=="") scope=substr(f,7) }
-    else if (f ~ /^author:/) { if (author=="") author=substr(f,8) }
-    else if (f ~ /^key:/) { if (!iskey) { key=substr(f,5); iskey=1 } }  # key may legitimately be "", so id=="" cannot be the seen-guard here
+    if (f ~ /^id:/) { if (!isid) { id=substr(f,4); isid=1 } }
+    else if (f ~ /^scope:/) { if (!isscope) { scope=substr(f,7); isscope=1 } }
+    else if (f ~ /^author:/) { if (!isauthor) { author=substr(f,8); isauthor=1 } }
+    else if (f ~ /^key:/) { if (!iskey) { key=substr(f,5); iskey=1 } }
     else if (f=="state:PROPOSED") { record=1; break }     # body follows
     else if (f ~ /^event:/) { if (!isevent) { event=substr(f,7); isevent=1 } }
     else if (f ~ /^by:/) break                            # note follows
