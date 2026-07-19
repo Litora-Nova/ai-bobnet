@@ -29,14 +29,20 @@ function journal(    x) {
   # opaque free text (body/note) and MUST NOT be re-parsed for structured markers —
   # otherwise a crafted body could spoof author (bypassing the two-actor gate) or a
   # crafted note could spoof event:PROMOTED. Break out before the free-text tail.
+  # `id:`/`event:` additionally take their FIRST occurrence, never last-wins — the
+  # same defence in depth as the bin/message fold (docs/CONTRACT.md §3): a hand-edited
+  # or foreign-writer line with two id: fields in its structured prefix (no free-text
+  # marker at all, so the break above cannot help) must fold deterministically
+  # instead of order-dependently, or a crafted second id: silently retargets the
+  # event onto a FOREIGN record.
   for (i=2;i<=NF;i++) {
     f=$i
-    if (f ~ /^id:/) id=substr(f,4)
+    if (f ~ /^id:/) { if (id=="") id=substr(f,4) }
     else if (f ~ /^scope:/) scope=substr(f,7)
     else if (f ~ /^author:/) author=substr(f,8)
     else if (f ~ /^key:/) key=substr(f,5)
     else if (f=="state:PROPOSED") { record=1; break }     # body follows
-    else if (f ~ /^event:/) { event=substr(f,7); isevent=1 }
+    else if (f ~ /^event:/) { if (!isevent) { event=substr(f,7); isevent=1 } }
     else if (f ~ /^by:/) break                            # note follows
   }
   if (id=="") next
