@@ -7,7 +7,13 @@
 #
 #   Message line: TS | id:<id> | from:<uid> | to:<uid> | state:PERSISTED | <body>
 #   Event line:   TS | id:<id> | event:<NOTIFIED|SEEN|PROCESSED|FAILED> | by:<uid>
-#                 (fail may append a trailing " | reason:<reason>")
+#                 (optionally " | actor:<label>"; fail may append a trailing " | reason:<reason>")
+#
+# `by:`/`from:`/`to:` are the ROUTING key (always an agent_uid, never an actor label).
+# When AIBOBNET_ACTOR is set (run-agent --as), an encoded `actor:<label>` field is
+# appended to the lines that record who acted, so the acting session is auditable
+# without disturbing routing or existing parsers (unknown fields are ignored by the fold).
+# It precedes `reason:` because reason is free text that runs to end-of-line.
 #
 # State machine (observable, never inferred): PERSISTED -> NOTIFIED -> SEEN -> PROCESSED | FAILED.
 # Pure bash + awk, no external deps (no jq, no sqlite). Fail-closed / fail-loud per P0.
@@ -137,6 +143,7 @@ _sanitize_line() { local s="$1"; printf '%s' "${s//$'\n'/ }"; }
 _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 aib_check_registry
+aib_load_actor        # -> AIB_ACTOR_FIELD ("" or " | actor:<label>"); dies on a bad label
 
 sub="${1:-}"
 [ -n "$sub" ] || aib_die 64 "usage: message <send|notify|inbox|replay|seen|done|fail|state|dlq|pending> ..."
@@ -190,7 +197,7 @@ case "$sub" in
       printf 'message: id %s already %s (notify no-op)\n' "$id" "$cur" >&2
       exit 0
     fi
-    printf '%s | id:%s | event:NOTIFIED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$to_path"
+    printf '%s | id:%s | event:NOTIFIED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$to_path"
     ;;
 
   # -------------------------------------------------------------------------- #
@@ -211,13 +218,13 @@ case "$sub" in
       seen)
         case "$cur" in
           PERSISTED|NOTIFIED)
-            printf '%s | id:%s | event:SEEN | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox";;
+            printf '%s | id:%s | event:SEEN | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox";;
           *) printf 'message: id %s already %s (seen no-op)\n' "$id" "$cur" >&2;;
         esac;;
       done)
         case "$cur" in
           PROCESSED|FAILED) printf 'message: id %s already %s (done no-op)\n' "$id" "$cur" >&2;;
-          *) printf '%s | id:%s | event:PROCESSED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox";;
+          *) printf '%s | id:%s | event:PROCESSED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox";;
         esac;;
       fail)
         case "$cur" in
@@ -225,10 +232,10 @@ case "$sub" in
           *)
             if [ -n "$reason" ]; then
               reason="$(_sanitize_line "$reason")"
-              printf '%s | id:%s | event:FAILED | by:%s | reason:%s\n' \
-                "$(_now)" "$id" "$_own_agent" "$reason" >> "$_own_inbox"
+              printf '%s | id:%s | event:FAILED | by:%s%s | reason:%s\n' \
+                "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" "$reason" >> "$_own_inbox"
             else
-              printf '%s | id:%s | event:FAILED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox"
+              printf '%s | id:%s | event:FAILED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox"
             fi;;
         esac;;
     esac

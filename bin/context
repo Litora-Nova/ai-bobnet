@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ai-bobnet — resolve the CURRENT agent's context from validated env + the registry.
 # Usage: context [--json]
-#   Inputs (set by the launcher / bin/run-agent): AIBOBNET_PROJECT_UID + AIBOBNET_TASK.
-#   Output: agent_uid project_uid task home standup_dir inbox_path mux_session.
+#   Inputs (set by the launcher / bin/run-agent): AIBOBNET_PROJECT_UID + AIBOBNET_AGENT_KEY.
+#   Output: agent_uid project_uid agent_key home standup_dir inbox_path mux_session.
 # Fail-closed: missing/unknown/inconsistent context -> non-zero exit + clear error.
+# The derived agent_uid is resolved against registry.agents — an agent that is not a
+# registry object does not resolve, even if its prefix parses (docs/DOMAIN.md §2).
 set -euo pipefail
 
 # --- locate engine root (symlink-safe) ---------------------------------------
@@ -28,14 +30,20 @@ esac
 aib_check_registry
 
 proj="${AIBOBNET_PROJECT_UID:-}"
-task="${AIBOBNET_TASK:-}"
-[ -n "$proj" ] || aib_die 6 "AIBOBNET_PROJECT_UID not set — cannot resolve context (launch via bin/run-agent)"
-[ -n "$task" ] || aib_die 6 "AIBOBNET_TASK not set — cannot resolve context (launch via bin/run-agent)"
+agent_key="${AIBOBNET_AGENT_KEY:-}"
+[ -n "$proj" ]      || aib_die 6 "AIBOBNET_PROJECT_UID not set — cannot resolve context (launch via bin/run-agent)"
+[ -n "$agent_key" ] || aib_die 6 "AIBOBNET_AGENT_KEY not set — cannot resolve context (launch via bin/run-agent)"
 aib_validate_token "$proj" project_uid
-aib_validate_token "$task" task
+aib_validate_token "$agent_key" agent_key
 aib_require_project "$proj"
 
-agent="${proj}-${task}"
+agent="${proj}-${agent_key}"
+
+# The Agent must be a registry object; the registry — not this env pair — decides
+# which project it belongs to. A mismatch is a poisoned/stale context, not a hint.
+aib_split_agent "$agent"
+[ "$AIB_PROJECT_UID" = "$proj" ] || aib_die 5 \
+  "inconsistent context: agent_uid '$agent' belongs to project '$AIB_PROJECT_UID', not '$proj'"
 
 # Consistency: a launcher-provided agent_uid must match the derived one.
 if [ -n "${AIBOBNET_AGENT_UID:-}" ] && [ "${AIBOBNET_AGENT_UID}" != "$agent" ]; then
@@ -51,7 +59,7 @@ if [ "$json" -eq 1 ]; then
   printf '{'
   printf '"agent_uid":%s,'   "$(aib_json "$agent")"
   printf '"project_uid":%s,' "$(aib_json "$proj")"
-  printf '"task":%s,'        "$(aib_json "$task")"
+  printf '"agent_key":%s,'   "$(aib_json "$agent_key")"
   printf '"home":%s,'        "$(aib_json "$home")"
   printf '"standup_dir":%s,' "$(aib_json "$standup_dir")"
   printf '"inbox_path":%s,'  "$(aib_json "$inbox_path")"
@@ -60,7 +68,7 @@ if [ "$json" -eq 1 ]; then
 else
   printf 'agent_uid=%s\n'   "$agent"
   printf 'project_uid=%s\n' "$proj"
-  printf 'task=%s\n'        "$task"
+  printf 'agent_key=%s\n'   "$agent_key"
   printf 'home=%s\n'        "$home"
   printf 'standup_dir=%s\n' "$standup_dir"
   printf 'inbox_path=%s\n'  "$inbox_path"

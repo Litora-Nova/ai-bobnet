@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # ai-bobnet — fail-closed launcher. Kills ambient-env foreign-routing (the #1 field bug).
-# Usage: run-agent <agent_uid> -- <cmd...>
+# Usage: run-agent [--as <actor-label>] <agent_uid> -- <cmd...>
 #   1. Scrub inherited routing env (STANDUP_DIR, INBOX*, MUX*, BOOT_*, PROJECT_*, AIBOBNET_*).
 #   2. Resolve + validate the target context from the registry (authority; env-independent).
 #   3. Export the clean, validated context, then exec the command.
 # A leaked ambient variable must NEVER route an agent into a foreign project.
+#
+# --as <actor-label> (on_behalf_of, docs/DOMAIN.md §2): a short-lived helper is a
+# Session/Attempt acting on behalf of an EXISTING agent — never a new Agent. The routing
+# identity stays the parent agent_uid (inbox, journal, memory scope, standup file,
+# AIBOBNET_AGENT_UID are unchanged); the label is exported as AIBOBNET_ACTOR for audit only.
+# Clearance is inherited and capped: it is always the parent's, and no flag can raise it.
 set -euo pipefail
 
 _src="${BASH_SOURCE[0]}"
@@ -18,12 +24,25 @@ REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
 . "$REPO_ROOT/lib/aibobnet.sh"
 
+_usage='usage: run-agent [--as <actor-label>] <agent_uid> -- <cmd...>'
+
+actor=""
+if [ "${1:-}" = "--as" ]; then
+  actor="${2:-}"
+  [ -n "$actor" ] || aib_die 64 "--as needs an actor label ($_usage)"
+  shift 2
+fi
+
 agent="${1:-}"
-[ -n "$agent" ] || aib_die 64 "usage: run-agent <agent_uid> -- <cmd...>"
+[ -n "$agent" ] || aib_die 64 "$_usage"
 shift
-[ "${1:-}" = "--" ] || aib_die 64 "usage: run-agent <agent_uid> -- <cmd...> (missing '--')"
+[ "${1:-}" = "--" ] || aib_die 64 "$_usage (missing '--')"
 shift
 [ "$#" -ge 1 ] || aib_die 64 "run-agent: no command given after '--'"
+
+# Validate the actor label BEFORE it is exported. The token charset admits no '|'
+# and no newline, so a label can never inject a field into a journal line.
+[ -z "$actor" ] || aib_validate_token "$actor" actor_label
 
 # --- scrub inherited routing env FIRST — before ANY registry resolution ------
 # Order is load-bearing: aib_registry_file honors AIBOBNET_REGISTRY, so a poisoned
@@ -40,9 +59,9 @@ done
 aib_check_registry
 
 # --- resolve + validate the TARGET context (from the canonical registry) -----
-aib_split_agent "$agent"                       # -> AIB_PROJECT_UID, AIB_TASK
+aib_split_agent "$agent"     # -> AIB_PROJECT_UID, AIB_AGENT_KEY, AIB_PROFILE, AIB_CLEARANCE
 proj="$AIB_PROJECT_UID"
-task="$AIB_TASK"
+agent_key="$AIB_AGENT_KEY"
 home="$(aib_project_field "$proj" home)"
 standup_dir="$(aib_project_field "$proj" standup_dir)"
 mux_session="$(aib_project_field "$proj" mux_session)"
@@ -50,12 +69,17 @@ inbox_path="${standup_dir}/inbox/${agent}.md"
 
 # --- export the clean, validated context, then exec --------------------------
 export AIBOBNET_PROJECT_UID="$proj"
-export AIBOBNET_TASK="$task"
-export AIBOBNET_AGENT_UID="$agent"
+export AIBOBNET_AGENT_KEY="$agent_key"
+export AIBOBNET_AGENT_UID="$agent"          # routing key — never the actor label
+export AIBOBNET_PROFILE="$AIB_PROFILE"      # MUTABLE; carries no authority
+export AIBOBNET_CLEARANCE="$AIB_CLEARANCE"  # from the agent object, inherited and capped
 export AIBOBNET_HOME="$home"
 export AIBOBNET_STANDUP_DIR="$standup_dir"
 export AIBOBNET_MUX_SESSION="$mux_session"
 export AIBOBNET_INBOX_PATH="$inbox_path"
 export STANDUP_DIR="$standup_dir"   # validated value, for ported tools that read it
+
+# Audit-only: who is acting on the parent agent's behalf. Never a routing input.
+[ -z "$actor" ] || export AIBOBNET_ACTOR="$actor"
 
 exec "$@"

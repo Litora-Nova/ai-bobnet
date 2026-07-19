@@ -61,6 +61,7 @@ _ping() {
 }
 
 aib_check_registry
+aib_load_actor        # -> AIB_ACTOR_FIELD ("" or " | actor:<label>"); dies on a bad label
 
 # --- resolve the calling agent (actor / `by:` of appended events) ------------
 _own_agent=""
@@ -101,8 +102,9 @@ while IFS= read -r id; do
     n="$(_attempts "$id")"; n="${n:-0}"
     if [ "$n" -ge "$max" ]; then
       # Dead-letter: append FAILED in the exact P1 event format (visible in `message dlq`).
-      printf '%s | id:%s | event:FAILED | by:%s | reason:%s\n' \
-        "$(_now)" "$id" "$_own_agent" "wakeup exhausted after $n attempts (no mux ack)" >> "$to_path"
+      printf '%s | id:%s | event:FAILED | by:%s%s | reason:%s\n' \
+        "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" \
+        "wakeup exhausted after $n attempts (no mux ack)" >> "$to_path"
       deadlettered=$((deadlettered+1))
     fi
   fi
