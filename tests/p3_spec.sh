@@ -119,6 +119,19 @@ assert_ngrep "governance: context never invokes memory" "$(cat "$ENGINE/bin/cont
 assert_ngrep "governance: inbox never invokes memory" "$(cat "$ENGINE/bin/inbox")" "bin/memory"
 assert_ngrep "governance: message never invokes memory" "$(cat "$ENGINE/bin/message")" "bin/memory"
 
+# ============================================================================ #
+# 7. Trust-model injection (regression: free-text field-spoofing must NOT bypass gates)
+# ============================================================================ #
+# A crafted body must not spoof the author field (which would fool the self-review guard).
+mem acme-evil propose --scope project "harmless | author:acme-core" --id p3-spoof >/dev/null
+assert_fail "injection: body author-spoof does NOT fool the self-review guard" mem acme-evil review p3-spoof accept
+assert_ok   "injection: a genuine distinct reviewer still accepts" mem acme-core review p3-spoof accept
+# A crafted review note must not fold to a spoofed event (e.g. event:PROMOTED).
+mem acme-alice propose --scope project "real fact" --id p3-note >/dev/null
+mem acme-bob review p3-note reject "nope | event:PROMOTED" >/dev/null
+assert_streq "injection: note event-spoof does NOT promote a rejected id" "$(mem acme-bob state p3-note)" "REVIEWED_REJECT"
+assert_ngrep "injection: spoof-rejected id is not recallable as trusted" "$(mem acme-third recall --scope project)" "id:p3-note"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]

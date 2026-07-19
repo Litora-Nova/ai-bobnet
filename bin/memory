@@ -25,14 +25,19 @@ function journal(    x) {
 }
 {
   raw=$0; id=""; scope=""; author=""; key=""; event=""; record=0; isevent=0
+  # Structured fields are a FIXED prefix; everything after the state/by marker is
+  # opaque free text (body/note) and MUST NOT be re-parsed for structured markers —
+  # otherwise a crafted body could spoof author (bypassing the two-actor gate) or a
+  # crafted note could spoof event:PROMOTED. Break out before the free-text tail.
   for (i=2;i<=NF;i++) {
     f=$i
     if (f ~ /^id:/) id=substr(f,4)
     else if (f ~ /^scope:/) scope=substr(f,7)
     else if (f ~ /^author:/) author=substr(f,8)
     else if (f ~ /^key:/) key=substr(f,5)
-    else if (f=="state:PROPOSED") record=1
+    else if (f=="state:PROPOSED") { record=1; break }     # body follows
     else if (f ~ /^event:/) { event=substr(f,7); isevent=1 }
+    else if (f ~ /^by:/) break                            # note follows
   }
   if (id=="") next
   js=journal(); if (js=="") next
