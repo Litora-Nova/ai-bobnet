@@ -147,6 +147,16 @@ assert_ok   "injection: a genuine distinct reviewer still accepts" mem acme-core
 mem acme-alice propose --scope project "real fact" --id p3-note >/dev/null
 mem acme-bob review p3-note reject "nope | event:PROMOTED" >/dev/null
 assert_streq "injection: note event-spoof does NOT promote a rejected id" "$(mem acme-bob state p3-note)" "REVIEWED_REJECT"
+# ...and the WRITTEN line must be unambiguous too, not merely ignored by this fold:
+# a crafted note is encoded, so a dashboard, a grep or a human cannot read a forged
+# field out of it either (DOMAIN §5 — the envelope is unambiguously encoded).
+assert_file_has "encoding: a crafted note carries no separator byte" \
+  "$acme_project" "note:nope %7C event:PROMOTED"
+assert_ngrep "encoding: no pipe precedes the forged event inside the note" \
+  "$(grep -F 'id:p3-note | event:' "$acme_project")" "| event:PROMOTED"
+# a crafted BODY is encoded the same way
+assert_file_has "encoding: a crafted body carries no separator byte" \
+  "$acme_project" "harmless %7C author:acme-core"
 assert_ngrep "injection: spoof-rejected id is not recallable as trusted" "$(mem acme-third recall --scope project)" "id:p3-note"
 
 # ============================================================================ #

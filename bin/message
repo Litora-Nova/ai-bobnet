@@ -146,8 +146,28 @@ _validate_id() {
   esac
 }
 
-# strip newlines (single-line journal invariant); pipes in body are tolerated.
-_sanitize_line() { local s="$1"; printf '%s' "${s//$'\n'/ }"; }
+# Encode a free-text tail (body / reason) so it can never look like structure.
+#   * newlines/CR collapse to a space -> the single-line journal invariant
+#   * every '|' becomes '%7C'         -> free text cannot contain the separator BYTE at
+#     all, so the line is unambiguous to EVERY reader (DOMAIN §5), not only to this fold.
+# Without this a crafted reason "z | actor:ghost" renders as
+#   … | by:acme-core | reason:z | actor:ghost
+# which a dashboard, a grep or a human reads as a genuine actor field — audit
+# falsification, even though the fold itself is not fooled.
+# Escaping it as '\|' is NOT enough: a pipe byte would remain, and a reader that splits
+# on '|' rather than on the full " | " separator still sees a forged field. Removing the
+# byte is the only encoding that holds for readers we do not control.
+# This is a display-level encoding, not a reversible codec: a literal "%7C" typed by a
+# user is indistinguishable from an encoded pipe, which is harmless — neither can form
+# a field. The fold's break at the free-text marker stays as defence in depth and keeps
+# reading legacy lines written before this change.
+_sanitize_line() {
+  local s="$1"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  s="${s//|/%7C}"
+  printf '%s' "$s"
+}
 
 _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 

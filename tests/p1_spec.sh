@@ -190,31 +190,120 @@ assert_streq "injection: crafted reason does NOT flip the victim's state" \
 assert_streq "injection: the attacker's own message still failed as intended" \
   "$(m beta-review state inj-atk)" "FAILED"
 assert_grep "injection: victim is still an OPEN message" "$(m beta-review inbox)" "id:inj-victim"
-assert_grep "injection: the crafted text stays readable as literal reason text" \
-  "$(m beta-review dlq)" "boom | id:inj-victim"
+# the text survives verbatim but NEUTRALISED: the separator is escaped, so the line
+# cannot be misread as structure by anything — not just by this fold
+assert_grep "injection: crafted reason is preserved but encoded" \
+  "$(m beta-review dlq)" "reason:boom %7C id:inj-victim %7C event:PROCESSED"
+assert_ngrep "injection: the crafted reason carries no pipe byte at all" \
+  "$(m beta-review dlq | grep -F 'id:inj-atk')" "boom |"
 
-# (b) crafted BODY — the cross-agent vector: a sender crafts the body of a message
-#     it delivers into someone else's journal
-m acme-evil send beta-review "evil | id:inj-victim | event:PROCESSED | actor:ghost" --id inj-body >/dev/null
+# (b) crafted BODY — the cross-agent vector, and the SHARPER claim: such a line wins the
+#     ismsg branch of the fold, so the damage would land on PROVENANCE (from:/body) rather
+#     than on state. Checking state alone would wrongly report this as safe.
+# select ONLY the victim's own row — the attacker's row mentions the victim id inside its
+# body, so a substring match would also pick that up and the assertions would be meaningless
+vic_row() { m beta-review inbox | grep "^id:inj-victim |"; }
+vic_row_before="$(vic_row)"
+m acme-evil send beta-review "GEFAELSCHT | id:inj-victim | from:acme-evil | state:PERSISTED | body vom angreifer" \
+  --id inj-body >/dev/null
+vic_row_after="$(vic_row)"
 assert_streq "injection: crafted body does NOT flip the victim's state" \
   "$(m beta-review state inj-victim)" "PERSISTED"
+assert_streq "injection: the victim's whole inbox row is byte-identical afterwards" \
+  "$vic_row_after" "$vic_row_before"
+assert_grep "injection: victim keeps its REAL sender (provenance intact)" \
+  "$vic_row_after" "from:acme-core"
+assert_ngrep "injection: victim's sender was not rewritten to the attacker" \
+  "$vic_row_after" "from:acme-evil"
+assert_grep "injection: victim keeps its REAL body" "$vic_row_after" "victim body"
+assert_ngrep "injection: the attacker's body did not land on the victim" \
+  "$vic_row_after" "body vom angreifer"
 assert_streq "injection: the crafted message is itself just PERSISTED" \
   "$(m beta-review state inj-body)" "PERSISTED"
 
-# (c) a crafted body must not forge the routing fields either
+# (c) a crafted body must not forge the routing fields of its OWN line either
 assert_grep "injection: crafted message keeps its REAL sender" \
   "$(m beta-review inbox)" "id:inj-body | state:PERSISTED | from:acme-evil"
 
-# (d) an injected actor: must never land where a genuine structured actor: sits
-#     (a real one is written by run-agent --as, directly after by:)
+# (d) an injected actor: must never be readable as a structured actor field. The fold
+#     ignores it, AND the encoding makes it unambiguous for every other reader too.
+m beta-review fail inj-body "z | actor:ghost" >/dev/null
 assert_ngrep "injection: forged actor: never reaches the structured prefix" \
   "$(cat "$beta_inbox")" "by:beta-review | actor:ghost"
+assert_grep "injection: a forged actor: is encoded in the raw journal" \
+  "$(cat "$beta_inbox")" "reason:z %7C actor:ghost"
+# the byte-level claim: no reader, however naive, can find a pipe before the forged label
+assert_ngrep "injection: no pipe byte precedes a forged actor label anywhere" \
+  "$(cat "$beta_inbox")" "| actor:ghost"
+# ...while a GENUINE --as label stays a real structured field (the fix must not
+# neutralise the feature it protects)
+m acme-core send beta-review "for a real actor" --id inj-real >/dev/null
+"$RUN" --as helper beta-review -- "$MSG" fail inj-real "plain reason" >/dev/null
+assert_file_has "injection: a genuine actor label is still a real field before reason:" \
+  "$beta_inbox" "event:FAILED | by:beta-review | actor:helper | reason:plain reason"
 
 # (e) the victim still completes normally — the journal is intact, not just unflipped
 m beta-review seen inj-victim >/dev/null
 m beta-review done inj-victim >/dev/null
 assert_streq "injection: victim still processes to completion afterwards" \
   "$(m beta-review state inj-victim)" "PROCESSED"
+
+# (f) LEGACY / FOREIGN WRITER lines — the second line of defence, tested on its own.
+# The write path now encodes pipes, so a newly written line can no longer carry a
+# separator inside free text. Lines written BEFORE that change (or by any other writer,
+# or by a hand edit of the journal) still exist and are not encoded, so the fold must
+# refuse them by itself. These lines are appended raw, deliberately bypassing bin/message.
+m acme-core send beta-review "legacy victim body" --id inj-leg-vic >/dev/null
+raw_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# a legacy FAILED line whose reason tail carries an unencoded id/event pair
+printf '%s | id:inj-leg-atk | event:FAILED | by:beta-review | reason:x | id:inj-leg-vic | event:PROCESSED\n' \
+  "$raw_ts" >> "$beta_inbox"
+assert_streq "legacy: an unencoded reason tail cannot flip a foreign state" \
+  "$(m beta-review state inj-leg-vic)" "PERSISTED"
+# a legacy message line whose body tail tries to rewrite the victim's provenance
+printf '%s | id:inj-leg-atk2 | from:acme-evil | to:beta-review | state:PERSISTED | GEF | id:inj-leg-vic | from:acme-evil | state:PERSISTED | body vom angreifer\n' \
+  "$raw_ts" >> "$beta_inbox"
+leg_row="$(m beta-review inbox | grep "^id:inj-leg-vic |")"
+assert_streq "legacy: an unencoded body tail cannot flip a foreign state" \
+  "$(m beta-review state inj-leg-vic)" "PERSISTED"
+assert_grep  "legacy: victim keeps its real sender against a legacy line" "$leg_row" "from:acme-core"
+assert_ngrep "legacy: victim's sender not rewritten by a legacy line"     "$leg_row" "from:acme-evil"
+assert_grep  "legacy: victim keeps its real body against a legacy line"   "$leg_row" "legacy victim body"
+
+# (g) the two fold defences are mutually redundant for the cases above, so each is
+# isolated here — otherwise a refactor could silently drop one and stay green.
+# g1 isolates the STOP-AT-FREE-TEXT rule: no id: in the structured prefix at all, so
+# first-occurrence-wins cannot help; only stopping at reason: keeps the line inert.
+printf '%s | event:FAILED | by:beta-review | reason:x | id:inj-leg-vic | event:PROCESSED\n' \
+  "$raw_ts" >> "$beta_inbox"
+assert_streq "legacy(isolated): stopping at the free-text marker keeps a prefix-less line inert" \
+  "$(m beta-review state inj-leg-vic)" "PERSISTED"
+# g2 isolates FIRST-OCCURRENCE-WINS: both ids sit in the structured prefix with no
+# free-text marker anywhere, so the break cannot help; only first-wins keeps id honest.
+printf '%s | id:inj-leg-atk3 | id:inj-leg-vic | event:PROCESSED | by:beta-review\n' \
+  "$raw_ts" >> "$beta_inbox"
+assert_streq "legacy(isolated): first-occurrence-wins keeps a double-id line honest" \
+  "$(m beta-review state inj-leg-vic)" "PERSISTED"
+# g3 isolates the STOP-AT-BODY rule specifically: a message line with no id: in its
+# prefix, whose body carries id:/from:. Without the break the body would be folded into
+# the victim's record and rewrite its provenance (the ismsg branch wins such a line).
+printf '%s | from:acme-evil | to:beta-review | state:PERSISTED | GEF | id:inj-leg-vic | from:acme-evil | state:PERSISTED | body vom angreifer\n' \
+  "$raw_ts" >> "$beta_inbox"
+leg_row3="$(m beta-review inbox | grep "^id:inj-leg-vic |")"
+assert_grep  "legacy(isolated): stopping at the body marker preserves the victim's sender" \
+  "$leg_row3" "from:acme-core"
+assert_ngrep "legacy(isolated): a prefix-less message line cannot rewrite provenance" \
+  "$leg_row3" "from:acme-evil"
+assert_grep  "legacy(isolated): stopping at the body marker preserves the victim's body" \
+  "$leg_row3" "legacy victim body"
+# g4 pins the remaining fold rule. This is a DETERMINISM pin, not a security claim: with
+# the breaks in place free text never reaches the field scan, so a second event: can only
+# come from a malformed line written by another writer. One event per line is the grammar;
+# taking the FIRST makes the fold deterministic instead of order-dependent.
+printf '%s | id:inj-leg-vic | event:SEEN | event:PROCESSED | by:beta-review\n' \
+  "$raw_ts" >> "$beta_inbox"
+assert_streq "legacy(isolated): a malformed double-event line folds to the FIRST event" \
+  "$(m beta-review state inj-leg-vic)" "SEEN"
 
 # ============================================================================ #
 # summary

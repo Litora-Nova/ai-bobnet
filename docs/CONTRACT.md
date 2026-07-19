@@ -72,9 +72,19 @@ raw UTF-8 needs no escape.
 - `from:`/`to:`/`by:` always carry an **`agent_uid`** — the routing key, never an actor label (see §4.1).
 - **Line grammar:** structured fields first, then at most **one** free-text tail, introduced by a
   known marker (`state:PERSISTED | <body>`, or `reason:<reason>`) and running to end of line.
-  Readers MUST stop scanning for fields at that marker. Free text is attacker-controlled and may
-  contain `|`, so a reader that keeps scanning lets a crafted body or reason forge `id:`/`event:`
-  and flip the state of a **foreign** message. Unknown structured fields are ignored (forward-compatible).
+  Unknown structured fields are ignored (forward-compatible).
+- **Free text is encoded on write:** line breaks collapse to a space and every `|` becomes `%7C`,
+  so a body, reason or note can never contain the field separator. This is what makes the line
+  *unambiguously encoded* (DOMAIN §5) for readers this engine does not control — a dashboard, a
+  `grep` or a human. Escaping the pipe rather than removing it would not do: a reader that splits
+  on `|` instead of on the full `" | "` still sees a forged field. It is a display encoding, not a
+  reversible codec.
+- **Readers MUST also stop scanning at the free-text marker.** With the write-side encoding this is
+  defence in depth, but it is load-bearing for lines written before the encoding existed, by another
+  writer, or by a hand edit — those still carry raw pipes. `id:` and `event:` additionally take their
+  first occurrence, so a malformed line folds deterministically instead of order-dependently.
+  Without these rules a crafted body or reason forges `id:`/`event:`/`from:` and rewrites the state
+  **and the provenance** of a *foreign* message.
 
 ## 4. Launch — fail-closed `bin/run-agent`
 

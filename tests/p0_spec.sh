@@ -390,6 +390,16 @@ assert_fail "malformed: a duplicate key is refused (order must not decide routin
   env AIBOBNET_REGISTRY="$dup" "$INBOX" acme-core-review
 dup_err="$(AIBOBNET_REGISTRY="$dup" "$INBOX" acme-core-review 2>&1 >/dev/null)"
 assert_grep "malformed: the message names the duplicate key" "$dup_err" "duplicate key"
+# A duplicated `clearance` is the case NO other check catches, and it is the dangerous
+# one: a duplicated `project` still dies on the uid/project consistency rule, but a second
+# clearance is structurally valid and silently grants the LAST (here: higher) value.
+# That is why duplicate keys are refused wholesale instead of per-field.
+dupclear="$(bad_reg dupclear "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"clearance\": \"t4\" } } }")"
+assert_fail "malformed: a duplicate clearance key is refused (no silent privilege gain)" \
+  env AIBOBNET_REGISTRY="$dupclear" "$INBOX" acme-core
+assert_ngrep "malformed: the refused registry never yields the higher clearance" \
+  "$(AIBOBNET_REGISTRY="$dupclear" "$RUN" acme-core -- sh -c 'echo CLEAR=$AIBOBNET_CLEARANCE' 2>&1)" "CLEAR=t4"
 # a duplicated agent_uid in the same section is caught too
 assert_fail "malformed: a duplicate agent_uid is refused" \
   env AIBOBNET_REGISTRY="$(bad_reg dupagent "{ $GOOD_PROJ, \"agents\": {
