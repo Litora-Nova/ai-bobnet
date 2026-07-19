@@ -136,6 +136,17 @@ assert_file_has "negative: heartbeat under poison landed in acme" \
 assert_absent  "negative: no acme-core log leaked into beta standup" \
   "$STATE/beta/standup/acme-core.log"
 
+# A poisoned AIBOBNET_REGISTRY must NOT become the resolution authority (scrub precedes resolve).
+cat > "$WORK/evil-registry.json" <<JSON
+{ "projects": { "acme": { "home": "/evil/home", "standup_dir": "/evil/standup", "mux_session": "evil" } } }
+JSON
+reg_poison_out="$(
+  AIBOBNET_REGISTRY="$WORK/evil-registry.json" \
+    "$RUN" acme-core -- bash -c 'printf "STANDUP=%s\nHOME=%s\n" "$AIBOBNET_STANDUP_DIR" "$AIBOBNET_HOME"' 2>/dev/null
+)"
+assert_grep "negative: AIBOBNET_REGISTRY poison ignored — canonical acme standup" "$reg_poison_out" "STANDUP=$STATE/acme/standup"
+assert_grep "negative: AIBOBNET_REGISTRY poison ignored — canonical acme home"    "$reg_poison_out" "HOME=$STATE/acme"
+
 # ============================================================================ #
 # 6. log.sh fail-loud
 # ============================================================================ #

@@ -25,18 +25,10 @@ shift
 shift
 [ "$#" -ge 1 ] || aib_die 64 "run-agent: no command given after '--'"
 
-aib_check_registry
-
-# --- resolve + validate the TARGET context (from the registry, not the env) ---
-aib_split_agent "$agent"                       # -> AIB_PROJECT_UID, AIB_TASK
-proj="$AIB_PROJECT_UID"
-task="$AIB_TASK"
-home="$(aib_project_field "$proj" home)"
-standup_dir="$(aib_project_field "$proj" standup_dir)"
-mux_session="$(aib_project_field "$proj" mux_session)"
-inbox_path="${standup_dir}/inbox/${agent}.md"
-
-# --- scrub inherited routing env ---------------------------------------------
+# --- scrub inherited routing env FIRST — before ANY registry resolution ------
+# Order is load-bearing: aib_registry_file honors AIBOBNET_REGISTRY, so a poisoned
+# AIBOBNET_REGISTRY=/evil.json would otherwise make the attacker's file the resolution
+# authority and route the agent into a foreign project. Scrub MUST precede resolution.
 for _v in $(compgen -v); do
   case "$_v" in
     STANDUP_DIR|STANDUP_DIR_*|INBOX*|MUX*|BOOT_*|PROJECT_*|AIBOBNET_*)
@@ -44,6 +36,17 @@ for _v in $(compgen -v); do
       ;;
   esac
 done
+
+aib_check_registry
+
+# --- resolve + validate the TARGET context (from the canonical registry) -----
+aib_split_agent "$agent"                       # -> AIB_PROJECT_UID, AIB_TASK
+proj="$AIB_PROJECT_UID"
+task="$AIB_TASK"
+home="$(aib_project_field "$proj" home)"
+standup_dir="$(aib_project_field "$proj" standup_dir)"
+mux_session="$(aib_project_field "$proj" mux_session)"
+inbox_path="${standup_dir}/inbox/${agent}.md"
 
 # --- export the clean, validated context, then exec --------------------------
 export AIBOBNET_PROJECT_UID="$proj"
