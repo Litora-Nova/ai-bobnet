@@ -198,6 +198,60 @@ printf '%s | id:p3-legacy-atk | id:p3-legacy-vic | event:PROMOTED | by:acme-evil
 assert_streq "legacy(isolated): first-occurrence-wins keeps a double-id line from flipping the victim" \
   "$(mem acme-core state p3-legacy-vic)" "PROPOSED"
 
+# ============================================================================ #
+# 10. Reviewer follow-up: fold-determinism for author:/scope:/key: on a repeated
+#     structured field — id:/event: got first-occurrence-wins in the earlier fix,
+#     author:/scope:/key: did not. These three checks prove ONLY that a repeated
+#     field folds to the FIRST occurrence, deterministically, the same way id:/event:
+#     already did. They do NOT prove the two-actor review gate is attacker-resistant
+#     — it is not: the journal is a plain file any project agent may append to
+#     (`propose` is not the only way a line is written), so a single, un-repeated
+#     `author:` naming anyone at all already passes the self-review check with or
+#     without this fix. That is a trust-boundary property of "the journal is a file",
+#     not a parser bug, and it is out of scope here (a PO call, not a bin/memory patch).
+#     Field-repetition-folds-to-first is still real and worth having: without it, a
+#     hand-edited or foreign-writer line's structured fields resolve order-dependently
+#     instead of deterministically, which is its own (smaller) correctness hazard.
+# ============================================================================ #
+
+# (a) author: — observed the same way the existing id: check (section 9) observes it:
+# through a real command outcome. acme-evil is genuinely the first-listed author, so
+# the fold must resolve `author` to acme-evil (not the later "ghost-author"), and
+# reviewing under that correctly-folded identity is then genuinely a self-review.
+raw_ts2="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '%s | id:p3-author-fold | scope:project | author:acme-evil | author:ghost-author | state:PROPOSED | fold-check fact\n' \
+  "$raw_ts2" >> "$acme_project"
+assert_fail "fold-determinism (author): a repeated author: field folds to the FIRST occurrence (self-review of it is correctly blocked)" \
+  mem acme-evil review p3-author-fold accept
+assert_streq "fold-determinism (author): folding to the first occurrence leaves the record untouched" \
+  "$(mem acme-evil state p3-author-fold)" "PROPOSED"
+
+# (b) scope: — observed via visibility: `list`/`recall` only render a record when the
+# folded scope: matches the journal it actually lives in (project.md here). The first
+# value is the real one ("project"); if the SECOND ("shared") won instead, the record
+# would silently vanish from every listing. scope:/key: are filter/display fields —
+# no auth-bypass is known through either; this shows determinism only.
+raw_ts3="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '%s | id:p3-scope-fold | scope:project | scope:shared | author:acme-core | state:PROPOSED | scope fold-check\n' \
+  "$raw_ts3" >> "$acme_project"
+scope_fold_row="$(mem acme-core list --state PROPOSED | grep 'id:p3-scope-fold ' || true)"
+assert_grep "fold-determinism (scope): a repeated scope: field folds to the FIRST occurrence, not the last" \
+  "$scope_fold_row" "scope:project"
+
+# (c) key: with an EMPTY first value — exactly the form that would have caught the
+# `if (key=="") ...` empty-sentinel mistake this fix itself made and then corrected
+# (an empty first value looks "unseen" to an empty-string guard, so a later key:
+# would still win). The explicit `iskey` flag must lock in on the first occurrence
+# regardless of its value.
+raw_ts4="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '%s | id:p3-key-fold | scope:project | author:acme-core | key: | key:evil-key | state:PROPOSED | key fold-check\n' \
+  "$raw_ts4" >> "$acme_project"
+key_fold_row="$(mem acme-core list --state PROPOSED | grep 'id:p3-key-fold ' || true)"
+assert_grep "fold-determinism (key, empty first value): folds to the empty FIRST occurrence, not the later 'evil-key'" \
+  "$key_fold_row" "key: | state:PROPOSED"
+assert_ngrep "fold-determinism (key, empty first value): the later key: value never leaks into the render" \
+  "$key_fold_row" "key:evil-key"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]
