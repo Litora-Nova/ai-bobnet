@@ -1,10 +1,17 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "projects": {
     "acme": {
       "home": "/srv/acme",
       "standup_dir": "/srv/acme/standup",
       "mux_session": "acme"
+    }
+  },
+  "agents": {
+    "acme-core": {
+      "project": "acme",
+      "profile": "engine-dev",
+      "clearance": "t2"
     }
   }
 }

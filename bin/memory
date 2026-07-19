@@ -145,7 +145,7 @@ $ctx
 EOF
   [ -n "$_own_agent" ] && [ -n "$_own_project" ] && [ -n "$_own_standup" ] || aib_die 6 "own context missing required fields"
   aib_validate_agent_uid "$_own_agent"; aib_validate_token "$_own_project" project_uid
-  aib_registry_query has "$_own_project" >/dev/null || aib_die 3 "own project is not in registry"
+  aib_registry_query projects has "$_own_project" >/dev/null || aib_die 3 "own project is not in registry"
   aib_split_agent "$_own_agent"; [ "$AIB_PROJECT_UID" = "$_own_project" ] || aib_die 5 "inconsistent own context project"
   registry_standup="$(aib_project_field "$_own_project" standup_dir)"
   [ "$registry_standup" = "$_own_standup" ] || aib_die 5 "inconsistent own context standup_dir"
