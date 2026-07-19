@@ -139,6 +139,13 @@ gate_id? · grant_id? · effect_id? · correlation_id · causation_id · schema_
   sequence cannot rebuild order or detect a wholly missing event, so it is forbidden.
 - Each record is **framed with a terminator and integrity marker** so a torn tail (kill during append) is
   detectable and quarantinable rather than silently corrupting the fold.
+- **A stream is identified by `(project_uid, stream_name)`.** `seq` counts within one stream; a consumer
+  cursor is `(stream, seq)`. The addressing is frozen; *how many* streams exist is policy, not format.
+  The engine starts with exactly **one stream `main` per project** — at agent-orchestration volumes a single
+  serialized append path is ample, and it buys total order for free (one broker, one cursor, a trivial
+  rebuild, an ops lens that is a plain read instead of a merge). Splitting later (blast radius of a torn
+  tail, a runaway writer flooding a shared journal) is **additive**: a new stream name, no format change.
+  Relations across streams are carried by `causation_id`/`correlation_id` — never by timestamps (see below).
 - Each stream has **one serializing append broker**. Encoding is: *encode → enforce byte cap → one checked
   append*. A record that exceeds the cap becomes an **Artifact by reference**; it is never inlined.
 - Replay reports gaps explicitly (`lost`); a stale consumer cursor after a rebuild is answered with an
@@ -250,7 +257,8 @@ escalates to a human.
 
 ## 12. Open contract points (explicitly not frozen)
 
-1. **Stream granularity** for the event spine (§6) — required before the spine implementation is frozen.
+1. ~~**Stream granularity** for the event spine (§6)~~ — **resolved 2026-07-19**: stream identity is
+   `(project_uid, stream_name)`, one stream `main` per project to start, splitting is additive. See §6.
 2. **Provider payload schemas** (§5) — frozen after the provider-session spike.
 3. **Registry vs. policy split** (§2) — clearance on the registry object (current) vs. a separate policy
    ledger keyed by `agent_uid`. Invariant either way: clearance binds to immutable identity.
