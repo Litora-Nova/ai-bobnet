@@ -198,6 +198,26 @@ printf '%s | id:p3-legacy-atk | id:p3-legacy-vic | event:PROMOTED | by:acme-evil
 assert_streq "legacy(isolated): first-occurrence-wins keeps a double-id line from flipping the victim" \
   "$(mem acme-core state p3-legacy-vic)" "PROPOSED"
 
+# ============================================================================ #
+# 10. Reviewer follow-up: author: (and scope:/key:) need the SAME first-occurrence
+#     guard as id:/event: — the merge message overclaimed parity, it only covered
+#     id:/event:. `author:` is the field the two-actor gate compares against
+#     (`rauthor[jk]==caller` in review's self-review check). A hand-edited /
+#     foreign-writer PROPOSED line with two author: fields in its structured prefix
+#     (no free-text marker anywhere, so stop-at-free-text cannot help) folded to the
+#     SECOND author under last-wins — so the REAL author (first occurrence) can make
+#     their own proposal look authored by someone else, then "independently" review
+#     and promote it themselves. That is the two-actor gate defeated by the exact
+#     class of hole id:/event: were just hardened against.
+# ============================================================================ #
+raw_ts2="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '%s | id:p3-author-spoof | scope:project | author:acme-evil | author:ghost-author | state:PROPOSED | self-promoted fact\n' \
+  "$raw_ts2" >> "$acme_project"
+assert_fail "author-guard: the REAL author (first occurrence) cannot self-review its spoofed-author proposal" \
+  mem acme-evil review p3-author-spoof accept
+assert_streq "author-guard: the spoofed proposal is still just PROPOSED (self-review never actually happened)" \
+  "$(mem acme-evil state p3-author-spoof)" "PROPOSED"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]
