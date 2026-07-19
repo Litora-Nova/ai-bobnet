@@ -175,6 +175,29 @@ mem acme-core propose --scope project "proj body" --id p3-uniq >/dev/null
 assert_fail "id-unique: reusing an id in another scope is refused" mem acme-core propose --scope shared "shared body" --id p3-uniq
 assert_streq "id-unique: original id still resolves after a rejected collision" "$(mem acme-core state p3-uniq)" "PROPOSED"
 
+# ============================================================================ #
+# 9. Legacy / foreign-writer defence in depth (parity with bin/message P1)
+# ============================================================================ #
+# bin/message's fold got a first-occurrence-wins rule for id:/event: after the P0.5
+# HIGH (docs/CONTRACT.md §3, bin/message _AIB_MSG_AWK): a hand-edited or foreign-writer
+# line with two id: fields in its structured prefix must fold deterministically, never
+# last-wins. bin/memory runs the SAME fold shape over the SAME line grammar (this file's
+# _AIB_MEM_AWK) but never got that guard — this isolates it exactly the way
+# tests/p1_spec.sh section 7(g2) isolates bin/message's. No CLI path can write a double
+# id: today (propose/review encode their free text), so this appends the foreign line
+# directly, the same way a hand edit or an older writer would.
+mem acme-core propose --scope project "victim fact" --id p3-legacy-vic >/dev/null
+assert_streq "legacy: victim starts PROPOSED" "$(mem acme-core state p3-legacy-vic)" "PROPOSED"
+raw_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# two id: fields, no free-text marker anywhere -> the "stop at free text" rule cannot
+# help here; only first-occurrence-wins keeps this deterministic. Last-wins would fold
+# this PROMOTED event onto the VICTIM's record, silently promoting it without any
+# review/promote gate ever running.
+printf '%s | id:p3-legacy-atk | id:p3-legacy-vic | event:PROMOTED | by:acme-evil\n' \
+  "$raw_ts" >> "$acme_project"
+assert_streq "legacy(isolated): first-occurrence-wins keeps a double-id line from flipping the victim" \
+  "$(mem acme-core state p3-legacy-vic)" "PROPOSED"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]
