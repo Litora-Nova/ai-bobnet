@@ -34,9 +34,20 @@ aib_registry_file() {
   printf '%s\n' "${AIBOBNET_REGISTRY:-$REPO_ROOT/registry.json}"
 }
 
+# Validate the registry ONCE, loudly, at the top level of every entrypoint. Every
+# query re-runs the same structural pass (defence in depth), but a query is often
+# consumed in `if !` or `$( )`, where a die could not abort — so the clear, actionable
+# message has to come from here.
 aib_check_registry() {
-  local reg; reg="$(aib_registry_file)"
+  local reg rc=0; reg="$(aib_registry_file)"
   [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
+  awk -v sect=projects -v op=validate -v uid="" -v field="" "$_AIB_AWK" "$reg" || rc=$?
+  case "$rc" in
+    0) ;;
+    6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
+    7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
+    *) aib_die 2 "registry failed validation (code $rc): $reg";;
+  esac
 }
 
 # --- registry parser (pure awk; no jq) ----------------------------------------
@@ -48,6 +59,51 @@ aib_check_registry() {
 # serves both. Field values must be JSON strings (flat); robust to arbitrary JSON
 # whitespace. Unknown extra fields are ignored (forward-compatible, never load-bearing).
 _AIB_AWK='
+# --- JSON grammar validator (recursive descent over the token stream) ---------
+# Balance checking alone is NOT enough: a single missing quote can re-synchronise on
+# the next one, leaving brackets balanced and every string terminated while a value
+# is silently WRONG (e.g. "home": "/h, "standup_dir": … makes home "/h, " and drops
+# standup_dir). At the identity + clearance authority a silently wrong value is worse
+# than a refusal, so the whole document must parse as JSON before anything is read.
+function is_atom(s) {
+  return (s=="true" || s=="false" || s=="null" ||
+          s ~ /^-?(0|[1-9][0-9]*)([.][0-9]+)?([eE][-+]?[0-9]+)?$/)
+}
+function p_value() {
+  if (pos > ntok) return 0
+  if (ty[pos]=="S") { pos++; return 1 }
+  if (ty[pos]=="V") { if (!is_atom(tok[pos])) return 0; pos++; return 1 }
+  if (ty[pos]=="P" && tok[pos]=="{") return p_object()
+  if (ty[pos]=="P" && tok[pos]=="[") return p_array()
+  return 0
+}
+function p_object(   myid, key) {
+  myid = ++nobj; pos++                                   # consume {
+  if (ty[pos]=="P" && tok[pos]=="}") { pos++; return 1 }
+  while (1) {
+    if (ty[pos]!="S") return 0                           # a key must be a JSON string
+    key = tok[pos]
+    if ((myid SUBSEP key) in kseen) { dupkey=1; return 0 }
+    kseen[myid SUBSEP key] = 1
+    pos++
+    if (!(ty[pos]=="P" && tok[pos]==":")) return 0
+    pos++
+    if (!p_value()) return 0
+    if (ty[pos]=="P" && tok[pos]==",") { pos++; continue }
+    if (ty[pos]=="P" && tok[pos]=="}") { pos++; return 1 }
+    return 0
+  }
+}
+function p_array() {
+  pos++                                                  # consume [
+  if (ty[pos]=="P" && tok[pos]=="]") { pos++; return 1 }
+  while (1) {
+    if (!p_value()) return 0
+    if (ty[pos]=="P" && tok[pos]==",") { pos++; continue }
+    if (ty[pos]=="P" && tok[pos]=="]") { pos++; return 1 }
+    return 0
+  }
+}
 { data = data $0 "\n" }
 END {
   n = length(data); i = 1; ntok = 0
@@ -56,19 +112,28 @@ END {
     if (c==" "||c=="\t"||c=="\r"||c=="\n") { i++; continue }
     if (c=="{"||c=="}"||c=="["||c=="]"||c==":"||c==",") { ntok++; tok[ntok]=c; ty[ntok]="P"; i++; continue }
     if (c=="\"") {
-      s=""; i++
+      s=""; i++; term=0
       while (i<=n) {
         d=substr(data,i,1)
         if (d=="\\") {
           e=substr(data,i+1,1)
           if(e=="n")s=s"\n"; else if(e=="t")s=s"\t"; else if(e=="r")s=s"\r";
+          else if(e=="b")s=s"\b"; else if(e=="f")s=s"\f";
           else if(e=="\"")s=s"\""; else if(e=="\\")s=s"\\"; else if(e=="/")s=s"/";
-          else s=s e
+          # Anything else is not a JSON escape. Accepting it (old behaviour: take the
+          # char verbatim) silently produced a DIFFERENT value than a strict reader —
+          # at the identity authority that is a divergence, so refuse. \u is included
+          # deliberately: this parser does not decode it, and mis-decoding it to
+          # "u0041" would be worse than saying so. Raw UTF-8 needs no escape.
+          else { exit 6 }
           i+=2; continue
         }
-        if (d=="\"") { i++; break }
+        if (d=="\"") { i++; term=1; break }
         s=s d; i++
       }
+      # An unterminated string silently swallowed the rest of the file (a torn write).
+      # Accepting it would let a half-written registry hand out identity and clearance.
+      if (!term) { exit 6 }
       ntok++; tok[ntok]=s; ty[ntok]="S"; continue
     }
     s=""
@@ -79,6 +144,17 @@ END {
     }
     ntok++; tok[ntok]=s; ty[ntok]="V"; continue
   }
+  # --- structural validation (fail-closed) ------------------------------------
+  # The registry is the identity AND clearance authority (DOMAIN §2), so a malformed
+  # file must never resolve. The whole document must parse as JSON: exactly ONE
+  # top-level value, no trailing data, and no duplicate key within the same object
+  # (last-write-wins would let key ORDER decide routing, clearance and memory scope).
+  pos = 1; nobj = 0; dupkey = 0
+  if (!p_value()) { if (dupkey) exit 7; exit 6 }
+  if (pos <= ntok) exit 6                      # trailing data after the top-level value
+  if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
+  if (op=="validate") { exit 0 }
+
   # Locate the requested TOP-LEVEL section (depth 1) — a nested key of the same
   # name must never be mistaken for it.
   pstart = 0; sdepth = 0
@@ -94,7 +170,12 @@ END {
     if (ty[j]=="P" && tok[j]=="}") { depth--; if(depth==0) break; if(depth==1) cur=""; continue }
     if (ty[j]=="S" && ty[j+1]=="P" && tok[j+1]==":") {
       if (depth==1) { cur=tok[j]; nuid++; uids[nuid]=cur; hasuid[cur]=1 }
-      else if (depth==2 && cur!="") { store[cur SUBSEP tok[j]] = tok[j+2] }
+      else if (depth==2 && cur!="") {
+        # Keep the value AND its token type. The type is enforced only where a field
+        # is actually consumed, so an unknown nested/array field stays forward-compatible.
+        store[cur SUBSEP tok[j]]   = tok[j+2]
+        storety[cur SUBSEP tok[j]] = ty[j+2]
+      }
     }
   }
   if (op=="keys") { for (k=1;k<=nuid;k++) print uids[k]; exit 0 }
@@ -102,7 +183,9 @@ END {
   if (op=="field") {
     if (!hasuid[uid]) exit 3
     key = uid SUBSEP field
-    if (key in store) { print store[key]; exit 0 } else { exit 4 }
+    if (!(key in store)) exit 4
+    if (storety[key] != "S") exit 8          # consumed fields MUST be JSON strings
+    print store[key]; exit 0
   }
   exit 9
 }'
@@ -122,20 +205,22 @@ aib_require_project() {
   fi
 }
 
-# aib_project_field <project_uid> <field> -> value (dies if missing/empty)
+# aib_project_field <project_uid> <field> -> value (dies if missing/empty/mistyped)
 aib_project_field() {
   local p="$1" f="$2" v rc=0
   v="$(aib_registry_query projects field "$p" "$f")" || rc=$?
+  [ "$rc" -ne 8 ] || aib_die 2 "registry: project '$p' field '$f' is not a JSON string"
   if [ "$rc" -ne 0 ] || [ -z "$v" ]; then
     aib_die 3 "registry: project '$p' has no usable field '$f'"
   fi
   printf '%s\n' "$v"
 }
 
-# aib_agent_field <agent_uid> <field> -> value (dies if missing/empty)
+# aib_agent_field <agent_uid> <field> -> value (dies if missing/empty/mistyped)
 aib_agent_field() {
   local a="$1" f="$2" v rc=0
   v="$(aib_registry_query agents field "$a" "$f")" || rc=$?
+  [ "$rc" -ne 8 ] || aib_die 2 "registry: agent '$a' field '$f' is not a JSON string"
   if [ "$rc" -ne 0 ] || [ -z "$v" ]; then
     aib_die 3 "registry: agent '$a' has no usable field '$f'"
   fi

@@ -350,6 +350,103 @@ assert_file_has "actor: an unlabelled event line is unchanged" \
 assert_ngrep "actor: no empty actor field is emitted" "$(cat "$tests_inbox")" "actor: |"
 
 # ============================================================================ #
+# 14. P0.5 — the registry is the identity authority, so a MALFORMED one must
+#     never resolve (a torn write must not hand out identity + clearance)
+# ============================================================================ #
+# Each case is driven through bin/inbox with AIBOBNET_REGISTRY (run-agent scrubs it).
+bad_reg() { # <name> <content>
+  printf '%s\n' "$2" > "$WORK/$1.json"
+  printf '%s' "$WORK/$1.json"
+}
+GOOD_PROJ='"projects": { "acme": { "home": "/h", "standup_dir": "/s", "mux_session": "m" } }'
+GOOD_AG='"agents": { "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t1" } }'
+
+# (a) torn write: cut off mid-agents-object, leaving an unterminated string.
+#     Before the fix this resolved happily and handed out the attacker's standup_dir.
+r="$(bad_reg torn '{ "schema_version": 2,
+  "projects": { "acme": { "home": "/evil/home", "standup_dir": "/evil/standup", "mux_session": "evil" } },
+  "agents": { "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t4')"
+assert_fail "malformed: torn write (unterminated string) is refused" \
+  env AIBOBNET_REGISTRY="$r" "$INBOX" acme-core
+torn_err="$(AIBOBNET_REGISTRY="$r" "$INBOX" acme-core 2>&1 >/dev/null)"
+assert_grep "malformed: the message says the registry is not valid JSON" "$torn_err" "not valid JSON"
+assert_ngrep "malformed: a torn registry leaks no path" "$torn_err" "/evil/standup"
+
+# (b) unbalanced / mismatched brackets
+assert_fail "malformed: missing closing brace is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg unbal "{ $GOOD_PROJ, $GOOD_AG")" "$INBOX" acme-core
+assert_fail "malformed: mismatched bracket type is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg mismatch "{ $GOOD_PROJ, $GOOD_AG ]")" "$INBOX" acme-core
+
+# (c) trailing data after the top-level value (two documents concatenated)
+assert_fail "malformed: trailing data after the top-level value is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg trail "{ $GOOD_PROJ, $GOOD_AG } { \"projects\": {} }")" "$INBOX" acme-core
+
+# (d) duplicate key: last-write-wins would let key ORDER decide routing/clearance
+dup="$(bad_reg dup '{ "projects": { "acme": { "home": "/h", "standup_dir": "/s", "mux_session": "m" },
+                                    "acme-core": { "home": "/h2", "standup_dir": "/s2", "mux_session": "m2" } },
+  "agents": { "acme-core-review": { "project": "acme", "profile": "p", "clearance": "t1", "project": "acme-core" } } }')"
+assert_fail "malformed: a duplicate key is refused (order must not decide routing)" \
+  env AIBOBNET_REGISTRY="$dup" "$INBOX" acme-core-review
+dup_err="$(AIBOBNET_REGISTRY="$dup" "$INBOX" acme-core-review 2>&1 >/dev/null)"
+assert_grep "malformed: the message names the duplicate key" "$dup_err" "duplicate key"
+# a duplicated agent_uid in the same section is caught too
+assert_fail "malformed: a duplicate agent_uid is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg dupagent "{ $GOOD_PROJ, \"agents\": {
+    \"acme-core\": { \"project\": \"acme\", \"profile\": \"a\", \"clearance\": \"t1\" },
+    \"acme-core\": { \"project\": \"acme\", \"profile\": \"b\", \"clearance\": \"t4\" } } }")" "$INBOX" acme-core
+
+# (e) wrong value type on a CONSUMED field — the comment claims JSON strings, so enforce it
+assert_fail "malformed: numeric clearance is refused (not a JSON string)" \
+  env AIBOBNET_REGISTRY="$(bad_reg numclear "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+    \"project\": \"acme\", \"profile\": \"p\", \"clearance\": 4 } } }")" "$INBOX" acme-core
+assert_fail "malformed: a non-string standup_dir is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg numdir "{ \"projects\": { \"acme\": {
+    \"home\": \"/h\", \"standup_dir\": 123, \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
+
+# (f) a single MISSING QUOTE that re-synchronises on the next one: brackets balance and
+#     every string terminates, so balance checking alone does NOT catch it — yet `home`
+#     silently becomes "/h, " and standup_dir disappears. A silently wrong value at the
+#     identity authority is worse than a refusal, so the document must parse as JSON.
+resync="$(bad_reg resync '{ "projects": { "acme": { "home": "/h, "standup_dir": "/s", "mux_session": "m" } },
+  "agents": { "acme-core": { "project": "acme", "profile": "p", "clearance": "t1" } } }')"
+assert_fail "malformed: a re-synchronising missing quote is refused" \
+  env AIBOBNET_REGISTRY="$resync" "$INBOX" acme-core
+resync_err="$(AIBOBNET_REGISTRY="$resync" "$INBOX" acme-core 2>&1 >/dev/null)"
+assert_grep "malformed: re-sync is reported as invalid JSON, not as a missing field" \
+  "$resync_err" "not valid JSON"
+# a bare (unquoted) value where a string belongs is the same class
+assert_fail "malformed: an unquoted value token is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg bareval "{ \"projects\": { \"acme\": {
+    \"home\": /h, \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
+# a missing comma between two pairs likewise
+assert_fail "malformed: a missing comma between pairs is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg nocomma "{ \"projects\": { \"acme\": {
+    \"home\": \"/h\" \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
+
+# (g) invalid escapes: taking the character verbatim yielded a DIFFERENT value than a
+#     strict JSON reader would. \u is refused outright rather than mis-decoded to "u0041".
+assert_fail "malformed: an invalid escape (\\m) is refused, not taken verbatim" \
+  env AIBOBNET_REGISTRY="$(bad_reg badesc "{ \"projects\": { \"acme\": {
+    \"home\": \"/h\", \"standup_dir\": \"/s\", \"\\mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
+assert_fail "malformed: an undecodable \\u escape is refused, not mis-decoded" \
+  env AIBOBNET_REGISTRY="$(bad_reg uesc "{ \"projects\": { \"acme\": {
+    \"home\": \"/\\u0041\", \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
+# valid escapes still decode
+assert_streq "malformed: a VALID escape still decodes normally" \
+  "$(AIBOBNET_REGISTRY="$(bad_reg okesc "{ \"projects\": { \"acme\": {
+    \"home\": \"/h\", \"standup_dir\": \"\\/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" \
+    "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+
+# (h) forward compatibility survives all of it: unknown nested/array fields are ignored,
+#     never load-bearing — the type rule applies only where a field is consumed.
+fwd="$(bad_reg fwd "{ \"schema_version\": 2, $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
+  \"display_name\": \"Core Bob äöü\", \"scopes\": [\"a\",\"b\"], \"meta\": { \"x\": \"y\" } } } }")"
+assert_streq "forward-compat: unknown nested + array fields still resolve" \
+  "$(AIBOBNET_REGISTRY="$fwd" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+
+# ============================================================================ #
 # summary
 # ============================================================================ #
 total=$((pass+fail))

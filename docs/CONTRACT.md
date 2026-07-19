@@ -43,6 +43,15 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 - Registry writes are the identity *and* clearance authority — gated at a high tier and audited
   (DOMAIN §2). Credential material is never co-located with it.
 
+**A malformed registry never resolves.** Because this file is the identity *and* clearance source,
+a half-written or hand-edited file must fail closed rather than hand out a wrong value:
+the whole document must parse as JSON (balance checking alone is not enough — a single missing
+quote can re-synchronise on the next one and silently change a value), exactly one top-level value
+with no trailing data, no duplicate key in one object (key order must never decide routing or
+clearance), and every *consumed* field must be a JSON string. Unknown nested or array fields stay
+ignored, so forward compatibility is unaffected. `\u` escapes are refused rather than mis-decoded —
+raw UTF-8 needs no escape.
+
 ## 2. Resolver — one place, no guessing
 
 `bin/context [--json]` resolves, for the **current** agent, from validated env + the registry:
@@ -61,6 +70,11 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 - Per-agent inbox file: `<standup_dir>/inbox/<agent_uid>.md` (append-only journal). No shared, address-filtered file.
 - Each line is structured: `TIMESTAMP | from:<agent_uid> | <text>` — the sender is a real field, not a free-text signature to parse.
 - `from:`/`to:`/`by:` always carry an **`agent_uid`** — the routing key, never an actor label (see §4.1).
+- **Line grammar:** structured fields first, then at most **one** free-text tail, introduced by a
+  known marker (`state:PERSISTED | <body>`, or `reason:<reason>`) and running to end of line.
+  Readers MUST stop scanning for fields at that marker. Free text is attacker-controlled and may
+  contain `|`, so a reader that keeps scanning lets a crafted body or reason forge `id:`/`event:`
+  and flip the state of a **foreign** message. Unknown structured fields are ignored (forward-compatible).
 
 ## 4. Launch — fail-closed `bin/run-agent`
 
