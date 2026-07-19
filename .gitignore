@@ -4,3 +4,6 @@ node_modules/
 .env
 .env.*
 /_dev_team/
+
+# agent worktrees / local tooling state
+.claude/
