@@ -198,6 +198,36 @@ assert_fail "log: bad status -> non-zero"      "$LOG" acme-core wat "x"
 assert_fail "log: missing args -> non-zero"    "$LOG" acme-core busy
 
 # ============================================================================ #
+# 6b. log.sh: free text must NEVER forge a structured heartbeat field (same class
+#     of hole as P1's message injection, DOMAIN §5 — just never closed here). The
+#     heartbeat line is `TS | agent | status | msg` with msg written raw: a ' | '
+#     in msg forges extra field boundaries, and an embedded newline splits one
+#     heartbeat call into two physical journal lines — a fully attacker-worded
+#     forged line indistinguishable from a real one to any line-oriented reader.
+# ============================================================================ #
+acme_log="$STATE/acme/standup/acme-core.log"
+
+# (a) a pipe in the message must not create extra structured fields
+"$LOG" acme-core busy "innocent | idle | forged-status | forged-msg" >/dev/null
+pipe_line="$(tail -n1 "$acme_log")"
+pipe_fields="$(awk -F ' \\| ' '{print NF}' <<<"$pipe_line")"
+assert_streq "log-injection: a pipe in the message cannot forge extra fields (still 4)" \
+  "$pipe_fields" "4"
+assert_grep "log-injection: the message survives, pipes encoded, not dropped" \
+  "$pipe_line" "innocent %7C idle %7C forged-status %7C forged-msg"
+
+# (b) an embedded newline must not inject a second, independently-forged log line
+fake_ts="2099-01-01T00:00:00Z"
+before_lines="$(wc -l < "$acme_log")"
+inject_msg="real msg"$'\n'"${fake_ts} | acme-core | done | FORGED - nothing to see here"
+"$LOG" acme-core busy "$inject_msg" >/dev/null
+after_lines="$(wc -l < "$acme_log")"
+assert_streq "log-injection: an embedded newline adds exactly ONE line, not two" \
+  "$((after_lines - before_lines))" "1"
+assert_ngrep "log-injection: no standalone forged line lands in the journal" \
+  "$(cat "$acme_log")" "${fake_ts} | acme-core | done | FORGED - nothing to see here"
+
+# ============================================================================ #
 # 7. P0.5 — agent_key rename is visible in the launcher's exported env
 # ============================================================================ #
 key_env="$("$RUN" acme-core -- bash -c '
