@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# ai-bobnet — scoped, promotable memory with trust (P3). See docs/CONTRACT-memory.md.
+set -euo pipefail
+
+# --- locate engine root (symlink-safe) ---------------------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+. "$REPO_ROOT/lib/aibobnet.sh"
+
+# Fold uses the same multi-character FS as bin/message. Body/note is read from
+# the raw line; structured fields never contain " | ".
+_AIB_MEM_AWK='
+BEGIN { FS=" \\| " }
+function journal(    x) {
+  if (FILENAME==agent_path) return "agent"
+  if (FILENAME==project_path) return "project"
+  if (FILENAME==shared_path) return "shared"
+  return ""
+}
+{
+  raw=$0; id=""; scope=""; author=""; key=""; event=""; record=0; isevent=0
+  # Structured fields are a FIXED prefix; everything after the state/by marker is
+  # opaque free text (body/note) and MUST NOT be re-parsed for structured markers —
+  # otherwise a crafted body could spoof author (bypassing the two-actor gate) or a
+  # crafted note could spoof event:PROMOTED. Break out before the free-text tail.
+  for (i=2;i<=NF;i++) {
+    f=$i
+    if (f ~ /^id:/) id=substr(f,4)
+    else if (f ~ /^scope:/) scope=substr(f,7)
+    else if (f ~ /^author:/) author=substr(f,8)
+    else if (f ~ /^key:/) key=substr(f,5)
+    else if (f=="state:PROPOSED") { record=1; break }     # body follows
+    else if (f ~ /^event:/) { event=substr(f,7); isevent=1 }
+    else if (f ~ /^by:/) break                            # note follows
+  }
+  if (id=="") next
+  js=journal(); if (js=="") next
+  jk=js SUBSEP id
+  if (record) {
+    if (!(jk in seen)) { seen[jk]=1; order[++n]=jk }
+    rscope[jk]=scope; rauthor[jk]=author; rkey[jk]=key
+    rts[jk]=substr(raw,1,index(raw," | ")-1)
+    m=index(raw," | state:PROPOSED | ")
+    if (m>0) rbody[jk]=substr(raw,m+length(" | state:PROPOSED | ")); else rbody[jk]=""
+    state[jk]="PROPOSED"
+  } else if (isevent && (jk in seen)) state[jk]=event
+}
+END {
+  if (mode=="meta") {
+    for (i=1;i<=n;i++) if (substr(order[i],index(order[i],SUBSEP)+1)==want) { jk=order[i]; printf "%s\t%s\t%s\n",rscope[jk],rauthor[jk],state[jk]; exit 0 }
+    exit 3
+  }
+  if (mode=="render") {
+    for (i=1;i<=n;i++) {
+      jk=order[i]; scope=rscope[jk]; js=substr(jk,1,index(jk,SUBSEP)-1); cur=state[jk]
+      if (scope=="" || scope!=js) continue
+      if (scope_filter!="" && scope!=scope_filter) continue
+      if (key_filter!="" && rkey[jk]!=key_filter) continue
+      if (list_mode=="recall")
+        ok=(scope=="agent" ? rauthor[jk]==caller : cur=="PROMOTED" || (rauthor[jk]==caller && cur=="PROPOSED"))
+      else {
+        ok=(scope=="agent" ? rauthor[jk]==caller : rauthor[jk]==caller || (cur=="PROPOSED" && rauthor[jk]!=caller))
+        if (state_filter!="" && cur!=state_filter) ok=0
+      }
+      if (ok) eligible[i]=1
+    }
+    for (out=1;out<=n;out++) {
+      best=0
+      for (i=1;i<=n;i++) if (eligible[i] && !used[i])
+        if (best==0 || rts[order[i]]>rts[order[best]] || (rts[order[i]]==rts[order[best]] && i>best)) best=i
+      if (best==0) break
+      used[best]=1; jk=order[best]; cur=state[jk]     # per-record state, not the eligibility-loop stale value
+      line=rts[jk] " | id:" substr(jk,index(jk,SUBSEP)+1) " | scope:" rscope[jk] " | author:" rauthor[jk] " | key:" rkey[jk] " | state:" cur " | " rbody[jk]
+      if (list_mode=="recall") print "advisory: " line; else print line
+    }
+    exit 0
+  }
+  if (mode=="state") {
+    for (i=1;i<=n;i++) if (substr(order[i],index(order[i],SUBSEP)+1)==want) { print state[order[i]]; exit 0 }
+    exit 3
+  }
+  exit 9
+}'
+
+# Read additive top-level "shared_memory_dir" only; no registry entry is made here.
+_AIB_SHARED_AWK='
+{ data=data $0 "\n" }
+END {
+  n=length(data); i=1; nt=0
+  while (i<=n) {
+    c=substr(data,i,1)
+    if (c==" "||c=="\t"||c=="\r"||c=="\n") { i++; continue }
+    if (c=="{"||c=="}"||c=="["||c=="]"||c==":"||c==",") { nt++; tok[nt]=c; typ[nt]="P"; i++; continue }
+    if (c=="\"") {
+      s=""; i++
+      while (i<=n) {
+        d=substr(data,i,1)
+        if (d=="\\") { e=substr(data,i+1,1); if(e=="n")s=s"\n"; else if(e=="t")s=s"\t"; else if(e=="r")s=s"\r"; else if(e=="\"")s=s"\""; else if(e=="\\")s=s"\\"; else if(e=="/")s=s"/"; else s=s e; i+=2; continue }
+        if (d=="\"") { i++; break }; s=s d; i++
+      }
+      nt++; tok[nt]=s; typ[nt]="S"; continue
+    }
+    s=""; while (i<=n) { d=substr(data,i,1); if (d==" "||d=="\t"||d=="\r"||d=="\n"||d==","||d=="}"||d=="]"||d==":") break; s=s d; i++ }; nt++; tok[nt]=s; typ[nt]="V"
+  }
+  depth=0
+  for (j=1;j<=nt;j++) {
+    if (typ[j]=="P" && tok[j]=="{") { depth++; continue }
+    if (typ[j]=="P" && tok[j]=="}") { depth--; continue }
+    if (depth==1 && typ[j]=="S" && tok[j]==key && typ[j+1]=="P" && tok[j+1]==":" && typ[j+2]=="S") { print tok[j+2]; exit 0 }
+  }
+  exit 3
+}'
+
+_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_validate_id() {
+  local id="$1"; [ -n "$id" ] || aib_die 4 "memory id is empty"
+  case "$id" in *[!A-Za-z0-9._-]*) aib_die 4 "invalid memory id '$id' (allowed: letters, digits, . _ -)";; esac
+}
+_sanitize_line() { local s="$1"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"; printf '%s' "$s"; }
+_validate_scope() {
+  local scope="$1"; aib_validate_token "$scope" memory_scope
+  case "$scope" in agent|project|shared) ;; *) aib_die 4 "invalid memory scope '$scope'";; esac
+}
+_validate_state() {
+  case "$1" in PROPOSED|REVIEWED_ACCEPT|REVIEWED_REJECT|PROMOTED) ;; *) aib_die 4 "invalid memory state '$1'";; esac
+}
+_load_own_context() {
+  local ctx line registry_standup
+  ctx="$("$REPO_ROOT/bin/context")" || aib_die 6 "cannot resolve own context (launch via bin/run-agent)"
+  _own_agent=""; _own_project=""; _own_standup=""
+  while IFS= read -r line; do
+    case "$line" in
+      agent_uid=*) _own_agent="${line#agent_uid=}";;
+      project_uid=*) _own_project="${line#project_uid=}";;
+      standup_dir=*) _own_standup="${line#standup_dir=}";;
+    esac
+  done <<EOF
+$ctx
+EOF
+  [ -n "$_own_agent" ] && [ -n "$_own_project" ] && [ -n "$_own_standup" ] || aib_die 6 "own context missing required fields"
+  aib_validate_agent_uid "$_own_agent"; aib_validate_token "$_own_project" project_uid
+  aib_registry_query has "$_own_project" >/dev/null || aib_die 3 "own project is not in registry"
+  aib_split_agent "$_own_agent"; [ "$AIB_PROJECT_UID" = "$_own_project" ] || aib_die 5 "inconsistent own context project"
+  registry_standup="$(aib_project_field "$_own_project" standup_dir)"
+  [ "$registry_standup" = "$_own_standup" ] || aib_die 5 "inconsistent own context standup_dir"
+}
+_shared_dir_optional() {
+  local reg value=""; reg="$(aib_registry_file)"
+  value="$(awk -v key=shared_memory_dir "$_AIB_SHARED_AWK" "$reg" 2>/dev/null || true)"; printf '%s' "$value"
+}
+_shared_dir_required() {
+  _shared_dir="$(_shared_dir_optional)"; [ -n "$_shared_dir" ] || aib_die 3 "shared_memory_dir is not configured in the registry"
+}
+_journal_for_scope() {
+  case "$1" in
+    agent) _journal="$_own_standup/memory/agent/$_own_agent.md"; _journal_dir="$_own_standup/memory/agent";;
+    project) _journal="$_own_standup/memory/project.md"; _journal_dir="$_own_standup/memory";;
+    shared) _shared_dir_required; _journal="$_shared_dir/shared.md"; _journal_dir="$_shared_dir";;
+    *) aib_die 4 "invalid memory scope '$1'";;
+  esac
+}
+_ensure_journal_dir() { mkdir -p "$_journal_dir" || aib_die 2 "cannot create memory journal directory: $_journal_dir"; }
+_journal_meta() {
+  local id="$1" file="$2" input="$2"; [ -f "$input" ] || input=/dev/null
+  awk -v mode=meta -v want="$id" -v agent_path="$input" -v project_path="" -v shared_path="" "$_AIB_MEM_AWK" "$input"
+}
+_reachable_collective() {
+  _paths=("$_own_standup/memory/project.md"); _shared_dir="$(_shared_dir_optional)"
+  [ -n "$_shared_dir" ] && _paths+=("$_shared_dir/shared.md")
+}
+_locate_collective() {
+  local id="$1" meta scope author state i count=0; _reachable_collective
+  _found_path=""; _found_scope=""; _found_author=""; _found_state=""
+  for i in "${!_paths[@]}"; do
+    if meta="$(_journal_meta "$id" "${_paths[$i]}" 2>/dev/null)"; then
+      IFS=$'\t' read -r scope author state <<EOF
+$meta
+EOF
+      count=$((count+1)); _found_path="${_paths[$i]}"; _found_scope="$scope"; _found_author="$author"; _found_state="$state"
+    fi
+  done
+  [ "$count" -gt 0 ] || aib_die 3 "memory id '$id' is not in a reachable collective journal"
+  [ "$count" -eq 1 ] || aib_die 5 "memory id '$id' is ambiguous across reachable journals"
+}
+_locate_any() {
+  local id="$1" meta scope author state i count=0
+  _paths=("$_own_standup/memory/agent/$_own_agent.md" "$_own_standup/memory/project.md"); _shared_dir="$(_shared_dir_optional)"
+  [ -n "$_shared_dir" ] && _paths+=("$_shared_dir/shared.md")
+  _found_path=""; _found_scope=""; _found_author=""; _found_state=""
+  for i in "${!_paths[@]}"; do
+    if meta="$(_journal_meta "$id" "${_paths[$i]}" 2>/dev/null)"; then
+      IFS=$'\t' read -r scope author state <<EOF
+$meta
+EOF
+      count=$((count+1)); _found_path="${_paths[$i]}"; _found_scope="$scope"; _found_author="$author"; _found_state="$state"
+    fi
+  done
+  [ "$count" -gt 0 ] || aib_die 3 "memory id '$id' is not in a reachable journal"
+  [ "$count" -eq 1 ] || aib_die 5 "memory id '$id' is ambiguous across reachable journals"
+}
+_render() {
+  local mode="$1" scope_filter="$2" key_filter="$3" state_filter="$4"
+  local agent_input="$_own_standup/memory/agent/$_own_agent.md" project_input="$_own_standup/memory/project.md" shared_input=""
+  [ -f "$agent_input" ] || agent_input=/dev/null; [ -f "$project_input" ] || project_input=/dev/null
+  [ -n "$_shared_dir" ] && shared_input="$_shared_dir/shared.md" && [ -f "$shared_input" ] || shared_input=/dev/null
+  awk -v mode=render -v list_mode="$mode" -v caller="$_own_agent" -v scope_filter="$scope_filter" -v key_filter="$key_filter" -v state_filter="$state_filter" \
+    -v agent_path="$agent_input" -v project_path="$project_input" -v shared_path="$shared_input" "$_AIB_MEM_AWK" "$agent_input" "$project_input" "$shared_input"
+}
+
+aib_check_registry; _load_own_context; _shared_dir=""
+sub="${1:-}"; [ -n "$sub" ] || aib_die 64 "usage: memory <propose|review|promote|recall|state|list> ..."; shift
+case "$sub" in
+  propose)
+    scope=""; key=""; id=""; body=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --scope) scope="${2:-}"; [ -n "$scope" ] || aib_die 64 "propose: --scope needs a value"; shift 2;;
+        --key) [ "$#" -ge 2 ] || aib_die 64 "propose: --key needs a value"; key="$2"; shift 2;;
+        --id) id="${2:-}"; [ -n "$id" ] || aib_die 64 "propose: --id needs a value"; shift 2;;
+        --*) aib_die 64 "propose: unexpected arg '$1'";;
+        *) [ -z "$body" ] || aib_die 64 "propose: unexpected extra body"; body="$1"; shift;;
+      esac
+    done
+    [ -n "$scope" ] && [ -n "$body" ] || aib_die 64 'usage: memory propose --scope <agent|project|shared> "<body>" [--id <id>]'
+    _validate_scope "$scope"; [ -n "$id" ] && _validate_id "$id"
+    key="$(_sanitize_line "$key")"; case "$key" in *' | '*) aib_die 4 "memory key must not contain ' | '";; esac
+    body="$(_sanitize_line "$body")"; _journal_for_scope "$scope"; _ensure_journal_dir
+    if [ -n "$id" ]; then
+      # ids must be globally unique across ALL reachable journals. Re-propose is idempotent only
+      # in the SAME journal while still PROPOSED; a collision in a DIFFERENT journal is refused —
+      # else _locate_* would go permanently ambiguous (a cross-journal id-collision DoS).
+      _sd="$(_shared_dir_optional)"
+      _jrnls=("$_own_standup/memory/agent/$_own_agent.md" "$_own_standup/memory/project.md")
+      [ -n "$_sd" ] && _jrnls+=("$_sd/shared.md")
+      for _j in "${_jrnls[@]}"; do
+        meta="$(_journal_meta "$id" "$_j" 2>/dev/null)" || continue
+        if [ "$_j" = "$_journal" ]; then
+          IFS=$'\t' read -r _old_scope _old_author _old_state <<EOF
+$meta
+EOF
+          [ "$_old_state" = PROPOSED ] && { printf '%s\n' "$id"; exit 0; }
+          aib_die 5 "memory id '$id' already exists with state $_old_state"
+        else
+          aib_die 5 "memory id '$id' already exists in another journal (ids must be globally unique)"
+        fi
+      done
+    fi
+    if [ -z "$id" ]; then stamp="$(_now)"; stamp="${stamp//:/}"; stamp="${stamp//-/}"; id="mem-${stamp}-$$-$RANDOM$RANDOM"; fi
+    printf '%s | id:%s | scope:%s | author:%s | key:%s | state:PROPOSED | %s\n' "$(_now)" "$id" "$scope" "$_own_agent" "$key" "$body" >> "$_journal"
+    printf '%s\n' "$id"
+    ;;
+  review)
+    id="${1:-}"; verdict="${2:-}"; note="${3:-}"
+    [ -n "$id" ] && [ -n "$verdict" ] || aib_die 64 'usage: memory review <id> <accept|reject> ["<note>"]'
+    [ "$#" -le 3 ] || aib_die 64 "review: unexpected arg '$4'"; _validate_id "$id"
+    case "$verdict" in accept|reject) ;; *) aib_die 64 "review: expected accept or reject";; esac
+    _agent_journal="$_own_standup/memory/agent/$_own_agent.md"
+    if _journal_meta "$id" "$_agent_journal" >/dev/null 2>&1; then aib_die 3 "agent-scope memory '$id' is private and not reviewable"; fi
+    _locate_collective "$id"; [ "$_found_author" != "$_own_agent" ] || aib_die 3 "memory author cannot review its own proposal"
+    case "$_found_state:$verdict" in
+      REVIEWED_ACCEPT:accept|REVIEWED_REJECT:reject) exit 0;;
+      REVIEWED_ACCEPT:*|REVIEWED_REJECT:*) aib_die 3 "memory '$id' already has a conflicting review";;
+      PROPOSED:*) ;;
+      *) aib_die 3 "memory '$id' is terminal or not reviewable (state $_found_state)";;
+    esac
+    note="$(_sanitize_line "$note")"; event=REVIEWED_ACCEPT; [ "$verdict" = reject ] && event=REVIEWED_REJECT
+    if [ -n "$note" ]; then printf '%s | id:%s | event:%s | by:%s | note:%s\n' "$(_now)" "$id" "$event" "$_own_agent" "$note" >> "$_found_path"
+    else printf '%s | id:%s | event:%s | by:%s\n' "$(_now)" "$id" "$event" "$_own_agent" >> "$_found_path"; fi
+    ;;
+  promote)
+    id="${1:-}"; [ -n "$id" ] || aib_die 64 'usage: memory promote <id>'; [ "$#" -eq 1 ] || aib_die 64 "promote: unexpected arg '$2'"
+    _validate_id "$id"; _locate_collective "$id"
+    case "$_found_state" in
+      PROMOTED) exit 0;;
+      REVIEWED_ACCEPT) printf '%s | id:%s | event:PROMOTED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_found_path";;
+      *) aib_die 3 "memory '$id' cannot be promoted from state $_found_state";;
+    esac
+    ;;
+  recall)
+    scope=""; key=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --scope) [ "$#" -ge 2 ] || aib_die 64 "recall: --scope needs a value"; scope="$2"; shift 2; _validate_scope "$scope";;
+        --key) [ "$#" -ge 2 ] || aib_die 64 "recall: --key needs a value"; key="$2"; shift 2;;
+        *) aib_die 64 "recall: unexpected arg '$1'";;
+      esac
+    done
+    if [ "$scope" = shared ]; then _shared_dir_required; else _shared_dir="$(_shared_dir_optional)"; fi
+    # The §4 reviewer-pending row is surfaced by list, not recall; default-deny remains intact.
+    _render recall "$scope" "$key" ""
+    ;;
+  state)
+    id="${1:-}"; [ -n "$id" ] || aib_die 64 'usage: memory state <id>'; [ "$#" -eq 1 ] || aib_die 64 "state: unexpected arg '$2'"
+    _validate_id "$id"; _locate_any "$id"; printf '%s\n' "$_found_state"
+    ;;
+  list)
+    state=""; scope=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --state) [ "$#" -ge 2 ] || aib_die 64 "list: --state needs a value"; state="$2"; shift 2; _validate_state "$state";;
+        --scope) [ "$#" -ge 2 ] || aib_die 64 "list: --scope needs a value"; scope="$2"; shift 2; _validate_scope "$scope";;
+        *) aib_die 64 "list: unexpected arg '$1'";;
+      esac
+    done
+    if [ "$scope" = shared ]; then _shared_dir_required; else _shared_dir="$(_shared_dir_optional)"; fi
+    _render list "$scope" "" "$state"
+    ;;
+  *) aib_die 64 "unknown subcommand '$sub' (propose|review|promote|recall|state|list)";;
+esac
