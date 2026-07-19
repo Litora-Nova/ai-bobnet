@@ -5,8 +5,10 @@
 # Callers MUST set REPO_ROOT (the engine root that holds registry.json + lib/) before
 # sourcing, e.g. via the symlink-safe resolver snippet each bin/ + scripts/ entrypoint uses.
 #
-# Registry authority: the project registry is the single source of truth for
-# home / standup_dir / mux_session. Env is never trusted for those paths.
+# Registry authority: the registry is the single source of truth for projects
+# (home / standup_dir / mux_session) AND for agents (project / profile / clearance).
+# Env is never trusted for those. An agent that is not in the registry is
+# fail-closed — even if its uid prefix parses (docs/DOMAIN.md §2).
 
 # --- fatal exit, always loud --------------------------------------------------
 aib_die() {
@@ -32,15 +34,80 @@ aib_registry_file() {
   printf '%s\n' "${AIBOBNET_REGISTRY:-$REPO_ROOT/registry.json}"
 }
 
+# Validate the registry ONCE, loudly, at the top level of every entrypoint. Every
+# query re-runs the same structural pass (defence in depth), but a query is often
+# consumed in `if !` or `$( )`, where a die could not abort — so the clear, actionable
+# message has to come from here.
 aib_check_registry() {
-  local reg; reg="$(aib_registry_file)"
+  local reg rc=0; reg="$(aib_registry_file)"
   [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
+  awk -v sect=projects -v op=validate -v uid="" -v field="" "$_AIB_AWK" "$reg" || rc=$?
+  case "$rc" in
+    0) ;;
+    6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
+    7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
+    10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
+    *) aib_die 2 "registry failed validation (code $rc): $reg";;
+  esac
 }
 
 # --- registry parser (pure awk; no jq) ----------------------------------------
-# Schema: { "projects": { "<uid>": { "home":..., "standup_dir":..., "mux_session":... }, ... } }
-# Field values must be JSON strings (flat). Robust to arbitrary JSON whitespace.
+# Schema (schema_version 2):
+#   { "schema_version": 2,
+#     "projects": { "<project_uid>": { "home":…, "standup_dir":…, "mux_session":… } },
+#     "agents":   { "<agent_uid>":   { "project":…, "profile":…, "clearance":… } } }
+# The top-level section is a PARAMETER (-v sect=projects|agents) so one tokenizer
+# serves both. Field values must be JSON strings (flat); robust to arbitrary JSON
+# whitespace. Unknown extra fields are ignored (forward-compatible, never load-bearing).
 _AIB_AWK='
+# --- JSON grammar validator (recursive descent over the token stream) ---------
+# Balance checking alone is NOT enough: a single missing quote can re-synchronise on
+# the next one, leaving brackets balanced and every string terminated while a value
+# is silently WRONG (e.g. "home": "/h, "standup_dir": … makes home "/h, " and drops
+# standup_dir). At the identity + clearance authority a silently wrong value is worse
+# than a refusal, so the whole document must parse as JSON before anything is read.
+function is_atom(s) {
+  return (s=="true" || s=="false" || s=="null" ||
+          s ~ /^-?(0|[1-9][0-9]*)([.][0-9]+)?([eE][-+]?[0-9]+)?$/)
+}
+function p_value() {
+  if (pos > ntok) return 0
+  if (ty[pos]=="S") { pos++; return 1 }
+  if (ty[pos]=="V") { if (!is_atom(tok[pos])) return 0; pos++; return 1 }
+  if (ty[pos]=="P" && tok[pos]=="{") return p_object()
+  if (ty[pos]=="P" && tok[pos]=="[") return p_array()
+  return 0
+}
+function p_object(   myid, key) {
+  myid = ++nobj; pos++                                   # consume {
+  if (ty[pos]=="P" && tok[pos]=="}") { pos++; return 1 }
+  while (1) {
+    if (ty[pos]!="S") return 0                           # a key must be a JSON string
+    # A KEY is always identity-relevant, so an undecodable one is refused up front —
+    # unlike a value, which is only refused where it is consumed.
+    if (tund[pos]) { badkey=1; return 0 }
+    key = tok[pos]
+    if ((myid SUBSEP key) in kseen) { dupkey=1; return 0 }
+    kseen[myid SUBSEP key] = 1
+    pos++
+    if (!(ty[pos]=="P" && tok[pos]==":")) return 0
+    pos++
+    if (!p_value()) return 0
+    if (ty[pos]=="P" && tok[pos]==",") { pos++; continue }
+    if (ty[pos]=="P" && tok[pos]=="}") { pos++; return 1 }
+    return 0
+  }
+}
+function p_array() {
+  pos++                                                  # consume [
+  if (ty[pos]=="P" && tok[pos]=="]") { pos++; return 1 }
+  while (1) {
+    if (!p_value()) return 0
+    if (ty[pos]=="P" && tok[pos]==",") { pos++; continue }
+    if (ty[pos]=="P" && tok[pos]=="]") { pos++; return 1 }
+    return 0
+  }
+}
 { data = data $0 "\n" }
 END {
   n = length(data); i = 1; ntok = 0
@@ -49,20 +116,33 @@ END {
     if (c==" "||c=="\t"||c=="\r"||c=="\n") { i++; continue }
     if (c=="{"||c=="}"||c=="["||c=="]"||c==":"||c==",") { ntok++; tok[ntok]=c; ty[ntok]="P"; i++; continue }
     if (c=="\"") {
-      s=""; i++
+      s=""; i++; term=0; und=0
       while (i<=n) {
         d=substr(data,i,1)
         if (d=="\\") {
           e=substr(data,i+1,1)
           if(e=="n")s=s"\n"; else if(e=="t")s=s"\t"; else if(e=="r")s=s"\r";
+          else if(e=="b")s=s"\b"; else if(e=="f")s=s"\f";
           else if(e=="\"")s=s"\""; else if(e=="\\")s=s"\\"; else if(e=="/")s=s"/";
-          else s=s e
+          # \u is VALID JSON that this parser cannot decode. Rejecting the whole file
+          # for it would break every registry written by a tool using json.dump(), which
+          # escapes non-ASCII by default — and CONTRACT.md explicitly invites unicode in
+          # display_name, a field nothing ever reads. So mark the token undecodable and
+          # defer: it only kills where it is actually read (as a key, or as a consumed
+          # field). Same shape as the value-type rule. Fail-closed stays where it counts.
+          else if(e=="u") { und=1 }
+          # Anything else is not a JSON escape at all. Taking the char verbatim silently
+          # produced a DIFFERENT value than a strict reader, so the document is refused.
+          else { exit 6 }
           i+=2; continue
         }
-        if (d=="\"") { i++; break }
+        if (d=="\"") { i++; term=1; break }
         s=s d; i++
       }
-      ntok++; tok[ntok]=s; ty[ntok]="S"; continue
+      # An unterminated string silently swallowed the rest of the file (a torn write).
+      # Accepting it would let a half-written registry hand out identity and clearance.
+      if (!term) { exit 6 }
+      ntok++; tok[ntok]=s; ty[ntok]="S"; tund[ntok]=und; continue
     }
     s=""
     while (i<=n) {
@@ -72,58 +152,121 @@ END {
     }
     ntok++; tok[ntok]=s; ty[ntok]="V"; continue
   }
-  pstart = 0
+  # --- structural validation (fail-closed) ------------------------------------
+  # The registry is the identity AND clearance authority (DOMAIN §2), so a malformed
+  # file must never resolve. The whole document must parse as JSON: exactly ONE
+  # top-level value, no trailing data, and no duplicate key within the same object
+  # (last-write-wins would let key ORDER decide routing, clearance and memory scope).
+  pos = 1; nobj = 0; dupkey = 0; badkey = 0
+  if (!p_value()) { if (dupkey) exit 7; if (badkey) exit 10; exit 6 }
+  if (pos <= ntok) exit 6                      # trailing data after the top-level value
+  if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
+  if (op=="validate") { exit 0 }
+
+  # Locate the requested TOP-LEVEL section (depth 1) — a nested key of the same
+  # name must never be mistaken for it.
+  pstart = 0; sdepth = 0
   for (j=1; j<=ntok; j++) {
-    if (ty[j]=="S" && tok[j]=="projects" && ty[j+1]=="P" && tok[j+1]==":" && ty[j+2]=="P" && tok[j+2]=="{") { pstart=j+2; break }
+    if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { sdepth++; continue }
+    if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) { sdepth--; continue }
+    if (sdepth==1 && ty[j]=="S" && tok[j]==sect && ty[j+1]=="P" && tok[j+1]==":" && ty[j+2]=="P" && tok[j+2]=="{") { pstart=j+2; break }
   }
   if (pstart==0) { exit 3 }
+  # Depth counts [] as well as {}. Nothing can currently reach a case where this
+  # matters: the object requirement below already rejects any section entry that is
+  # not an object, so no array can place content at depth 2. This is unreachable
+  # redundancy and NOT the defence against MED-2 — the object requirement is; do not
+  # cite this line as protection. It is kept for one reason: it makes `depth` mean
+  # what its name says. Previously [] were ignored symmetrically, so the count
+  # balanced by accident rather than by construction, and a refactor that relaxes the
+  # object requirement would silently re-open the hole. No test covers it, because no
+  # black-box input can distinguish it from its absence.
   depth=0; cur=""; nuid=0
   for (j=pstart; j<=ntok; j++) {
-    if (ty[j]=="P" && tok[j]=="{") { depth++; continue }
-    if (ty[j]=="P" && tok[j]=="}") { depth--; if(depth==0) break; if(depth==1) cur=""; continue }
+    if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { depth++; continue }
+    if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) {
+      depth--
+      if (depth==0) break
+      if (depth==1) cur=""
+      continue
+    }
     if (ty[j]=="S" && ty[j+1]=="P" && tok[j+1]==":") {
-      if (depth==1) { cur=tok[j]; nuid++; uids[nuid]=cur; hasuid[cur]=1 }
-      else if (depth==2 && cur!="") { store[cur SUBSEP tok[j]] = tok[j+2] }
+      if (depth==1) {
+        # THIS is the defence against MED-2. A section entry MUST be an object: an
+        # array/string/number is not an agent or a project, so it is not registered and
+        # its contents are attributed to nothing. Without it an object nested in an array
+        # resolved as a full agent carrying its OWN clearance, while jq and python saw a
+        # list and no agent at all — enforcement view and audit view disagreeing about
+        # clearance. Covered by tests/p0_spec.sh (section 14i).
+        if (ty[j+2]=="P" && tok[j+2]=="{") { cur=tok[j]; nuid++; uids[nuid]=cur; hasuid[cur]=1 }
+        else cur=""
+      }
+      else if (depth==2 && cur!="") {
+        # Keep the value, its token type AND whether it decoded. Both are enforced only
+        # where a field is actually consumed, so an unknown nested/array field — or a
+        # \u escape in a field nobody reads — stays forward-compatible.
+        store[cur SUBSEP tok[j]]    = tok[j+2]
+        storety[cur SUBSEP tok[j]]  = ty[j+2]
+        storeund[cur SUBSEP tok[j]] = tund[j+2]
+      }
     }
   }
-  if (op=="projects") { for (k=1;k<=nuid;k++) print uids[k]; exit 0 }
-  if (op=="has")      { if (hasuid[uid]) exit 0; else exit 3 }
+  if (op=="keys") { for (k=1;k<=nuid;k++) print uids[k]; exit 0 }
+  if (op=="has")  { if (hasuid[uid]) exit 0; else exit 3 }
   if (op=="field") {
     if (!hasuid[uid]) exit 3
     key = uid SUBSEP field
-    if (key in store) { print store[key]; exit 0 } else { exit 4 }
+    if (!(key in store)) exit 4
+    if (storety[key] != "S") exit 8          # consumed fields MUST be JSON strings
+    if (storeund[key]) exit 10               # ...and MUST be fully decodable
+    print store[key]; exit 0
   }
   exit 9
 }'
 
-# aib_registry_query <projects|has|field> [uid] [field]
+# aib_registry_query <projects|agents> <keys|has|field> [uid] [field]
 aib_registry_query() {
-  local op="$1" uid="${2:-}" field="${3:-}" reg
+  local sect="$1" op="$2" uid="${3:-}" field="${4:-}" reg
   reg="$(aib_registry_file)"
   [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
-  awk -v op="$op" -v uid="$uid" -v field="$field" "$_AIB_AWK" "$reg"
+  awk -v sect="$sect" -v op="$op" -v uid="$uid" -v field="$field" "$_AIB_AWK" "$reg"
 }
 
 aib_require_project() {
   local p="$1"
-  if ! aib_registry_query has "$p"; then
-    aib_die 3 "unknown project_uid: '$p' (not in registry). Known: $(aib_registry_query projects | tr '\n' ' ')"
+  if ! aib_registry_query projects has "$p"; then
+    aib_die 3 "unknown project_uid: '$p' (not in registry). Known: $(aib_registry_query projects keys | tr '\n' ' ')"
   fi
 }
 
-# aib_project_field <project_uid> <field> -> value (dies if missing/empty)
+# aib_project_field <project_uid> <field> -> value (dies if missing/empty/mistyped)
 aib_project_field() {
   local p="$1" f="$2" v rc=0
-  v="$(aib_registry_query field "$p" "$f")" || rc=$?
+  v="$(aib_registry_query projects field "$p" "$f")" || rc=$?
+  [ "$rc" -ne 8 ]  || aib_die 2 "registry: project '$p' field '$f' is not a JSON string"
+  [ "$rc" -ne 10 ] || aib_die 2 "registry: project '$p' field '$f' uses a \\u escape this parser cannot decode — write it as raw UTF-8 (refusing to act on a half-decoded value)"
   if [ "$rc" -ne 0 ] || [ -z "$v" ]; then
     aib_die 3 "registry: project '$p' has no usable field '$f'"
   fi
   printf '%s\n' "$v"
 }
 
+# aib_agent_field <agent_uid> <field> -> value (dies if missing/empty/mistyped)
+aib_agent_field() {
+  local a="$1" f="$2" v rc=0
+  v="$(aib_registry_query agents field "$a" "$f")" || rc=$?
+  [ "$rc" -ne 8 ]  || aib_die 2 "registry: agent '$a' field '$f' is not a JSON string"
+  [ "$rc" -ne 10 ] || aib_die 2 "registry: agent '$a' field '$f' uses a \\u escape this parser cannot decode — write it as raw UTF-8 (refusing to act on a half-decoded value)"
+  if [ "$rc" -ne 0 ] || [ -z "$v" ]; then
+    aib_die 3 "registry: agent '$a' has no usable field '$f'"
+  fi
+  printf '%s\n' "$v"
+}
+
 # --- identity validation ------------------------------------------------------
 aib_validate_token() {
-  # single id token (project_uid or task): lowercase/digit/hyphen, no edge/double hyphen
+  # single id token (project_uid, agent_key, profile, actor label):
+  # lowercase/digit/hyphen, no edge/double hyphen
   local t="$1" what="$2"
   [ -n "$t" ] || aib_die 4 "$what is empty"
   case "$t" in
@@ -140,38 +283,73 @@ aib_validate_agent_uid() {
     -*|*-|*--*)   aib_die 4 "invalid agent_uid '$a' (no leading/trailing/double hyphen)";;
   esac
   case "$a" in
-    *-*) : ;;  # must be <project>-<task>
-    *)   aib_die 4 "invalid agent_uid '$a' (expected <project_uid>-<task>)";;
+    *-*) : ;;  # must be <project_uid>-<agent_key>
+    *)   aib_die 4 "invalid agent_uid '$a' (expected <project_uid>-<agent_key>)";;
   esac
 }
 
-# --- resolve project + task from an agent_uid (deterministic, fail-closed) -----
-# Sets globals AIB_PROJECT_UID and AIB_TASK. A registered project uid is a prefix
-# of the agent_uid up to the first "-"; ambiguous matches refuse to guess.
+aib_validate_clearance() {
+  local c="$1" what="${2:-clearance}"
+  case "$c" in
+    t1|t2|t3|t4) ;;
+    *) aib_die 4 "invalid $what '$c' (expected: t1|t2|t3|t4)";;
+  esac
+}
+
+# --- resolve an agent_uid via the registry (deterministic, fail-closed) -------
+# An Agent is a REGISTRY OBJECT (DOMAIN §2): lookup is the authority, parsing is
+# validation only. There is deliberately NO prefix-scan fallback — a fallback would
+# re-open exactly the ambiguity ("acme" vs "acme-core") that this closes.
+# Sets globals: AIB_PROJECT_UID · AIB_AGENT_KEY · AIB_PROFILE · AIB_CLEARANCE.
 aib_split_agent() {
-  local agent="$1"
-  aib_validate_agent_uid "$agent"
-  local plist; plist="$(aib_registry_query projects)" || true
-  local match="" mtask="" count=0 p rest
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    case "$agent" in
-      "$p"-*)
-        rest="${agent#"$p"-}"
-        [ -n "$rest" ] || continue
-        match="$p"; mtask="$rest"; count=$((count+1))
-        ;;
-    esac
-  done <<EOF
-$plist
-EOF
-  if [ "$count" -eq 0 ]; then
-    aib_die 3 "cannot resolve project for agent_uid '$agent' (no registered project is a prefix). Known: $(printf '%s ' $plist)"
-  elif [ "$count" -gt 1 ]; then
-    aib_die 5 "ambiguous agent_uid '$agent' — matches multiple registered projects; refusing to guess"
+  local agent="$1" project profile clearance key
+  aib_validate_agent_uid "$agent"                      # shape validation ONLY
+
+  if ! aib_registry_query agents has "$agent"; then
+    aib_die 3 "unknown agent_uid '$agent' (not in registry)"
   fi
-  AIB_PROJECT_UID="$match"
-  AIB_TASK="$mtask"
+
+  # `project` is mandatory and authoritative — never guessed from the prefix.
+  project="$(aib_agent_field "$agent" project)"
+  aib_validate_token "$project" project_uid
+  if ! aib_registry_query projects has "$project"; then
+    aib_die 3 "registry: agent '$agent' names unknown project '$project'"
+  fi
+
+  # The uid MUST carry its project's prefix; otherwise the registry disagrees with itself.
+  case "$agent" in
+    "$project"-*) key="${agent#"$project"-}";;
+    *) aib_die 5 "registry inconsistent: agent_uid '$agent' does not match its project '$project'";;
+  esac
+  case "$key" in
+    ''|*[!a-z0-9-]*|-*|*-|*--*)
+      aib_die 5 "registry inconsistent: agent_uid '$agent' does not match its project '$project'";;
+  esac
+
+  # profile is MUTABLE; clearance lives on the AGENT object and never on the profile
+  # (a profile swap MUST NOT change clearance — DOMAIN §2).
+  profile="$(aib_agent_field "$agent" profile)"
+  aib_validate_token "$profile" profile
+  clearance="$(aib_agent_field "$agent" clearance)"
+  aib_validate_clearance "$clearance" "clearance of agent '$agent'"
+
+  AIB_PROJECT_UID="$project"
+  AIB_AGENT_KEY="$key"
+  AIB_PROFILE="$profile"
+  AIB_CLEARANCE="$clearance"
+}
+
+# --- optional actor label (on_behalf_of; DOMAIN §2 "Ephemeral helpers") -------
+# A short-lived helper is a Session/Attempt acting on behalf of an existing Agent —
+# never a new Agent. The label is audit-only and MUST NOT influence routing.
+# Sets globals: AIB_ACTOR (may be empty) and AIB_ACTOR_FIELD (encoded journal suffix).
+# Validation is the encoding guarantee: the token charset admits no '|' and no newline.
+aib_load_actor() {
+  AIB_ACTOR="${AIBOBNET_ACTOR:-}"
+  AIB_ACTOR_FIELD=""
+  [ -n "$AIB_ACTOR" ] || return 0
+  aib_validate_token "$AIB_ACTOR" actor_label
+  AIB_ACTOR_FIELD=" | actor:$AIB_ACTOR"
 }
 
 # aib_inbox_path <agent_uid> -> recipient's own inbox file (deterministic)

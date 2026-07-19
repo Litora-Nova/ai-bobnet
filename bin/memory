@@ -122,7 +122,18 @@ _validate_id() {
   local id="$1"; [ -n "$id" ] || aib_die 4 "memory id is empty"
   case "$id" in *[!A-Za-z0-9._-]*) aib_die 4 "invalid memory id '$id' (allowed: letters, digits, . _ -)";; esac
 }
-_sanitize_line() { local s="$1"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"; printf '%s' "$s"; }
+# Encode a free-text tail (key / body / note): collapse line breaks and tabs, and replace
+# every '|' with '%7C'. Same reasoning as bin/message — the fold already stops at the
+# free-text marker, but the WRITTEN line must be unambiguous to every reader (DOMAIN §5),
+# or a crafted note renders as "note:nope | event:PROMOTED" and falsifies the audit trail
+# for anything that is not this exact fold. Removing the byte (rather than escaping it to
+# '\|') is what makes it hold for readers we do not control.
+_sanitize_line() {
+  local s="$1"
+  s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"
+  s="${s//|/%7C}"
+  printf '%s' "$s"
+}
 _validate_scope() {
   local scope="$1"; aib_validate_token "$scope" memory_scope
   case "$scope" in agent|project|shared) ;; *) aib_die 4 "invalid memory scope '$scope'";; esac
@@ -145,7 +156,7 @@ $ctx
 EOF
   [ -n "$_own_agent" ] && [ -n "$_own_project" ] && [ -n "$_own_standup" ] || aib_die 6 "own context missing required fields"
   aib_validate_agent_uid "$_own_agent"; aib_validate_token "$_own_project" project_uid
-  aib_registry_query has "$_own_project" >/dev/null || aib_die 3 "own project is not in registry"
+  aib_registry_query projects has "$_own_project" >/dev/null || aib_die 3 "own project is not in registry"
   aib_split_agent "$_own_agent"; [ "$AIB_PROJECT_UID" = "$_own_project" ] || aib_die 5 "inconsistent own context project"
   registry_standup="$(aib_project_field "$_own_project" standup_dir)"
   [ "$registry_standup" = "$_own_standup" ] || aib_die 5 "inconsistent own context standup_dir"

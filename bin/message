@@ -7,7 +7,14 @@
 #
 #   Message line: TS | id:<id> | from:<uid> | to:<uid> | state:PERSISTED | <body>
 #   Event line:   TS | id:<id> | event:<NOTIFIED|SEEN|PROCESSED|FAILED> | by:<uid>
-#                 (fail may append a trailing " | reason:<reason>")
+#                 (both may carry " | actor:<label>" before the free-text tail;
+#                  fail may append a trailing " | reason:<reason>")
+#
+# `by:`/`from:`/`to:` are the ROUTING key (always an agent_uid, never an actor label).
+# When AIBOBNET_ACTOR is set (run-agent --as), an encoded `actor:<label>` field is
+# appended to the lines that record who acted, so the acting session is auditable
+# without disturbing routing or existing parsers (unknown fields are ignored by the fold).
+# It precedes `reason:` because reason is free text that runs to end-of-line.
 #
 # State machine (observable, never inferred): PERSISTED -> NOTIFIED -> SEEN -> PROCESSED | FAILED.
 # Pure bash + awk, no external deps (no jq, no sqlite). Fail-closed / fail-loud per P0.
@@ -38,8 +45,16 @@ REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
 . "$REPO_ROOT/lib/aibobnet.sh"
 
 # --- journal fold (pure awk; last-event-wins per CONTRACT §2) ------------------
-# Multi-char FS " | " is a regex, so the pipe is escaped. Structured fields never
-# contain " | "; free-text body/reason are reconstructed from the raw record.
+# Multi-char FS " | " is a regex, so the pipe is escaped.
+#
+# LINE GRAMMAR (load-bearing for trust): structured fields FIRST, then at most ONE
+# free-text tail, introduced by a known marker (`state:PERSISTED | <body>` or
+# `reason:<reason>`, both running to end-of-line). The field scan MUST stop at that
+# marker. Scanning on would re-parse attacker-controlled free text as structured
+# fields, so a crafted body or reason could forge `id:`/`event:` and silently flip
+# the state of a FOREIGN message — exactly the durability guarantee P1 exists for.
+# `_sanitize_line` strips newlines, NOT pipes, so the fold is the only line of defence.
+# Defence in depth: `id:` and `event:` take their FIRST occurrence, never last-wins.
 _AIB_MSG_AWK='
 BEGIN { FS=" \\| " }
 {
@@ -47,12 +62,13 @@ BEGIN { FS=" \\| " }
   id=""; from=""; to=""; ismsg=0; isev=0; ev=""; by=""
   for (i=2;i<=NF;i++) {
     f=$i
-    if      (f ~ /^id:/)            { id=substr(f,4) }
+    if      (f ~ /^id:/)            { if (id=="")  id=substr(f,4) }
     else if (f ~ /^from:/)          { from=substr(f,6) }
     else if (f ~ /^to:/)            { to=substr(f,4) }
-    else if (f=="state:PERSISTED")  { ismsg=1 }
-    else if (f ~ /^event:/)         { ev=substr(f,7); isev=1 }
+    else if (f ~ /^event:/)         { if (!isev) { ev=substr(f,7); isev=1 } }
     else if (f ~ /^by:/)            { by=substr(f,4) }
+    else if (f=="state:PERSISTED")  { ismsg=1; break }   # body follows -> stop scanning
+    else if (f ~ /^reason:/)        { break }            # reason follows -> stop scanning
   }
   if (id=="") next                       # not a P1 line (e.g. a P0 plain line) -> ignore
   if (!(id in known)) { known[id]=1; order[++n]=id }
@@ -131,12 +147,33 @@ _validate_id() {
   esac
 }
 
-# strip newlines (single-line journal invariant); pipes in body are tolerated.
-_sanitize_line() { local s="$1"; printf '%s' "${s//$'\n'/ }"; }
+# Encode a free-text tail (body / reason) so it can never look like structure.
+#   * newlines/CR collapse to a space -> the single-line journal invariant
+#   * every '|' becomes '%7C'         -> free text cannot contain the separator BYTE at
+#     all, so the line is unambiguous to EVERY reader (DOMAIN §5), not only to this fold.
+# Without this a crafted reason "z | actor:ghost" renders as
+#   … | by:acme-core | reason:z | actor:ghost
+# which a dashboard, a grep or a human reads as a genuine actor field — audit
+# falsification, even though the fold itself is not fooled.
+# Escaping it as '\|' is NOT enough: a pipe byte would remain, and a reader that splits
+# on '|' rather than on the full " | " separator still sees a forged field. Removing the
+# byte is the only encoding that holds for readers we do not control.
+# This is a display-level encoding, not a reversible codec: a literal "%7C" typed by a
+# user is indistinguishable from an encoded pipe, which is harmless — neither can form
+# a field. The fold's break at the free-text marker stays as defence in depth and keeps
+# reading legacy lines written before this change.
+_sanitize_line() {
+  local s="$1"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  s="${s//|/%7C}"
+  printf '%s' "$s"
+}
 
 _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 aib_check_registry
+aib_load_actor        # -> AIB_ACTOR_FIELD ("" or " | actor:<label>"); dies on a bad label
 
 sub="${1:-}"
 [ -n "$sub" ] || aib_die 64 "usage: message <send|notify|inbox|replay|seen|done|fail|state|dlq|pending> ..."
@@ -172,8 +209,11 @@ case "$sub" in
 
     body="$(_sanitize_line "$body")"
     mkdir -p "$(dirname "$to_path")" || aib_die 2 "cannot create inbox dir for $to"
-    printf '%s | id:%s | from:%s | to:%s | state:PERSISTED | %s\n' \
-      "$(_now)" "$id" "$_own_agent" "$to" "$body" >> "$to_path"
+    # `send` records who acted via from:, so it carries actor: too — otherwise the audit
+    # chain has a gap at exactly the action that creates work for another agent. It sits
+    # after to: and before the state marker, because the body runs to end of line.
+    printf '%s | id:%s | from:%s | to:%s%s | state:PERSISTED | %s\n' \
+      "$(_now)" "$id" "$_own_agent" "$to" "$AIB_ACTOR_FIELD" "$body" >> "$to_path"
     printf '%s\n' "$id"
     ;;
 
@@ -190,7 +230,7 @@ case "$sub" in
       printf 'message: id %s already %s (notify no-op)\n' "$id" "$cur" >&2
       exit 0
     fi
-    printf '%s | id:%s | event:NOTIFIED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$to_path"
+    printf '%s | id:%s | event:NOTIFIED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$to_path"
     ;;
 
   # -------------------------------------------------------------------------- #
@@ -211,13 +251,13 @@ case "$sub" in
       seen)
         case "$cur" in
           PERSISTED|NOTIFIED)
-            printf '%s | id:%s | event:SEEN | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox";;
+            printf '%s | id:%s | event:SEEN | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox";;
           *) printf 'message: id %s already %s (seen no-op)\n' "$id" "$cur" >&2;;
         esac;;
       done)
         case "$cur" in
           PROCESSED|FAILED) printf 'message: id %s already %s (done no-op)\n' "$id" "$cur" >&2;;
-          *) printf '%s | id:%s | event:PROCESSED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox";;
+          *) printf '%s | id:%s | event:PROCESSED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox";;
         esac;;
       fail)
         case "$cur" in
@@ -225,10 +265,10 @@ case "$sub" in
           *)
             if [ -n "$reason" ]; then
               reason="$(_sanitize_line "$reason")"
-              printf '%s | id:%s | event:FAILED | by:%s | reason:%s\n' \
-                "$(_now)" "$id" "$_own_agent" "$reason" >> "$_own_inbox"
+              printf '%s | id:%s | event:FAILED | by:%s%s | reason:%s\n' \
+                "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" "$reason" >> "$_own_inbox"
             else
-              printf '%s | id:%s | event:FAILED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_own_inbox"
+              printf '%s | id:%s | event:FAILED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox"
             fi;;
         esac;;
     esac

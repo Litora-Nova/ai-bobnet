@@ -12,7 +12,11 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-cr.XXXXXX")"
 STATE="$WORK/state"; mkdir -p "$STATE/acme/standup"
 REG="$WORK/registry.json"
 cat > "$REG" <<JSON
-{ "projects": { "acme": { "home": "$STATE/acme", "standup_dir": "$STATE/acme/standup", "mux_session": "acme" } } }
+{
+  "schema_version": 2,
+  "projects": { "acme": { "home": "$STATE/acme", "standup_dir": "$STATE/acme/standup", "mux_session": "acme" } },
+  "agents":   { "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t2" } }
+}
 JSON
 HBLOG="$STATE/acme/standup/acme-core.log"
 
