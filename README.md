@@ -5,6 +5,12 @@ rebuilt on a clean, deterministic core.
 
 > **Status: work in progress — clean-core rebuild.** The core (identity, deterministic messaging/delivery,
 > memory-with-trust) is built from the ground up; proven components are ported in incrementally.
+>
+> **Built and tested:** P0 identity/registry, P1 delivery, P2 wakeup/local adapter, P3 scoped memory,
+> and the watchdogged `codex-run` wrapper. **Specified, not yet implemented:** the serialized event
+> spine, provider-wide reference monitor, Gate/Grant/Effect state machines, profile provisioning,
+> full runtime lifecycle, external adapters, and dashboard projection. `docs/DOMAIN.md` is the
+> normative target contract; it is not a claim that every domain surface already exists in code.
 
 ## Design principles
 - **Deterministic foundation.** A freshly booted agent — whatever its runtime — can heartbeat, read its inbox,
