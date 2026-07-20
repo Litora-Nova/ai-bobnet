@@ -38,6 +38,8 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 
 - The **object key IS the `agent_uid`**. `project`, `profile` and `clearance` are mandatory;
   `project` is authoritative and is never guessed from the prefix.
+- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2`.
+  Missing, mistyped, nested-only, or unsupported versions fail closed before any identity resolves.
 - `display_name` is optional and free text (may contain spaces/unicode); it never routes.
 - Unknown extra fields are ignored (forward-compatible) and never load-bearing.
 - Registry writes are the identity *and* clearance authority — gated at a high tier and audited
@@ -50,6 +52,12 @@ quote can re-synchronise on the next one and silently change a value), exactly o
 with no trailing data, no duplicate key in one object (key order must never decide routing or
 clearance), and every *consumed* field must be a JSON string. Unknown nested or array fields stay
 ignored, so forward compatibility is unaffected.
+
+Registry strings MUST NOT contain ASCII control characters, either literally or through JSON
+escapes (`\n`, `\r`, `\t`, `\b`, `\f`, or `\u0000`–`\u001f`/`\u007f`). These values cross into
+line-oriented context and journal protocols; accepting a decoded newline would let one registry
+field forge a second `key=value` line. Literal control bytes are also invalid JSON. The registry is
+rejected before any value is used.
 
 A **section entry must be an object**: a list under `agents` is not an agent. (Counting only `{}`
 for depth once let an object nested in an array resolve as a full agent *with its own clearance*,
