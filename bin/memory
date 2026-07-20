@@ -195,6 +195,7 @@ _journal_meta() {
 _reachable_collective() {
   _paths=("$_own_standup/memory/project.md"); _shared_dir="$(_shared_dir_optional)"
   [ -n "$_shared_dir" ] && _paths+=("$_shared_dir/shared.md")
+  return 0
 }
 _locate_collective() {
   local id="$1" meta scope author state i count=0; _reachable_collective
