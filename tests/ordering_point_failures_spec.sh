@@ -218,45 +218,43 @@ assert_nonzero "message append failure: command fails" "$message_writefail_rc"
 assert_streq "message append failure: no id is printed" "$(cat "$WORK/message-writefail.out")" ""
 assert_nonempty_file "message append failure: a diagnostic is printed" "$WORK/message-writefail.err"
 
-# 6. Killing a wakeup while its notify commit owns the recipient lock must not
-# strand an advisory lock. The shim acquires the real kernel lock, signals that
-# point, and waits; the whole private process group is then terminated.
+# 6. A wakeup hook runs inside the recipient mutation boundary. A concurrent
+# recipient mutation must wait, and killing the lock owner must release the
+# kernel lock so the same mutation can then complete.
 msg acme-core send beta-review "lock release" --id wakeup-kill >/dev/null
-REAL_FLOCK="$(command -v flock)"
-FLOCK_MARKER="$WORK/flock-held"
-FLOCK_RELEASE="$WORK/flock-release"
-cat > "$SHIM/flock" <<'SH'
+HOOK_MARKER="$WORK/hook-entered"
+HOOK_RELEASE="$WORK/hook-release"
+BLOCKING_HOOK="$WORK/blocking-hook"
+cat > "$BLOCKING_HOOK" <<'SH'
 #!/usr/bin/env bash
-"$AIB_TEST_REAL_FLOCK" "$@" || exit $?
-: > "$AIB_TEST_FLOCK_MARKER"
-while [ ! -e "$AIB_TEST_FLOCK_RELEASE" ]; do sleep 0.01; done
-SH
-chmod +x "$SHIM/flock"
-
-SUCCESS_HOOK="$WORK/success-hook"
-cat > "$SUCCESS_HOOK" <<'SH'
-#!/usr/bin/env bash
+: > "$AIB_TEST_HOOK_MARKER"
+while [ ! -e "$AIB_TEST_HOOK_RELEASE" ]; do sleep 0.01; done
 exit 0
 SH
-chmod +x "$SUCCESS_HOOK"
+chmod +x "$BLOCKING_HOOK"
 
-setsid env PATH="$SHIM:$PATH" AIB_TEST_REAL_FLOCK="$REAL_FLOCK" \
-  AIB_TEST_FLOCK_MARKER="$FLOCK_MARKER" AIB_TEST_FLOCK_RELEASE="$FLOCK_RELEASE" \
-  "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$SUCCESS_HOOK" \
+setsid env AIB_TEST_HOOK_MARKER="$HOOK_MARKER" AIB_TEST_HOOK_RELEASE="$HOOK_RELEASE" \
+  "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$BLOCKING_HOOK" \
   "$WAKE" beta-review >"$WORK/wakeup-kill.out" 2>"$WORK/wakeup-kill.err" & wakeup_pid=$!
 
 ticks=0
-while [ ! -e "$FLOCK_MARKER" ] && [ "$ticks" -lt 500 ]; do
+while [ ! -e "$HOOK_MARKER" ] && [ "$ticks" -lt 500 ]; do
   sleep 0.01
   ticks=$((ticks+1))
 done
-if [ -e "$FLOCK_MARKER" ]; then
-  ok "killed wakeup: notify commit acquired the recipient lock"
-  kill -TERM -- "-$wakeup_pid" 2>/dev/null || true
+if [ -e "$HOOK_MARKER" ]; then
+  ok "killed wakeup: blocking hook was entered"
 else
-  no "killed wakeup: notify commit did not acquire the recipient lock"
-  kill -TERM -- "-$wakeup_pid" 2>/dev/null || true
+  no "killed wakeup: blocking hook was not entered"
 fi
+
+timeout 1 "$RUN" beta-review -- "$MSG" seen wakeup-kill \
+  >"$WORK/while-hook.out" 2>"$WORK/while-hook.err"
+while_hook_rc=$?
+assert_streq "killed wakeup: recipient mutation waits while the hook owns the lock" \
+  "$while_hook_rc" "124"
+
+kill -TERM -- "-$wakeup_pid" 2>/dev/null || true
 wait "$wakeup_pid" 2>/dev/null || true
 
 timeout 5 "$RUN" beta-review -- "$MSG" seen wakeup-kill \
