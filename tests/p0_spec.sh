@@ -388,6 +388,7 @@ bad_reg() { # <name> <content>
   printf '%s\n' "$2" > "$WORK/$1.json"
   printf '%s' "$WORK/$1.json"
 }
+GOOD_SCHEMA='"schema_version": 2'
 GOOD_PROJ='"projects": { "acme": { "home": "/h", "standup_dir": "/s", "mux_session": "m" } }'
 GOOD_AG='"agents": { "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t1" } }'
 
@@ -404,16 +405,16 @@ assert_ngrep "malformed: a torn registry leaks no path" "$torn_err" "/evil/stand
 
 # (b) unbalanced / mismatched brackets
 assert_fail "malformed: missing closing brace is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg unbal "{ $GOOD_PROJ, $GOOD_AG")" "$INBOX" acme-core
+  env AIBOBNET_REGISTRY="$(bad_reg unbal "{ $GOOD_SCHEMA, $GOOD_PROJ, $GOOD_AG")" "$INBOX" acme-core
 assert_fail "malformed: mismatched bracket type is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg mismatch "{ $GOOD_PROJ, $GOOD_AG ]")" "$INBOX" acme-core
+  env AIBOBNET_REGISTRY="$(bad_reg mismatch "{ $GOOD_SCHEMA, $GOOD_PROJ, $GOOD_AG ]")" "$INBOX" acme-core
 
 # (c) trailing data after the top-level value (two documents concatenated)
 assert_fail "malformed: trailing data after the top-level value is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg trail "{ $GOOD_PROJ, $GOOD_AG } { \"projects\": {} }")" "$INBOX" acme-core
+  env AIBOBNET_REGISTRY="$(bad_reg trail "{ $GOOD_SCHEMA, $GOOD_PROJ, $GOOD_AG } { \"projects\": {} }")" "$INBOX" acme-core
 
 # (d) duplicate key: last-write-wins would let key ORDER decide routing/clearance
-dup="$(bad_reg dup '{ "projects": { "acme": { "home": "/h", "standup_dir": "/s", "mux_session": "m" },
+dup="$(bad_reg dup '{ "schema_version": 2, "projects": { "acme": { "home": "/h", "standup_dir": "/s", "mux_session": "m" },
                                     "acme-core": { "home": "/h2", "standup_dir": "/s2", "mux_session": "m2" } },
   "agents": { "acme-core-review": { "project": "acme", "profile": "p", "clearance": "t1", "project": "acme-core" } } }')"
 assert_fail "malformed: a duplicate key is refused (order must not decide routing)" \
@@ -424,7 +425,7 @@ assert_grep "malformed: the message names the duplicate key" "$dup_err" "duplica
 # one: a duplicated `project` still dies on the uid/project consistency rule, but a second
 # clearance is structurally valid and silently grants the LAST (here: higher) value.
 # That is why duplicate keys are refused wholesale instead of per-field.
-dupclear="$(bad_reg dupclear "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+dupclear="$(bad_reg dupclear "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
   \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"clearance\": \"t4\" } } }")"
 assert_fail "malformed: a duplicate clearance key is refused (no silent privilege gain)" \
   env AIBOBNET_REGISTRY="$dupclear" "$INBOX" acme-core
@@ -434,28 +435,28 @@ assert_grep "malformed: duplicate clearance is refused AS a duplicate key" \
 # ...and the refusal is caused by the DUPLICATION, not by the shape or by t4 itself:
 # the same registry with the duplicate removed resolves normally.
 assert_streq "malformed: the same registry without the duplicate resolves fine" \
-  "$(AIBOBNET_REGISTRY="$(bad_reg dupclear_ok "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  "$(AIBOBNET_REGISTRY="$(bad_reg dupclear_ok "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
     \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t4\" } } }")" \
     "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
 # a duplicated agent_uid in the same section is caught too
 assert_fail "malformed: a duplicate agent_uid is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg dupagent "{ $GOOD_PROJ, \"agents\": {
+  env AIBOBNET_REGISTRY="$(bad_reg dupagent "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": {
     \"acme-core\": { \"project\": \"acme\", \"profile\": \"a\", \"clearance\": \"t1\" },
     \"acme-core\": { \"project\": \"acme\", \"profile\": \"b\", \"clearance\": \"t4\" } } }")" "$INBOX" acme-core
 
 # (e) wrong value type on a CONSUMED field — the comment claims JSON strings, so enforce it
 assert_fail "malformed: numeric clearance is refused (not a JSON string)" \
-  env AIBOBNET_REGISTRY="$(bad_reg numclear "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  env AIBOBNET_REGISTRY="$(bad_reg numclear "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
     \"project\": \"acme\", \"profile\": \"p\", \"clearance\": 4 } } }")" "$INBOX" acme-core
 assert_fail "malformed: a non-string standup_dir is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg numdir "{ \"projects\": { \"acme\": {
+  env AIBOBNET_REGISTRY="$(bad_reg numdir "{ $GOOD_SCHEMA, \"projects\": { \"acme\": {
     \"home\": \"/h\", \"standup_dir\": 123, \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
 
 # (f) a single MISSING QUOTE that re-synchronises on the next one: brackets balance and
 #     every string terminates, so balance checking alone does NOT catch it — yet `home`
 #     silently becomes "/h, " and standup_dir disappears. A silently wrong value at the
 #     identity authority is worse than a refusal, so the document must parse as JSON.
-resync="$(bad_reg resync '{ "projects": { "acme": { "home": "/h, "standup_dir": "/s", "mux_session": "m" } },
+resync="$(bad_reg resync '{ "schema_version": 2, "projects": { "acme": { "home": "/h, "standup_dir": "/s", "mux_session": "m" } },
   "agents": { "acme-core": { "project": "acme", "profile": "p", "clearance": "t1" } } }')"
 assert_fail "malformed: a re-synchronising missing quote is refused" \
   env AIBOBNET_REGISTRY="$resync" "$INBOX" acme-core
@@ -464,22 +465,22 @@ assert_grep "malformed: re-sync is reported as invalid JSON, not as a missing fi
   "$resync_err" "not valid JSON"
 # a bare (unquoted) value where a string belongs is the same class
 assert_fail "malformed: an unquoted value token is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg bareval "{ \"projects\": { \"acme\": {
+  env AIBOBNET_REGISTRY="$(bad_reg bareval "{ $GOOD_SCHEMA, \"projects\": { \"acme\": {
     \"home\": /h, \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
 # a missing comma between two pairs likewise
 assert_fail "malformed: a missing comma between pairs is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg nocomma "{ \"projects\": { \"acme\": {
+  env AIBOBNET_REGISTRY="$(bad_reg nocomma "{ $GOOD_SCHEMA, \"projects\": { \"acme\": {
     \"home\": \"/h\" \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
 
 # (g) invalid escapes: taking the character verbatim yielded a DIFFERENT value than a
 #     strict JSON reader would. \u is refused outright rather than mis-decoded to "u0041".
 assert_fail "malformed: an invalid escape (\\m) is refused, not taken verbatim" \
-  env AIBOBNET_REGISTRY="$(bad_reg badesc "{ \"projects\": { \"acme\": {
+  env AIBOBNET_REGISTRY="$(bad_reg badesc "{ $GOOD_SCHEMA, \"projects\": { \"acme\": {
     \"home\": \"/h\", \"standup_dir\": \"/s\", \"\\mux_session\": \"m\" } }, $GOOD_AG }")" "$INBOX" acme-core
 # \u is deferred to the point of use, so the SAME registry is fine for a consumer that
 # does not read the affected field and fail-closed for one that does. `home` is read by
 # bin/context but not by bin/inbox — a precise pair, and the whole point of deferring.
-uhome="$(bad_reg uesc "{ \"projects\": { \"acme\": {
+uhome="$(bad_reg uesc "{ $GOOD_SCHEMA, \"projects\": { \"acme\": {
   \"home\": \"/\\u0041\", \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")"
 assert_streq "u-escape: a consumer that never reads the field still resolves" \
   "$(AIBOBNET_REGISTRY="$uhome" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
@@ -490,7 +491,7 @@ assert_grep "u-escape: and it says the value could not be decoded" \
   "cannot decode"
 # valid escapes still decode
 assert_streq "malformed: a VALID escape still decodes normally" \
-  "$(AIBOBNET_REGISTRY="$(bad_reg okesc "{ \"projects\": { \"acme\": {
+  "$(AIBOBNET_REGISTRY="$(bad_reg okesc "{ $GOOD_SCHEMA, \"projects\": { \"acme\": {
     \"home\": \"/h\", \"standup_dir\": \"\\/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" \
     "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
 
@@ -498,7 +499,7 @@ assert_streq "malformed: a VALID escape still decodes normally" \
 #     an array back at "field" level, so a list resolved as a full agent WITH ITS OWN
 #     CLEARANCE, while jq and python see a list and no agent at all. Enforcement view and
 #     audit view must not disagree — least of all about clearance.
-arrreg="$(bad_reg arrsect "{ $GOOD_PROJ, \"agents\": {
+arrreg="$(bad_reg arrsect "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": {
   \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\" },
   \"acme-list\": [ { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t4\" } ] } }")"
 assert_fail "array-entry: a list under agents does not resolve as an agent" \
@@ -526,7 +527,7 @@ assert_streq "array-entry: a real sibling agent still resolves normally" \
   "$(AIBOBNET_REGISTRY="$arrreg" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
 # the same shape one level down (an array as a FIELD value) stays forward-compatible
 assert_streq "array-entry: an array as a field value is still ignored, not fatal" \
-  "$(AIBOBNET_REGISTRY="$(bad_reg arrfield "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  "$(AIBOBNET_REGISTRY="$(bad_reg arrfield "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
     \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
     \"scopes\": [ { \"clearance\": \"t4\" } ] } } }")" "$INBOX" acme-core 2>/dev/null)" \
   "/s/inbox/acme-core.md"
@@ -534,13 +535,13 @@ assert_streq "array-entry: an array as a field value is still ignored, not fatal
 # (j) \u is VALID JSON this parser cannot decode. Rejecting the file outright would break
 #     every registry written with json.dump() (which escapes non-ASCII by default) because
 #     of display_name — a field nothing reads. So it is deferred to the point of use.
-ureg="{ $GOOD_PROJ, \"agents\": { \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\",
+ureg="{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\",
   \"clearance\": \"t1\", \"display_name\": \"B\\u00f6b\" } } }"
 assert_streq "u-escape: \\u in an UNREAD field does not break resolution" \
   "$(AIBOBNET_REGISTRY="$(bad_reg uunread "$ureg")" "$INBOX" acme-core 2>/dev/null)" \
   "/s/inbox/acme-core.md"
 # ...but a CONSUMED field with \u is fail-closed, with its own honest message
-uconsumed="$(bad_reg uconsumed "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+uconsumed="$(bad_reg uconsumed "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
   \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"\\u0074\\u0031\" } } }")"
 assert_fail "u-escape: \\u in a CONSUMED field is refused" \
   env AIBOBNET_REGISTRY="$uconsumed" "$INBOX" acme-core
@@ -550,7 +551,7 @@ assert_grep "u-escape: the message names the real cause, not a syntax error" \
 assert_ngrep "u-escape: it is NOT reported as invalid JSON (the file is valid)" \
   "$uerr" "not valid JSON"
 # ...and a \u in an object KEY is refused up front: a key is always identity-relevant
-ukey="$(bad_reg ukey "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+ukey="$(bad_reg ukey "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
   \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"\\u0078\": \"y\" } } }")"
 assert_fail "u-escape: \\u in an object KEY is refused up front" \
   env AIBOBNET_REGISTRY="$ukey" "$INBOX" acme-core
@@ -558,7 +559,7 @@ assert_grep "u-escape: the key case says it is about a key" \
   "$(AIBOBNET_REGISTRY="$ukey" "$INBOX" acme-core 2>&1 >/dev/null)" "OBJECT KEY"
 # a genuinely invalid escape stays a hard JSON error (parity with a strict reader)
 assert_grep "u-escape: an invalid escape is still reported as invalid JSON" \
-  "$(AIBOBNET_REGISTRY="$(bad_reg badesc2 "{ $GOOD_PROJ, \"agents\": { \"acme-core\": {
+  "$(AIBOBNET_REGISTRY="$(bad_reg badesc2 "{ $GOOD_SCHEMA, $GOOD_PROJ, \"agents\": { \"acme-core\": {
     \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\", \"x\": \"a\\mb\" } } }")" \
     "$INBOX" acme-core 2>&1 >/dev/null)" "not valid JSON"
 
@@ -569,6 +570,62 @@ fwd="$(bad_reg fwd "{ \"schema_version\": 2, $GOOD_PROJ, \"agents\": { \"acme-co
   \"display_name\": \"Core Bob äöü\", \"scopes\": [\"a\",\"b\"], \"meta\": { \"x\": \"y\" } } } }")"
 assert_streq "forward-compat: unknown nested + array fields still resolve" \
   "$(AIBOBNET_REGISTRY="$fwd" "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+
+# (k) schema_version is the compatibility gate, not decorative metadata. Only a
+# top-level JSON number with the engine's exact supported version may resolve.
+assert_fail "schema: a missing schema_version is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg schema-missing "{ $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
+schema_err="$(AIBOBNET_REGISTRY="$(bad_reg schema-unsupported "{ \"schema_version\": 3, $GOOD_PROJ, $GOOD_AG }")" \
+  "$INBOX" acme-core 2>&1 >/dev/null)"
+assert_grep "schema: the refusal names schema_version" "$schema_err" "schema_version"
+assert_fail "schema: an unsupported schema version is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg schema-v3 "{ \"schema_version\": 3, $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
+assert_fail "schema: a string that looks like version 2 is refused" \
+  env AIBOBNET_REGISTRY="$(bad_reg schema-string "{ \"schema_version\": \"2\", $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
+assert_fail "schema: a nested version cannot replace the top-level gate" \
+  env AIBOBNET_REGISTRY="$(bad_reg schema-nested "{ \"meta\": { \"schema_version\": 2 }, $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
+
+# (l) Registry values cross into line-oriented context and journal protocols. A
+# JSON escape that decodes to an ASCII control byte must be rejected at the registry
+# boundary, before it can forge a second key=value line or alter a path/token.
+for control_escape in n r t b f; do
+  control_reg="$(bad_reg "control-$control_escape" "{ \"schema_version\": 2, \"projects\": { \"acme\": {
+    \"home\": \"/h\\${control_escape}agent_uid=acme-evil\", \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")"
+  assert_fail "control: escaped \\$control_escape in a registry string is refused" \
+    env AIBOBNET_REGISTRY="$control_reg" AIBOBNET_PROJECT_UID=acme AIBOBNET_AGENT_KEY=core "$CTX"
+done
+lf_out="$(AIBOBNET_REGISTRY="$(bad_reg control-lf-evidence "{ \"schema_version\": 2, \"projects\": { \"acme\": {
+  \"home\": \"/h\\nagent_uid=acme-evil\", \"standup_dir\": \"/s\", \"mux_session\": \"m\" } }, $GOOD_AG }")" \
+  AIBOBNET_PROJECT_UID=acme AIBOBNET_AGENT_KEY=core "$CTX" 2>&1)"
+assert_ngrep "control: LF injection never emits a forged agent_uid field" "$lf_out" "agent_uid=acme-evil"
+assert_grep "control: the refusal names the decoded-control cause" "$lf_out" "control character"
+
+unicode_control="$(bad_reg control-unicode "{ \"schema_version\": 2, $GOOD_PROJ, \"agents\": {
+  \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
+  \"display_name\": \"Core\\u000aagent_uid=acme-evil\" } } }")"
+assert_fail "control: a Unicode escape for ASCII LF is refused even in an unread field" \
+  env AIBOBNET_REGISTRY="$unicode_control" "$INBOX" acme-core
+assert_grep "control: the Unicode-control refusal names the decoded-control cause" \
+  "$(AIBOBNET_REGISTRY="$unicode_control" "$INBOX" acme-core 2>&1 >/dev/null)" "control character"
+
+invalid_unicode="$(bad_reg invalid-unicode "{ \"schema_version\": 2, $GOOD_PROJ, \"agents\": {
+  \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
+  \"display_name\": \"Core\\u12xz\" } } }")"
+assert_fail "malformed: a Unicode escape requires exactly four hexadecimal digits" \
+  env AIBOBNET_REGISTRY="$invalid_unicode" "$INBOX" acme-core
+assert_grep "malformed: an invalid Unicode escape is reported as invalid JSON" \
+  "$(AIBOBNET_REGISTRY="$invalid_unicode" "$INBOX" acme-core 2>&1 >/dev/null)" "not valid JSON"
+
+# A literal control byte in a JSON string is invalid JSON, independently of the
+# decoded-control policy above. This raw newline used to be accepted by the tokenizer.
+raw_lf="$(bad_reg control-raw-lf '{ "schema_version": 2, "projects": { "acme": {
+  "home": "/h
+agent_uid=acme-evil", "standup_dir": "/s", "mux_session": "m" } },
+  "agents": { "acme-core": { "project": "acme", "profile": "p", "clearance": "t1" } } }')"
+assert_fail "malformed: a literal newline inside a JSON string is refused" \
+  env AIBOBNET_REGISTRY="$raw_lf" "$INBOX" acme-core
+assert_grep "malformed: a literal newline is reported as invalid JSON" \
+  "$(AIBOBNET_REGISTRY="$raw_lf" "$INBOX" acme-core 2>&1 >/dev/null)" "not valid JSON"
 
 # ============================================================================ #
 # summary

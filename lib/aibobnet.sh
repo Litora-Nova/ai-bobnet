@@ -47,6 +47,8 @@ aib_check_registry() {
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
     7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
     10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
+    11) aib_die 2 "registry schema_version must be the JSON number 2 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
+    12) aib_die 2 "registry contains a JSON string escape that decodes to an ASCII control character — refusing unsafe line/path data: $reg";;
     *) aib_die 2 "registry failed validation (code $rc): $reg";;
   esac
 }
@@ -121,8 +123,10 @@ END {
         d=substr(data,i,1)
         if (d=="\\") {
           e=substr(data,i+1,1)
-          if(e=="n")s=s"\n"; else if(e=="t")s=s"\t"; else if(e=="r")s=s"\r";
-          else if(e=="b")s=s"\b"; else if(e=="f")s=s"\f";
+          # Registry values cross into line-oriented key=value and journal protocols.
+          # A decoded ASCII control byte could forge a second field/line or alter a
+          # path invisibly, so valid JSON control escapes are outside this schema.
+          if(e=="n"||e=="t"||e=="r"||e=="b"||e=="f") { exit 12 }
           else if(e=="\"")s=s"\""; else if(e=="\\")s=s"\\"; else if(e=="/")s=s"/";
           # \u is VALID JSON that this parser cannot decode. Rejecting the whole file
           # for it would break every registry written by a tool using json.dump(), which
@@ -130,13 +134,24 @@ END {
           # display_name, a field nothing ever reads. So mark the token undecodable and
           # defer: it only kills where it is actually read (as a key, or as a consumed
           # field). Same shape as the value-type rule. Fail-closed stays where it counts.
-          else if(e=="u") { und=1 }
+          else if(e=="u") {
+            uhex=substr(data,i+2,4)
+            if (uhex !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) exit 6
+            # U+0000..U+001F plus U+007F are ASCII controls even when expressed
+            # through the otherwise-deferred Unicode form.
+            if (uhex ~ /^00(0[0-9A-Fa-f]|1[0-9A-Fa-f])$/ || uhex ~ /^007[fF]$/) exit 12
+            und=1; i+=6; continue
+          }
           # Anything else is not a JSON escape at all. Taking the char verbatim silently
           # produced a DIFFERENT value than a strict reader, so the document is refused.
           else { exit 6 }
           i+=2; continue
         }
         if (d=="\"") { i++; term=1; break }
+        # Unescaped U+0000..U+001F bytes are invalid inside a JSON string. `awk`
+        # receives record separators through the newline re-added above, so test the
+        # full portable control class rather than treating a physical LF as whitespace.
+        if (d ~ /[[:cntrl:]]/) { exit 6 }
         s=s d; i++
       }
       # An unterminated string silently swallowed the rest of the file (a torn write).
@@ -161,6 +176,20 @@ END {
   if (!p_value()) { if (dupkey) exit 7; if (badkey) exit 10; exit 6 }
   if (pos <= ntok) exit 6                      # trailing data after the top-level value
   if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
+
+  # schema_version is the compatibility gate, not decorative metadata. Only the
+  # exact JSON number 2 at depth 1 selects the grammar implemented by this parser;
+  # a nested lookalike, a string "2", or an unknown version must fail closed.
+  schema_seen=0; sdepth=0
+  for (j=1; j<=ntok; j++) {
+    if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { sdepth++; continue }
+    if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) { sdepth--; continue }
+    if (sdepth==1 && ty[j]=="S" && tok[j]=="schema_version" && ty[j+1]=="P" && tok[j+1]==":") {
+      schema_seen=1
+      if (ty[j+2]!="V" || tok[j+2]!="2") exit 11
+    }
+  }
+  if (!schema_seen) exit 11
   if (op=="validate") { exit 0 }
 
   # Locate the requested TOP-LEVEL section (depth 1) — a nested key of the same
