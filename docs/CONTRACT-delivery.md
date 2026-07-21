@@ -56,6 +56,11 @@ Sender/recipient are real fields — **never a free-text signature to parse.**
 
 ## 8. Watcher = wakeup only
 - The notify/wakeup mechanism only pings ("check your inbox"). It does **not** prove delivery via heartbeat-line-count or re-nudges — proof lives in the state events (§3). (The heuristic watcher is dismantled in P2 after parity; P1 provides the receipts that replace it.)
+- Wakeup holds the recipient inbox lock across eligibility revalidation, its configurable external hook,
+  and the checked result append. This prevents parallel cooperating wakeups from invoking the hook twice
+  in the non-crashing path, at the cost of delaying other mutations for that recipient while a slow hook
+  holds the lock. A crash releases `flock`; if it occurs after the hook takes effect but before the result
+  append, a retry may invoke the hook again. This is not an exactly-once guarantee.
 
 ## 9. Acceptance (P1 slice) — black-box, synthetic projects, example id `acme`
 - `send → PERSISTED → NOTIFIED → SEEN → PROCESSED`, state observable at each step.

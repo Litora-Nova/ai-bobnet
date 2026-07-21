@@ -30,6 +30,9 @@ memory journal mutations.
   `<standup_dir>/memory/.aibobnet-memory.lock`.
 - A mutation acquires the applicable exclusive lock, folds every journal required for its decision,
   revalidates the precondition, and performs one checked append before releasing the lock.
+- Wakeup deliberately includes external work in its critical section: it holds the recipient inbox lock
+  across eligibility revalidation, the configurable hook/mux ping, and the checked result append. This
+  prevents a parallel cooperating wakeup from invoking the hook for the same eligible state.
 - A lock or append failure is loud. The caller does not report a state that was not committed.
 - Read-only folds do not acquire the writer lock. They retain the existing snapshot/fold behavior and are
   explicitly not linearizable with concurrent commits.
@@ -50,6 +53,12 @@ supported CLI.
 
 Rejected. Command-specific locks can protect different files or lock in different orders, recreating the
 cross-command and cross-journal race at a less visible boundary.
+
+### Release the inbox lock around the wakeup hook
+
+Rejected. Two cooperating wakeups could both revalidate the same PERSISTED message and invoke the external
+hook before either appends NOTIFIED. Holding the recipient lock across the hook removes that duplicate in
+the non-crashing path, while leaving unrelated recipient journals independent.
 
 ### Use sentinel directories or PID lock files
 
@@ -76,6 +85,11 @@ and cutover plan.
   that bypass the supported commands.
 - Process exit releases lock ownership without a stale-lock recovery protocol. The sidecar file may remain
   on disk and is harmless.
+- A slow or hung wakeup hook delays cooperating mutations for that recipient for as long as it holds the
+  inbox lock. This is an explicit availability cost of preventing parallel duplicate hook invocations.
+- A crash after a wakeup hook takes effect but before its result append can cause a retry to invoke the hook
+  again. Kernel lock release prevents a stale lock, not duplicate external effects across that crash
+  window; exactly-once wakeup is not guaranteed.
 - The ordering point applies to mutations only. It does not provide a coherent namespace snapshot or
   linearizable reads.
 - Durability means surviving process restart after a successful append. No `fsync` or power-loss guarantee

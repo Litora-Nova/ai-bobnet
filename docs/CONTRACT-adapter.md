@@ -18,9 +18,16 @@ any external runtime (CAO = inspiration, not a dependency).
 - Scans the target agent's inbox journal for messages in `PERSISTED` (not yet `NOTIFIED`), appends `NOTIFIED`
   through the same locked `bin/message notify` commit semantics, and pings the recipient's `mux_session`
   (from registry) via a **configurable wakeup hook** (`AIBOBNET_WAKEUP_HOOK`; default: mux send;
-  test-stubbable/capturable). Candidate discovery is lock-free and may be stale; the mutation revalidates
-  state under the writer lock, so a stale candidate cannot create a duplicate transition. Idempotent —
-  never re-notifies NOTIFIED/terminal.
+  test-stubbable/capturable). Candidate discovery is lock-free and may be stale. For each candidate,
+  wakeup takes the recipient inbox lock and holds it across eligibility revalidation, the hook/mux ping,
+  and the checked result append. A stale candidate therefore cannot create a second hook invocation while
+  a cooperating wakeup owns the lock. Idempotent in the non-crashing path — never re-notifies
+  NOTIFIED/terminal.
+- **Availability trade-off:** a slow or hung hook delays every cooperating mutation for that recipient
+  while the inbox lock is held. It does not block a different recipient's independently locked journal.
+- **Crash boundary:** process exit or kill releases `flock`, but a crash after the hook takes effect and
+  before its journal result is appended leaves the message eligible for retry. The retry may invoke the
+  hook again. Wakeup does not provide exactly-once external effects.
 - **Bounded:** after N failed wake attempts a message is dead-lettered (visible via `bin/message dlq`), never
   infinitely re-pinged.
 - Fail-closed/fail-loud per P0; targets resolved via the registry, never env-guessed.
@@ -43,8 +50,8 @@ any external runtime (CAO = inspiration, not a dependency).
 ## 5. Acceptance (P2 slice) — black-box, synthetic projects, example id `acme`
 - **Wakeup:** PERSISTED message → `bin/wakeup` → NOTIFIED appended + recipient pinged (stub hook captured in test);
   idempotent (2nd wakeup = no re-notify); bounded (exhausted → dlq).
-- **Concurrent wakeup:** two wakeups may observe the same candidate, but locked revalidation commits at most
-  one NOTIFIED transition.
+- **Concurrent wakeup:** two wakeups may observe the same candidate, but the recipient lock admits one
+  eligible hook invocation and result append at a time; a waiting wakeup revalidates and becomes a no-op.
 - **Adapter parity:** each `/send /inbox /seen /done /fail /state /dlq` yields the SAME journal state as the
   equivalent `bin/message` call (adapter ≡ CLI).
 - **Hardening:** daemon binds `127.0.0.1` only; missing/wrong auth token → rejected; no default token.
