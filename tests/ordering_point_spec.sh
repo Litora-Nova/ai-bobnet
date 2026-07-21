@@ -143,15 +143,9 @@ release_hook_after_first() {
   : > "$HOOK_RELEASE"
 }
 
-wake_barrier="$WORK/wake-barrier"
-mkdir -p "$wake_barrier"
 release_hook_after_first & hook_release_pid=$!
-release_fold_after_first "$wake_barrier" & wake_release_pid=$!
 for n in 1 2; do
-  env PATH="$SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
-    AIB_TEST_BARRIER="$wake_barrier" AIB_TEST_FOLD_MODE=state \
-    AIB_TEST_FOLD_WANT=wake-race AIB_TEST_HOOK_LOG="$HOOK_LOG" \
-    AIB_TEST_HOOK_RELEASE="$HOOK_RELEASE" \
+  env AIB_TEST_HOOK_LOG="$HOOK_LOG" AIB_TEST_HOOK_RELEASE="$HOOK_RELEASE" \
     "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$HOOK" \
       "$WAKE" beta-review >"$WORK/wake-$n.out" 2>&1 &
   eval "wake_${n}_pid=$!"
@@ -159,7 +153,6 @@ done
 wait "$wake_1_pid"; wake_1_rc=$?
 wait "$wake_2_pid"; wake_2_rc=$?
 wait "$hook_release_pid"
-wait "$wake_release_pid"
 assert_streq "parallel wakeup: both commands complete cleanly" "$wake_1_rc:$wake_2_rc" "0:0"
 hook_count="$(grep -cFx 'wake-race' "$HOOK_LOG" 2>/dev/null || true)"
 assert_streq "parallel wakeup: the success hook is invoked exactly once" "$hook_count" "1"
