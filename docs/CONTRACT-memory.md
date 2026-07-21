@@ -83,6 +83,11 @@ unilaterally inject "fact" into project/shared recall. This is the memory analog
 **author proposes, an independent reviewer accepts, then it is promoted.** Poisoned/rejected proposals stay
 `REJECTED` in the journal (auditable, never recalled), never silently deleted.
 
+This guarantee is currently **CLI discipline inside the cooperative-with-audit trust boundary**, not
+hostile-writer integrity. The journals are ordinary project files; an actor that bypasses `bin/memory`
+and writes a forged event directly can bypass the two-actor workflow. The CLI enforces independent review
+for callers that use it, while cryptographic/OS append integrity requires the future serialized writer.
+
 ## 7. Acceptance (P3 slice) — black-box, synthetic projects, example id `acme`
 - **Scope isolation:** `agent`-scope proposed by `acme-core` is recalled by `acme-core`, and is **never**
   returned to `acme-tests`.

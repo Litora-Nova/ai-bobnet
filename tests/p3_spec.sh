@@ -94,13 +94,26 @@ cat > "$NO_SHARED" <<JSON
     "beta": { "home": "$STATE/beta", "standup_dir": "$STATE/beta/standup", "mux_session": "beta" }
   },
   "agents": {
-    "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t2" },
-    "beta-core": { "project": "beta", "profile": "engine-dev", "clearance": "t2" }
+    "acme-core":   { "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "acme-review": { "project": "acme", "profile": "review",     "clearance": "t1" },
+    "beta-core":   { "project": "beta", "profile": "engine-dev", "clearance": "t2" }
   }
 }
 JSON
 assert_fail "shared: missing shared_memory_dir fails closed" \
   "$RUN" acme-core -- env AIBOBNET_REGISTRY="$NO_SHARED" "$MEM" propose --scope shared "must fail" --id p3-no-shared
+
+# shared_memory_dir is optional for a project-only installation. Its absence must
+# not make project review/promote return rc=1 silently under `set -e`.
+no_shared_project="$(mem acme-core propose --scope project "local-only fact" --id p3-no-shared-project)"
+assert_ok "project without shared config: independent reviewer accepts" \
+  "$RUN" acme-review -- env AIBOBNET_REGISTRY="$NO_SHARED" "$MEM" review "$no_shared_project" accept
+assert_streq "project without shared config: accepted review is observable" \
+  "$("$RUN" acme-review -- env AIBOBNET_REGISTRY="$NO_SHARED" "$MEM" state "$no_shared_project")" "REVIEWED_ACCEPT"
+assert_ok "project without shared config: accepted memory promotes" \
+  "$RUN" acme-review -- env AIBOBNET_REGISTRY="$NO_SHARED" "$MEM" promote "$no_shared_project"
+assert_streq "project without shared config: promotion is observable" \
+  "$("$RUN" acme-core -- env AIBOBNET_REGISTRY="$NO_SHARED" "$MEM" state "$no_shared_project")" "PROMOTED"
 
 # ============================================================================ #
 # 4. Rejected proposals stay auditable and never surface in recall

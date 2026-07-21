@@ -4,6 +4,13 @@
 disagrees with this document, this document wins. Vocabulary and invariants here are stable; anything
 still open is listed explicitly in §12 — nothing is silently undecided.
 
+> **Implementation status:** this document defines the target contract, not the current feature set.
+> P0 identity/registry, P1 delivery, P2 wakeup/local adapter, P3 scoped memory, and `codex-run` are
+> built and tested. The serialized event spine, provider-wide reference monitor, Gate/Grant/Effect
+> state machines, profile provisioning, full runtime lifecycle, external adapters, and dashboard
+> projection remain specified but unimplemented. Until the reference monitor exists, `clearance`
+> is registry/audit data rather than an enforced authorization decision.
+
 Principle behind the freeze: *the previous generation became unreliable because reliability was added as
 heuristics on top of an ambiguous core.* The cure is a small, deterministic domain that an agent can use
 **without research**.
