@@ -356,6 +356,114 @@ assert_streq "message fold failure: no id is printed" "$(cat "$WORK/message-fold
 assert_absent "message fold failure: no journal record is committed" \
   "$INBOX" "id:message-foldfail"
 
+# 9. A fold that emits plausible partial output and then fails is still a
+# failure. Neither mutation decisions nor public reads may trust its stdout.
+PARTIAL_SHIM="$WORK/partial-output-shim"
+PARTIAL_MARKER="$WORK/partial-output-reached"
+mkdir -p "$PARTIAL_SHIM"
+cat > "$PARTIAL_SHIM/awk" <<'SH'
+#!/usr/bin/env bash
+matched_mode=0
+matched_want=0
+matched_file=0
+for arg in "$@"; do
+  [ "$arg" = "mode=$AIB_TEST_PARTIAL_MODE" ] && matched_mode=1
+  [ "$arg" = "want=$AIB_TEST_PARTIAL_WANT" ] && matched_want=1
+  [ -z "${AIB_TEST_PARTIAL_FILE:-}" ] || [ "$arg" != "$AIB_TEST_PARTIAL_FILE" ] || matched_file=1
+done
+[ "$AIB_TEST_PARTIAL_WANT" != '*' ] || matched_want=1
+[ -n "${AIB_TEST_PARTIAL_FILE:-}" ] || matched_file=1
+if [ "$matched_mode" -eq 1 ] && [ "$matched_want" -eq 1 ] && [ "$matched_file" -eq 1 ]; then
+  : > "$AIB_TEST_PARTIAL_MARKER"
+  case "$AIB_TEST_PARTIAL_MODE" in
+    state) printf '%s\n' PERSISTED;;
+    meta)  printf 'project\tacme-core\tPROPOSED\n';;
+  esac
+  exit 2
+fi
+exec "$AIB_TEST_REAL_AWK" "$@"
+SH
+chmod +x "$PARTIAL_SHIM/awk"
+
+msg acme-core send beta-review "partial state fold" --id message-partial-state >/dev/null
+
+rm -f "$PARTIAL_MARKER"
+env PATH="$PARTIAL_SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+  AIB_TEST_PARTIAL_MARKER="$PARTIAL_MARKER" AIB_TEST_PARTIAL_MODE=state \
+  AIB_TEST_PARTIAL_WANT=message-partial-state AIB_TEST_PARTIAL_FILE='' \
+  "$RUN" beta-review -- "$MSG" state message-partial-state \
+  >"$WORK/partial-state-read.out" 2>"$WORK/partial-state-read.err"
+partial_state_read_rc=$?
+if [ -e "$PARTIAL_MARKER" ]; then
+  ok "partial state read: targeted fold emitted output and rc 2"
+else
+  no "partial state read: targeted fold was not reached"
+fi
+assert_nonzero "partial state read: public read propagates rc 2" "$partial_state_read_rc"
+assert_streq "partial state read: unverified state is not printed" \
+  "$(cat "$WORK/partial-state-read.out")" ""
+
+rm -f "$PARTIAL_MARKER"
+env PATH="$PARTIAL_SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+  AIB_TEST_PARTIAL_MARKER="$PARTIAL_MARKER" AIB_TEST_PARTIAL_MODE=state \
+  AIB_TEST_PARTIAL_WANT=message-partial-state AIB_TEST_PARTIAL_FILE='' \
+  "$RUN" beta-review -- "$MSG" done message-partial-state \
+  >"$WORK/partial-state-done.out" 2>"$WORK/partial-state-done.err"
+partial_state_done_rc=$?
+if [ -e "$PARTIAL_MARKER" ]; then
+  ok "partial state mutation: targeted fold emitted output and rc 2"
+else
+  no "partial state mutation: targeted fold was not reached"
+fi
+assert_nonzero "partial state mutation: done fails closed" "$partial_state_done_rc"
+assert_absent "partial state mutation: no PROCESSED event is appended" \
+  "$INBOX" "id:message-partial-state | event:PROCESSED"
+assert_streq "partial state mutation: normal state remains PERSISTED" \
+  "$(msg beta-review state message-partial-state 2>/dev/null || true)" "PERSISTED"
+
+# A metadata fold follows the same rule. Plausible scope/author/state output may
+# not hide rc 2 and permit an engine-global id collision in the shared journal.
+mem acme-core propose --scope project "partial meta fold" --id memory-partial-meta >/dev/null
+rm -f "$PARTIAL_MARKER"
+env PATH="$PARTIAL_SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+  AIB_TEST_PARTIAL_MARKER="$PARTIAL_MARKER" AIB_TEST_PARTIAL_MODE=meta \
+  AIB_TEST_PARTIAL_WANT=memory-partial-meta AIB_TEST_PARTIAL_FILE="$PROJECT_JOURNAL" \
+  "$RUN" beta-review -- "$MEM" propose --scope shared \
+    "must reject partial metadata" --id memory-partial-meta \
+  >"$WORK/partial-meta.out" 2>"$WORK/partial-meta.err"
+partial_meta_rc=$?
+if [ -e "$PARTIAL_MARKER" ]; then
+  ok "partial metadata: targeted fold emitted valid metadata and rc 2"
+else
+  no "partial metadata: targeted fold was not reached"
+fi
+assert_nonzero "partial metadata: shared proposal fails closed" "$partial_meta_rc"
+assert_streq "partial metadata: no id is acknowledged" "$(cat "$WORK/partial-meta.out")" ""
+assert_absent "partial metadata: no shared proposal is appended" \
+  "$SHARED_JOURNAL" "id:memory-partial-meta"
+assert_streq "partial metadata: original proposal remains unambiguous" \
+  "$(mem acme-core state memory-partial-meta 2>/dev/null || true)" "PROPOSED"
+
+# Generated ids use the same metadata scan. An unexpected error is not proof
+# that the generated id is free, even when no explicit id was supplied.
+rm -f "$PARTIAL_MARKER"
+env PATH="$PARTIAL_SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+  AIB_TEST_PARTIAL_MARKER="$PARTIAL_MARKER" AIB_TEST_PARTIAL_MODE=meta \
+  AIB_TEST_PARTIAL_WANT='*' AIB_TEST_PARTIAL_FILE="$PROJECT_JOURNAL" \
+  "$RUN" acme-core -- "$MEM" propose --scope project "generated scan must fail" \
+  >"$WORK/generated-meta.out" 2>"$WORK/generated-meta.err"
+generated_meta_rc=$?
+if [ -e "$PARTIAL_MARKER" ]; then
+  ok "generated metadata: targeted collision scan returned rc 2"
+else
+  no "generated metadata: targeted collision scan was not reached"
+fi
+assert_nonzero "generated metadata: proposal fails closed" "$generated_meta_rc"
+assert_streq "generated metadata: no generated id is acknowledged" \
+  "$(cat "$WORK/generated-meta.out")" ""
+assert_absent "generated metadata: no proposal is appended" \
+  "$PROJECT_JOURNAL" "generated scan must fail"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]
