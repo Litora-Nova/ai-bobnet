@@ -8,13 +8,14 @@
 set -uo pipefail
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
+SOURCE_ENGINE="${AIB_ORDERING_SOURCE_ROOT:-$SRC_ROOT}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-ordering.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 ENGINE="$WORK/engine"
 STATE="$WORK/state"
 mkdir -p "$ENGINE" "$STATE/acme" "$STATE/beta"
-cp -R "$SRC_ROOT/bin" "$SRC_ROOT/scripts" "$SRC_ROOT/lib" "$ENGINE/"
+cp -R "$SOURCE_ENGINE/bin" "$SOURCE_ENGINE/scripts" "$SOURCE_ENGINE/lib" "$ENGINE/"
 
 cat > "$ENGINE/registry.json" <<JSON
 {
@@ -73,15 +74,20 @@ SH
 chmod +x "$SHIM/awk"
 
 release_fold_after_first() {
-  local barrier="$1" marker
-  while :; do
+  local barrier="$1" marker ticks=0
+  while [ "$ticks" -lt 500 ]; do
     for marker in "$barrier"/ready.*; do
-      [ -e "$marker" ] && break 2
+      if [ -e "$marker" ]; then
+        sleep 1
+        : > "$barrier/release"
+        return 0
+      fi
     done
     sleep 0.01
+    ticks=$((ticks+1))
   done
-  sleep 1
   : > "$barrier/release"
+  return 1
 }
 
 race_m() {
@@ -103,7 +109,8 @@ race_m "$send_barrier" exists send-race acme-core \
   send beta-review "second sender" --id send-race >"$WORK/send-2.out" 2>&1 & send_2=$!
 wait "$send_1"; send_1_rc=$?
 wait "$send_2"; send_2_rc=$?
-wait "$send_release_pid"
+wait "$send_release_pid"; send_release_rc=$?
+assert_streq "parallel send: the fold release was reached" "$send_release_rc" "0"
 assert_streq "parallel send: both idempotent calls succeed" "$send_1_rc:$send_2_rc" "0:0"
 send_count="$(grep -cF 'id:send-race | from:acme-core | to:beta-review' "$INBOX" 2>/dev/null || true)"
 assert_streq "parallel send: exactly one PERSISTED record is committed" "$send_count" "1"
@@ -119,7 +126,8 @@ race_m "$terminal_barrier" state terminal-race beta-review \
   fail terminal-race "parallel failure" >"$WORK/fail.out" 2>&1 & fail_pid=$!
 wait "$done_pid"; done_rc=$?
 wait "$fail_pid"; fail_rc=$?
-wait "$terminal_release_pid"
+wait "$terminal_release_pid"; terminal_release_rc=$?
+assert_streq "parallel terminal: the fold release was reached" "$terminal_release_rc" "0"
 assert_streq "parallel terminal: both commands complete cleanly" "$done_rc:$fail_rc" "0:0"
 terminal_count="$(grep -Ec 'id:terminal-race \| event:(PROCESSED|FAILED)' "$INBOX" 2>/dev/null || true)"
 assert_streq "parallel terminal: exactly one terminal event is committed" "$terminal_count" "1"
@@ -138,7 +146,15 @@ SH
 chmod +x "$HOOK"
 
 release_hook_after_first() {
-  while [ ! -s "$HOOK_LOG" ]; do sleep 0.01; done
+  local ticks=0
+  while [ ! -s "$HOOK_LOG" ] && [ "$ticks" -lt 500 ]; do
+    sleep 0.01
+    ticks=$((ticks+1))
+  done
+  if [ ! -s "$HOOK_LOG" ]; then
+    : > "$HOOK_RELEASE"
+    return 1
+  fi
   sleep 1
   : > "$HOOK_RELEASE"
 }
@@ -152,7 +168,8 @@ for n in 1 2; do
 done
 wait "$wake_1_pid"; wake_1_rc=$?
 wait "$wake_2_pid"; wake_2_rc=$?
-wait "$hook_release_pid"
+wait "$hook_release_pid"; hook_release_rc=$?
+assert_streq "parallel wakeup: the hook release was reached" "$hook_release_rc" "0"
 assert_streq "parallel wakeup: both commands complete cleanly" "$wake_1_rc:$wake_2_rc" "0:0"
 hook_count="$(grep -cFx 'wake-race' "$HOOK_LOG" 2>/dev/null || true)"
 assert_streq "parallel wakeup: the success hook is invoked exactly once" "$hook_count" "1"

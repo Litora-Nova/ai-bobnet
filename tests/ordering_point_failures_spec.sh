@@ -7,13 +7,14 @@
 set -uo pipefail
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
+SOURCE_ENGINE="${AIB_ORDERING_SOURCE_ROOT:-$SRC_ROOT}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-ordering-failures.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 ENGINE="$WORK/engine"
 STATE="$WORK/state"
 mkdir -p "$ENGINE" "$STATE/acme" "$STATE/beta" "$STATE/shared"
-cp -R "$SRC_ROOT/bin" "$SRC_ROOT/scripts" "$SRC_ROOT/lib" "$ENGINE/"
+cp -R "$SOURCE_ENGINE/bin" "$SOURCE_ENGINE/scripts" "$SOURCE_ENGINE/lib" "$ENGINE/"
 
 cat > "$ENGINE/registry.json" <<JSON
 {
@@ -219,21 +220,22 @@ assert_streq "message append failure: no id is printed" "$(cat "$WORK/message-wr
 assert_nonempty_file "message append failure: a diagnostic is printed" "$WORK/message-writefail.err"
 
 # 6. A wakeup hook runs inside the recipient mutation boundary. A concurrent
-# recipient mutation must wait, and killing the lock owner must release the
-# kernel lock so the same mutation can then complete.
+# recipient mutation must wait. Killing only the wakeup parent must release the
+# lock even while its blocked hook child remains alive; inherited lock handles
+# must not let an orphaned external process stall future journal mutations.
 msg acme-core send beta-review "lock release" --id wakeup-kill >/dev/null
 HOOK_MARKER="$WORK/hook-entered"
 HOOK_RELEASE="$WORK/hook-release"
 BLOCKING_HOOK="$WORK/blocking-hook"
 cat > "$BLOCKING_HOOK" <<'SH'
 #!/usr/bin/env bash
-: > "$AIB_TEST_HOOK_MARKER"
+printf '%s\n' "$$" > "$AIB_TEST_HOOK_MARKER"
 while [ ! -e "$AIB_TEST_HOOK_RELEASE" ]; do sleep 0.01; done
 exit 0
 SH
 chmod +x "$BLOCKING_HOOK"
 
-setsid env AIB_TEST_HOOK_MARKER="$HOOK_MARKER" AIB_TEST_HOOK_RELEASE="$HOOK_RELEASE" \
+env AIB_TEST_HOOK_MARKER="$HOOK_MARKER" AIB_TEST_HOOK_RELEASE="$HOOK_RELEASE" \
   "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$BLOCKING_HOOK" \
   "$WAKE" beta-review >"$WORK/wakeup-kill.out" 2>"$WORK/wakeup-kill.err" & wakeup_pid=$!
 
@@ -254,8 +256,14 @@ while_hook_rc=$?
 assert_streq "killed wakeup: recipient mutation waits while the hook owns the lock" \
   "$while_hook_rc" "124"
 
-kill -TERM -- "-$wakeup_pid" 2>/dev/null || true
+hook_pid="$(cat "$HOOK_MARKER" 2>/dev/null || true)"
+kill -TERM "$wakeup_pid" 2>/dev/null || true
 wait "$wakeup_pid" 2>/dev/null || true
+if [ -n "$hook_pid" ] && kill -0 "$hook_pid" 2>/dev/null; then
+  ok "killed wakeup: hook child remains blocked after its parent exits"
+else
+  no "killed wakeup: hook child did not remain alive"
+fi
 
 timeout 5 "$RUN" beta-review -- "$MSG" seen wakeup-kill \
   >"$WORK/after-kill.out" 2>"$WORK/after-kill.err"
@@ -263,6 +271,90 @@ after_kill_rc=$?
 assert_streq "killed wakeup: a subsequent recipient mutation completes" "$after_kill_rc" "0"
 seen_count="$(grep -cF 'id:wakeup-kill | event:SEEN' "$INBOX" 2>/dev/null || true)"
 assert_streq "killed wakeup: the subsequent mutation commits exactly once" "$seen_count" "1"
+
+: > "$HOOK_RELEASE"
+ticks=0
+while [ -n "$hook_pid" ] && kill -0 "$hook_pid" 2>/dev/null && [ "$ticks" -lt 500 ]; do
+  sleep 0.01
+  ticks=$((ticks+1))
+done
+if [ -z "$hook_pid" ] || ! kill -0 "$hook_pid" 2>/dev/null; then
+  ok "killed wakeup: released hook child exits during cleanup"
+else
+  no "killed wakeup: released hook child did not exit"
+  kill -TERM "$hook_pid" 2>/dev/null || true
+fi
+
+# 7. Explicit memory ids are engine-global collision keys, including project
+# and private journals that are not otherwise readable by the proposing agent.
+mem acme-core propose --scope project "global project id" --id global-project-id >/dev/null
+mem beta-review propose --scope shared "must collide with acme project" --id global-project-id \
+  >"$WORK/global-project.out" 2>"$WORK/global-project.err"
+global_project_rc=$?
+assert_nonzero "global memory id: shared proposal rejects another project's project id" \
+  "$global_project_rc"
+assert_absent "global memory id: rejected shared proposal appends nothing" \
+  "$SHARED_JOURNAL" "id:global-project-id"
+assert_streq "global memory id: project record remains unambiguous" \
+  "$(mem acme-core state global-project-id 2>/dev/null || true)" "PROPOSED"
+
+mem acme-core propose --scope agent "global private id" --id global-private-id >/dev/null
+mem beta-review propose --scope shared "must collide with acme private" --id global-private-id \
+  >"$WORK/global-private.out" 2>"$WORK/global-private.err"
+global_private_rc=$?
+assert_nonzero "global memory id: shared proposal rejects another project's private id" \
+  "$global_private_rc"
+assert_absent "global memory id: private collision appends no shared record" \
+  "$SHARED_JOURNAL" "id:global-private-id"
+assert_streq "global memory id: private record remains unambiguous" \
+  "$(mem acme-core state global-private-id 2>/dev/null || true)" "PROPOSED"
+
+mem acme-review propose --scope agent "other agent private id" --id other-private-id >/dev/null
+mem acme-core propose --scope project "must collide with other private" --id other-private-id \
+  >"$WORK/other-private.out" 2>"$WORK/other-private.err"
+other_private_rc=$?
+assert_nonzero "global memory id: project proposal rejects another agent's private id" \
+  "$other_private_rc"
+assert_absent "global memory id: other-agent collision appends no project record" \
+  "$PROJECT_JOURNAL" "id:other-private-id"
+assert_streq "global memory id: other agent's private record remains unambiguous" \
+  "$(mem acme-review state other-private-id 2>/dev/null || true)" "PROPOSED"
+
+# 8. An explicit send must propagate an unexpected exists-fold failure. Treating
+# every non-match status as "absent" would acknowledge and append unverified work.
+FOLDFAIL_SHIM="$WORK/foldfail-shim"
+FOLDFAIL_MARKER="$WORK/foldfail-reached"
+mkdir -p "$FOLDFAIL_SHIM"
+cat > "$FOLDFAIL_SHIM/awk" <<'SH'
+#!/usr/bin/env bash
+matched_mode=0
+matched_want=0
+for arg in "$@"; do
+  [ "$arg" = mode=exists ] && matched_mode=1
+  [ "$arg" = want=message-foldfail ] && matched_want=1
+done
+if [ "$matched_mode" -eq 1 ] && [ "$matched_want" -eq 1 ]; then
+  : > "$AIB_TEST_FOLDFAIL_MARKER"
+  exit 2
+fi
+exec "$AIB_TEST_REAL_AWK" "$@"
+SH
+chmod +x "$FOLDFAIL_SHIM/awk"
+
+env PATH="$FOLDFAIL_SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+  AIB_TEST_FOLDFAIL_MARKER="$FOLDFAIL_MARKER" \
+  "$RUN" acme-core -- "$MSG" send beta-review "fold failure" --id message-foldfail \
+  >"$WORK/message-foldfail.out" 2>"$WORK/message-foldfail.err"
+message_foldfail_rc=$?
+if [ -e "$FOLDFAIL_MARKER" ]; then
+  ok "message fold failure: targeted exists fold was reached"
+else
+  no "message fold failure: targeted exists fold was not reached"
+fi
+assert_nonzero "message fold failure: send fails closed" "$message_foldfail_rc"
+assert_streq "message fold failure: no id is printed" "$(cat "$WORK/message-foldfail.out")" ""
+assert_absent "message fold failure: no journal record is committed" \
+  "$INBOX" "id:message-foldfail"
 
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
