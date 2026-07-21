@@ -52,10 +52,11 @@ Record line (on `propose`):
 Event line (transitions):
 `TS | id:<id> | event:<REVIEWED_ACCEPT|REVIEWED_REJECT|PROMOTED> | by:<uid> [| note:<note>]`
 
-A memory's current state = the fold (last event) over its `id`. Reads fold stable snapshots captured under
-the namespace lock; they never combine independently moving journal views. The legacy line grammar has no
-sequence, frame, or checksum. A SQLite index is an OPTIONAL future accelerator — the file journal is
-authoritative.
+A memory's current state = the fold (last event) over its `id`. Read-only folds retain their existing
+lock-free behavior and are not linearizable with concurrent commits. In particular, a multi-journal read
+is not a coherent namespace snapshot and may observe journals at different commit points. The legacy line
+grammar has no sequence, frame, or checksum. A SQLite index is an OPTIONAL future accelerator — the file
+journal is authoritative.
 
 ## 3. Commands — `bin/memory <sub>`
 - `propose --scope <agent|project|shared> [--key <k>] "<body>" [--id <id>]`

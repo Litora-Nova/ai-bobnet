@@ -87,9 +87,9 @@ JSON error.
 
 **Write to the recipient's own inbox (`bin/inbox <agent_uid>`); read only your own (`bin/context` → `inbox_path`).**
 - Per-agent inbox file: `<standup_dir>/inbox/<agent_uid>.md` (append-only journal). No shared, address-filtered file.
-- P1 delivery and P2 wakeup serialize mutations with an advisory `flock` on `<inbox_path>.lock`; their
-  read-side folds use stable snapshots taken under the same lock. The sidecar lock is coordination state,
-  not a second journal or source of truth.
+- P1 delivery and P2 wakeup serialize mutations with an advisory `flock` on `<inbox_path>.lock`. Read-only
+  folds remain lock-free and are not linearizable with concurrent commits. The sidecar lock is coordination
+  state, not a second journal or source of truth.
 - Each line is structured: `TIMESTAMP | from:<agent_uid> | <text>` — the sender is a real field, not a free-text signature to parse.
 - `from:`/`to:`/`by:` always carry an **`agent_uid`** — the routing key, never an actor label (see §4.1).
 - **Line grammar:** structured fields first, then at most **one** free-text tail, introduced by a

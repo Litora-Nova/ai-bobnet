@@ -31,8 +31,8 @@ memory journal mutations.
 - A mutation acquires the applicable exclusive lock, folds every journal required for its decision,
   revalidates the precondition, and performs one checked append before releasing the lock.
 - A lock or append failure is loud. The caller does not report a state that was not committed.
-- Read operations capture a stable snapshot under the same lock and fold that snapshot after releasing
-  the lock.
+- Read-only folds do not acquire the writer lock. They retain the existing snapshot/fold behavior and are
+  explicitly not linearizable with concurrent commits.
 - The existing record grammar remains unchanged. Physical append order remains the only ordering in these
   journals.
 
@@ -76,7 +76,8 @@ and cutover plan.
   that bypass the supported commands.
 - Process exit releases lock ownership without a stale-lock recovery protocol. The sidecar file may remain
   on disk and is harmless.
-- Reads observe a coherent snapshot, but they may be stale immediately after the snapshot is released.
+- The ordering point applies to mutations only. It does not provide a coherent namespace snapshot or
+  linearizable reads.
 - Durability means surviving process restart after a successful append. No `fsync` or power-loss guarantee
   is added.
 

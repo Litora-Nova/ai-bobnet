@@ -15,8 +15,9 @@ Sender/recipient are real fields — **never a free-text signature to parse.**
 - Every mutation takes an exclusive `flock` on `<inbox-journal>.lock`. The writer folds and revalidates
   under that lock, then performs one checked append before releasing it. A lock or append failure is a
   loud non-zero result; the command MUST NOT report a state that was not committed.
-- Reads fold a stable snapshot captured while holding the same lock. They do not keep the lock while
-  formatting output, but they never fold a moving journal.
+- Read-only folds retain their existing lock-free behavior. They do not acquire the writer lock and are
+  not linearizable with concurrent commits; a result may be stale relative to a concurrent or immediately
+  subsequent mutation.
 - Message line: `TS | id:<id> | from:<uid> | to:<uid> | state:PERSISTED | <body>`
 - Event line:   `TS | id:<id> | event:<NOTIFIED|SEEN|PROCESSED|FAILED> | by:<uid>`
 - Physical journal order is the only ordering supplied by this contract. This prelude does not add a
@@ -45,9 +46,10 @@ Sender/recipient are real fields — **never a free-text signature to parse.**
   This is idempotent journal mutation, not exactly-once external effect delivery.
 
 ## 6. Replay (restart-safe)
-- A fresh/restarted agent runs `replay` → gets exactly the messages not yet PROCESSED/FAILED, in physical
-  journal order from one stable snapshot. Timestamps never establish replay order. **Nothing committed is
-  silently lost on a process recycle.** Power-loss durability is outside this contract.
+- A fresh/restarted agent runs `replay` → gets the messages observed as not yet PROCESSED/FAILED, in the
+  physical journal order observed by its lock-free fold. Timestamps never establish replay order. Replay
+  is not linearizable with concurrent writers. **Nothing committed is silently lost on a process
+  recycle.** Power-loss durability is outside this contract.
 
 ## 7. Dead-letter
 - A message that FAILs (or exceeds a retry bound) is retained in `bin/message dlq` — visible, never silently dropped, never infinitely re-notified.

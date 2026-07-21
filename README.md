@@ -7,8 +7,9 @@ rebuilt on a clean, deterministic core.
 > memory-with-trust) is built from the ground up; proven components are ported in incrementally.
 >
 > **Built and tested:** P0 identity/registry, P1 delivery, P2 wakeup/local adapter, P3 scoped memory,
-> the serialized commit path for the current delivery and memory journals, and the watchdogged
-> `codex-run` wrapper. **Specified, not yet implemented:** the full serialized event spine,
+> and the watchdogged `codex-run` wrapper. **Contracted, implementation pending:** the serialized
+> commit path for the current delivery and memory journals. **Specified, not yet
+> implemented:** the full serialized event spine,
 > provider-wide reference monitor, Gate/Grant/Effect state machines, profile provisioning, full
 > runtime lifecycle, external adapters, and dashboard projection. `docs/DOMAIN.md` is the normative
 > target contract; it is not a claim that every domain surface already exists in code.

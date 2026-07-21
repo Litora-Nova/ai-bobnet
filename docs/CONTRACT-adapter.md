@@ -18,9 +18,9 @@ any external runtime (CAO = inspiration, not a dependency).
 - Scans the target agent's inbox journal for messages in `PERSISTED` (not yet `NOTIFIED`), appends `NOTIFIED`
   through the same locked `bin/message notify` commit semantics, and pings the recipient's `mux_session`
   (from registry) via a **configurable wakeup hook** (`AIBOBNET_WAKEUP_HOOK`; default: mux send;
-  test-stubbable/capturable). Candidate discovery uses a stable journal snapshot and the locked commit
-  revalidates state, so a stale candidate cannot create a duplicate transition. Idempotent — never
-  re-notifies NOTIFIED/terminal.
+  test-stubbable/capturable). Candidate discovery is lock-free and may be stale; the mutation revalidates
+  state under the writer lock, so a stale candidate cannot create a duplicate transition. Idempotent —
+  never re-notifies NOTIFIED/terminal.
 - **Bounded:** after N failed wake attempts a message is dead-lettered (visible via `bin/message dlq`), never
   infinitely re-pinged.
 - Fail-closed/fail-loud per P0; targets resolved via the registry, never env-guessed.
