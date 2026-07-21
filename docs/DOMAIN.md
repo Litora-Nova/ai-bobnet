@@ -9,7 +9,10 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > built and tested. The serialized event spine, provider-wide reference monitor, Gate/Grant/Effect
 > state machines, profile provisioning, full runtime lifecycle, external adapters, and dashboard
 > projection remain specified but unimplemented. Until the reference monitor exists, `clearance`
-> is registry/audit data rather than an enforced authorization decision.
+> is registry/audit data rather than an enforced authorization decision. The registry does not yet
+> carry the execution binding of §2.1 either: `codex-run` still takes `--model`/`--effort` as launcher
+> flags with tool-side defaults, so today those flags are the source rather than an override of a
+> registry-resolved value.
 
 Principle behind the freeze: *the previous generation became unreliable because reliability was added as
 heuristics on top of an ambiguous core.* The cure is a small, deterministic domain that an agent can use
@@ -39,7 +42,7 @@ heuristics on top of an ambiguous core.* The cure is a small, deterministic doma
 | **Event** | An immutable fact. Projections derive state from events; state is never guessed. |
 | **Artifact** | A referenceable result (file, branch, commit, report, test result) — **by reference**. |
 
-**Technical adapters:** **Provider** (a CLI/agent runtime binding) · **Runtime** (tmux, process, container, remote) · **Policy** (machine-readable rule for capabilities, risk, approval).
+**Technical adapters:** **Provider** (a CLI/agent runtime binding — `claude-code`, `codex`, …; this is the object others call a "harness", and it stays free per agent, see §2.1) · **Runtime** (tmux, process, container, remote) · **Policy** (machine-readable rule for capabilities, risk, approval).
 
 **Retired as core objects:** Archetype → *Profile* · Persona → optional `display_name` · Ring → visual filter only · Territory → *Scope* · Helper → *Session/Attempt under a parent Agent* · standing service personas → *system modules*.
 
@@ -54,6 +57,9 @@ agent_uid   = <project_uid> "-" <agent_key>     # IMMUTABLE. The routing key.
 agent_key   = explicit, immutable (default: the profile name; suffixed when several share a profile)
 profile     = MUTABLE
 display_name= OPTIONAL, MUTABLE
+provider    = MUTABLE                          # which agent runtime executes this agent (§2.1)
+model       = MUTABLE
+effort      = MUTABLE
 ```
 
 - An **Agent is a registry object**. Lookup is the authority; parsing is validation only. An agent that is
@@ -71,6 +77,30 @@ display_name= OPTIONAL, MUTABLE
   receive messages, own memory, or be addressed later? → registry Agent. Otherwise → Session/Attempt.*
 
 Registry shape: `projects` · `agents` · `teams` · `profiles`.
+
+### 2.1 Execution binding — `provider`, `model`, `effort`
+
+How an Agent is executed is **registry data on the agent object**, not a launcher flag and not a per-tool
+default. Without this, the same agent runs on a different model depending on who started it, and no
+projection can answer "what is this team actually running on".
+
+- **`provider`** names the agent runtime binding (`claude-code`, `codex`, …) — the term the vocabulary
+  already defines; there is no second word for it. **`model`** and **`effort`** are the settings inside
+  that binding. All three are MUTABLE and MUST NOT affect `agent_uid`, routing, inbox, journal, or memory
+  scope — swapping the runtime under an agent does not create a different agent.
+- **Resolution order is fixed and total:** `agent` → `team` → `project` default. The first level that
+  specifies a field wins; a resolved value is never assembled from several levels. An agent with no team,
+  or a team level that specifies nothing, falls through silently to the next level — teams stay invisible
+  when unused (§1). This is what makes the registry the *single* source of model truth rather than one
+  opinion among several.
+- **An execution binding never grants clearance.** A `provider`/`model`/`effort` change MUST NOT alter
+  clearance, for the same reason a `profile` swap must not (above).
+- **But it can cap it.** §7 bars `soft-enforcement` runtimes from high-tier and T4 work. That bar binds
+  here: an agent's **effective** authority is `min(clearance, what its provider can actually enforce)`.
+  Registry clearance is therefore a ceiling, never a promise. Because this is security-relevant,
+  `provider` changes are **audited events**, like clearance changes.
+- **An Attempt records the resolved binding it actually ran with** (§5). The registry is mutable, so the
+  current object cannot answer what executed last Tuesday; only the Attempt can. Audit reads the Attempt.
 
 ---
 
