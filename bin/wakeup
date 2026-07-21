@@ -4,7 +4,7 @@
 # Wakeup is a PROMPT, not a delivery-proof. For a target agent it:
 #   1. finds messages still in PERSISTED (not yet NOTIFIED) — via `bin/message pending`,
 #   2. pings the target's mux_session through a configurable hook,
-#   3. on a successful ping appends NOTIFIED — via `bin/message notify` (P1 semantics),
+#   3. on a successful ping commits NOTIFIED through the canonical journal mutation seam,
 #   4. on a failed ping records a bounded retry; after N failures the message is
 #      dead-lettered (FAILED, visible in `bin/message dlq`), never re-pinged forever.
 # Proof of SEEN/PROCESSED stays the recipient's own P1 receipt — wakeup NEVER infers
@@ -14,6 +14,9 @@
 #
 # Actor identity: the calling agent (from bin/context) is the `by:` of every event it
 # appends; launch via bin/run-agent so the context is resolvable and fail-closed.
+# The recipient lock intentionally spans revalidation, the hook, and the resulting
+# record to prevent concurrent duplicate pings. A slow hook therefore delays other
+# cooperating mutations of that recipient's inbox.
 #
 # Config (read from this process's own env; under run-agent set it on the wakeup command
 # itself — run-agent scrubs the ambient AIBOBNET_* routing namespace by design):
@@ -83,31 +86,65 @@ max="${AIBOBNET_WAKEUP_MAX_ATTEMPTS:-3}"
 case "$max" in ''|*[!0-9]*) aib_die 64 "AIBOBNET_WAKEUP_MAX_ATTEMPTS must be a positive integer";; esac
 [ "$max" -ge 1 ] || aib_die 64 "AIBOBNET_WAKEUP_MAX_ATTEMPTS must be >= 1"
 
-# count prior failed-ping markers for an id (journal-recorded, restart-safe;
-# markers carry NO `id:`/`event:` field so the P1 fold ignores them entirely).
-_attempts() { grep -cF "| wakeattempt:$1 |" "$to_path" 2>/dev/null || true; }
+# Count prior failed-ping markers for an id (journal-recorded, restart-safe).
+# Retry-only markers carry no id/event field, so the P1 fold ignores them.
+_attempts() { grep -cF "| wakeattempt:$1 |" "$2" 2>/dev/null || true; }
+
+_wakeup_decide() {
+  local journal="$1" id="$2" wake_target="$3" session="$4" attempt_max="$5"
+  local pending candidate found=0 prior n
+
+  # The lock covers eligibility, the external ping, and its resulting record. Otherwise
+  # parallel wakeup processes can all ping from the same stale pending snapshot.
+  pending="$("$MSG" pending "$wake_target")" || aib_die 6 "cannot revalidate wakeup candidate '$id'"
+  while IFS= read -r candidate; do
+    if [ "$candidate" = "$id" ]; then found=1; break; fi
+  done <<< "$pending"
+  if [ "$found" -eq 0 ]; then
+    AIB_JOURNAL_ACTION=noop
+    AIB_JOURNAL_RESULT=skipped
+    return 0
+  fi
+
+  if _ping "$wake_target" "$session" "$id" >/dev/null; then
+    AIB_JOURNAL_ACTION=append
+    printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:NOTIFIED | by:%s%s' \
+      "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD"
+    AIB_JOURNAL_RESULT=notified
+    return 0
+  fi
+
+  prior="$(_attempts "$id" "$journal")"
+  prior="${prior:-0}"
+  n=$((prior+1))
+  AIB_JOURNAL_ACTION=append
+  if [ "$n" -ge "$attempt_max" ]; then
+    # One record is both the final attempt marker and the terminal event. This avoids
+    # a crash window between two appends while retaining the legacy fold grammar.
+    printf -v AIB_JOURNAL_RECORD '%s | wakeattempt:%s | id:%s | event:FAILED | by:%s%s | reason:%s' \
+      "$(_now)" "$id" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" \
+      "wakeup exhausted after $n attempts (no mux ack)"
+    AIB_JOURNAL_RESULT=deadlettered
+  else
+    printf -v AIB_JOURNAL_RECORD '%s | wakeattempt:%s | by:%s' \
+      "$(_now)" "$id" "$_own_agent"
+    AIB_JOURNAL_RESULT=attempted
+  fi
+}
 
 woke=0; notified=0; deadlettered=0
 # List candidates once (fold of the target journal); process each.
 while IFS= read -r id; do
   [ -n "$id" ] || continue
   woke=$((woke+1))
-  if _ping "$target" "$mux_session" "$id"; then
-    # Ping delivered -> record NOTIFIED via P1 semantics (idempotent; no divergent logic).
-    "$MSG" notify "$target" "$id" >/dev/null
-    notified=$((notified+1))
-  else
-    # Ping failed -> bounded retry. Record the attempt, then dead-letter if exhausted.
-    printf '%s | wakeattempt:%s | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$to_path"
-    n="$(_attempts "$id")"; n="${n:-0}"
-    if [ "$n" -ge "$max" ]; then
-      # Dead-letter: append FAILED in the exact P1 event format (visible in `message dlq`).
-      printf '%s | id:%s | event:FAILED | by:%s%s | reason:%s\n' \
-        "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" \
-        "wakeup exhausted after $n attempts (no mux ack)" >> "$to_path"
-      deadlettered=$((deadlettered+1))
-    fi
-  fi
+  outcome="$(aib_journal_commit "$to_path.lock" "$to_path" _wakeup_decide \
+    "$id" "$target" "$mux_session" "$max")"
+  case "$outcome" in
+    notified) notified=$((notified+1));;
+    deadlettered) deadlettered=$((deadlettered+1));;
+    attempted|skipped) ;;
+    *) aib_die 2 "unexpected wakeup commit outcome: $outcome";;
+  esac
 done < <("$MSG" pending "$target")
 
 printf 'wakeup %s: %d candidate(s), %d notified, %d dead-lettered\n' \

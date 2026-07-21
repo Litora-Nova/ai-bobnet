@@ -188,6 +188,18 @@ _journal_for_scope() {
   esac
 }
 _ensure_journal_dir() { mkdir -p "$_journal_dir" || aib_die 2 "cannot create memory journal directory: $_journal_dir"; }
+_memory_lock_path() {
+  local configured_shared
+  configured_shared="$(_shared_dir_optional)"
+  if [ -n "$configured_shared" ]; then
+    printf '%s/.aibobnet-memory.lock\n' "$configured_shared"
+  else
+    printf '%s/memory/.aibobnet-memory.lock\n' "$_own_standup"
+  fi
+}
+_ensure_memory_lock_dir() {
+  mkdir -p "$(dirname "$_memory_lock")" || aib_die 2 "cannot create memory lock directory"
+}
 _journal_meta() {
   local id="$1" file="$2" input="$2"; [ -f "$input" ] || input=/dev/null
   awk -v mode=meta -v want="$id" -v agent_path="$input" -v project_path="" -v shared_path="" "$_AIB_MEM_AWK" "$input"
@@ -227,6 +239,101 @@ EOF
   [ "$count" -gt 0 ] || aib_die 3 "memory id '$id' is not in a reachable journal"
   [ "$count" -eq 1 ] || aib_die 5 "memory id '$id' is ambiguous across reachable journals"
 }
+_memory_namespace_journals() {
+  local configured_shared
+  configured_shared="$(_shared_dir_optional)"
+  # Preserve the P3 reachability contract: another agent's private journal and
+  # another project's project journal are not visible collision authorities.
+  _jrnls=("$_own_standup/memory/agent/$_own_agent.md" "$_own_standup/memory/project.md")
+  [ -z "$configured_shared" ] || _jrnls+=("$configured_shared/shared.md")
+}
+_memory_propose_decide() {
+  local journal="$1" scope="$2" key="$3" body="$4" id="$5"
+  local meta _j _old_scope _old_author _old_state collision
+
+  _memory_namespace_journals
+  if [ -n "$id" ]; then
+    for _j in "${_jrnls[@]}"; do
+      [ ! -e "$_j" ] || [ -r "$_j" ] || aib_die 2 "memory journal is unreadable: $_j"
+      meta="$(_journal_meta "$id" "$_j" 2>/dev/null)" || continue
+      if [ "$_j" = "$journal" ]; then
+        IFS=$'\t' read -r _old_scope _old_author _old_state <<EOF
+$meta
+EOF
+        if [ "$_old_state" = PROPOSED ]; then
+          AIB_JOURNAL_ACTION=noop
+          AIB_JOURNAL_RESULT="$id"
+          return 0
+        fi
+        aib_die 5 "memory id '$id' already exists with state $_old_state"
+      fi
+      aib_die 5 "memory id '$id' already exists in another journal (ids must be globally unique)"
+    done
+  else
+    while :; do
+      id="mem-$(_now | tr -d ':-')-$$-$RANDOM$RANDOM"
+      collision=0
+      for _j in "${_jrnls[@]}"; do
+        [ ! -e "$_j" ] || [ -r "$_j" ] || aib_die 2 "memory journal is unreadable: $_j"
+        if _journal_meta "$id" "$_j" >/dev/null 2>&1; then
+          collision=1
+          break
+        fi
+      done
+      [ "$collision" -eq 1 ] || break
+    done
+  fi
+
+  AIB_JOURNAL_ACTION=append
+  printf -v AIB_JOURNAL_RECORD '%s | id:%s | scope:%s | author:%s | key:%s | state:PROPOSED | %s' \
+    "$(_now)" "$id" "$scope" "$_own_agent" "$key" "$body"
+  AIB_JOURNAL_RESULT="$id"
+}
+_memory_review_decide() {
+  local journal="$1" id="$2" verdict="$3" note="$4" event
+  local agent_journal="$_own_standup/memory/agent/$_own_agent.md"
+
+  if _journal_meta "$id" "$agent_journal" >/dev/null 2>&1; then
+    aib_die 3 "agent-scope memory '$id' is private and not reviewable"
+  fi
+  _locate_collective "$id"
+  [ "$_found_path" = "$journal" ] || aib_die 5 "memory '$id' changed journal while waiting for its lock"
+  [ "$_found_author" != "$_own_agent" ] || aib_die 3 "memory author cannot review its own proposal"
+  case "$_found_state:$verdict" in
+    REVIEWED_ACCEPT:accept|REVIEWED_REJECT:reject)
+      AIB_JOURNAL_ACTION=noop
+      return 0
+      ;;
+    REVIEWED_ACCEPT:*|REVIEWED_REJECT:*) aib_die 3 "memory '$id' already has a conflicting review";;
+    PROPOSED:*) ;;
+    *) aib_die 3 "memory '$id' is terminal or not reviewable (state $_found_state)";;
+  esac
+
+  event=REVIEWED_ACCEPT
+  [ "$verdict" != reject ] || event=REVIEWED_REJECT
+  AIB_JOURNAL_ACTION=append
+  if [ -n "$note" ]; then
+    printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:%s | by:%s | note:%s' \
+      "$(_now)" "$id" "$event" "$_own_agent" "$note"
+  else
+    printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:%s | by:%s' \
+      "$(_now)" "$id" "$event" "$_own_agent"
+  fi
+}
+_memory_promote_decide() {
+  local journal="$1" id="$2"
+  _locate_collective "$id"
+  [ "$_found_path" = "$journal" ] || aib_die 5 "memory '$id' changed journal while waiting for its lock"
+  case "$_found_state" in
+    PROMOTED) AIB_JOURNAL_ACTION=noop;;
+    REVIEWED_ACCEPT)
+      AIB_JOURNAL_ACTION=append
+      printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:PROMOTED | by:%s' \
+        "$(_now)" "$id" "$_own_agent"
+      ;;
+    *) aib_die 3 "memory '$id' cannot be promoted from state $_found_state";;
+  esac
+}
 _render() {
   local mode="$1" scope_filter="$2" key_filter="$3" state_filter="$4"
   local agent_input="$_own_standup/memory/agent/$_own_agent.md" project_input="$_own_standup/memory/project.md" shared_input=""
@@ -254,56 +361,27 @@ case "$sub" in
     _validate_scope "$scope"; [ -n "$id" ] && _validate_id "$id"
     key="$(_sanitize_line "$key")"; case "$key" in *' | '*) aib_die 4 "memory key must not contain ' | '";; esac
     body="$(_sanitize_line "$body")"; _journal_for_scope "$scope"; _ensure_journal_dir
-    if [ -n "$id" ]; then
-      # ids must be globally unique across ALL reachable journals. Re-propose is idempotent only
-      # in the SAME journal while still PROPOSED; a collision in a DIFFERENT journal is refused —
-      # else _locate_* would go permanently ambiguous (a cross-journal id-collision DoS).
-      _sd="$(_shared_dir_optional)"
-      _jrnls=("$_own_standup/memory/agent/$_own_agent.md" "$_own_standup/memory/project.md")
-      [ -n "$_sd" ] && _jrnls+=("$_sd/shared.md")
-      for _j in "${_jrnls[@]}"; do
-        meta="$(_journal_meta "$id" "$_j" 2>/dev/null)" || continue
-        if [ "$_j" = "$_journal" ]; then
-          IFS=$'\t' read -r _old_scope _old_author _old_state <<EOF
-$meta
-EOF
-          [ "$_old_state" = PROPOSED ] && { printf '%s\n' "$id"; exit 0; }
-          aib_die 5 "memory id '$id' already exists with state $_old_state"
-        else
-          aib_die 5 "memory id '$id' already exists in another journal (ids must be globally unique)"
-        fi
-      done
-    fi
-    if [ -z "$id" ]; then stamp="$(_now)"; stamp="${stamp//:/}"; stamp="${stamp//-/}"; id="mem-${stamp}-$$-$RANDOM$RANDOM"; fi
-    printf '%s | id:%s | scope:%s | author:%s | key:%s | state:PROPOSED | %s\n' "$(_now)" "$id" "$scope" "$_own_agent" "$key" "$body" >> "$_journal"
-    printf '%s\n' "$id"
+    _memory_lock="$(_memory_lock_path)"; _ensure_memory_lock_dir
+    # Proposal identity, namespace-wide collision detection, and append are one transaction.
+    aib_journal_commit "$_memory_lock" "$_journal" _memory_propose_decide "$scope" "$key" "$body" "$id"
     ;;
   review)
     id="${1:-}"; verdict="${2:-}"; note="${3:-}"
     [ -n "$id" ] && [ -n "$verdict" ] || aib_die 64 'usage: memory review <id> <accept|reject> ["<note>"]'
     [ "$#" -le 3 ] || aib_die 64 "review: unexpected arg '$4'"; _validate_id "$id"
     case "$verdict" in accept|reject) ;; *) aib_die 64 "review: expected accept or reject";; esac
+    note="$(_sanitize_line "$note")"
     _agent_journal="$_own_standup/memory/agent/$_own_agent.md"
     if _journal_meta "$id" "$_agent_journal" >/dev/null 2>&1; then aib_die 3 "agent-scope memory '$id' is private and not reviewable"; fi
-    _locate_collective "$id"; [ "$_found_author" != "$_own_agent" ] || aib_die 3 "memory author cannot review its own proposal"
-    case "$_found_state:$verdict" in
-      REVIEWED_ACCEPT:accept|REVIEWED_REJECT:reject) exit 0;;
-      REVIEWED_ACCEPT:*|REVIEWED_REJECT:*) aib_die 3 "memory '$id' already has a conflicting review";;
-      PROPOSED:*) ;;
-      *) aib_die 3 "memory '$id' is terminal or not reviewable (state $_found_state)";;
-    esac
-    note="$(_sanitize_line "$note")"; event=REVIEWED_ACCEPT; [ "$verdict" = reject ] && event=REVIEWED_REJECT
-    if [ -n "$note" ]; then printf '%s | id:%s | event:%s | by:%s | note:%s\n' "$(_now)" "$id" "$event" "$_own_agent" "$note" >> "$_found_path"
-    else printf '%s | id:%s | event:%s | by:%s\n' "$(_now)" "$id" "$event" "$_own_agent" >> "$_found_path"; fi
+    _locate_collective "$id"; _target_journal="$_found_path"
+    _memory_lock="$(_memory_lock_path)"; _ensure_memory_lock_dir
+    aib_journal_commit "$_memory_lock" "$_target_journal" _memory_review_decide "$id" "$verdict" "$note"
     ;;
   promote)
     id="${1:-}"; [ -n "$id" ] || aib_die 64 'usage: memory promote <id>'; [ "$#" -eq 1 ] || aib_die 64 "promote: unexpected arg '$2'"
-    _validate_id "$id"; _locate_collective "$id"
-    case "$_found_state" in
-      PROMOTED) exit 0;;
-      REVIEWED_ACCEPT) printf '%s | id:%s | event:PROMOTED | by:%s\n' "$(_now)" "$id" "$_own_agent" >> "$_found_path";;
-      *) aib_die 3 "memory '$id' cannot be promoted from state $_found_state";;
-    esac
+    _validate_id "$id"; _locate_collective "$id"; _target_journal="$_found_path"
+    _memory_lock="$(_memory_lock_path)"; _ensure_memory_lock_dir
+    aib_journal_commit "$_memory_lock" "$_target_journal" _memory_promote_decide "$id"
     ;;
   recall)
     scope=""; key=""

@@ -17,7 +17,7 @@
 # It precedes `reason:` because reason is free text that runs to end-of-line.
 #
 # State machine (observable, never inferred): PERSISTED -> NOTIFIED -> SEEN -> PROCESSED | FAILED.
-# Pure bash + awk, no external deps (no jq, no sqlite). Fail-closed / fail-loud per P0.
+# Bash + awk + util-linux flock; no jq/sqlite. Fail-closed / fail-loud per P0.
 #
 # Commands:
 #   send <to_uid> "<body>" [--id <id>]   append PERSISTED to recipient's journal, print id (idempotent)
@@ -172,6 +172,96 @@ _sanitize_line() {
 
 _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+_message_send_decide() {
+  local journal="$1" to="$2" body="$3" id="$4"
+  if [ -n "$id" ]; then
+    if _fold exists "$journal" "$id" >/dev/null 2>&1; then
+      AIB_JOURNAL_ACTION=noop
+      AIB_JOURNAL_RESULT="$id"
+      return 0
+    fi
+  else
+    while :; do
+      id="msg-$(_now | tr -d ':-')-$$-${RANDOM}${RANDOM}"
+      _fold exists "$journal" "$id" >/dev/null 2>&1 || break
+    done
+  fi
+
+  AIB_JOURNAL_ACTION=append
+  printf -v AIB_JOURNAL_RECORD '%s | id:%s | from:%s | to:%s%s | state:PERSISTED | %s' \
+    "$(_now)" "$id" "$_own_agent" "$to" "$AIB_ACTOR_FIELD" "$body"
+  AIB_JOURNAL_RESULT="$id"
+}
+
+_message_notify_decide() {
+  local journal="$1" to="$2" id="$3" cur
+  cur="$(_state_of "$id" "$journal" 2>/dev/null || true)"
+  [ -n "$cur" ] || aib_die 3 "notify: unknown message id '$id' for $to"
+  if [ "$cur" != PERSISTED ]; then
+    printf 'message: id %s already %s (notify no-op)\n' "$id" "$cur" >&2
+    AIB_JOURNAL_ACTION=noop
+    return 0
+  fi
+
+  AIB_JOURNAL_ACTION=append
+  printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:NOTIFIED | by:%s%s' \
+    "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD"
+}
+
+_message_transition_decide() {
+  local journal="$1" verb="$2" id="$3" reason="$4" cur
+  cur="$(_state_of "$id" "$journal" 2>/dev/null || true)"
+  [ -n "$cur" ] || aib_die 3 "$verb: unknown message id '$id' in own inbox"
+
+  case "$verb" in
+    seen)
+      case "$cur" in
+        PERSISTED|NOTIFIED)
+          AIB_JOURNAL_ACTION=append
+          printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:SEEN | by:%s%s' \
+            "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD"
+          ;;
+        *)
+          printf 'message: id %s already %s (seen no-op)\n' "$id" "$cur" >&2
+          AIB_JOURNAL_ACTION=noop
+          ;;
+      esac
+      ;;
+    done)
+      case "$cur" in
+        PROCESSED|FAILED)
+          printf 'message: id %s already %s (done no-op)\n' "$id" "$cur" >&2
+          AIB_JOURNAL_ACTION=noop
+          ;;
+        *)
+          AIB_JOURNAL_ACTION=append
+          printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:PROCESSED | by:%s%s' \
+            "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD"
+          ;;
+      esac
+      ;;
+    fail)
+      case "$cur" in
+        PROCESSED|FAILED)
+          printf 'message: id %s already %s (fail no-op)\n' "$id" "$cur" >&2
+          AIB_JOURNAL_ACTION=noop
+          ;;
+        *)
+          AIB_JOURNAL_ACTION=append
+          if [ -n "$reason" ]; then
+            printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:FAILED | by:%s%s | reason:%s' \
+              "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" "$reason"
+          else
+            printf -v AIB_JOURNAL_RECORD '%s | id:%s | event:FAILED | by:%s%s' \
+              "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD"
+          fi
+          ;;
+      esac
+      ;;
+    *) aib_die 2 "unknown message transition: $verb";;
+  esac
+}
+
 aib_check_registry
 aib_load_actor        # -> AIB_ACTOR_FIELD ("" or " | actor:<label>"); dies on a bad label
 
@@ -197,24 +287,13 @@ case "$sub" in
     _load_own_context
     to_path="$("$REPO_ROOT/bin/inbox" "$to")"     # P0 resolver (fail-closed on unknown recipient)
 
-    if [ -n "$id" ]; then
-      _validate_id "$id"
-      if _fold exists "$to_path" "$id" >/dev/null 2>&1; then
-        printf '%s\n' "$id"                        # idempotent: id already persisted -> no-op
-        exit 0
-      fi
-    else
-      id="msg-$(_now | tr -d ':-')-$$-${RANDOM}${RANDOM}"
-    fi
-
+    [ -z "$id" ] || _validate_id "$id"
     body="$(_sanitize_line "$body")"
     mkdir -p "$(dirname "$to_path")" || aib_die 2 "cannot create inbox dir for $to"
     # `send` records who acted via from:, so it carries actor: too — otherwise the audit
     # chain has a gap at exactly the action that creates work for another agent. It sits
     # after to: and before the state marker, because the body runs to end of line.
-    printf '%s | id:%s | from:%s | to:%s%s | state:PERSISTED | %s\n' \
-      "$(_now)" "$id" "$_own_agent" "$to" "$AIB_ACTOR_FIELD" "$body" >> "$to_path"
-    printf '%s\n' "$id"
+    aib_journal_commit "$to_path.lock" "$to_path" _message_send_decide "$to" "$body" "$id"
     ;;
 
   # -------------------------------------------------------------------------- #
@@ -224,13 +303,8 @@ case "$sub" in
     _validate_id "$id"
     _load_own_context
     to_path="$("$REPO_ROOT/bin/inbox" "$to")"
-    cur="$(_state_of "$id" "$to_path" 2>/dev/null || true)"
-    [ -n "$cur" ] || aib_die 3 "notify: unknown message id '$id' for $to"
-    if [ "$cur" != "PERSISTED" ]; then
-      printf 'message: id %s already %s (notify no-op)\n' "$id" "$cur" >&2
-      exit 0
-    fi
-    printf '%s | id:%s | event:NOTIFIED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$to_path"
+    mkdir -p "$(dirname "$to_path")" || aib_die 2 "cannot create inbox dir for $to"
+    aib_journal_commit "$to_path.lock" "$to_path" _message_notify_decide "$to" "$id"
     ;;
 
   # -------------------------------------------------------------------------- #
@@ -244,34 +318,9 @@ case "$sub" in
     reason=""
     [ "$sub" = "fail" ] && reason="${2:-}"
     _load_own_context
-    cur="$(_state_of "$id" "$_own_inbox" 2>/dev/null || true)"
-    [ -n "$cur" ] || aib_die 3 "$sub: unknown message id '$id' in own inbox"
-
-    case "$sub" in
-      seen)
-        case "$cur" in
-          PERSISTED|NOTIFIED)
-            printf '%s | id:%s | event:SEEN | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox";;
-          *) printf 'message: id %s already %s (seen no-op)\n' "$id" "$cur" >&2;;
-        esac;;
-      done)
-        case "$cur" in
-          PROCESSED|FAILED) printf 'message: id %s already %s (done no-op)\n' "$id" "$cur" >&2;;
-          *) printf '%s | id:%s | event:PROCESSED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox";;
-        esac;;
-      fail)
-        case "$cur" in
-          PROCESSED|FAILED) printf 'message: id %s already %s (fail no-op)\n' "$id" "$cur" >&2;;
-          *)
-            if [ -n "$reason" ]; then
-              reason="$(_sanitize_line "$reason")"
-              printf '%s | id:%s | event:FAILED | by:%s%s | reason:%s\n' \
-                "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" "$reason" >> "$_own_inbox"
-            else
-              printf '%s | id:%s | event:FAILED | by:%s%s\n' "$(_now)" "$id" "$_own_agent" "$AIB_ACTOR_FIELD" >> "$_own_inbox"
-            fi;;
-        esac;;
-    esac
+    [ "$sub" != fail ] || reason="$(_sanitize_line "$reason")"
+    mkdir -p "$(dirname "$_own_inbox")" || aib_die 2 "cannot create own inbox directory"
+    aib_journal_commit "$_own_inbox.lock" "$_own_inbox" _message_transition_decide "$sub" "$id" "$reason"
     ;;
 
   # -------------------------------------------------------------------------- #
