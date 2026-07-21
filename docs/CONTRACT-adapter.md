@@ -16,7 +16,7 @@ any external runtime (CAO = inspiration, not a dependency).
 
 ## 1. Wakeup notifier — `bin/wakeup [<agent_uid>]`
 - Scans the target agent's inbox journal for messages in `PERSISTED` (not yet `NOTIFIED`), appends `NOTIFIED`
-  through the same locked `bin/message notify` commit semantics, and pings the recipient's `mux_session`
+  through the same locked delivery commit semantics, and pings the recipient's `mux_session`
   (from registry) via a **configurable wakeup hook** (`AIBOBNET_WAKEUP_HOOK`; default: mux send;
   test-stubbable/capturable). Candidate discovery is lock-free and may be stale. For each candidate,
   wakeup takes the recipient inbox lock and holds it across eligibility revalidation, the hook/mux ping,
