@@ -7,15 +7,19 @@ any external runtime (CAO = inspiration, not a dependency).
 
 ## Non-negotiables
 - **Journal = source of truth** (P1 append-only files). The adapter is a thin accelerator: everything it does
-  goes through the same journal + `bin/message` semantics. **Adapter down ⇒ the P1 CLI still fully works.**
+  goes through the same serialized journal commit path and `bin/message` semantics. **Adapter down ⇒ the
+  P1 CLI still fully works.**
 - **Wakeup ≠ delivery-proof.** The wakeup only pings ("check your inbox"). Proof of SEEN/PROCESSED stays the
   recipient's P1 receipt. **No heartbeat-line-count / re-nudge heuristics — ever.**
-- **Pure-bash core stays pure-bash/awk.** The OPTIONAL HTTP daemon may use `python3` **stdlib only** (no pip deps).
+- **Core dependencies stay small and explicit.** Journal commits use `flock` from util-linux. The OPTIONAL
+  HTTP daemon may use `python3` **stdlib only** (no pip deps).
 
 ## 1. Wakeup notifier — `bin/wakeup [<agent_uid>]`
 - Scans the target agent's inbox journal for messages in `PERSISTED` (not yet `NOTIFIED`), appends `NOTIFIED`
-  (`bin/message notify` semantics), and pings the recipient's `mux_session` (from registry) via a **configurable
-  wakeup hook** (`AIBOBNET_WAKEUP_HOOK`; default: mux send; test-stubbable/capturable). Idempotent — never
+  through the same locked `bin/message notify` commit semantics, and pings the recipient's `mux_session`
+  (from registry) via a **configurable wakeup hook** (`AIBOBNET_WAKEUP_HOOK`; default: mux send;
+  test-stubbable/capturable). Candidate discovery uses a stable journal snapshot and the locked commit
+  revalidates state, so a stale candidate cannot create a duplicate transition. Idempotent — never
   re-notifies NOTIFIED/terminal.
 - **Bounded:** after N failed wake attempts a message is dead-lettered (visible via `bin/message dlq`), never
   infinitely re-pinged.
@@ -39,11 +43,14 @@ any external runtime (CAO = inspiration, not a dependency).
 ## 5. Acceptance (P2 slice) — black-box, synthetic projects, example id `acme`
 - **Wakeup:** PERSISTED message → `bin/wakeup` → NOTIFIED appended + recipient pinged (stub hook captured in test);
   idempotent (2nd wakeup = no re-notify); bounded (exhausted → dlq).
+- **Concurrent wakeup:** two wakeups may observe the same candidate, but locked revalidation commits at most
+  one NOTIFIED transition.
 - **Adapter parity:** each `/send /inbox /seen /done /fail /state /dlq` yields the SAME journal state as the
   equivalent `bin/message` call (adapter ≡ CLI).
 - **Hardening:** daemon binds `127.0.0.1` only; missing/wrong auth token → rejected; no default token.
 - **Journal authority:** with the daemon stopped, the P1 CLI still sends/reads/transitions fully.
-- p0 + p1 suites stay green. Pure-bash core untouched; `python3` stdlib only for the daemon.
+- p0 + p1 suites stay green. Core journal commits require util-linux `flock`; `python3` stdlib only for
+  the optional daemon.
 
 ---
 White-label: example id `acme`; no real names, infrastructure, or hosts.

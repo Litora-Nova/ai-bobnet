@@ -1,0 +1,85 @@
+# ADR-001: Serialize Legacy Journal Commits with `flock`
+
+## Status
+
+Accepted
+
+## Date
+
+2026-07-21
+
+## Context
+
+Delivery and memory state are folds over append-only, line-oriented files. Their original command paths
+checked the current fold and appended in separate steps. Two concurrent processes could therefore observe
+the same pre-state and both append a commit that should have been idempotent or mutually exclusive.
+
+The full event spine in `docs/DOMAIN.md` will eventually replace these legacy journals with a versioned
+event envelope, explicit stream ordering, framing, integrity markers, and projection contracts. That is a
+larger migration. The current system needs one deterministic commit point now without pretending that the
+event spine already exists.
+
+## Decision
+
+Use util-linux `flock` as the single-host serialization primitive for all supported delivery, wakeup, and
+memory journal mutations.
+
+- A delivery journal uses `<inbox-journal>.lock`.
+- All memory journals in one reachable namespace share a lock. When `shared_memory_dir` is configured,
+  the lock is `<shared_memory_dir>/.aibobnet-memory.lock`; otherwise it is
+  `<standup_dir>/memory/.aibobnet-memory.lock`.
+- A mutation acquires the applicable exclusive lock, folds every journal required for its decision,
+  revalidates the precondition, and performs one checked append before releasing the lock.
+- A lock or append failure is loud. The caller does not report a state that was not committed.
+- Read operations capture a stable snapshot under the same lock and fold that snapshot after releasing
+  the lock.
+- The existing record grammar remains unchanged. Physical append order remains the only ordering in these
+  journals.
+
+This is a cooperative writer contract. The supported commands use the lock; an unsupported direct writer
+can ignore an advisory lock and is outside the guarantee.
+
+## Alternatives Considered
+
+### Keep independent check and append steps
+
+Rejected. It leaves duplicate-ID and lifecycle-transition races open even when every caller uses the
+supported CLI.
+
+### Add separate locks in each command
+
+Rejected. Command-specific locks can protect different files or lock in different orders, recreating the
+cross-command and cross-journal race at a less visible boundary.
+
+### Use sentinel directories or PID lock files
+
+Rejected. They require stale-owner recovery after crashes. Kernel-managed `flock` releases ownership when
+the process or descriptor exits; the persistent sidecar file does not represent a live owner.
+
+### Make SQLite or a resident daemon authoritative now
+
+Rejected for this prelude. Files remain the source of truth, and adding a second authority would expand the
+migration without delivering the narrow concurrency fix. A future projection may still use SQLite as a
+disposable index.
+
+### Implement the full event spine in this change
+
+Deferred. Its envelope, migration, replay, integrity, and projection semantics require a separate contract
+and cutover plan.
+
+## Consequences
+
+- Concurrent supported writers have one decision-and-commit point, so deduplication and transition
+  preconditions can be enforced atomically.
+- `flock` from util-linux becomes an explicit runtime dependency.
+- The mechanism is single-host and advisory. It does not protect against hostile or accidental writers
+  that bypass the supported commands.
+- Process exit releases lock ownership without a stale-lock recovery protocol. The sidecar file may remain
+  on disk and is harmless.
+- Reads observe a coherent snapshot, but they may be stale immediately after the snapshot is released.
+- Durability means surviving process restart after a successful append. No `fsync` or power-loss guarantee
+  is added.
+
+The following remain explicitly deferred: sequence numbers, event envelopes, framing, checksums, byte caps,
+the per-project `main` stream, cursors, projectors, gap detection, torn-tail detection or quarantine,
+hostile-writer integrity, cross-host coordination, and exactly-once effects.

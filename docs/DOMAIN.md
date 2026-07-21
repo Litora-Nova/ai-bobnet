@@ -5,14 +5,18 @@ disagrees with this document, this document wins. Vocabulary and invariants here
 still open is listed explicitly in §12 — nothing is silently undecided.
 
 > **Implementation status:** this document defines the target contract, not the current feature set.
-> P0 identity/registry, P1 delivery, P2 wakeup/local adapter, P3 scoped memory, and `codex-run` are
-> built and tested. The serialized event spine, provider-wide reference monitor, Gate/Grant/Effect
-> state machines, profile provisioning, full runtime lifecycle, external adapters, and dashboard
-> projection remain specified but unimplemented. Until the reference monitor exists, `clearance`
-> is registry/audit data rather than an enforced authorization decision. The registry does not yet
-> carry the execution binding of §2.1 either: `codex-run` still takes `--model`/`--effort` as launcher
-> flags with tool-side defaults, so today those flags are the source rather than an override of a
-> registry-resolved value.
+> P0 identity/registry, P1 delivery, P2 wakeup/local adapter, P3 scoped memory, the serialized commit
+> path for their current line-oriented journals, and `codex-run` are built and tested. The full
+> serialized event spine, provider-wide reference monitor, Gate/Grant/Effect state machines, profile
+> provisioning, full runtime lifecycle, external adapters, and dashboard projection remain specified
+> but unimplemented. Until the reference monitor exists, `clearance` is registry/audit data rather
+> than an enforced authorization decision. The registry does not yet carry the execution binding of
+> §2.1 either: `codex-run` still takes `--model`/`--effort` as launcher flags with tool-side defaults,
+> so today those flags are the source rather than an override of a registry-resolved value.
+>
+> The current serialization layer is a legacy-journal prelude to §6, not its implementation. It does
+> not add sequence numbers, event envelopes, framing, integrity markers, a project `main` stream,
+> cursors, projectors, gap detection, or torn-tail recovery.
 
 Principle behind the freeze: *the previous generation became unreliable because reliability was added as
 heuristics on top of an ambiguous core.* The cure is a small, deterministic domain that an agent can use
