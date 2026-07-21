@@ -122,6 +122,20 @@ _fold() {
 # current folded state of <id> in <file>; empty string + rc!=0 if absent.
 _state_of() { _fold state "$2" "$1"; }
 
+# Read one folded state without letting plausible partial stdout mask a failed
+# fold. On success the state is published in _message_state_result; rc 3 means
+# absent, while every other non-zero status is an operational read failure.
+_message_read_state() {
+  local journal="$1" id="$2" value rc=0
+  _message_state_result=""
+  value="$(_state_of "$id" "$journal" 2>/dev/null)" || rc=$?
+  case "$rc" in
+    0) _message_state_result="$value"; return 0;;
+    3) return 3;;
+    *) aib_die 2 "cannot read message journal while resolving id '$id' (fold code $rc): $journal";;
+  esac
+}
+
 # --- resolve OWN context via P0 bin/context (never env-guessed) ----------------
 _own_agent=""; _own_inbox=""
 _load_own_context() {
@@ -204,9 +218,10 @@ _message_send_decide() {
 }
 
 _message_notify_decide() {
-  local journal="$1" to="$2" id="$3" cur
-  cur="$(_state_of "$id" "$journal" 2>/dev/null || true)"
-  [ -n "$cur" ] || aib_die 3 "notify: unknown message id '$id' for $to"
+  local journal="$1" to="$2" id="$3" cur rc=0
+  _message_read_state "$journal" "$id" || rc=$?
+  [ "$rc" -ne 3 ] || aib_die 3 "notify: unknown message id '$id' for $to"
+  cur="$_message_state_result"
   if [ "$cur" != PERSISTED ]; then
     printf 'message: id %s already %s (notify no-op)\n' "$id" "$cur" >&2
     AIB_JOURNAL_ACTION=noop
@@ -219,9 +234,10 @@ _message_notify_decide() {
 }
 
 _message_transition_decide() {
-  local journal="$1" verb="$2" id="$3" reason="$4" cur
-  cur="$(_state_of "$id" "$journal" 2>/dev/null || true)"
-  [ -n "$cur" ] || aib_die 3 "$verb: unknown message id '$id' in own inbox"
+  local journal="$1" verb="$2" id="$3" reason="$4" cur rc=0
+  _message_read_state "$journal" "$id" || rc=$?
+  [ "$rc" -ne 3 ] || aib_die 3 "$verb: unknown message id '$id' in own inbox"
+  cur="$_message_state_result"
 
   case "$verb" in
     seen)
@@ -347,8 +363,10 @@ case "$sub" in
     [ -n "$id" ] || aib_die 64 "usage: message state <id>"
     _validate_id "$id"
     _load_own_context
-    s="$(_state_of "$id" "$_own_inbox" 2>/dev/null || true)"
-    [ -n "$s" ] || aib_die 3 "state: unknown message id '$id' in own inbox"
+    rc=0
+    _message_read_state "$_own_inbox" "$id" || rc=$?
+    [ "$rc" -ne 3 ] || aib_die 3 "state: unknown message id '$id' in own inbox"
+    s="$_message_state_result"
     printf '%s\n' "$s"
     ;;
 

@@ -204,6 +204,16 @@ _journal_meta() {
   local id="$1" file="$2" input="$2"; [ -f "$input" ] || input=/dev/null
   awk -v mode=meta -v want="$id" -v agent_path="$input" -v project_path="" -v shared_path="" "$_AIB_MEM_AWK" "$input"
 }
+_memory_meta_read() {
+  local id="$1" file="$2" value rc=0
+  _memory_meta_result=""
+  value="$(_journal_meta "$id" "$file" 2>/dev/null)" || rc=$?
+  case "$rc" in
+    0) _memory_meta_result="$value"; return 0;;
+    3) return 3;;
+    *) aib_die 2 "cannot read memory journal while resolving id '$id' (fold code $rc): $file";;
+  esac
+}
 _reachable_collective() {
   _paths=("$_own_standup/memory/project.md"); _shared_dir="$(_shared_dir_optional)"
   [ -n "$_shared_dir" ] && _paths+=("$_shared_dir/shared.md")
@@ -213,7 +223,8 @@ _locate_collective() {
   local id="$1" meta scope author state i count=0; _reachable_collective
   _found_path=""; _found_scope=""; _found_author=""; _found_state=""
   for i in "${!_paths[@]}"; do
-    if meta="$(_journal_meta "$id" "${_paths[$i]}" 2>/dev/null)"; then
+    if _memory_meta_read "$id" "${_paths[$i]}"; then
+      meta="$_memory_meta_result"
       IFS=$'\t' read -r scope author state <<EOF
 $meta
 EOF
@@ -229,7 +240,8 @@ _locate_any() {
   [ -n "$_shared_dir" ] && _paths+=("$_shared_dir/shared.md")
   _found_path=""; _found_scope=""; _found_author=""; _found_state=""
   for i in "${!_paths[@]}"; do
-    if meta="$(_journal_meta "$id" "${_paths[$i]}" 2>/dev/null)"; then
+    if _memory_meta_read "$id" "${_paths[$i]}"; then
+      meta="$_memory_meta_result"
       IFS=$'\t' read -r scope author state <<EOF
 $meta
 EOF
@@ -289,7 +301,10 @@ _memory_propose_decide() {
   if [ -n "$id" ]; then
     for _j in "${_jrnls[@]}"; do
       [ ! -e "$_j" ] || [ -r "$_j" ] || aib_die 2 "memory journal is unreadable: $_j"
-      meta="$(_journal_meta "$id" "$_j" 2>/dev/null)" || continue
+      if ! _memory_meta_read "$id" "$_j"; then
+        continue
+      fi
+      meta="$_memory_meta_result"
       if [ "$_j" = "$journal" ]; then
         IFS=$'\t' read -r _old_scope _old_author _old_state <<EOF
 $meta
@@ -301,7 +316,7 @@ EOF
         fi
         aib_die 5 "memory id '$id' already exists with state $_old_state"
       fi
-      aib_die 5 "memory id '$id' already exists in another journal (ids must be globally unique)"
+      aib_die 5 "memory id '$id' already exists in another journal (ids must be unique within the target scope's collision namespace)"
     done
   else
     while :; do
@@ -309,7 +324,7 @@ EOF
       collision=0
       for _j in "${_jrnls[@]}"; do
         [ ! -e "$_j" ] || [ -r "$_j" ] || aib_die 2 "memory journal is unreadable: $_j"
-        if _journal_meta "$id" "$_j" >/dev/null 2>&1; then
+        if _memory_meta_read "$id" "$_j"; then
           collision=1
           break
         fi
@@ -327,7 +342,7 @@ _memory_review_decide() {
   local journal="$1" id="$2" verdict="$3" note="$4" event
   local agent_journal="$_own_standup/memory/agent/$_own_agent.md"
 
-  if _journal_meta "$id" "$agent_journal" >/dev/null 2>&1; then
+  if _memory_meta_read "$id" "$agent_journal"; then
     aib_die 3 "agent-scope memory '$id' is private and not reviewable"
   fi
   _locate_collective "$id"
@@ -408,7 +423,7 @@ case "$sub" in
     case "$verdict" in accept|reject) ;; *) aib_die 64 "review: expected accept or reject";; esac
     note="$(_sanitize_line "$note")"
     _agent_journal="$_own_standup/memory/agent/$_own_agent.md"
-    if _journal_meta "$id" "$_agent_journal" >/dev/null 2>&1; then aib_die 3 "agent-scope memory '$id' is private and not reviewable"; fi
+    if _memory_meta_read "$id" "$_agent_journal"; then aib_die 3 "agent-scope memory '$id' is private and not reviewable"; fi
     _locate_collective "$id"; _target_journal="$_found_path"
     _memory_lock="$(_memory_lock_path)"; _ensure_memory_lock_dir
     aib_journal_commit "$_memory_lock" "$_target_journal" _memory_review_decide "$id" "$verdict" "$note"
