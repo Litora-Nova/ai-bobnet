@@ -42,14 +42,24 @@ REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
 MSG="$REPO_ROOT/bin/message"
 _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Run an external hook command without the active journal descriptor. The public
+# wakeup process keeps owning the lock while it waits, but an orphaned hook cannot
+# retain that lock after wakeup itself is terminated.
+_run_hook_command() (
+  if [ -n "${AIB_JOURNAL_LOCK_FD:-}" ]; then
+    exec {AIB_JOURNAL_LOCK_FD}>&-
+  fi
+  exec "$@"
+)
+
 # --- default wakeup hook: best-effort mux (tmux) send ------------------------
 # Overridable via AIBOBNET_WAKEUP_HOOK. Fail-closed: if no reachable session, exit
 # non-zero so the message stays PERSISTED and the bounded retry/dead-letter kicks in.
 _default_hook() {
   local target="$1" session="$2" id="$3"
   command -v tmux >/dev/null 2>&1 || return 1
-  tmux has-session -t "$session" >/dev/null 2>&1 || return 1
-  tmux send-keys -t "$session" \
+  _run_hook_command tmux has-session -t "$session" >/dev/null 2>&1 || return 1
+  _run_hook_command tmux send-keys -t "$session" \
     "# ai-bobnet wakeup: new mail ($id) for $target — run: bin/message inbox" Enter >/dev/null 2>&1
 }
 
@@ -57,7 +67,7 @@ _default_hook() {
 _ping() {
   local target="$1" session="$2" id="$3"
   if [ -n "${AIBOBNET_WAKEUP_HOOK:-}" ]; then
-    "$AIBOBNET_WAKEUP_HOOK" "$target" "$session" "$id"
+    _run_hook_command "$AIBOBNET_WAKEUP_HOOK" "$target" "$session" "$id"
   else
     _default_hook "$target" "$session" "$id"
   fi
@@ -137,8 +147,9 @@ woke=0; notified=0; deadlettered=0
 while IFS= read -r id; do
   [ -n "$id" ] || continue
   woke=$((woke+1))
-  outcome="$(aib_journal_commit "$to_path.lock" "$to_path" _wakeup_decide \
-    "$id" "$target" "$mux_session" "$max")"
+  aib_journal_commit "$to_path.lock" "$to_path" _wakeup_decide \
+    "$id" "$target" "$mux_session" "$max"
+  outcome="$AIB_JOURNAL_COMMIT_RESULT"
   case "$outcome" in
     notified) notified=$((notified+1));;
     deadlettered) deadlettered=$((deadlettered+1));;

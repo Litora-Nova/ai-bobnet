@@ -240,18 +240,52 @@ EOF
   [ "$count" -eq 1 ] || aib_die 5 "memory id '$id' is ambiguous across reachable journals"
 }
 _memory_namespace_journals() {
-  local configured_shared
+  local target_scope="$1" configured_shared candidate projects project standup
   configured_shared="$(_shared_dir_optional)"
-  # Preserve the P3 reachability contract: another agent's private journal and
-  # another project's project journal are not visible collision authorities.
-  _jrnls=("$_own_standup/memory/agent/$_own_agent.md" "$_own_standup/memory/project.md")
+
+  _jrnls=()
+  case "$target_scope" in
+    agent)
+      # A private id must not collide with collective memory visible to its owner.
+      _jrnls+=("$_own_standup/memory/agent/$_own_agent.md")
+      _jrnls+=("$_own_standup/memory/project.md")
+      ;;
+    project)
+      # A project id is visible to every project agent, so every private journal
+      # in that project participates in its collision namespace.
+      for candidate in "$_own_standup"/memory/agent/*.md; do
+        [ -e "$candidate" ] || continue
+        _jrnls+=("$candidate")
+      done
+      _jrnls+=("$_own_standup/memory/project.md")
+      ;;
+    shared)
+      # Shared memory is visible from every registered project. A shared id must
+      # therefore be absent from every supported project and private journal.
+      [ -n "$configured_shared" ] || aib_die 3 "shared_memory_dir is not configured in the registry"
+      projects="$(aib_registry_query projects keys)" || aib_die 2 "cannot enumerate projects for shared memory id validation"
+      while IFS= read -r project; do
+        [ -n "$project" ] || continue
+        standup="$(aib_project_field "$project" standup_dir)"
+        for candidate in "$standup"/memory/agent/*.md; do
+          [ -e "$candidate" ] || continue
+          _jrnls+=("$candidate")
+        done
+        _jrnls+=("$standup/memory/project.md")
+      done <<< "$projects"
+      ;;
+    *) aib_die 2 "unknown memory collision scope: $target_scope";;
+  esac
+
+  # Keep shared last: all collective writes include it, and race tests pause on
+  # the final reachable fold while the namespace lock remains held.
   [ -z "$configured_shared" ] || _jrnls+=("$configured_shared/shared.md")
 }
 _memory_propose_decide() {
   local journal="$1" scope="$2" key="$3" body="$4" id="$5"
   local meta _j _old_scope _old_author _old_state collision
 
-  _memory_namespace_journals
+  _memory_namespace_journals "$scope"
   if [ -n "$id" ]; then
     for _j in "${_jrnls[@]}"; do
       [ ! -e "$_j" ] || [ -r "$_j" ] || aib_die 2 "memory journal is unreadable: $_j"
@@ -364,6 +398,8 @@ case "$sub" in
     _memory_lock="$(_memory_lock_path)"; _ensure_memory_lock_dir
     # Proposal identity, namespace-wide collision detection, and append are one transaction.
     aib_journal_commit "$_memory_lock" "$_journal" _memory_propose_decide "$scope" "$key" "$body" "$id"
+    [ -n "$AIB_JOURNAL_COMMIT_RESULT" ] || aib_die 2 "memory proposal committed without an id"
+    printf '%s\n' "$AIB_JOURNAL_COMMIT_RESULT"
     ;;
   review)
     id="${1:-}"; verdict="${2:-}"; note="${3:-}"

@@ -172,10 +172,20 @@ _sanitize_line() {
 
 _now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+_message_id_exists() {
+  local journal="$1" id="$2" rc=0
+  _fold exists "$journal" "$id" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0;;
+    3) return 1;;
+    *) aib_die 2 "cannot read message journal while checking id '$id' (fold code $rc): $journal";;
+  esac
+}
+
 _message_send_decide() {
   local journal="$1" to="$2" body="$3" id="$4"
   if [ -n "$id" ]; then
-    if _fold exists "$journal" "$id" >/dev/null 2>&1; then
+    if _message_id_exists "$journal" "$id"; then
       AIB_JOURNAL_ACTION=noop
       AIB_JOURNAL_RESULT="$id"
       return 0
@@ -183,7 +193,7 @@ _message_send_decide() {
   else
     while :; do
       id="msg-$(_now | tr -d ':-')-$$-${RANDOM}${RANDOM}"
-      _fold exists "$journal" "$id" >/dev/null 2>&1 || break
+      _message_id_exists "$journal" "$id" || break
     done
   fi
 
@@ -294,6 +304,8 @@ case "$sub" in
     # chain has a gap at exactly the action that creates work for another agent. It sits
     # after to: and before the state marker, because the body runs to end of line.
     aib_journal_commit "$to_path.lock" "$to_path" _message_send_decide "$to" "$body" "$id"
+    [ -n "$AIB_JOURNAL_COMMIT_RESULT" ] || aib_die 2 "send committed without a message id"
+    printf '%s\n' "$AIB_JOURNAL_COMMIT_RESULT"
     ;;
 
   # -------------------------------------------------------------------------- #
