@@ -20,14 +20,18 @@ any external runtime (CAO = inspiration, not a dependency).
   (from registry) via a **configurable wakeup hook** (`AIBOBNET_WAKEUP_HOOK`; default: mux send;
   test-stubbable/capturable). Candidate discovery is lock-free and may be stale. For each candidate,
   wakeup takes the recipient inbox lock and holds it across eligibility revalidation, the hook/mux ping,
-  and the checked result append. A stale candidate therefore cannot create a second hook invocation while
-  a cooperating wakeup owns the lock. Idempotent in the non-crashing path — never re-notifies
-  NOTIFIED/terminal.
+  and the checked result append. Only one cooperating hook attempt for that recipient can run at a time.
+  After a successful or terminal result, a waiting wakeup revalidates to a no-op; after a non-terminal
+  failed attempt, it may perform the next serialized retry.
 - **Availability trade-off:** a slow or hung hook delays every cooperating mutation for that recipient
-  while the inbox lock is held. It does not block a different recipient's independently locked journal.
-- **Crash boundary:** process exit or kill releases `flock`, but a crash after the hook takes effect and
-  before its journal result is appended leaves the message eligible for retry. The retry may invoke the
-  hook again. Wakeup does not provide exactly-once external effects.
+  while the wakeup parent remains alive and holds the inbox lock. It does not block a different recipient's
+  independently locked journal. The external hook child closes its inherited lock descriptor before
+  `exec`; sending `TERM` to the wakeup parent PID therefore releases `flock` even if that child remains
+  alive.
+- **Crash boundary:** a surviving child may still produce the external effect after the parent releases the
+  lock, and a crash after the hook takes effect but before its journal result is appended leaves the message
+  eligible for retry. A later wakeup may invoke the hook again. Wakeup does not provide exactly-once
+  external effects.
 - **Bounded:** after N failed wake attempts a message is dead-lettered (visible via `bin/message dlq`), never
   infinitely re-pinged.
 - Fail-closed/fail-loud per P0; targets resolved via the registry, never env-guessed.
@@ -51,7 +55,8 @@ any external runtime (CAO = inspiration, not a dependency).
 - **Wakeup:** PERSISTED message → `bin/wakeup` → NOTIFIED appended + recipient pinged (stub hook captured in test);
   idempotent (2nd wakeup = no re-notify); bounded (exhausted → dlq).
 - **Concurrent wakeup:** two wakeups may observe the same candidate, but the recipient lock admits one
-  eligible hook invocation and result append at a time; a waiting wakeup revalidates and becomes a no-op.
+  eligible hook attempt and result append at a time. A waiter becomes a no-op after NOTIFIED or terminal
+  FAILED; after a non-terminal failed hook, it may perform the next serialized retry.
 - **Adapter parity:** each `/send /inbox /seen /done /fail /state /dlq` yields the SAME journal state as the
   equivalent `bin/message` call (adapter ≡ CLI).
 - **Hardening:** daemon binds `127.0.0.1` only; missing/wrong auth token → rejected; no default token.

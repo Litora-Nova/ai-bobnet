@@ -44,8 +44,20 @@ All memory mutations in one reachable namespace share one advisory lock. When `s
 configured, the lock is `<shared_memory_dir>/.aibobnet-memory.lock`; otherwise it is
 `<standup_dir>/memory/.aibobnet-memory.lock`. The writer takes an exclusive `flock`, folds every journal
 needed for the decision, revalidates the operation, and performs one checked append before releasing the
-lock. This common lock makes ID uniqueness and lifecycle decisions atomic across the agent, project, and
-shared journals visible in that namespace. Lock or append failure is loud and never reported as committed.
+lock. This common lock makes the supported scope-aware collision scan and append atomic. Lock or append
+failure is loud and never reported as committed.
+
+The collision set expands with the proposed scope:
+
+- `agent` checks the caller's private journal plus the project and configured shared collective journals
+  reachable by that caller.
+- `project` checks every private journal in the caller's project plus that project's collective journal
+  and the configured shared journal.
+- `shared` checks every registered project's private and project journals plus the shared journal.
+
+Two private journals owned by different agents are not jointly reachable for an `agent` proposal and may
+reuse an ID. A later `project` or `shared` proposal fails loud if that ID occurs anywhere in its broader
+collision set. IDs are therefore scope-aware, not globally unique across unrelated private journals.
 
 Record line (on `propose`):
 `TS | id:<id> | scope:<agent|project|shared> | author:<uid> | key:<key> | state:PROPOSED | <body>`
@@ -83,10 +95,10 @@ journal is authoritative.
 Anything else (a third party's un-promoted proposal) is **never** returned. Default is deny, not allow.
 
 ## 5. Idempotency & determinism
-- `id` is unique across the reachable memory namespace for writers that use the supported command path;
-  re-`propose` with an existing id = no-op (dedup). `promote`/`review` on an already-terminal or
-  already-applied id = no-op. The precondition check and append share the namespace lock, so concurrent
-  compliant retries cannot both commit.
+- `id` is unique within the target scope's collision set for writers that use the supported command path;
+  re-`propose` in the same journal with an existing PROPOSED id = no-op (dedup). `promote`/`review` on an
+  already-terminal or already-applied id = no-op. The scope-aware collision check, lifecycle precondition,
+  and append share the namespace lock, so concurrent compliant retries cannot both commit.
 - Explicit IDs; no `date +%N`-random guessing for identity. Bash/awk plus util-linux `flock`;
   fail-closed (exit 3 unresolved / exit 5 ambiguous) + fail-loud on every refusal, per P0.
 
@@ -111,8 +123,11 @@ Cryptographic integrity and an OS-enforced writer boundary remain future work.
   (recallable cross-project). Missing `shared_memory_dir` ⇒ fail-closed, loud.
 - **Poisoning contained:** a rejected proposal never surfaces in `recall`; remains auditable in the journal.
 - **Idempotency:** double-propose (same id) = one record; double-promote = no error/effect.
-- **Concurrency:** simultaneous proposals with one id commit one record across the reachable namespace;
-  simultaneous reviews/promotions are revalidated under the namespace lock.
+- **Scope-aware IDs:** private journals for different agents may reuse an id; a project proposal rejects an
+  id found in any private journal in its project, and a shared proposal rejects an id found in any private
+  or project journal of any registered project.
+- **Concurrency:** simultaneous proposals with one id commit at most one record within the applicable
+  scope-aware collision set; simultaneous reviews/promotions are revalidated under the namespace lock.
 - **Failure:** lock acquisition and append failures are loud and never reported as committed memory.
 - **Governance untouched:** memory is never consulted for routing/identity/tier — verified by construction
   (no `bin/memory` call in `bin/context`/`bin/inbox`/`bin/message`).
