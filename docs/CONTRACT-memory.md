@@ -47,6 +47,14 @@ needed for the decision, revalidates the operation, and performs one checked app
 lock. This common lock makes the supported scope-aware collision scan and append atomic. Lock or append
 failure is loud and never reported as committed.
 
+With `shared_memory_dir` configured, the common lock is registry-wide on the host: every supported memory
+mutation in every registered project takes it, including private agent-scope writes. A shared proposal's
+ID collision scan reaches every registered project's private and project journals. If a narrower writer
+used a separate lock, it could append between that cross-journal scan and the shared append, violating
+scope-aware ID uniqueness. Serializing unrelated project and private writes reduces write concurrency and
+widens the availability blast radius of a slow memory mutation. This is an accepted trade-off for atomic
+cross-journal ID uniqueness in the file-journal design.
+
 The collision set expands with the proposed scope:
 
 - `agent` checks the caller's private journal plus the project and configured shared collective journals

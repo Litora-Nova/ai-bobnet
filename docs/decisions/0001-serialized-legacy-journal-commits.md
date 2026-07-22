@@ -28,6 +28,11 @@ memory journal mutations.
 - All memory journals in one reachable namespace share a lock. When `shared_memory_dir` is configured,
   the lock is `<shared_memory_dir>/.aibobnet-memory.lock`; otherwise it is
   `<standup_dir>/memory/.aibobnet-memory.lock`.
+- With `shared_memory_dir` configured, this lock is registry-wide on the host: every supported memory
+  mutation in every registered project takes it, including private agent-scope writes. This deliberately
+  broad ordering point lets a shared proposal scan every registered private and project journal and
+  reserve an ID without racing a narrower writer. A private append protected by a separate lock could
+  otherwise occur between that cross-journal collision scan and the shared append.
 - Memory collision scans are scope-aware: private proposals check their own private and reachable
   collective journals; project proposals also check every private journal in that project; shared
   proposals check every registered project's private and project journals. Separate private journals are
@@ -94,6 +99,10 @@ and cutover plan.
 - `flock` from util-linux becomes an explicit runtime dependency.
 - The mechanism is single-host and advisory. It does not protect against hostile or accidental writers
   that bypass the supported commands.
+- A configured `shared_memory_dir` serializes all supported memory writes registry-wide, so an unrelated
+  project or private agent-scope write must wait behind the current memory mutation. The reduced write
+  concurrency and wider availability blast radius are accepted trade-offs for atomic scope-aware,
+  cross-journal ID uniqueness.
 - Process exit releases lock ownership without a stale-lock recovery protocol. In particular, `TERM` to
   the wakeup parent PID releases its inbox lock even if the external hook child remains alive, because that
   child closed the inherited lock descriptor before `exec`. The sidecar file may remain on disk and is
