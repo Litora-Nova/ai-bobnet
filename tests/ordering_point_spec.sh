@@ -108,6 +108,20 @@ prepare_barrier() {
   mkfifo "$1/events"
 }
 
+release_barrier_gates() {
+  local barrier="$1" gate gate_fd rc=0
+  for gate in "$barrier"/gate.*; do
+    [ -p "$gate" ] || continue
+    if exec {gate_fd}<>"$gate"; then
+      printf 'release\n' >&"$gate_fd" || rc=1
+      exec {gate_fd}>&- || rc=1
+    else
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
 release_after_contention() {
   local barrier="$1" mode="$2" event pid lock_path
   local attempt_count=0 held_count=0 fold_count=0 event_fd gate rc=0
@@ -143,13 +157,21 @@ release_after_contention() {
     esac
   done
   : > "$barrier/release"
-  for gate in "$barrier"/gate.*; do
-    [ -p "$gate" ] || continue
-    printf 'release\n' > "$gate"
-  done
+  release_barrier_gates "$barrier" || rc=1
   exec {event_fd}>&-
   return "$rc"
 }
+
+stale_gate_barrier="$WORK/stale-gate-barrier"
+mkdir -p "$stale_gate_barrier"
+mkfifo "$stale_gate_barrier/gate.stale"
+export -f release_barrier_gates
+if timeout 1 bash -c 'release_barrier_gates "$1"' _ "$stale_gate_barrier"; then
+  ok "barrier cleanup: a stale FIFO without a reader cannot block release"
+else
+  no "barrier cleanup: stale FIFO release blocked or failed"
+fi
+export -n -f release_barrier_gates
 
 race_m() {
   local barrier="$1" mode="$2" want="$3" agent="$4"
