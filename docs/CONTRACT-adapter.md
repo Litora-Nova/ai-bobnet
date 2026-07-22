@@ -22,7 +22,9 @@ any external runtime (CAO = inspiration, not a dependency).
   wakeup takes the recipient inbox lock and holds it across eligibility revalidation, the hook/mux ping,
   and the checked result append. Only one cooperating hook attempt for that recipient can run at a time.
   After a successful or terminal result, a waiting wakeup revalidates to a no-op; after a non-terminal
-  failed attempt, it may perform the next serialized retry.
+  failed attempt, it may perform the next serialized retry. A hook MUST NOT call `bin/wakeup` or any
+  supported command that acquires the inbox lock of the recipient it fires for — same-recipient re-entry
+  is an unbounded self-deadlock (blocking `flock -x`, no timeout; see ADR-0001).
 - **Availability trade-off:** a slow or hung hook delays every cooperating mutation for that recipient
   while the wakeup parent remains alive and holds the inbox lock. It does not block a different recipient's
   independently locked journal. The external hook child closes its inherited lock descriptor before

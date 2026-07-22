@@ -59,7 +59,9 @@ Sender/recipient are real fields — **never a free-text signature to parse.**
 - Wakeup holds the recipient inbox lock across eligibility revalidation, its configurable external hook,
   and the checked result append. This prevents simultaneous cooperating hook attempts, but a non-terminal
   failed attempt permits the next serialized retry. The trade-off is that a slow hook delays other
-  mutations for that recipient. The wakeup parent owns the lock; the hook child closes its inherited lock
+  mutations for that recipient, and a hung hook blocks them indefinitely — in particular, a hook that
+  re-enters its own recipient's inbox lock is an unbounded self-deadlock (see ADR-0001).
+  The wakeup parent owns the lock; the hook child closes its inherited lock
   descriptor before `exec`, so `TERM` to the parent PID releases `flock` even if the child remains alive.
   If the hook takes effect without a result append, a retry may invoke it again. This is not an
   exactly-once guarantee.
