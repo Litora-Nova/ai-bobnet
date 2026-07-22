@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # ai-bobnet — shared deterministic core library. SOURCE this, do not execute it.
 #
-# Contract: docs/CONTRACT.md. No external deps (no jq/python) — bash + awk + date only.
+# Contract: docs/CONTRACT.md. Runtime: bash + awk + date + util-linux flock.
 # Callers MUST set REPO_ROOT (the engine root that holds registry.json + lib/) before
 # sourcing, e.g. via the symlink-safe resolver snippet each bin/ + scripts/ entrypoint uses.
 #
@@ -16,6 +16,72 @@ aib_die() {
   local code="$1"; shift
   printf 'ai-bobnet: %s\n' "$*" >&2
   exit "$code"
+}
+
+# --- serialized journal mutation ---------------------------------------------
+# aib_journal_commit <lock_path> <journal_path> <decider_fn> [args...]
+#
+# The decider runs while the exclusive sidecar lock is held. It MUST set:
+#   AIB_JOURNAL_ACTION=append  and AIB_JOURNAL_RECORD=<one complete record>, or
+#   AIB_JOURNAL_ACTION=noop
+# It MAY set AIB_JOURNAL_RESULT. After a successful checked append (or no-op),
+# the helper publishes that value as AIB_JOURNAL_COMMIT_RESULT; the caller may
+# then print it. This prevents a caller from acknowledging an unwritten record.
+#
+# This is journal-local serialization for the legacy line protocols. It is not
+# the future event spine: it assigns no sequence, framing, cursor, or integrity
+# metadata. Locks are advisory and protect only cooperating writers.
+aib_journal_commit() {
+  local lock_path="${1:-}" journal_path="${2:-}" decider_fn="${3:-}"
+  local _aib_lock_fd rc commit_result
+  [ "$#" -ge 3 ] || aib_die 2 "journal commit requires lock path, journal path, and decider"
+  shift 3
+
+  [ -n "$lock_path" ] && [ -n "$journal_path" ] && [ -n "$decider_fn" ] ||
+    aib_die 2 "journal commit requires lock path, journal path, and decider"
+  [ -z "${AIB_JOURNAL_ACTIVE_LOCK:-}" ] ||
+    aib_die 2 "nested journal commits are not supported"
+  command -v flock >/dev/null 2>&1 ||
+    aib_die 6 "required runtime dependency not found: flock (util-linux)"
+
+  AIB_JOURNAL_COMMIT_RESULT=""
+  exec {_aib_lock_fd}>>"$lock_path" || aib_die 2 "cannot open journal lock: $lock_path"
+  flock -x "$_aib_lock_fd" || aib_die 2 "cannot acquire journal lock: $lock_path"
+
+  # These locals are dynamically visible to the decider and to a sanctioned
+  # external-child wrapper. The public command process owns the descriptor.
+  local AIB_JOURNAL_ACTIVE_LOCK="$lock_path"
+  local AIB_JOURNAL_LOCK_FD="$_aib_lock_fd"
+  local AIB_JOURNAL_ACTION=""
+  local AIB_JOURNAL_RECORD=""
+  local AIB_JOURNAL_RESULT=""
+  # A decider cannot acknowledge success directly. Unexpected output is diagnostic;
+  # only the post-commit result reaches the caller after the checked mutation below.
+  "$decider_fn" "$journal_path" "$@" >&2 || {
+    rc=$?
+    exec {_aib_lock_fd}>&- || true
+    return "$rc"
+  }
+
+  case "$AIB_JOURNAL_ACTION" in
+    append)
+      [ -n "$AIB_JOURNAL_RECORD" ] || aib_die 2 "journal decider returned an empty append record"
+      case "$AIB_JOURNAL_RECORD" in
+        *$'\n'*|*$'\r'*) aib_die 2 "journal decider returned a multi-line record";;
+      esac
+      if ! printf '%s\n' "$AIB_JOURNAL_RECORD" >> "$journal_path"; then
+        aib_die 2 "cannot append journal record: $journal_path"
+      fi
+      ;;
+    noop)
+      [ -z "$AIB_JOURNAL_RECORD" ] || aib_die 2 "journal no-op returned an append record"
+      ;;
+    *) aib_die 2 "journal decider returned no valid action";;
+  esac
+
+  commit_result="$AIB_JOURNAL_RESULT"
+  exec {_aib_lock_fd}>&- || aib_die 2 "cannot close journal lock: $lock_path"
+  AIB_JOURNAL_COMMIT_RESULT="$commit_result"
 }
 
 # --- minimal JSON string encoder (for context --json) -------------------------

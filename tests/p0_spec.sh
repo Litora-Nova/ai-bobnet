@@ -608,6 +608,14 @@ assert_fail "control: a Unicode escape for ASCII LF is refused even in an unread
 assert_grep "control: the Unicode-control refusal names the decoded-control cause" \
   "$(AIBOBNET_REGISTRY="$unicode_control" "$INBOX" acme-core 2>&1 >/dev/null)" "control character"
 
+unicode_del="$(bad_reg control-unicode-del "{ \"schema_version\": 2, $GOOD_PROJ, \"agents\": {
+  \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
+  \"display_name\": \"Core\\u007fagent_uid=acme-evil\" } } }")"
+assert_fail "control: a Unicode escape for ASCII DEL is refused even in an unread field" \
+  env AIBOBNET_REGISTRY="$unicode_del" "$INBOX" acme-core
+assert_grep "control: the Unicode-DEL refusal names the decoded-control cause" \
+  "$(AIBOBNET_REGISTRY="$unicode_del" "$INBOX" acme-core 2>&1 >/dev/null)" "control character"
+
 invalid_unicode="$(bad_reg invalid-unicode "{ \"schema_version\": 2, $GOOD_PROJ, \"agents\": {
   \"acme-core\": { \"project\": \"acme\", \"profile\": \"p\", \"clearance\": \"t1\",
   \"display_name\": \"Core\\u12xz\" } } }")"
