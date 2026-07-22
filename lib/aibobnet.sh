@@ -113,14 +113,15 @@ aib_check_registry() {
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
     7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
     10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
-    11) aib_die 2 "registry schema_version must be the JSON number 2 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
+    11) aib_die 2 "registry schema_version must be the JSON number 2 or 3 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
     12) aib_die 2 "registry contains a JSON string escape that decodes to an ASCII control character — refusing unsafe line/path data: $reg";;
     *) aib_die 2 "registry failed validation (code $rc): $reg";;
   esac
 }
 
 # --- registry parser (pure awk; no jq) ----------------------------------------
-# Schema (schema_version 2):
+# Legacy schema 2 and execution-binding schema 3 share the same strict JSON reader.
+# Schema 3 additively introduces teams plus provider/model/effort binding fields.
 #   { "schema_version": 2,
 #     "projects": { "<project_uid>": { "home":…, "standup_dir":…, "mux_session":… } },
 #     "agents":   { "<agent_uid>":   { "project":…, "profile":…, "clearance":… } } }
@@ -244,19 +245,21 @@ END {
   if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
 
   # schema_version is the compatibility gate, not decorative metadata. Only the
-  # exact JSON number 2 at depth 1 selects the grammar implemented by this parser;
-  # a nested lookalike, a string "2", or an unknown version must fail closed.
+  # exact JSON numbers 2 and 3 at depth 1 select grammars implemented by this reader;
+  # a nested lookalike, a string value, or an unknown version must fail closed.
   schema_seen=0; sdepth=0
   for (j=1; j<=ntok; j++) {
     if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { sdepth++; continue }
     if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) { sdepth--; continue }
     if (sdepth==1 && ty[j]=="S" && tok[j]=="schema_version" && ty[j+1]=="P" && tok[j+1]==":") {
       schema_seen=1
-      if (ty[j+2]!="V" || tok[j+2]!="2") exit 11
+      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3")) exit 11
+      schema_value=tok[j+2]
     }
   }
   if (!schema_seen) exit 11
   if (op=="validate") { exit 0 }
+  if (op=="schema") { print schema_value; exit 0 }
 
   # Locate the requested TOP-LEVEL section (depth 1) — a nested key of the same
   # name must never be mistaken for it.
