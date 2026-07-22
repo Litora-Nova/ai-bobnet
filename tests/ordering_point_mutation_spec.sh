@@ -111,6 +111,40 @@ expect_targeted_failure "ignored append error" "$IGNORE_APPEND" \
   'FAIL - message append failure: command fails' \
   "$WORK/ignore-append.out"
 
+# 4. Removing the duplicate-review no-op must allow a second event, which the
+# deterministic same-verdict race detects at the journal boundary.
+DUPLICATE_REVIEW="$(make_mutant duplicate-review)"
+replace_exact "$DUPLICATE_REVIEW/bin/memory" \
+  '      return 0' \
+  '      : # mutation: duplicate-review no-op removed'
+duplicate_review_mutation_rc=$?
+if [ "$duplicate_review_mutation_rc" -eq 0 ]; then
+  ok "duplicate review guard: exact mutation applied once"
+else
+  no "duplicate review guard: source anchors did not match expected shape"
+fi
+expect_targeted_failure "duplicate review guard" "$DUPLICATE_REVIEW" \
+  "$SRC_ROOT/tests/ordering_point_failures_spec.sh" \
+  'FAIL - duplicate review: exactly one REVIEWED_ACCEPT event is committed' \
+  "$WORK/duplicate-review.out"
+
+# 5. An off-by-one exhaustion guard permits one ping beyond the configured
+# budget. The concurrent near-limit race must expose that extra hook call.
+LATE_EXHAUSTION="$(make_mutant late-exhaustion)"
+replace_exact "$LATE_EXHAUSTION/bin/wakeup" \
+  '  if [ "$n" -ge "$attempt_max" ]; then' \
+  '  if [ "$n" -gt "$attempt_max" ]; then'
+late_exhaustion_mutation_rc=$?
+if [ "$late_exhaustion_mutation_rc" -eq 0 ]; then
+  ok "late wakeup exhaustion: exact mutation applied once"
+else
+  no "late wakeup exhaustion: source anchor did not match exactly once"
+fi
+expect_targeted_failure "late wakeup exhaustion" "$LATE_EXHAUSTION" \
+  "$SRC_ROOT/tests/ordering_point_spec.sh" \
+  'FAIL - concurrent wakeup exhaustion: failed hook stops at the attempt budget' \
+  "$WORK/late-exhaustion.out"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]

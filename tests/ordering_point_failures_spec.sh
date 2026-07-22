@@ -8,6 +8,7 @@ set -uo pipefail
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 SOURCE_ENGINE="${AIB_ORDERING_SOURCE_ROOT:-$SRC_ROOT}"
+printf 'ordering source engine: %s\n' "$SOURCE_ENGINE" >&2
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-ordering-failures.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -72,10 +73,13 @@ successes() {
   printf '%s\n' "$count"
 }
 
-# Pause a selected memory fold after it has read the last reachable journal.
-# Without a namespace lock both racers capture the same stale state. With the
-# lock, one racer reaches the pause and the peer waits until after its commit.
+# A flock shim reports lock identity and can park an acquired holder. Selected
+# awk folds park after capturing state. The controller releases one fold only
+# after a peer has attempted the same lock; with distinct or missing locks it
+# waits for both stale folds. Lock-only races release an acquired holder only
+# after the peer attempts its lock. No wall-clock grace decides race readiness.
 REAL_AWK="$(command -v awk)"
+REAL_FLOCK="$(command -v flock)"
 SHIM="$WORK/shim"
 mkdir -p "$SHIM"
 cat > "$SHIM/awk" <<'SH'
@@ -94,42 +98,147 @@ fi
 out="$AIB_TEST_BARRIER/out.$$"
 "$AIB_TEST_REAL_AWK" "$@" > "$out"
 rc=$?
-: > "$AIB_TEST_BARRIER/ready.$$"
-while [ ! -e "$AIB_TEST_BARRIER/release" ]; do sleep 0.01; done
+if [ "${AIB_TEST_PAUSE_FOLD:-0}" -eq 1 ] &&
+   [ ! -e "$AIB_TEST_BARRIER/release" ]; then
+  gate="$AIB_TEST_BARRIER/gate.fold.$$"
+  mkfifo "$gate"
+  exec {gate_fd}<>"$gate" || exit 98
+  printf 'fold\t%s\t-\n' "$$" > "$AIB_TEST_BARRIER/events"
+  IFS= read -r -u "$gate_fd" _release || exit 98
+  exec {gate_fd}>&- || exit 98
+fi
 cat "$out"
 exit "$rc"
 SH
 chmod +x "$SHIM/awk"
 
-release_fold_after_first() {
-  local barrier="$1" marker ticks=0
-  while [ "$ticks" -lt 500 ]; do
-    for marker in "$barrier"/ready.*; do
-      [ -e "$marker" ] && { sleep 1; : > "$barrier/release"; return 0; }
-    done
-    sleep 0.01
-    ticks=$((ticks+1))
-  done
-  : > "$barrier/release"
-  return 1
+cat > "$SHIM/flock" <<'SH'
+#!/usr/bin/env bash
+lock_fd="${!#}"
+lock_path="$(readlink "/proc/self/fd/$lock_fd" 2>/dev/null || true)"
+[ -n "$lock_path" ] || { printf 'cannot resolve test lock fd %s\n' "$lock_fd" >&2; exit 98; }
+if [ ! -e "$AIB_TEST_BARRIER/release" ]; then
+  printf 'attempt\t%s\t%s\n' "$$" "$lock_path" > "$AIB_TEST_BARRIER/events"
+fi
+"$AIB_TEST_REAL_FLOCK" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "${AIB_TEST_PAUSE_LOCK:-0}" -eq 1 ] &&
+   [ ! -e "$AIB_TEST_BARRIER/release" ]; then
+  gate="$AIB_TEST_BARRIER/gate.lock.$$"
+  mkfifo "$gate"
+  exec {gate_fd}<>"$gate" || exit 98
+  printf 'held\t%s\t%s\n' "$$" "$lock_path" > "$AIB_TEST_BARRIER/events"
+  IFS= read -r -u "$gate_fd" _release || exit 98
+  exec {gate_fd}>&- || exit 98
+fi
+exit "$rc"
+SH
+chmod +x "$SHIM/flock"
+
+prepare_barrier() {
+  mkdir -p "$1"
+  mkfifo "$1/events"
 }
 
+release_barrier_gates() {
+  local barrier="$1" gate gate_fd rc=0
+  for gate in "$barrier"/gate.*; do
+    [ -p "$gate" ] || continue
+    if exec {gate_fd}<>"$gate"; then
+      printf 'release\n' >&"$gate_fd" || rc=1
+      exec {gate_fd}>&- || rc=1
+    else
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+release_after_contention() {
+  local barrier="$1" mode="$2" event pid lock_path
+  local attempt_count=0 held_count=0 fold_count=0 event_fd gate rc=0
+  local first_lock="" second_lock=""
+  exec {event_fd}<>"$barrier/events" || return 1
+  while :; do
+    if ! IFS=$'\t' read -r -t 10 -u "$event_fd" event pid lock_path; then
+      rc=1
+      break
+    fi
+    case "$event" in
+      attempt)
+        attempt_count=$((attempt_count+1))
+        [ "$attempt_count" -ne 1 ] || first_lock="$lock_path"
+        [ "$attempt_count" -ne 2 ] || second_lock="$lock_path"
+        ;;
+      held) held_count=$((held_count+1));;
+      fold) fold_count=$((fold_count+1));;
+    esac
+    case "$mode" in
+      fold)
+        [ "$fold_count" -lt 2 ] || break
+        if [ "$attempt_count" -ge 2 ] && [ "$first_lock" = "$second_lock" ] &&
+           [ "$fold_count" -ge 1 ]; then break; fi
+        ;;
+      lock)
+        if [ "$attempt_count" -ge 2 ] && [ "$first_lock" = "$second_lock" ] &&
+           [ "$held_count" -ge 1 ]; then break; fi
+        if [ "$attempt_count" -ge 2 ] && [ "$first_lock" != "$second_lock" ] &&
+           [ "$held_count" -ge 2 ]; then break; fi
+        ;;
+      *) rc=1; break;;
+    esac
+  done
+  : > "$barrier/release"
+  release_barrier_gates "$barrier" || rc=1
+  exec {event_fd}>&-
+  return "$rc"
+}
+
+stale_gate_barrier="$WORK/stale-gate-barrier"
+mkdir -p "$stale_gate_barrier"
+mkfifo "$stale_gate_barrier/gate.stale"
+export -f release_barrier_gates
+if timeout 1 bash -c 'release_barrier_gates "$1"' _ "$stale_gate_barrier"; then
+  ok "barrier cleanup: a stale FIFO without a reader cannot block release"
+else
+  no "barrier cleanup: stale FIFO release blocked or failed"
+fi
+export -n -f release_barrier_gates
+
+retained_gate_barrier="$WORK/retained-gate-barrier"
+mkdir -p "$retained_gate_barrier"
+mkfifo "$retained_gate_barrier/gate.late-reader"
+exec {retained_gate_fd}<>"$retained_gate_barrier/gate.late-reader"
+retained_gate_value=""
+release_barrier_gates "$retained_gate_barrier"
+if IFS= read -r -t 1 -u "$retained_gate_fd" retained_gate_value &&
+   [ "$retained_gate_value" = release ]; then
+  ok "barrier cleanup: an opened receiver retains release until its late read"
+else
+  no "barrier cleanup: release was lost before the opened receiver read it"
+fi
+exec {retained_gate_fd}>&-
+
 race_mem() {
-  local barrier="$1" want="$2" agent="$3"
-  shift 3
+  local barrier="$1" want="$2" mode="$3" agent="$4"
+  local pause_fold=0 pause_lock=1
+  [ "$mode" != fold ] || { pause_fold=1; pause_lock=0; }
+  shift 4
   env PATH="$SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+    AIB_TEST_REAL_FLOCK="$REAL_FLOCK" \
     AIB_TEST_BARRIER="$barrier" AIB_TEST_FOLD_MODE=meta \
     AIB_TEST_FOLD_WANT="$want" AIB_TEST_FOLD_FILE="$SHARED_JOURNAL" \
+    AIB_TEST_PAUSE_FOLD="$pause_fold" AIB_TEST_PAUSE_LOCK="$pause_lock" \
     timeout 10 "$RUN" "$agent" -- "$MEM" "$@"
 }
 
 # 1. One explicit memory id may occupy only one reachable journal.
 cross_barrier="$WORK/cross-barrier"
-mkdir -p "$cross_barrier"
-release_fold_after_first "$cross_barrier" & cross_release_pid=$!
-race_mem "$cross_barrier" memory-cross acme-core \
+prepare_barrier "$cross_barrier"
+release_after_contention "$cross_barrier" fold & cross_release_pid=$!
+race_mem "$cross_barrier" memory-cross fold acme-core \
   propose --scope project "project racer" --id memory-cross >"$WORK/cross-project.out" 2>&1 & cross_project_pid=$!
-race_mem "$cross_barrier" memory-cross acme-core \
+race_mem "$cross_barrier" memory-cross fold acme-core \
   propose --scope shared "shared racer" --id memory-cross >"$WORK/cross-shared.out" 2>&1 & cross_shared_pid=$!
 wait "$cross_project_pid"; cross_project_rc=$?
 wait "$cross_shared_pid"; cross_shared_rc=$?
@@ -146,11 +255,11 @@ assert_streq "cross-scope propose: exactly one PROPOSED record is committed" "$c
 
 # A same-scope retry remains idempotent while sharing the same commit lock.
 retry_barrier="$WORK/retry-barrier"
-mkdir -p "$retry_barrier"
-release_fold_after_first "$retry_barrier" & retry_release_pid=$!
-race_mem "$retry_barrier" memory-retry acme-core \
+prepare_barrier "$retry_barrier"
+release_after_contention "$retry_barrier" fold & retry_release_pid=$!
+race_mem "$retry_barrier" memory-retry fold acme-core \
   propose --scope project "first retry body" --id memory-retry >"$WORK/retry-1.out" 2>&1 & retry_1_pid=$!
-race_mem "$retry_barrier" memory-retry acme-core \
+race_mem "$retry_barrier" memory-retry fold acme-core \
   propose --scope project "second retry body" --id memory-retry >"$WORK/retry-2.out" 2>&1 & retry_2_pid=$!
 wait "$retry_1_pid"; retry_1_rc=$?
 wait "$retry_2_pid"; retry_2_rc=$?
@@ -163,11 +272,11 @@ assert_streq "same-scope retry: exactly one PROPOSED record is committed" "$retr
 # 2. Conflicting reviews must serialize their state decision with the append.
 mem acme-core propose --scope project "review race" --id memory-review >/dev/null
 review_barrier="$WORK/review-barrier"
-mkdir -p "$review_barrier"
-release_fold_after_first "$review_barrier" & review_release_pid=$!
-race_mem "$review_barrier" memory-review acme-review \
+prepare_barrier "$review_barrier"
+release_after_contention "$review_barrier" lock & review_release_pid=$!
+race_mem "$review_barrier" memory-review lock acme-review \
   review memory-review accept "accept racer" >"$WORK/accept.out" 2>&1 & accept_pid=$!
-race_mem "$review_barrier" memory-review acme-second \
+race_mem "$review_barrier" memory-review lock acme-second \
   review memory-review reject "reject racer" >"$WORK/reject.out" 2>&1 & reject_pid=$!
 wait "$accept_pid"; accept_rc=$?
 wait "$reject_pid"; reject_rc=$?
@@ -178,15 +287,33 @@ assert_streq "conflicting review: exactly one command wins" \
 review_count="$(grep -Ec 'id:memory-review \| event:REVIEWED_(ACCEPT|REJECT)' "$PROJECT_JOURNAL" 2>/dev/null || true)"
 assert_streq "conflicting review: exactly one review event is committed" "$review_count" "1"
 
-# 3. Promotion retries are successful no-ops after the first serialized append.
+# 3. Duplicate reviews with the same verdict serialize to one event.
+mem acme-core propose --scope project "duplicate review race" --id memory-review-duplicate >/dev/null
+duplicate_review_barrier="$WORK/duplicate-review-barrier"
+prepare_barrier "$duplicate_review_barrier"
+release_after_contention "$duplicate_review_barrier" lock & duplicate_review_release_pid=$!
+race_mem "$duplicate_review_barrier" memory-review-duplicate lock acme-review \
+  review memory-review-duplicate accept "first accept" >"$WORK/accept-1.out" 2>&1 & accept_1_pid=$!
+race_mem "$duplicate_review_barrier" memory-review-duplicate lock acme-second \
+  review memory-review-duplicate accept "second accept" >"$WORK/accept-2.out" 2>&1 & accept_2_pid=$!
+wait "$accept_1_pid"; accept_1_rc=$?
+wait "$accept_2_pid"; accept_2_rc=$?
+wait "$duplicate_review_release_pid"; duplicate_review_release_rc=$?
+assert_streq "duplicate review: the lock release was reached" "$duplicate_review_release_rc" "0"
+assert_streq "duplicate review: both idempotent commands succeed" "$accept_1_rc:$accept_2_rc" "0:0"
+duplicate_review_count="$(grep -cF 'id:memory-review-duplicate | event:REVIEWED_ACCEPT' "$PROJECT_JOURNAL" 2>/dev/null || true)"
+assert_streq "duplicate review: exactly one REVIEWED_ACCEPT event is committed" \
+  "$duplicate_review_count" "1"
+
+# 4. Promotion retries are successful no-ops after the first serialized append.
 mem acme-core propose --scope project "promotion race" --id memory-promote >/dev/null
 mem acme-review review memory-promote accept >/dev/null
 promote_barrier="$WORK/promote-barrier"
-mkdir -p "$promote_barrier"
-release_fold_after_first "$promote_barrier" & promote_release_pid=$!
-race_mem "$promote_barrier" memory-promote acme-review \
+prepare_barrier "$promote_barrier"
+release_after_contention "$promote_barrier" lock & promote_release_pid=$!
+race_mem "$promote_barrier" memory-promote lock acme-review \
   promote memory-promote >"$WORK/promote-1.out" 2>&1 & promote_1_pid=$!
-race_mem "$promote_barrier" memory-promote acme-second \
+race_mem "$promote_barrier" memory-promote lock acme-second \
   promote memory-promote >"$WORK/promote-2.out" 2>&1 & promote_2_pid=$!
 wait "$promote_1_pid"; promote_1_rc=$?
 wait "$promote_2_pid"; promote_2_rc=$?
@@ -196,7 +323,7 @@ assert_streq "parallel promote: both idempotent commands succeed" "$promote_1_rc
 promote_count="$(grep -cF 'id:memory-promote | event:PROMOTED' "$PROJECT_JOURNAL" 2>/dev/null || true)"
 assert_streq "parallel promote: exactly one PROMOTED event is committed" "$promote_count" "1"
 
-# 4. Failure to open the delivery lock must fail before acknowledging the id.
+# 5. Failure to open the delivery lock must fail before acknowledging the id.
 LOCKFAIL_INBOX="$STATE/beta/standup/inbox/beta-lockfail.md"
 mkdir -p "$(dirname "$LOCKFAIL_INBOX")" "$LOCKFAIL_INBOX.lock"
 timeout 5 "$RUN" acme-core -- "$MSG" send beta-lockfail "lock failure" --id message-lockfail \
@@ -206,7 +333,7 @@ assert_nonzero "message lock-open failure: command fails" "$message_lockfail_rc"
 assert_streq "message lock-open failure: no id is printed" "$(cat "$WORK/message-lockfail.out")" ""
 assert_absent "message lock-open failure: no journal record is committed" "$LOCKFAIL_INBOX" "id:message-lockfail"
 
-# 5. A checked append must fail loudly and never print a success id. A symlink
+# 6. A checked append must fail loudly and never print a success id. A symlink
 # to the finite, readable, non-appendable procfs status file reaches the append
 # after the normal pre-append fold without depending on the test user's uid.
 WRITEFAIL_INBOX="$STATE/beta/standup/inbox/beta-writefail.md"
@@ -219,7 +346,7 @@ assert_nonzero "message append failure: command fails" "$message_writefail_rc"
 assert_streq "message append failure: no id is printed" "$(cat "$WORK/message-writefail.out")" ""
 assert_nonempty_file "message append failure: a diagnostic is printed" "$WORK/message-writefail.err"
 
-# 6. A wakeup hook runs inside the recipient mutation boundary. A concurrent
+# 7. A wakeup hook runs inside the recipient mutation boundary. A concurrent
 # recipient mutation must wait. Killing only the wakeup parent must release the
 # lock even while its blocked hook child remains alive; inherited lock handles
 # must not let an orphaned external process stall future journal mutations.
@@ -285,7 +412,7 @@ else
   kill -TERM "$hook_pid" 2>/dev/null || true
 fi
 
-# 7. Explicit memory ids are engine-global collision keys, including project
+# 8. Explicit memory ids are engine-global collision keys, including project
 # and private journals that are not otherwise readable by the proposing agent.
 mem acme-core propose --scope project "global project id" --id global-project-id >/dev/null
 mem beta-review propose --scope shared "must collide with acme project" --id global-project-id \
