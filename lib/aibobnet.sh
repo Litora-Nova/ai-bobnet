@@ -92,6 +92,31 @@ aib_json() {
   printf '"%s"' "$s"
 }
 
+# Append a heartbeat from an already-resolved managed bundle without reopening
+# the registry. This preserves scripts/log.sh's status and line-encoding contract;
+# it does not turn the caller or run-agent into a security boundary.
+aib_log_resolved() {
+  local standup_dir="${1:-}" agent="${2:-}" status="${3:-}" msg="${4:-}" ts
+  [ -n "$standup_dir" ] && [ -n "$agent" ] && [ -n "$status" ] && [ -n "$msg" ] ||
+    aib_die 64 'usage: aib_log_resolved <standup_dir> <agent_uid> <busy|idle|blocked|done> "<one line>"'
+  aib_validate_agent_uid "$agent"
+  case "$status" in
+    busy|idle|blocked|done) ;;
+    *) aib_die 64 "invalid status '$status' (expected: busy|idle|blocked|done)";;
+  esac
+  case "$standup_dir" in
+    *$'\n'*|*$'\r'*) aib_die 4 "invalid pre-resolved standup_dir (contains a line break)";;
+  esac
+
+  msg="${msg//$'\n'/ }"
+  msg="${msg//$'\r'/ }"
+  msg="${msg//|/%7C}"
+  mkdir -p -- "$standup_dir" || aib_die 2 "cannot create standup_dir: $standup_dir"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '%s | %s | %s | %s\n' "$ts" "$agent" "$status" "$msg" >> "$standup_dir/$agent.log" ||
+    aib_die 2 "cannot append heartbeat log: $standup_dir/$agent.log"
+}
+
 # --- registry location --------------------------------------------------------
 # AIBOBNET_REGISTRY overrides for advanced/local use; otherwise the canonical
 # location is <REPO_ROOT>/registry.json. (bin/run-agent scrubs AIBOBNET_* by
@@ -100,14 +125,35 @@ aib_registry_file() {
   printf '%s\n' "${AIBOBNET_REGISTRY:-$REPO_ROOT/registry.json}"
 }
 
+# Read one registry generation into the calling function's dynamically scoped
+# AIB_REGISTRY_SNAPSHOT. Managed resolution must never reopen the mutable file
+# between identity, clearance, team, and binding lookups.
+aib_load_registry_snapshot() {
+  local reg
+  reg="$(aib_registry_file)"
+  [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
+  AIB_REGISTRY_SNAPSHOT="$(<"$reg")" || aib_die 2 "cannot read registry snapshot: $reg"
+}
+
+aib_registry_awk() {
+  local sect="$1" op="$2" uid="${3:-}" field="${4:-}" reg
+  if [ "${AIB_REGISTRY_SNAPSHOT+x}" = x ]; then
+    printf '%s\n' "$AIB_REGISTRY_SNAPSHOT" |
+      awk -v sect="$sect" -v op="$op" -v uid="$uid" -v field="$field" "$_AIB_AWK"
+    return
+  fi
+  reg="$(aib_registry_file)"
+  [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
+  awk -v sect="$sect" -v op="$op" -v uid="$uid" -v field="$field" "$_AIB_AWK" "$reg"
+}
+
 # Validate the registry ONCE, loudly, at the top level of every entrypoint. Every
 # query re-runs the same structural pass (defence in depth), but a query is often
 # consumed in `if !` or `$( )`, where a die could not abort — so the clear, actionable
 # message has to come from here.
 aib_check_registry() {
   local reg rc=0; reg="$(aib_registry_file)"
-  [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
-  awk -v sect=projects -v op=validate -v uid="" -v field="" "$_AIB_AWK" "$reg" || rc=$?
+  aib_registry_awk projects validate "" "" || rc=$?
   case "$rc" in
     0) ;;
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
@@ -324,10 +370,11 @@ END {
 
 # aib_registry_query <projects|agents> <keys|has|field> [uid] [field]
 aib_registry_query() {
-  local sect="$1" op="$2" uid="${3:-}" field="${4:-}" reg
-  reg="$(aib_registry_file)"
-  [ -r "$reg" ] || aib_die 2 "registry not found or unreadable: $reg"
-  awk -v sect="$sect" -v op="$op" -v uid="$uid" -v field="$field" "$_AIB_AWK" "$reg"
+  aib_registry_awk "$1" "$2" "${3:-}" "${4:-}"
+}
+
+aib_registry_schema_version() {
+  aib_registry_query projects schema
 }
 
 aib_require_project() {
@@ -361,6 +408,29 @@ aib_agent_field() {
   printf '%s\n' "$v"
 }
 
+# Read an optional field from the active registry snapshot without confusing
+# absence with an invalid present value. Returns 4 only for true absence; every
+# present-empty, non-string, or undecodable value fails closed here.
+aib_snapshot_field() {
+  local sect="$1" uid="$2" field="$3" label="$4" value rc=0
+  value="$(aib_registry_query "$sect" field "$uid" "$field")" || rc=$?
+  case "$rc" in
+    0)
+      [ -n "$value" ] || aib_die 3 "registry: $label field '$field' is present but empty"
+      AIB_SNAPSHOT_FIELD_VALUE="$value"
+      return 0
+      ;;
+    4)
+      AIB_SNAPSHOT_FIELD_VALUE=""
+      return 4
+      ;;
+    8)  aib_die 2 "registry: $label field '$field' is not a JSON string";;
+    10) aib_die 2 "registry: $label field '$field' uses a \\u escape this parser cannot decode — write it as raw UTF-8";;
+    3)  aib_die 3 "registry: unknown $label";;
+    *)  aib_die 2 "registry: cannot read $label field '$field' (code $rc)";;
+  esac
+}
+
 # --- identity validation ------------------------------------------------------
 aib_validate_token() {
   # single id token (project_uid, agent_key, profile, actor label):
@@ -392,6 +462,41 @@ aib_validate_clearance() {
     t1|t2|t3|t4) ;;
     *) aib_die 4 "invalid $what '$c' (expected: t1|t2|t3|t4)";;
   esac
+}
+
+aib_validate_provider() {
+  local provider="$1"
+  [ "${#provider}" -le 64 ] || aib_die 4 "invalid provider '$provider' (maximum: 64 bytes)"
+  aib_validate_token "$provider" provider
+}
+
+aib_validate_model() {
+  local model="$1"
+  [ -n "$model" ] && [ "${#model}" -le 256 ] ||
+    aib_die 4 "invalid model '$model' (expected 1-256 bytes)"
+  case "$model" in
+    *[!A-Za-z0-9._:/-]*)
+      aib_die 4 "invalid model '$model' (allowed: letters, digits, dot, underscore, colon, slash, hyphen)"
+      ;;
+  esac
+}
+
+# Effort semantics belong to the selected provider adapter. The core constrains
+# the registry transport to a small token; Lane B applies Codex's closed enum.
+aib_validate_effort() {
+  local effort="$1"
+  [ "${#effort}" -le 64 ] || aib_die 4 "invalid effort '$effort' (maximum: 64 bytes)"
+  aib_validate_token "$effort" effort
+}
+
+aib_validate_team_uid() {
+  local team="$1" project="$2" key
+  aib_validate_agent_uid "$team"
+  case "$team" in
+    "$project"-*) key="${team#"$project"-}";;
+    *) aib_die 5 "registry inconsistent: team_uid '$team' does not match project '$project'";;
+  esac
+  aib_validate_token "$key" team_key
 }
 
 # --- resolve an agent_uid via the registry (deterministic, fail-closed) -------
@@ -435,6 +540,111 @@ aib_split_agent() {
   AIB_AGENT_KEY="$key"
   AIB_PROFILE="$profile"
   AIB_CLEARANCE="$clearance"
+}
+
+# Resolve one binding field independently through agent -> direct team -> project.
+# Sets AIB_RESOLVED_VALUE and AIB_RESOLVED_SOURCE. All lookups use the caller's
+# immutable AIB_REGISTRY_SNAPSHOT; only a truly absent field falls through.
+aib_resolve_binding_field() {
+  local field="$1" agent="$2" team="$3" project="$4"
+
+  if aib_snapshot_field agents "$agent" "$field" "agent '$agent'"; then
+    AIB_RESOLVED_VALUE="$AIB_SNAPSHOT_FIELD_VALUE"
+    AIB_RESOLVED_SOURCE="agent:$agent"
+    return 0
+  fi
+  if [ -n "$team" ] && aib_snapshot_field teams "$team" "$field" "team '$team'"; then
+    AIB_RESOLVED_VALUE="$AIB_SNAPSHOT_FIELD_VALUE"
+    AIB_RESOLVED_SOURCE="team:$team"
+    return 0
+  fi
+  if aib_snapshot_field projects "$project" "$field" "project '$project'"; then
+    AIB_RESOLVED_VALUE="$AIB_SNAPSHOT_FIELD_VALUE"
+    AIB_RESOLVED_SOURCE="project:$project"
+    return 0
+  fi
+  aib_die 3 "registry: execution binding field '$field' is absent at agent, direct team, and project levels"
+}
+
+# aib_resolve_agent_snapshot <agent_uid> <legacy|managed>
+#
+# Reads and validates exactly one registry snapshot, then resolves identity,
+# clearance, paths, direct-team membership, and (for schema 3) execution binding.
+# This is a context bundle, not a security boundary or reference monitor.
+aib_resolve_agent_snapshot() {
+  local agent="$1" mode="${2:-legacy}" schema team="" team_project
+  local provider provider_source model model_source effort effort_source
+  local AIB_REGISTRY_SNAPSHOT
+
+  case "$mode" in
+    legacy|managed) ;;
+    *) aib_die 64 "invalid resolver mode '$mode' (expected: legacy|managed)";;
+  esac
+
+  aib_load_registry_snapshot
+  aib_check_registry
+  schema="$(aib_registry_schema_version)" || aib_die 2 "registry: cannot read schema_version"
+  if [ "$mode" = managed ] && [ "$schema" != 3 ]; then
+    aib_die 3 "managed execution binding requires registry schema_version 3 (found $schema)"
+  fi
+
+  aib_split_agent "$agent"
+  AIB_AGENT_UID="$agent"
+  AIB_REGISTRY_SCHEMA_VERSION="$schema"
+  AIB_TEAM_UID=""
+  AIB_PROVIDER=""
+  AIB_PROVIDER_SOURCE=""
+  AIB_MODEL=""
+  AIB_MODEL_SOURCE=""
+  AIB_EFFORT=""
+  AIB_EFFORT_SOURCE=""
+
+  AIB_HOME="$(aib_project_field "$AIB_PROJECT_UID" home)"
+  AIB_STANDUP_DIR="$(aib_project_field "$AIB_PROJECT_UID" standup_dir)"
+  AIB_MUX_SESSION="$(aib_project_field "$AIB_PROJECT_UID" mux_session)"
+  AIB_INBOX_PATH="${AIB_STANDUP_DIR}/inbox/${agent}.md"
+
+  # Schema 2 remains a legacy identity/context format. It never invents binding.
+  [ "$schema" = 3 ] || return 0
+
+  if aib_snapshot_field agents "$agent" team_uid "agent '$agent'"; then
+    team="$AIB_SNAPSHOT_FIELD_VALUE"
+    aib_validate_team_uid "$team" "$AIB_PROJECT_UID"
+    if ! aib_registry_query teams has "$team"; then
+      aib_die 3 "registry: agent '$agent' names unknown direct team '$team'"
+    fi
+    if ! aib_snapshot_field teams "$team" project "team '$team'"; then
+      aib_die 3 "registry: team '$team' has no project"
+    fi
+    team_project="$AIB_SNAPSHOT_FIELD_VALUE"
+    aib_validate_token "$team_project" "project of team '$team'"
+    [ "$team_project" = "$AIB_PROJECT_UID" ] || aib_die 5 \
+      "registry inconsistent: team '$team' belongs to project '$team_project', not '$AIB_PROJECT_UID'"
+    AIB_TEAM_UID="$team"
+  fi
+
+  aib_resolve_binding_field provider "$agent" "$team" "$AIB_PROJECT_UID"
+  provider="$AIB_RESOLVED_VALUE"; provider_source="$AIB_RESOLVED_SOURCE"
+  aib_validate_provider "$provider"
+
+  aib_resolve_binding_field model "$agent" "$team" "$AIB_PROJECT_UID"
+  model="$AIB_RESOLVED_VALUE"; model_source="$AIB_RESOLVED_SOURCE"
+  aib_validate_model "$model"
+
+  aib_resolve_binding_field effort "$agent" "$team" "$AIB_PROJECT_UID"
+  effort="$AIB_RESOLVED_VALUE"; effort_source="$AIB_RESOLVED_SOURCE"
+  aib_validate_effort "$effort"
+
+  AIB_PROVIDER="$provider"
+  AIB_PROVIDER_SOURCE="$provider_source"
+  AIB_MODEL="$model"
+  AIB_MODEL_SOURCE="$model_source"
+  AIB_EFFORT="$effort"
+  AIB_EFFORT_SOURCE="$effort_source"
+}
+
+aib_resolve_managed_agent() {
+  aib_resolve_agent_snapshot "$1" managed
 }
 
 # --- optional actor label (on_behalf_of; DOMAIN §2 "Ephemeral helpers") -------

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ai-bobnet — fail-closed launcher. Kills ambient-env foreign-routing (the #1 field bug).
+# ai-bobnet — fail-closed context wrapper. This is NOT a security boundary or
+# reference monitor: the final command remains an unrestricted exec.
 # Usage: run-agent [--as <actor-label>] <agent_uid> -- <cmd...>
 #   1. Scrub inherited routing env (STANDUP_DIR, INBOX*, MUX*, BOOT_*, PROJECT_*, AIBOBNET_*).
 #   2. Resolve + validate the target context from the registry (authority; env-independent).
@@ -56,16 +57,14 @@ for _v in $(compgen -v); do
   esac
 done
 
-aib_check_registry
-
-# --- resolve + validate the TARGET context (from the canonical registry) -----
-aib_split_agent "$agent"     # -> AIB_PROJECT_UID, AIB_AGENT_KEY, AIB_PROFILE, AIB_CLEARANCE
+# --- resolve + validate one TARGET snapshot from the canonical registry ------
+aib_resolve_agent_snapshot "$agent" legacy
 proj="$AIB_PROJECT_UID"
 agent_key="$AIB_AGENT_KEY"
-home="$(aib_project_field "$proj" home)"
-standup_dir="$(aib_project_field "$proj" standup_dir)"
-mux_session="$(aib_project_field "$proj" mux_session)"
-inbox_path="${standup_dir}/inbox/${agent}.md"
+home="$AIB_HOME"
+standup_dir="$AIB_STANDUP_DIR"
+mux_session="$AIB_MUX_SESSION"
+inbox_path="$AIB_INBOX_PATH"
 
 # --- export the clean, validated context, then exec --------------------------
 export AIBOBNET_PROJECT_UID="$proj"
@@ -78,6 +77,18 @@ export AIBOBNET_STANDUP_DIR="$standup_dir"
 export AIBOBNET_MUX_SESSION="$mux_session"
 export AIBOBNET_INBOX_PATH="$inbox_path"
 export STANDUP_DIR="$standup_dir"   # validated value, for ported tools that read it
+
+# Schema 3 supplies one registry-resolved execution bundle. These values remain
+# observability/context only here; run-agent does not enforce provider behavior.
+if [ "$AIB_REGISTRY_SCHEMA_VERSION" = 3 ]; then
+  export AIBOBNET_PROVIDER="$AIB_PROVIDER"
+  export AIBOBNET_PROVIDER_SOURCE="$AIB_PROVIDER_SOURCE"
+  export AIBOBNET_MODEL="$AIB_MODEL"
+  export AIBOBNET_MODEL_SOURCE="$AIB_MODEL_SOURCE"
+  export AIBOBNET_EFFORT="$AIB_EFFORT"
+  export AIBOBNET_EFFORT_SOURCE="$AIB_EFFORT_SOURCE"
+  export AIBOBNET_REGISTRY_SCHEMA_VERSION="$AIB_REGISTRY_SCHEMA_VERSION"
+fi
 
 # Audit-only: who is acting on the parent agent's behalf. Never a routing input.
 [ -z "$actor" ] || export AIBOBNET_ACTOR="$actor"
