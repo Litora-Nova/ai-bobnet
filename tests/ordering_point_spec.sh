@@ -47,10 +47,13 @@ assert_streq() {
   if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi
 }
 
-# Pause only the selected message fold, after awk has captured its result. The
-# release delay starts when the first racer arrives. With no lock, the peer also
-# captures stale state before release. With a lock, the peer folds after append.
+# A flock shim reports lock identity and can park an acquired holder. Selected
+# awk folds park after capturing state. The controller releases one fold only
+# after a peer has attempted the same lock; with distinct or missing locks it
+# waits for both stale folds. Lock-only races release an acquired holder only
+# after the peer attempts its lock. No wall-clock grace decides race readiness.
 REAL_AWK="$(command -v awk)"
+REAL_FLOCK="$(command -v flock)"
 SHIM="$WORK/shim"
 mkdir -p "$SHIM"
 cat > "$SHIM/awk" <<'SH'
@@ -67,43 +70,101 @@ fi
 out="$AIB_TEST_BARRIER/out.$$"
 "$AIB_TEST_REAL_AWK" "$@" > "$out"
 rc=$?
-: > "$AIB_TEST_BARRIER/ready.$$"
-while [ ! -e "$AIB_TEST_BARRIER/release" ]; do sleep 0.01; done
+if [ "${AIB_TEST_PAUSE_FOLD:-0}" -eq 1 ] &&
+   [ ! -e "$AIB_TEST_BARRIER/release" ]; then
+  gate="$AIB_TEST_BARRIER/gate.fold.$$"
+  mkfifo "$gate"
+  printf 'fold\t%s\t-\n' "$$" > "$AIB_TEST_BARRIER/events"
+  IFS= read -r _release < "$gate"
+fi
 cat "$out"
 exit "$rc"
 SH
 chmod +x "$SHIM/awk"
 
-release_fold_after_first() {
-  local barrier="$1" marker ticks=0
-  while [ "$ticks" -lt 500 ]; do
-    for marker in "$barrier"/ready.*; do
-      if [ -e "$marker" ]; then
-        sleep 1
-        : > "$barrier/release"
-        return 0
-      fi
-    done
-    sleep 0.01
-    ticks=$((ticks+1))
+cat > "$SHIM/flock" <<'SH'
+#!/usr/bin/env bash
+lock_fd="${!#}"
+lock_path="$(readlink "/proc/self/fd/$lock_fd" 2>/dev/null || true)"
+[ -n "$lock_path" ] || { printf 'cannot resolve test lock fd %s\n' "$lock_fd" >&2; exit 98; }
+if [ ! -e "$AIB_TEST_BARRIER/release" ]; then
+  printf 'attempt\t%s\t%s\n' "$$" "$lock_path" > "$AIB_TEST_BARRIER/events"
+fi
+"$AIB_TEST_REAL_FLOCK" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "${AIB_TEST_PAUSE_LOCK:-0}" -eq 1 ] &&
+   [ ! -e "$AIB_TEST_BARRIER/release" ]; then
+  gate="$AIB_TEST_BARRIER/gate.lock.$$"
+  mkfifo "$gate"
+  printf 'held\t%s\t%s\n' "$$" "$lock_path" > "$AIB_TEST_BARRIER/events"
+  IFS= read -r _release < "$gate"
+fi
+exit "$rc"
+SH
+chmod +x "$SHIM/flock"
+
+prepare_barrier() {
+  mkdir -p "$1"
+  mkfifo "$1/events"
+}
+
+release_after_contention() {
+  local barrier="$1" mode="$2" event pid lock_path
+  local attempt_count=0 held_count=0 fold_count=0 event_fd gate rc=0
+  local first_lock="" second_lock=""
+  exec {event_fd}<>"$barrier/events" || return 1
+  while :; do
+    if ! IFS=$'\t' read -r -t 10 -u "$event_fd" event pid lock_path; then
+      rc=1
+      break
+    fi
+    case "$event" in
+      attempt)
+        attempt_count=$((attempt_count+1))
+        [ "$attempt_count" -ne 1 ] || first_lock="$lock_path"
+        [ "$attempt_count" -ne 2 ] || second_lock="$lock_path"
+        ;;
+      held) held_count=$((held_count+1));;
+      fold) fold_count=$((fold_count+1));;
+    esac
+    case "$mode" in
+      fold)
+        [ "$fold_count" -lt 2 ] || break
+        if [ "$attempt_count" -ge 2 ] && [ "$first_lock" = "$second_lock" ] &&
+           [ "$fold_count" -ge 1 ]; then break; fi
+        ;;
+      lock)
+        if [ "$attempt_count" -ge 2 ] && [ "$first_lock" = "$second_lock" ] &&
+           [ "$held_count" -ge 1 ]; then break; fi
+        if [ "$attempt_count" -ge 2 ] && [ "$first_lock" != "$second_lock" ] &&
+           [ "$held_count" -ge 2 ]; then break; fi
+        ;;
+      *) rc=1; break;;
+    esac
   done
   : > "$barrier/release"
-  return 1
+  for gate in "$barrier"/gate.*; do
+    [ -p "$gate" ] || continue
+    printf 'release\n' > "$gate"
+  done
+  exec {event_fd}>&-
+  return "$rc"
 }
 
 race_m() {
   local barrier="$1" mode="$2" want="$3" agent="$4"
   shift 4
   env PATH="$SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+    AIB_TEST_REAL_FLOCK="$REAL_FLOCK" \
     AIB_TEST_BARRIER="$barrier" AIB_TEST_FOLD_MODE="$mode" \
-    AIB_TEST_FOLD_WANT="$want" \
+    AIB_TEST_FOLD_WANT="$want" AIB_TEST_PAUSE_FOLD=1 AIB_TEST_PAUSE_LOCK=0 \
     "$RUN" "$agent" -- "$MSG" "$@"
 }
 
 # 1. Concurrent idempotent sends must commit one PERSISTED record.
 send_barrier="$WORK/send-barrier"
-mkdir -p "$send_barrier"
-release_fold_after_first "$send_barrier" & send_release_pid=$!
+prepare_barrier "$send_barrier"
+release_after_contention "$send_barrier" fold & send_release_pid=$!
 race_m "$send_barrier" exists send-race acme-core \
   send beta-review "first sender" --id send-race >"$WORK/send-1.out" 2>&1 & send_1=$!
 race_m "$send_barrier" exists send-race acme-core \
@@ -119,8 +180,8 @@ assert_streq "parallel send: exactly one PERSISTED record is committed" "$send_c
 # 2. Concurrent terminal transitions must have one winner.
 m acme-core send beta-review "terminal race" --id terminal-race >/dev/null
 terminal_barrier="$WORK/terminal-barrier"
-mkdir -p "$terminal_barrier"
-release_fold_after_first "$terminal_barrier" & terminal_release_pid=$!
+prepare_barrier "$terminal_barrier"
+release_after_contention "$terminal_barrier" fold & terminal_release_pid=$!
 race_m "$terminal_barrier" state terminal-race beta-review \
   done terminal-race >"$WORK/done.out" 2>&1 & done_pid=$!
 race_m "$terminal_barrier" state terminal-race beta-review \
@@ -137,32 +198,21 @@ assert_streq "parallel terminal: exactly one terminal event is committed" "$term
 m acme-core send beta-review "wakeup race" --id wake-race >/dev/null
 HOOK="$WORK/slow-success-hook"
 HOOK_LOG="$WORK/hook.log"
-HOOK_RELEASE="$WORK/hook.release"
+hook_barrier="$WORK/hook-barrier"
+prepare_barrier "$hook_barrier"
 cat > "$HOOK" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$3" >> "$AIB_TEST_HOOK_LOG"
-while [ ! -e "$AIB_TEST_HOOK_RELEASE" ]; do sleep 0.01; done
 exit 0
 SH
 chmod +x "$HOOK"
 
-release_hook_after_first() {
-  local ticks=0
-  while [ ! -s "$HOOK_LOG" ] && [ "$ticks" -lt 500 ]; do
-    sleep 0.01
-    ticks=$((ticks+1))
-  done
-  if [ ! -s "$HOOK_LOG" ]; then
-    : > "$HOOK_RELEASE"
-    return 1
-  fi
-  sleep 1
-  : > "$HOOK_RELEASE"
-}
-
-release_hook_after_first & hook_release_pid=$!
+release_after_contention "$hook_barrier" lock & hook_release_pid=$!
 for n in 1 2; do
-  env AIB_TEST_HOOK_LOG="$HOOK_LOG" AIB_TEST_HOOK_RELEASE="$HOOK_RELEASE" \
+  env PATH="$SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+    AIB_TEST_REAL_FLOCK="$REAL_FLOCK" \
+    AIB_TEST_BARRIER="$hook_barrier" AIB_TEST_PAUSE_LOCK=1 \
+    AIB_TEST_HOOK_LOG="$HOOK_LOG" \
     "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$HOOK" \
       "$WAKE" beta-review >"$WORK/wake-$n.out" 2>&1 &
   eval "wake_${n}_pid=$!"
