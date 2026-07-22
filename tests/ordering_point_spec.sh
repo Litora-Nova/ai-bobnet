@@ -9,6 +9,7 @@ set -uo pipefail
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 SOURCE_ENGINE="${AIB_ORDERING_SOURCE_ROOT:-$SRC_ROOT}"
+printf 'ordering source engine: %s\n' "$SOURCE_ENGINE" >&2
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-ordering.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
