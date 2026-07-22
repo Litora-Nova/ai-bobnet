@@ -107,14 +107,22 @@ profile, or clearance.
 One managed-resolution API owns schema-3 validation and returns one process-local bundle containing:
 
 - schema version;
-- agent and project identity, profile, and clearance;
+- agent and project identity, profile, clearance, and the resolved standup directory;
 - optional direct-team membership;
 - resolved `provider`, `model`, and `effort`;
 - the exact source level and UID for each binding field.
 
 The complete bundle comes from one validated read of one registry file generation. Identity and binding
-for one launch must not be assembled from separate reads. A provider adapter consumes this bundle; it
-must not reopen the registry, repeat precedence logic, or replace a resolved field with its own default.
+for one launch must not be assembled from separate reads. A provider adapter and the managed heartbeat
+path consume this bundle; neither may reopen the registry, repeat precedence logic, or replace a resolved
+field with its own default.
+
+Managed heartbeats use a shared pre-resolved primitive with the bundle's `agent_uid` and `standup_dir`.
+That primitive preserves the standalone logger's closed status enum and LF/CR/pipe sanitization, but does
+not authenticate the identity with a second registry read. It is an internal, process-local interface;
+there is no public flag or ambient environment input for supplying a pre-resolved heartbeat identity or
+path. Standalone `scripts/log.sh` remains registry-authenticated for callers that do not already hold a
+managed-resolution bundle.
 
 For schema 3, `bin/context` text and JSON output and the environment produced by `bin/run-agent` add these
 exact fields:
@@ -133,9 +141,20 @@ Inherited values in those environment variables are scrubbed and cannot override
 Schema-2 `bin/context` and `bin/run-agent` keep their legacy identity/context behavior but expose no
 execution binding that can authorize a managed provider launch.
 
-RM-0 exposes no registry generation or digest. It also creates no durable Attempt record. The effective
-binding may appear in a heartbeat for operator visibility, but a mutable heartbeat is neither a durable
-audit event nor historical proof of what ran.
+Before provider execution, managed launch exports the resolved schema-3 identity and binding namespace to
+the child. It removes inherited values first, including `CODEX_RUN_BIN`, so the child sees the validated
+bundle rather than ambient lookalikes. This export is context and observability, not authorization.
+The managed child receives the legacy resolved identity/path variables, `STANDUP_DIR`, every binding and
+source variable in the table above, and `AIBOBNET_TEAM_UID` (empty when the agent has no direct team).
+
+The pre-existing `AIBOBNET_REGISTRY` advanced/test locator can select the registry file that is read before
+the snapshot is created. It is not a per-field provider/model/effort override and is not forwarded to the
+provider child. RM-0 does not turn that caller-controlled registry locator into a security boundary.
+
+RM-0 exposes no registry generation or digest. It also creates no durable Attempt record or
+provider-change audit. Both remain specified target behavior. The effective binding may appear in a
+heartbeat for operator visibility, but a mutable heartbeat is neither a durable audit event nor historical
+proof of what ran.
 
 ## 4. Managed launch interfaces
 
@@ -152,11 +171,12 @@ execution binding. Exactly one prompt source is required: `--prompt`, `--prompt-
 selected by `-`.
 
 `bin/codex-run` remains a compatibility command, but it delegates to `bin/launch-agent` and does not
-open the registry or resolve a field itself. `--model` and `--effort` are refused with a migration error;
-there is no model or effort default in either command.
+open the registry or resolve a field itself. Both entry points refuse `--model` and `--effort` with a
+migration error and exit 64; there is no model or effort default in either command.
 
-The managed path ignores the ambient `CODEX_RUN_BIN` test override. The Codex adapter invokes the
-installed `codex` executable found through `PATH`; deterministic tests provide a controlled `PATH` entry.
+The former `CODEX_RUN_BIN` variable has no managed-launch role and is removed before provider execution.
+The Codex adapter invokes the installed executable named exactly `codex` through `PATH`; deterministic
+tests prepend a controlled directory containing an executable with that exact name.
 Because `PATH`, the wider inherited process environment, and raw provider execution are not brokered, the
 managed path is not an enforcement boundary.
 
@@ -175,10 +195,14 @@ A conforming RM-0 implementation proves:
 - malformed, missing, unknown, or foreign direct-team membership fails closed;
 - inherited binding variables and `CODEX_RUN_BIN` cannot become managed binding or executable authority;
 - one launch cannot mix identity or binding from two registry generations;
+- managed start and terminal heartbeats use the same resolved identity/path bundle without reopening the
+  registry, while retaining status validation and LF/CR/pipe sanitization;
+- a label containing LF, CR, or `|` still produces exactly one physical busy line and one physical terminal
+  line, with the payload sanitized rather than interpreted as structure;
 - provider changes do not alter clearance;
 - Codex argv and heartbeat use the resolved model and effort exactly;
-- model/effort overrides, schema-2 managed launch, provider mismatch, and missing or unknown adapters fail
-  before the provider stub starts;
+- model/effort overrides, schema-2 managed launch, provider mismatch, and unknown or unimplemented
+  providers fail before the provider stub starts;
 - an adapter that reopens the registry, restores a local default, or removes precedence/provenance makes
   the adversarial suite fail.
 

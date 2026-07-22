@@ -14,6 +14,7 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 | `project_uid` | one project / bobiverse | `acme` | `registry.json` → `projects` |
 | `agent_uid` | one agent instance; the routing key | `acme-core` | `registry.json` → `agents` (the object key) |
 | `agent_key` | the uid's per-project part | `core`, `review`, `infra` | derived: `agent_uid` minus the `<project_uid>-` prefix |
+| `team_uid` | optional flat direct team | `acme-engine` | schema-3 agent object → `team_uid`; never inferred |
 | `profile` | reusable task/capability set — **mutable** | `engine-dev` | the agent object's `profile` field |
 | `clearance` | the agent's trust level, `t1`–`t4` | `t2` | the agent object's `clearance` field — **never the profile** |
 | `display_name` | optional cosmetic name / avatar | (theme) | the theme layer — **never** a routing key |
@@ -26,7 +27,7 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 - The word `task` is reserved for the *Project → Run → Task → Attempt* work unit. It is **never** an
   identity token — not in an env var, not in output.
 
-### Registry shape (`schema_version: 2`)
+### Registry versions (`schema_version: 2 | 3`)
 
 ```json
 {
@@ -38,12 +39,20 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 
 - The **object key IS the `agent_uid`**. `project`, `profile` and `clearance` are mandatory;
   `project` is authoritative and is never guessed from the prefix.
-- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2`.
+- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2` or `3`.
   Missing, mistyped, nested-only, or unsupported versions fail closed before any identity resolves.
+- **Schema 2 is the legacy identity/context shape above.** Its existing commands remain supported, but it
+  cannot start a managed provider because it has no authoritative execution binding.
+- **Schema 3 adds managed execution binding.** It adds flat `teams`, optional direct `agent.team_uid`, and
+  optional `provider`, `model`, and `effort` fields at project/team/agent level. Field-wise resolution,
+  validation, provenance, migration, and rollback are normative in
+  `docs/CONTRACT-execution-binding.md`.
 - `display_name` is optional and free text (may contain spaces/unicode); it never routes.
-- Unknown extra fields are ignored (forward-compatible) and never load-bearing.
-- Registry writes are the identity *and* clearance authority — gated at a high tier and audited
-  (DOMAIN §2). Credential material is never co-located with it.
+- Unknown extra fields are ignored (forward-compatible) and never load-bearing. Schema-3 binding and team
+  fields are known and load-bearing, so they are validated when consumed.
+- Registry writes are the identity *and* clearance authority — gated at a high tier and audited in the
+  target contract (DOMAIN §2). RM-0 adds no registry writer or durable audit path. Credential material is
+  never co-located with the registry.
 
 **A malformed registry never resolves.** Because this file is the identity *and* clearance source,
 a half-written or hand-edited file must fail closed rather than hand out a wrong value:
@@ -73,13 +82,17 @@ JSON error.
 
 ## 2. Resolver — one place, no guessing
 
-`bin/context [--json]` resolves, for the **current** agent, from validated env + the registry:
+`bin/context [--json]` resolves, for the **current** agent, from validated env + one registry snapshot:
 `agent_uid · project_uid · agent_key · home · standup_dir · inbox_path · mux_session`.
 - Inputs: `AIBOBNET_PROJECT_UID` + `AIBOBNET_AGENT_KEY` (set by the launcher) → `agent_uid`; the rest
   from `registry.json`. The derived `agent_uid` is then looked up in `agents`, and the project it
   declares must match — a stale env pair cannot outvote the registry.
 - **Fail-closed:** unknown agent / missing / inconsistent context → non-zero exit + clear error.
   Never guess, never default to a foreign path.
+- Under schema 3 it additionally exposes `provider`, `model`, `effort`, their exact per-field
+  `agent:<uid> | team:<uid> | project:<uid>` sources, and `registry_schema_version=3`. The same resolved
+  bundle is used for one launch; an adapter must not reopen the registry. Under schema 2 the legacy output
+  remains available, but it is not a managed-launch binding.
 
 `bin/inbox <agent_uid>` → prints the **recipient's** inbox path (deterministic; used when writing TO another agent).
 
@@ -123,6 +136,12 @@ Exported: `AIBOBNET_PROJECT_UID · AIBOBNET_AGENT_KEY · AIBOBNET_AGENT_UID · A
 AIBOBNET_CLEARANCE · AIBOBNET_HOME · AIBOBNET_STANDUP_DIR · AIBOBNET_MUX_SESSION ·
 AIBOBNET_INBOX_PATH · STANDUP_DIR` (+ `AIBOBNET_ACTOR` when `--as` is given).
 
+For schema 3, it also exports `AIBOBNET_PROVIDER · AIBOBNET_PROVIDER_SOURCE · AIBOBNET_MODEL ·
+AIBOBNET_MODEL_SOURCE · AIBOBNET_EFFORT · AIBOBNET_EFFORT_SOURCE ·
+AIBOBNET_REGISTRY_SCHEMA_VERSION`. Inherited values in this namespace are scrubbed before resolution.
+`bin/run-agent` remains an arbitrary-command context wrapper, not a provider security boundary. Managed
+provider entry and its non-enforcement limits are defined in `docs/CONTRACT-execution-binding.md`.
+
 A leaked ambient variable must **never** route an agent into a foreign project (the #1 field bug this core exists to kill).
 
 ### 4.1 `--as <actor-label>` — `on_behalf_of`, not a new identity
@@ -149,6 +168,14 @@ behalf of an existing Agent — never a new Agent** (DOMAIN §2).
 `scripts/log.sh <agent_uid> <busy|idle|blocked|done> "<one line>"`:
 - Requires a resolvable context (agent_uid must be a registry agent → standup_dir). **Unknown/inconsistent → error + hint; never a default dir.**
 - Writes `<standup_dir>/<agent_uid>.log`. `agent_uid` is canonical; persona is display-only (the dashboard maps it via the theme).
+- Validates the closed status enum and collapses LF/CR while encoding `|` in free text before its
+  single-line append.
+
+Managed launch does not call this public entry point, because that would reopen the registry after its
+single-snapshot resolution. It uses the same shared write primitive with the already-resolved `agent_uid`
+and `standup_dir`, preserving status validation and sanitization. The pre-resolved form is internal and
+process-local, with no public flag or ambient-environment injection surface. Standalone `scripts/log.sh`
+remains registry-authenticated.
 
 ## 6. Acceptance (P0 slice)
 
@@ -159,6 +186,10 @@ in the ambient env (scrubbed by `run-agent`). Proven by `tests/`.
 Because the registry is the identity authority, **every agent that heartbeats, is woken, owns memory
 or is launched must exist in `agents`** — `bin/run-agent`, `scripts/log.sh`, `bin/wakeup` and
 `bin/memory` all fail closed on an unregistered uid. That is intended, not a regression.
+
+Schema-3 acceptance additionally proves deterministic field-wise fallback/provenance, flat direct-team
+validation, a single snapshot across identity and binding, and schema-2 refusal before managed provider
+execution. It does not claim policy or T4 enforcement.
 
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts anywhere in this repo.

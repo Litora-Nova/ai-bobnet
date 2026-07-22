@@ -38,11 +38,18 @@ Introduce registry schema 3 and a provider-neutral managed launch seam.
 - A single managed resolver reads and validates one registry snapshot and returns identity, clearance,
   membership, binding, and provenance as one process-local bundle. Adapters consume that bundle and never
   reopen the registry or apply their own precedence/defaults.
+- Managed heartbeats use the bundle's pre-resolved agent identity and standup directory through a shared
+  writer primitive; they do not call the registry-authenticated `scripts/log.sh` entry point and cause a
+  second read. The primitive retains closed status validation and LF/CR/pipe sanitization. Standalone
+  `scripts/log.sh` remains registry-authenticated. The pre-resolved primitive is internal and process-local;
+  it has no public flag or ambient-environment input.
 - `bin/launch-agent` is the supported provider-neutral entry. RM-0 implements one real adapter, `codex`.
-  Standalone `bin/codex-run` delegates into the same entry and performs no second resolution.
+  Standalone `bin/codex-run` is a thin `exec` delegator into the same entry and performs no second
+  resolution.
 - Provider is never a CLI or environment choice. Former `--model` and `--effort` options are refused with
   a migration error. Neither the launcher nor the adapter owns model/effort defaults.
-- Managed execution ignores ambient `CODEX_RUN_BIN`. Tests select a stub with a controlled `PATH`.
+- `CODEX_RUN_BIN` has no managed production or test-seam role and is removed before the provider child.
+  Tests prepend a controlled `PATH` directory containing an executable named exactly `codex`.
   Production still locates the installed `codex` executable through `PATH`.
 - Schema-3 context output and launcher environment expose the resolved values and `level:uid` provenance.
   Inherited binding variables are scrubbed before resolution.
@@ -107,6 +114,8 @@ provide the immutable Attempt history required by the target contract.
 
 - A managed launch has one deterministic registry source for provider, model, and effort, with observable
   provenance for each field.
+- Managed start and terminal heartbeats cannot drift to another registry generation, while preserving the
+  existing single-line sanitization contract.
 - Schema 3 is a deliberate compatibility boundary. Consumers must migrate registry data and former
   model/effort arguments together; rollback must restore schema 2 before an old reader runs.
 - Legacy schema-2 identity/context and arbitrary `run-agent` commands remain available, but upgraded
