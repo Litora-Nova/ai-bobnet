@@ -11,6 +11,7 @@ mkdir -p "$ENGINE"
 cp -R "$SRC_ROOT/bin" "$SRC_ROOT/lib" "$ENGINE/"
 CTX="$ENGINE/bin/context"
 RUN="$ENGINE/bin/run-agent"
+INBOX="$ENGINE/bin/inbox"
 
 pass=0; fail=0
 ok(){ pass=$((pass+1)); printf 'ok   - %s\n' "$1"; }
@@ -121,6 +122,22 @@ assert_has "env poison: model comes from team" "$run_env" "model=team/model-v2"
 assert_has "env poison: effort comes from agent" "$run_env" "effort=high"
 assert_has "env poison: schema comes from snapshot" "$run_env" "registry_schema_version=3"
 assert_lacks "env poison: no ambient binding survives" "$run_env" "evil"
+
+# Resolver snapshots are process-local state, never an ambient registry authority.
+# Both a direct legacy entrypoint and a run-agent child must reopen the canonical
+# file-backed registry rather than consume an attacker-supplied shell variable.
+AMBIENT_SNAPSHOT='{
+  "schema_version": 2,
+  "projects": { "acme": { "home": "/evil", "standup_dir": "/evil-standup", "mux_session": "evil" } },
+  "agents": { "acme-mixed": { "project": "acme", "profile": "evil", "clearance": "t4" } }
+}'
+direct_inbox="$(AIB_REGISTRY_SNAPSHOT="$AMBIENT_SNAPSHOT" "$INBOX" acme-mixed 2>/dev/null)"
+assert_eq "snapshot poison: direct legacy entrypoint uses canonical registry" \
+  "$direct_inbox" "/srv/acme/standup/inbox/acme-mixed.md"
+wrapped_inbox="$(AIB_REGISTRY_SNAPSHOT="$AMBIENT_SNAPSHOT" \
+  "$RUN" acme-mixed -- "$INBOX" acme-mixed 2>/dev/null)"
+assert_eq "snapshot poison: run-agent child uses canonical registry" \
+  "$wrapped_inbox" "/srv/acme/standup/inbox/acme-mixed.md"
 
 # Only absence falls through. Present-invalid values must fail at that level.
 invalid_case(){
