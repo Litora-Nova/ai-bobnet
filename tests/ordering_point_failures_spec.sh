@@ -247,7 +247,25 @@ assert_streq "conflicting review: exactly one command wins" \
 review_count="$(grep -Ec 'id:memory-review \| event:REVIEWED_(ACCEPT|REJECT)' "$PROJECT_JOURNAL" 2>/dev/null || true)"
 assert_streq "conflicting review: exactly one review event is committed" "$review_count" "1"
 
-# 3. Promotion retries are successful no-ops after the first serialized append.
+# 3. Duplicate reviews with the same verdict serialize to one event.
+mem acme-core propose --scope project "duplicate review race" --id memory-review-duplicate >/dev/null
+duplicate_review_barrier="$WORK/duplicate-review-barrier"
+prepare_barrier "$duplicate_review_barrier"
+release_after_contention "$duplicate_review_barrier" lock & duplicate_review_release_pid=$!
+race_mem "$duplicate_review_barrier" memory-review-duplicate lock acme-review \
+  review memory-review-duplicate accept "first accept" >"$WORK/accept-1.out" 2>&1 & accept_1_pid=$!
+race_mem "$duplicate_review_barrier" memory-review-duplicate lock acme-second \
+  review memory-review-duplicate accept "second accept" >"$WORK/accept-2.out" 2>&1 & accept_2_pid=$!
+wait "$accept_1_pid"; accept_1_rc=$?
+wait "$accept_2_pid"; accept_2_rc=$?
+wait "$duplicate_review_release_pid"; duplicate_review_release_rc=$?
+assert_streq "duplicate review: the lock release was reached" "$duplicate_review_release_rc" "0"
+assert_streq "duplicate review: both idempotent commands succeed" "$accept_1_rc:$accept_2_rc" "0:0"
+duplicate_review_count="$(grep -cF 'id:memory-review-duplicate | event:REVIEWED_ACCEPT' "$PROJECT_JOURNAL" 2>/dev/null || true)"
+assert_streq "duplicate review: exactly one REVIEWED_ACCEPT event is committed" \
+  "$duplicate_review_count" "1"
+
+# 4. Promotion retries are successful no-ops after the first serialized append.
 mem acme-core propose --scope project "promotion race" --id memory-promote >/dev/null
 mem acme-review review memory-promote accept >/dev/null
 promote_barrier="$WORK/promote-barrier"
@@ -265,7 +283,7 @@ assert_streq "parallel promote: both idempotent commands succeed" "$promote_1_rc
 promote_count="$(grep -cF 'id:memory-promote | event:PROMOTED' "$PROJECT_JOURNAL" 2>/dev/null || true)"
 assert_streq "parallel promote: exactly one PROMOTED event is committed" "$promote_count" "1"
 
-# 4. Failure to open the delivery lock must fail before acknowledging the id.
+# 5. Failure to open the delivery lock must fail before acknowledging the id.
 LOCKFAIL_INBOX="$STATE/beta/standup/inbox/beta-lockfail.md"
 mkdir -p "$(dirname "$LOCKFAIL_INBOX")" "$LOCKFAIL_INBOX.lock"
 timeout 5 "$RUN" acme-core -- "$MSG" send beta-lockfail "lock failure" --id message-lockfail \
@@ -275,7 +293,7 @@ assert_nonzero "message lock-open failure: command fails" "$message_lockfail_rc"
 assert_streq "message lock-open failure: no id is printed" "$(cat "$WORK/message-lockfail.out")" ""
 assert_absent "message lock-open failure: no journal record is committed" "$LOCKFAIL_INBOX" "id:message-lockfail"
 
-# 5. A checked append must fail loudly and never print a success id. A symlink
+# 6. A checked append must fail loudly and never print a success id. A symlink
 # to the finite, readable, non-appendable procfs status file reaches the append
 # after the normal pre-append fold without depending on the test user's uid.
 WRITEFAIL_INBOX="$STATE/beta/standup/inbox/beta-writefail.md"
@@ -288,7 +306,7 @@ assert_nonzero "message append failure: command fails" "$message_writefail_rc"
 assert_streq "message append failure: no id is printed" "$(cat "$WORK/message-writefail.out")" ""
 assert_nonempty_file "message append failure: a diagnostic is printed" "$WORK/message-writefail.err"
 
-# 6. A wakeup hook runs inside the recipient mutation boundary. A concurrent
+# 7. A wakeup hook runs inside the recipient mutation boundary. A concurrent
 # recipient mutation must wait. Killing only the wakeup parent must release the
 # lock even while its blocked hook child remains alive; inherited lock handles
 # must not let an orphaned external process stall future journal mutations.
@@ -354,7 +372,7 @@ else
   kill -TERM "$hook_pid" 2>/dev/null || true
 fi
 
-# 7. Explicit memory ids are engine-global collision keys, including project
+# 8. Explicit memory ids are engine-global collision keys, including project
 # and private journals that are not otherwise readable by the proposing agent.
 mem acme-core propose --scope project "global project id" --id global-project-id >/dev/null
 mem beta-review propose --scope shared "must collide with acme project" --id global-project-id \

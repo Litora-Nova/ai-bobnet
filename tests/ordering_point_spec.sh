@@ -227,6 +227,52 @@ assert_streq "parallel wakeup: the success hook is invoked exactly once" "$hook_
 notified_count="$(grep -cF 'id:wake-race | event:NOTIFIED' "$INBOX" 2>/dev/null || true)"
 assert_streq "parallel wakeup: exactly one NOTIFIED event is committed" "$notified_count" "1"
 
+# 4. Concurrent failed wakeups at the attempt limit must exhaust exactly once.
+m acme-core send beta-review "wakeup exhaustion race" --id wake-exhaust-race >/dev/null
+EXHAUST_HOOK="$WORK/failing-hook"
+EXHAUST_HOOK_LOG="$WORK/failing-hook.log"
+cat > "$EXHAUST_HOOK" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$3" >> "$AIB_TEST_HOOK_LOG"
+exit 1
+SH
+chmod +x "$EXHAUST_HOOK"
+
+# Leave one attempt in a budget of two, then race the two exhaustion candidates.
+env AIB_TEST_HOOK_LOG="$EXHAUST_HOOK_LOG" \
+  "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$EXHAUST_HOOK" \
+    AIBOBNET_WAKEUP_MAX_ATTEMPTS=2 "$WAKE" beta-review >/dev/null 2>&1
+exhaust_barrier="$WORK/exhaust-barrier"
+prepare_barrier "$exhaust_barrier"
+release_after_contention "$exhaust_barrier" lock & exhaust_release_pid=$!
+for n in 1 2; do
+  env PATH="$SHIM:$PATH" AIB_TEST_REAL_AWK="$REAL_AWK" \
+    AIB_TEST_REAL_FLOCK="$REAL_FLOCK" AIB_TEST_BARRIER="$exhaust_barrier" \
+    AIB_TEST_PAUSE_LOCK=1 AIB_TEST_HOOK_LOG="$EXHAUST_HOOK_LOG" \
+    "$RUN" acme-core -- env AIBOBNET_WAKEUP_HOOK="$EXHAUST_HOOK" \
+      AIBOBNET_WAKEUP_MAX_ATTEMPTS=2 "$WAKE" beta-review \
+      >"$WORK/exhaust-$n.out" 2>&1 &
+  eval "exhaust_${n}_pid=$!"
+done
+wait "$exhaust_1_pid"; exhaust_1_rc=$?
+wait "$exhaust_2_pid"; exhaust_2_rc=$?
+wait "$exhaust_release_pid"; exhaust_release_rc=$?
+assert_streq "concurrent wakeup exhaustion: the lock release was reached" \
+  "$exhaust_release_rc" "0"
+assert_streq "concurrent wakeup exhaustion: both commands complete cleanly" \
+  "$exhaust_1_rc:$exhaust_2_rc" "0:0"
+exhaust_hook_count="$(grep -cFx 'wake-exhaust-race' "$EXHAUST_HOOK_LOG" 2>/dev/null || true)"
+assert_streq "concurrent wakeup exhaustion: failed hook stops at the attempt budget" \
+  "$exhaust_hook_count" "2"
+exhaust_attempt_count="$(grep -cF '| wakeattempt:wake-exhaust-race |' "$INBOX" 2>/dev/null || true)"
+assert_streq "concurrent wakeup exhaustion: exactly two attempt records are committed" \
+  "$exhaust_attempt_count" "2"
+exhaust_failed_count="$(grep -cF 'wakeattempt:wake-exhaust-race | id:wake-exhaust-race | event:FAILED' "$INBOX" 2>/dev/null || true)"
+assert_streq "concurrent wakeup exhaustion: exactly one terminal FAILED event is committed" \
+  "$exhaust_failed_count" "1"
+assert_streq "concurrent wakeup exhaustion: final state is FAILED" \
+  "$(m beta-review state wake-exhaust-race)" "FAILED"
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]
