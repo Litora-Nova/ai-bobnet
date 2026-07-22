@@ -28,6 +28,11 @@ memory journal mutations.
 - All memory journals in one reachable namespace share a lock. When `shared_memory_dir` is configured,
   the lock is `<shared_memory_dir>/.aibobnet-memory.lock`; otherwise it is
   `<standup_dir>/memory/.aibobnet-memory.lock`.
+- With `shared_memory_dir` configured, this lock is registry-wide on the host: every supported memory
+  mutation in every registered project takes it, including private agent-scope writes. This deliberately
+  broad ordering point lets a shared proposal scan every registered private and project journal and
+  reserve an ID without racing a narrower writer. A private append protected by a separate lock could
+  otherwise occur between that cross-journal collision scan and the shared append.
 - Memory collision scans are scope-aware: private proposals check their own private and reachable
   collective journals; project proposals also check every private journal in that project; shared
   proposals check every registered project's private and project journals. Separate private journals are
@@ -38,6 +43,11 @@ memory journal mutations.
   across eligibility revalidation, the configurable hook/mux ping, and the checked result append. This
   serializes cooperating hook attempts for the same eligible state. The wakeup parent owns the lock; the
   external child closes its inherited lock descriptor before `exec`.
+- The `AIBOBNET_WAKEUP_HOOK` interface is non-reentrant for the recipient it is firing for. A hook must
+  not call `bin/wakeup` or another supported command that tries to acquire that same recipient inbox
+  lock. The parent still owns the lock while it waits for the hook, and the re-entering command uses
+  blocking `flock -x` with no timeout. The parent and re-entering command can therefore wait for each
+  other forever.
 - A lock or append failure is loud. The caller does not report a state that was not committed.
 - Read-only folds do not acquire the writer lock. They retain the existing snapshot/fold behavior and are
   explicitly not linearizable with concurrent commits.
@@ -89,13 +99,20 @@ and cutover plan.
 - `flock` from util-linux becomes an explicit runtime dependency.
 - The mechanism is single-host and advisory. It does not protect against hostile or accidental writers
   that bypass the supported commands.
+- A configured `shared_memory_dir` serializes all supported memory writes registry-wide, so an unrelated
+  project or private agent-scope write must wait behind the current memory mutation. The reduced write
+  concurrency and wider availability blast radius are accepted trade-offs for atomic scope-aware,
+  cross-journal ID uniqueness.
 - Process exit releases lock ownership without a stale-lock recovery protocol. In particular, `TERM` to
   the wakeup parent PID releases its inbox lock even if the external hook child remains alive, because that
   child closed the inherited lock descriptor before `exec`. The sidecar file may remain on disk and is
   harmless.
-- A slow or hung wakeup hook delays cooperating mutations for that recipient for as long as the wakeup
-  parent waits and holds the inbox lock. This is an explicit availability cost of preventing overlapping
-  hook attempts.
+- A slow wakeup hook delays cooperating mutations for that recipient for as long as the wakeup parent
+  waits and holds the inbox lock. A hung hook blocks them indefinitely. In particular, same-recipient
+  hook re-entry is an unbounded self-deadlock: the inner command waits forever on blocking `flock -x`
+  while the lock-owning parent waits for the hook, because lock acquisition has no timeout. Hooks must
+  not re-enter the lock of the recipient they fire for. This is an explicit availability cost of
+  preventing overlapping hook attempts.
 - A non-terminal failed wakeup attempt appends its attempt marker and permits the next serialized retry;
   only a successful or terminal result makes a waiting wakeup a no-op.
 - A crash after a wakeup hook takes effect but before its result append can cause a retry to invoke the hook
