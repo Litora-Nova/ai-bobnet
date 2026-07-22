@@ -30,3 +30,5 @@ the Python 3 standard library only; it has no pip dependency.
 - **White-label.** Ships publicly; example project id `acme`; no real names, infrastructure, or hosts.
 
 Predecessor engine: `claude-bobnet` (remains canonical until this reaches parity).
+
+Licensed under the [Apache License 2.0](LICENSE).
