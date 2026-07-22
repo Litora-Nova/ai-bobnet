@@ -38,6 +38,11 @@ memory journal mutations.
   across eligibility revalidation, the configurable hook/mux ping, and the checked result append. This
   serializes cooperating hook attempts for the same eligible state. The wakeup parent owns the lock; the
   external child closes its inherited lock descriptor before `exec`.
+- The `AIBOBNET_WAKEUP_HOOK` interface is non-reentrant for the recipient it is firing for. A hook must
+  not call `bin/wakeup` or another supported command that tries to acquire that same recipient inbox
+  lock. The parent still owns the lock while it waits for the hook, and the re-entering command uses
+  blocking `flock -x` with no timeout. The parent and re-entering command can therefore wait for each
+  other forever.
 - A lock or append failure is loud. The caller does not report a state that was not committed.
 - Read-only folds do not acquire the writer lock. They retain the existing snapshot/fold behavior and are
   explicitly not linearizable with concurrent commits.
@@ -93,9 +98,12 @@ and cutover plan.
   the wakeup parent PID releases its inbox lock even if the external hook child remains alive, because that
   child closed the inherited lock descriptor before `exec`. The sidecar file may remain on disk and is
   harmless.
-- A slow or hung wakeup hook delays cooperating mutations for that recipient for as long as the wakeup
-  parent waits and holds the inbox lock. This is an explicit availability cost of preventing overlapping
-  hook attempts.
+- A slow wakeup hook delays cooperating mutations for that recipient for as long as the wakeup parent
+  waits and holds the inbox lock. A hung hook blocks them indefinitely. In particular, same-recipient
+  hook re-entry is an unbounded self-deadlock: the inner command waits forever on blocking `flock -x`
+  while the lock-owning parent waits for the hook, because lock acquisition has no timeout. Hooks must
+  not re-enter the lock of the recipient they fire for. This is an explicit availability cost of
+  preventing overlapping hook attempts.
 - A non-terminal failed wakeup attempt appends its attempt marker and permits the next serialized retry;
   only a successful or terminal result makes a waiting wakeup a no-op.
 - A crash after a wakeup hook takes effect but before its result append can cause a retry to invoke the hook
