@@ -102,8 +102,10 @@ if [ "${AIB_TEST_PAUSE_FOLD:-0}" -eq 1 ] &&
    [ ! -e "$AIB_TEST_BARRIER/release" ]; then
   gate="$AIB_TEST_BARRIER/gate.fold.$$"
   mkfifo "$gate"
+  exec {gate_fd}<>"$gate" || exit 98
   printf 'fold\t%s\t-\n' "$$" > "$AIB_TEST_BARRIER/events"
-  IFS= read -r _release < "$gate"
+  IFS= read -r -u "$gate_fd" _release || exit 98
+  exec {gate_fd}>&- || exit 98
 fi
 cat "$out"
 exit "$rc"
@@ -124,8 +126,10 @@ if [ "$rc" -eq 0 ] && [ "${AIB_TEST_PAUSE_LOCK:-0}" -eq 1 ] &&
    [ ! -e "$AIB_TEST_BARRIER/release" ]; then
   gate="$AIB_TEST_BARRIER/gate.lock.$$"
   mkfifo "$gate"
+  exec {gate_fd}<>"$gate" || exit 98
   printf 'held\t%s\t%s\n' "$$" "$lock_path" > "$AIB_TEST_BARRIER/events"
-  IFS= read -r _release < "$gate"
+  IFS= read -r -u "$gate_fd" _release || exit 98
+  exec {gate_fd}>&- || exit 98
 fi
 exit "$rc"
 SH
@@ -200,6 +204,20 @@ else
   no "barrier cleanup: stale FIFO release blocked or failed"
 fi
 export -n -f release_barrier_gates
+
+retained_gate_barrier="$WORK/retained-gate-barrier"
+mkdir -p "$retained_gate_barrier"
+mkfifo "$retained_gate_barrier/gate.late-reader"
+exec {retained_gate_fd}<>"$retained_gate_barrier/gate.late-reader"
+retained_gate_value=""
+release_barrier_gates "$retained_gate_barrier"
+if IFS= read -r -t 1 -u "$retained_gate_fd" retained_gate_value &&
+   [ "$retained_gate_value" = release ]; then
+  ok "barrier cleanup: an opened receiver retains release until its late read"
+else
+  no "barrier cleanup: release was lost before the opened receiver read it"
+fi
+exec {retained_gate_fd}>&-
 
 race_mem() {
   local barrier="$1" want="$2" mode="$3" agent="$4"
