@@ -12,11 +12,15 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > dashboard projection remain specified but unimplemented. Until the reference monitor exists,
 > `clearance` is registry/audit data rather than an enforced authorization decision.
 >
-> **The managed-launch path is NO ENFORCEMENT.** It resolves a binding and dispatches an adapter; it does
-> not apply §7's decision function, mediate provider syscalls or arbitrary children, constrain network/VCS
-> effects, protect `PATH`, prevent raw provider execution, or make T4 decisions. It does not yet implement
-> the target §7 environment allow-list. It also creates no durable Attempt record or provider-change audit;
-> a heartbeat that shows the binding is operational visibility, not historical proof.
+> **The managed-launch path is a POLICY GATE for cooperating agents (RM-1), not containment.** A pure
+> Policy Decision Point (`aib_authorize_launch`) caps effective authority at `min(clearance, declared
+> provider capabilities)` (§2.1), resolves the adapter from an absolute registry path rather than `PATH`,
+> and constructs the child environment from the §7 allow-list via `env -i`. It is still **not** a reference
+> monitor: it does not mediate provider syscalls or arbitrary children, constrain network/VCS effects,
+> prevent a hostile local process from running a provider directly, or make T4 decisions, and the
+> capabilities it caps against are declared data, trusted rather than verified — non-bypassability is the
+> later reference monitor. It also creates no durable Attempt record or provider-change audit event; a
+> heartbeat that shows the binding is operational visibility, not historical proof. See ADR-0003.
 >
 > The delivery and memory contracts define the implemented intermediate legacy-journal commit protocol.
 > The protocol is a prelude to §6, not its implementation: it does not add sequence numbers, event
@@ -113,9 +117,12 @@ migration contract in `docs/CONTRACT-execution-binding.md`.
 - **But it can cap it.** §7 bars `soft-enforcement` runtimes from high-tier and T4 work. That bar binds
   here: an agent's **effective** authority is `min(clearance, what its provider can actually enforce)`.
   Registry clearance is therefore a ceiling, never a promise. Because this is security-relevant,
-  `provider` changes are **audited events**, like clearance changes. RM-0 does not implement this cap:
-  it resolves and records the binding but neither enforces `min(clearance, provider)` nor emits the
-  provider-change audit event.
+  `provider` changes are **audited events**, like clearance changes. RM-1 implements the cap **at the
+  managed-launch seam**: the PDP computes `min(clearance, declared provider capabilities)` and the launch
+  runs at the clamped values (see `docs/CONTRACT-execution-binding.md` §7, ADR-0003). The capabilities are
+  declared registry data, trusted rather than verified, and the cap binds only launches that pass through
+  the seam — a bypassing process is unaffected (that is the reference monitor's job). The provider-change
+  **audit event** is still not emitted; a durable record awaits the Attempt/event spine.
 - **An Attempt records the resolved binding it actually ran with** (§5). The registry is mutable, so the
   current object cannot answer what executed last Tuesday; only the Attempt can. Audit reads the Attempt.
   RM-0 does not implement this target: its heartbeat binding is not a durable Attempt or audit record.
@@ -231,8 +238,10 @@ for a high-risk action.
   takes effect. A provider-side permission callback is **defense in depth, not a reference monitor**: it
   cannot intercept a provider process's own syscalls. Where a runtime can only be advised, it is labelled
   **`soft-enforcement`** honestly and barred from high-tier and T4 work.
-- The current managed-launch seam is below neither raw provider execution nor provider syscalls. It only
-  resolves and dispatches a binding and is therefore labelled **NO ENFORCEMENT**, not a reference monitor.
+- The current managed-launch seam is below neither raw provider execution nor provider syscalls. It caps
+  effective authority, pins the adapter to an absolute path, and constructs the child environment from this
+  allow-list (RM-1), but it cannot intercept a bypassing process — it is a **policy gate for cooperating
+  agents**, honestly not a reference monitor.
 - There is no global "skip all restrictions" mode. At most `--unrestricted-within-tier`; T4, secret and
   deployment floors and the audit trail remain active.
 - **T4 is human-only and immutable.** No provider flag, CLI option or policy may silently cross it.
