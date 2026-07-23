@@ -141,8 +141,18 @@ _aib_load_registry_snapshot() {
   _AIB_RESOLVER_REGISTRY="$(aib_registry_file)"
   [ -r "$_AIB_RESOLVER_REGISTRY" ] ||
     aib_die 2 "registry not found or unreadable: $_AIB_RESOLVER_REGISTRY"
-  _AIB_RESOLVER_SNAPSHOT="$(<"$_AIB_RESOLVER_REGISTRY")" ||
-    aib_die 2 "cannot read registry snapshot: $_AIB_RESOLVER_REGISTRY"
+  # ONE registry open. `$(<file)` silently DROPS embedded NUL bytes, so a torn or
+  # tampered registry could resolve identity from a value a strict reader would
+  # never see — and the registry crosses into line-oriented key=value / journal
+  # protocols where a decoded NUL is unsafe. `read -r -d ''` reads until the first
+  # NUL: rc=0 means a NUL delimiter WAS found (reject, loud); rc>0 is the ordinary
+  # EOF case where the variable now holds the complete file content. Detection is by
+  # `read`'s return status alone — a bash var cannot hold a NUL, so inspecting the
+  # string would need a SECOND read, exactly the double-open that deadlocked the
+  # one-write FIFO seam in the retired hotfix. Stays a single redirect.
+  if IFS= read -r -d '' _AIB_RESOLVER_SNAPSHOT < "$_AIB_RESOLVER_REGISTRY"; then
+    aib_die 2 "registry contains a raw NUL byte — refusing unsafe identity/clearance data: $_AIB_RESOLVER_REGISTRY"
+  fi
 }
 
 _aib_snapshot_awk() {
@@ -535,6 +545,31 @@ aib_validate_team_uid() {
   aib_validate_token "$key" team_key
 }
 
+# Validate EVERY team key at load time, not only the one an agent happens to
+# reference. Lazy per-reference validation (aib_validate_team_uid at the point of
+# use) let a malformed, unreferenced team key sit silently in the registry until
+# first use — RM-0 finding #3. The teams map is authority data: a team whose uid
+# disagrees with its own declared project means the file is inconsistent even if no
+# agent points at it yet, so it is a loud fail-closed at load. Each key is checked
+# against ITS OWN declared project (a registry may carry teams for several projects).
+# The while-loop stays in the current shell (here-doc, not a pipe) so aib_die's exit
+# aborts the caller rather than a subshell. Snapshot-only: never re-opens the file.
+_aib_validate_all_team_keys() {
+  local team team_project
+  # teams is optional: an absent OR empty section makes `keys` yield no lines, so
+  # the loop simply never runs and there is nothing to validate.
+  while IFS= read -r team; do
+    [ -n "$team" ] || continue
+    _aib_snapshot_field teams "$team" project "team '$team'" ||
+      aib_die 3 "registry: team '$team' has no project"
+    team_project="$AIB_SNAPSHOT_FIELD_VALUE"
+    aib_validate_token "$team_project" "project of team '$team'"
+    aib_validate_team_uid "$team" "$team_project"
+  done <<EOF
+$(_aib_snapshot_query teams keys)
+EOF
+}
+
 # --- resolve an agent_uid via the registry (deterministic, fail-closed) -------
 # An Agent is a REGISTRY OBJECT (DOMAIN §2): lookup is the authority, parsing is
 # validation only. There is deliberately NO prefix-scan fallback — a fallback would
@@ -669,6 +704,11 @@ aib_resolve_agent_snapshot() {
     3|4) ;;
     *) return 0;;
   esac
+
+  # Validate EVERY team key at load, before any binding resolution — an inconsistent
+  # team key anywhere in the registry is a load-time fault, not a lazily-discovered
+  # one (RM-0 finding #3).
+  _aib_validate_all_team_keys
 
   if _aib_snapshot_field agents "$agent" team_uid "agent '$agent'"; then
     team="$AIB_SNAPSHOT_FIELD_VALUE"
