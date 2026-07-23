@@ -127,6 +127,25 @@ case "$AIB_EFFORT" in
   *) aib_die 64 "unsupported Codex registry effort '$AIB_EFFORT' (expected: low|medium|high|max)";;
 esac
 
+# Resolve the adapter exactly where the provider will run. This is one
+# observability event, not executable pinning, durable audit, or enforcement.
+codex_path="$(cd "$cwd" && command -v codex)" ||
+  aib_die 127 "codex executable not found through PATH from cwd: $cwd"
+case "$codex_path" in
+  ""|*[[:cntrl:]]*) aib_die 127 "codex PATH lookup returned no usable single-line path";;
+esac
+launch_binding_event="$(
+  printf '{"event":"managed_launch_binding","agent_uid":%s,"provider":%s,"provider_source":%s,"model":%s,"model_source":%s,"effort":%s,"effort_source":%s,"adapter_path":%s}' \
+    "$(aib_json "$AIB_AGENT_UID")" \
+    "$(aib_json "$AIB_PROVIDER")" \
+    "$(aib_json "$AIB_PROVIDER_SOURCE")" \
+    "$(aib_json "$AIB_MODEL")" \
+    "$(aib_json "$AIB_MODEL_SOURCE")" \
+    "$(aib_json "$AIB_EFFORT")" \
+    "$(aib_json "$AIB_EFFORT_SOURCE")" \
+    "$(aib_json "$codex_path")"
+)"
+
 # Scrub inherited routing/binding claims only after the registry test seam has
 # supplied the snapshot. The provider child receives exactly the resolved bundle.
 for _v in $(compgen -v); do
@@ -160,6 +179,8 @@ export STANDUP_DIR="$AIB_STANDUP_DIR"
 hb() {
   aib_log_resolved "$AIB_STANDUP_DIR" "$AIB_AGENT_UID" "$1" "$2"
 }
+
+printf '%s\n' "$launch_binding_event" >&2
 
 lbl="${label:-codex-run}"
 hb busy "codex-run: $AIB_MODEL/$sandbox effort=$AIB_EFFORT — $lbl"

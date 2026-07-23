@@ -95,7 +95,7 @@ expect_targeted_failure() {
 }
 
 expect_baseline_green "$SRC_ROOT/tests/managed_launch_spec.sh" \
-  "40 checks: 40 ok / 0 fail" "$WORK/clean-launch.out"
+  "41 checks: 41 ok / 0 fail" "$WORK/clean-launch.out"
 expect_baseline_green "$SRC_ROOT/tests/codex_run_spec.sh" \
   "74 checks: 74 ok / 0 fail" "$WORK/clean-codex-run.out"
 
@@ -210,6 +210,24 @@ expect_targeted_failure "end-of-options-removed" \
   "$NO_EOO/tests/managed_launch_spec.sh" \
   "leading-dash prompt passes after end-of-options --" \
   "$WORK/end-of-options-removed.out"
+
+# 10. The emitted adapter_path must be the codex actually resolved at the launch
+# cwd, not a constant. Forging codex_path to a fixed value (the || aib_die 127 is
+# skipped because the assignment now succeeds) leaves a launch that still runs, but
+# the provenance event carries a bogus adapter_path — so the observability the
+# feature promises would silently misreport where the provider ran.
+# (The emit printf line itself is not a replace_exact target: its '%s\n' format
+# carries a backslash, which awk -v would expand in the anchor; the positive
+# managed_launch assertion already fails closed if that line is removed.)
+FORGE_ADAPTER="$(make_mutant adapter-path-forged)"
+replace_exact "$FORGE_ADAPTER/bin/launch-agent" \
+  'codex_path="$(cd "$cwd" && command -v codex)" ||' \
+  'codex_path="/forged/codex" ||'
+record_mutation "adapter-path-forged" "$?"
+expect_targeted_failure "adapter-path-forged" \
+  "$FORGE_ADAPTER/tests/managed_launch_spec.sh" \
+  "launch emits structured resolved binding and adapter path on stderr" \
+  "$WORK/adapter-path-forged.out"
 
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"

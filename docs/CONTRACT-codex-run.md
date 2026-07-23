@@ -66,7 +66,15 @@ the file used for the one initial snapshot; it is not a binding-field override o
 
 ## 4. Observable and bounded behavior
 
-After all pre-launch validation succeeds:
+After all pre-launch validation succeeds, and before the busy heartbeat, emit one
+`managed_launch_binding` JSON object to **stderr** carrying the resolved `agent_uid`,
+`provider`/`model`/`effort` with their `level:uid` sources, and `adapter_path` (the `codex` resolved via
+`command -v` from `--cwd`). This is a transient observability event for the launching operator/tooling; it
+is not written to any journal and is **not** the durable Attempt record or provider-change audit (still
+specified, not yet built). `adapter_path` reports which `codex` the PATH lookup found — it is not
+executable pinning, and the watchdog run below re-resolves `codex` through `PATH` independently.
+
+Then:
 
 1. Emit a `busy` heartbeat for the selected agent containing the resolved model, selected sandbox,
    resolved effort, and label. The managed heartbeat primitive uses the already-resolved `agent_uid` and
@@ -76,7 +84,7 @@ After all pre-launch validation succeeds:
    ```text
    timeout <seconds> codex exec -m <resolved-model> -s <sandbox> \
      -c model_reasoning_effort="<resolved-effort>" \
-     -c approval_policy="never" <prompt>
+     -c approval_policy="never" -- <prompt>
    ```
 
 3. Report one terminal outcome:
@@ -97,7 +105,9 @@ path.
 ## 5. Executable and test seam
 
 `CODEX_RUN_BIN` has no production or test-seam role and is removed before provider execution. The adapter
-executes the installed executable named exactly `codex` through `PATH`. Deterministic specs prepend a
+executes the installed executable named exactly `codex` through `PATH`. If `codex` is not resolvable
+through `PATH` from `--cwd`, or the lookup yields no usable single-line path, managed launch fails closed
+and loud before any heartbeat or provider process (exit 127). Deterministic specs prepend a
 controlled directory containing a stub with that exact executable name to prove argument fidelity,
 timeout, error, success, heartbeat, cwd, and pre-launch refusal without network access.
 

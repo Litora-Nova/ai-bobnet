@@ -99,11 +99,11 @@ has(){ case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3')";; esac; }
 hasnt(){ case "$2" in *"$3"*) no "$1 (unexpected '$3')";; *) ok "$1";; esac; }
 not_called(){ [ ! -e "$SENTINEL" ] && ok "$1" || no "$1 (provider executed)"; }
 
-RUN_OUT=""; RUN_RC=0; CASE_MODE=ok; CASE_SLEEP=5; CASE_RC=7
+RUN_OUT=""; RUN_ERR=""; RUN_RC=0; CASE_MODE=ok; CASE_SLEEP=5; CASE_RC=7
 run_launch() {
   local registry="$1"; shift
   rm -f "$SENTINEL" "$POISON_SENTINEL" "$ARGV_OUT" "$ENV_OUT" "$PWD_OUT"
-  RUN_OUT=""; RUN_RC=0
+  RUN_OUT=""; RUN_ERR=""; RUN_RC=0
   RUN_OUT="$(
     PATH="$STUB_BIN:$SYSTEM_PATH" \
     AIBOBNET_REGISTRY="$registry" \
@@ -115,8 +115,10 @@ run_launch() {
     STUB_SENTINEL="$SENTINEL" STUB_ARGV_OUT="$ARGV_OUT" STUB_ENV_OUT="$ENV_OUT" \
     STUB_PWD_OUT="$PWD_OUT" STUB_MODE="$CASE_MODE" STUB_SLEEP="$CASE_SLEEP" \
     STUB_RC="$CASE_RC" STUB_REGISTRY="$registry" \
-      "$LA" "$@" 2>&1
+      "$LA" "$@" 2>"$WORK/launch-stderr"
   )" || RUN_RC=$?
+  RUN_ERR="$(<"$WORK/launch-stderr")"
+  [ -z "$RUN_ERR" ] || RUN_OUT="${RUN_OUT}${RUN_OUT:+$'\n'}${RUN_ERR}"
 }
 
 write_v3 "$REG" codex high
@@ -143,6 +145,8 @@ has "child gets resolved paths" "$env_out" "standup_dir=$STATE/acme/standup"
 has "child gets resolved inbox" "$env_out" "inbox_path=$STATE/acme/standup/inbox/acme-core.md"
 has "child gets resolved binding and provenance" "$env_out" $'provider=codex\nprovider_source=project:acme\nmodel=team/model-v2\nmodel_source=team:acme-engine\neffort=high\neffort_source=agent:acme-core\nschema=3'
 has "child sees CODEX_RUN_BIN removed" "$env_out" "codex_run_bin=unset"
+binding_emit="{\"event\":\"managed_launch_binding\",\"agent_uid\":\"acme-core\",\"provider\":\"codex\",\"provider_source\":\"project:acme\",\"model\":\"team/model-v2\",\"model_source\":\"team:acme-engine\",\"effort\":\"high\",\"effort_source\":\"agent:acme-core\",\"adapter_path\":\"$STUB_BIN/codex\"}"
+has "launch emits structured resolved binding and adapter path on stderr" "$RUN_ERR" "$binding_emit"
 has "busy heartbeat uses resolved model and effort" "$(<"$HBLOG")" "| busy | codex-run: team/model-v2/read-only effort=high — managed"
 has "terminal heartbeat records success" "$(<"$HBLOG")" "| done | codex-run OK — managed"
 
