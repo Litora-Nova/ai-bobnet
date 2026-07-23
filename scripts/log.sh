@@ -17,23 +17,6 @@ REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
 . "$REPO_ROOT/lib/aibobnet.sh"
 
-# Encode the free-text message so it can never be misread as structure: newlines/CR
-# collapse to a space (the journal is one heartbeat per line — an embedded newline
-# would otherwise split one call into two physical lines, the second one entirely
-# attacker-worded and indistinguishable from a real heartbeat to any line-oriented
-# reader), and every '|' becomes '%7C' (so a crafted message cannot forge extra
-# `TS | agent | status | msg` field boundaries either). Same pattern as bin/message's
-# _sanitize_line (encoding, not escaping, is what stays unambiguous for readers this
-# script does not control — a dashboard, a grep, a human). agent/status are already
-# restricted tokens (registry uid / fixed enum), so only msg needs this.
-_sanitize_line() {
-  local s="$1"
-  s="${s//$'\n'/ }"
-  s="${s//$'\r'/ }"
-  s="${s//|/%7C}"
-  printf '%s' "$s"
-}
-
 agent="${1:-}"
 status="${2:-}"
 msg="${3:-}"
@@ -50,7 +33,7 @@ aib_check_registry
 aib_split_agent "$agent"                      # -> AIB_PROJECT_UID (fail-loud if unresolvable)
 standup_dir="$(aib_project_field "$AIB_PROJECT_UID" standup_dir)"
 
-mkdir -p "$standup_dir" || aib_die 2 "cannot create standup_dir: $standup_dir"
-ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-msg="$(_sanitize_line "$msg")"
-printf '%s | %s | %s | %s\n' "$ts" "$agent" "$status" "$msg" >> "$standup_dir/$agent.log"
+# Standalone log.sh stays registry-authenticated. Managed callers bypass this
+# front door and pass their already-resolved process-local bundle directly to the
+# same primitive, so their heartbeat path never reopens mutable registry state.
+aib_log_resolved "$standup_dir" "$agent" "$status" "$msg"

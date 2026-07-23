@@ -2,7 +2,7 @@
 # ai-bobnet — resolve the CURRENT agent's context from validated env + the registry.
 # Usage: context [--json]
 #   Inputs (set by the launcher / bin/run-agent): AIBOBNET_PROJECT_UID + AIBOBNET_AGENT_KEY.
-#   Output: agent_uid project_uid agent_key home standup_dir inbox_path mux_session.
+#   Output: legacy identity/path context plus schema-3 execution binding + provenance.
 # Fail-closed: missing/unknown/inconsistent context -> non-zero exit + clear error.
 # The derived agent_uid is resolved against registry.agents — an agent that is not a
 # registry object does not resolve, even if its prefix parses (docs/DOMAIN.md §2).
@@ -27,21 +27,17 @@ case "${1:-}" in
   *)      aib_die 64 "usage: context [--json]";;
 esac
 
-aib_check_registry
-
 proj="${AIBOBNET_PROJECT_UID:-}"
 agent_key="${AIBOBNET_AGENT_KEY:-}"
 [ -n "$proj" ]      || aib_die 6 "AIBOBNET_PROJECT_UID not set — cannot resolve context (launch via bin/run-agent)"
 [ -n "$agent_key" ] || aib_die 6 "AIBOBNET_AGENT_KEY not set — cannot resolve context (launch via bin/run-agent)"
 aib_validate_token "$proj" project_uid
 aib_validate_token "$agent_key" agent_key
-aib_require_project "$proj"
-
 agent="${proj}-${agent_key}"
 
-# The Agent must be a registry object; the registry — not this env pair — decides
-# which project it belongs to. A mismatch is a poisoned/stale context, not a hint.
-aib_split_agent "$agent"
+# One validated registry snapshot supplies identity, clearance, paths, direct team,
+# and (for schema 3) the complete execution binding. Ambient binding env is ignored.
+aib_resolve_agent_snapshot "$agent" legacy
 [ "$AIB_PROJECT_UID" = "$proj" ] || aib_die 5 \
   "inconsistent context: agent_uid '$agent' belongs to project '$AIB_PROJECT_UID', not '$proj'"
 
@@ -50,10 +46,10 @@ if [ -n "${AIBOBNET_AGENT_UID:-}" ] && [ "${AIBOBNET_AGENT_UID}" != "$agent" ]; 
   aib_die 5 "inconsistent context: AIBOBNET_AGENT_UID='${AIBOBNET_AGENT_UID}' != derived '$agent'"
 fi
 
-home="$(aib_project_field "$proj" home)"
-standup_dir="$(aib_project_field "$proj" standup_dir)"
-mux_session="$(aib_project_field "$proj" mux_session)"
-inbox_path="${standup_dir}/inbox/${agent}.md"
+home="$AIB_HOME"
+standup_dir="$AIB_STANDUP_DIR"
+mux_session="$AIB_MUX_SESSION"
+inbox_path="$AIB_INBOX_PATH"
 
 if [ "$json" -eq 1 ]; then
   printf '{'
@@ -64,6 +60,15 @@ if [ "$json" -eq 1 ]; then
   printf '"standup_dir":%s,' "$(aib_json "$standup_dir")"
   printf '"inbox_path":%s,'  "$(aib_json "$inbox_path")"
   printf '"mux_session":%s'  "$(aib_json "$mux_session")"
+  if [ "$AIB_REGISTRY_SCHEMA_VERSION" = 3 ]; then
+    printf ',"provider":%s'                "$(aib_json "$AIB_PROVIDER")"
+    printf ',"provider_source":%s'         "$(aib_json "$AIB_PROVIDER_SOURCE")"
+    printf ',"model":%s'                   "$(aib_json "$AIB_MODEL")"
+    printf ',"model_source":%s'            "$(aib_json "$AIB_MODEL_SOURCE")"
+    printf ',"effort":%s'                  "$(aib_json "$AIB_EFFORT")"
+    printf ',"effort_source":%s'           "$(aib_json "$AIB_EFFORT_SOURCE")"
+    printf ',"registry_schema_version":%s' "$(aib_json "$AIB_REGISTRY_SCHEMA_VERSION")"
+  fi
   printf '}\n'
 else
   printf 'agent_uid=%s\n'   "$agent"
@@ -73,4 +78,13 @@ else
   printf 'standup_dir=%s\n' "$standup_dir"
   printf 'inbox_path=%s\n'  "$inbox_path"
   printf 'mux_session=%s\n' "$mux_session"
+  if [ "$AIB_REGISTRY_SCHEMA_VERSION" = 3 ]; then
+    printf 'provider=%s\n'                "$AIB_PROVIDER"
+    printf 'provider_source=%s\n'         "$AIB_PROVIDER_SOURCE"
+    printf 'model=%s\n'                   "$AIB_MODEL"
+    printf 'model_source=%s\n'            "$AIB_MODEL_SOURCE"
+    printf 'effort=%s\n'                  "$AIB_EFFORT"
+    printf 'effort_source=%s\n'           "$AIB_EFFORT_SOURCE"
+    printf 'registry_schema_version=%s\n' "$AIB_REGISTRY_SCHEMA_VERSION"
+  fi
 fi

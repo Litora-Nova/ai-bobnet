@@ -1,12 +1,16 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "projects": {
     "acme": {
       "home": "/srv/acme",
       "standup_dir": "/srv/acme/standup",
-      "mux_session": "acme"
+      "mux_session": "acme",
+      "provider": "codex",
+      "model": "example-model",
+      "effort": "high"
     }
   },
+  "teams": {},
   "agents": {
     "acme-core": {
       "project": "acme",

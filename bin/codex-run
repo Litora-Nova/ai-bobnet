@@ -1,24 +1,8 @@
 #!/usr/bin/env bash
-# ai-bobnet — codex-run: watchdogged, heartbeat-owning wrapper around `codex exec`.
-# See docs/CONTRACT-codex-run.md.
-#
-# Fixes two field friction points of a raw codex() call:
-#   1. it blocks with no self-timeout (a hang looks like thinking)  -> watchdog via `timeout`.
-#   2. a read-only codex helper cannot heartbeat (invisible)         -> this wrapper owns the heartbeat.
-#
-# Usage: codex-run --as <agent_uid> [opts] (--prompt <t> | --prompt-file <f> | -)
-#   --as <uid>        REQUIRED heartbeat identity (registry-resolvable, fail-closed)
-#   --model <m>       default gpt-5.6-luna
-#   --sandbox <s>     read-only (default) | workspace-write ; danger-full-access REFUSED
-#   --cwd <dir>       where codex runs (default $PWD; must exist)
-#   --timeout <secs>  watchdog deadline (default 1200; positive integer)
-#   --effort <e>      low|medium|high|max (default high)
-#   --label <t>       heartbeat label (default codex-run)
-#   -                 read prompt from stdin
-# Env: CODEX_RUN_BIN overrides the codex binary (test seam; default `codex`).
+# Compatibility entrypoint. All parsing, resolution, heartbeat, and adapter
+# behavior belongs to launch-agent so this path cannot create a second truth.
 set -euo pipefail
 
-# --- locate engine root (symlink-safe) ---------------------------------------
 _src="${BASH_SOURCE[0]}"
 while [ -h "$_src" ]; do
   _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
@@ -26,76 +10,5 @@ while [ -h "$_src" ]; do
   case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
 done
 _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
-REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
-# shellcheck source=lib/aibobnet.sh
-. "$REPO_ROOT/lib/aibobnet.sh"
 
-CODEX_RUN_BIN="${CODEX_RUN_BIN:-codex}"
-LOG_SH="$REPO_ROOT/scripts/log.sh"
-
-as=""; model="gpt-5.6-luna"; sandbox="read-only"; cwd="$PWD"
-timeout_s="1200"; effort="high"; label=""; prompt=""; prompt_file=""; have_prompt=0
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --as)          as="${2:-}"; shift 2;;
-    --model)       model="${2:-}"; shift 2;;
-    --sandbox)     sandbox="${2:-}"; shift 2;;
-    --cwd)         cwd="${2:-}"; shift 2;;
-    --timeout)     timeout_s="${2:-}"; shift 2;;
-    --effort)      effort="${2:-}"; shift 2;;
-    --label)       label="${2:-}"; shift 2;;
-    --prompt)      prompt="${2:-}"; have_prompt=1; shift 2;;
-    --prompt-file) prompt_file="${2:-}"; shift 2;;
-    -)             prompt="$(cat)"; have_prompt=1; shift;;
-    -h|--help)     sed -n '6,19p' "$0"; exit 0;;
-    *)             aib_die 64 "unknown arg: $1";;
-  esac
-done
-
-# --- validate (fail-closed) ---------------------------------------------------
-[ -n "$as" ] || aib_die 64 "usage: codex-run --as <agent_uid> [opts] (--prompt <t>|--prompt-file <f>|-)"
-aib_validate_agent_uid "$as"
-case "$sandbox" in
-  read-only|workspace-write) ;;
-  danger-full-access) aib_die 64 "refusing --sandbox danger-full-access (fail-closed; use workspace-write)";;
-  *) aib_die 64 "invalid --sandbox '$sandbox' (expected: read-only|workspace-write)";;
-esac
-case "$effort" in low|medium|high|max) ;; *) aib_die 64 "invalid --effort '$effort' (low|medium|high|max)";; esac
-case "$timeout_s" in ''|*[!0-9]*) aib_die 64 "invalid --timeout '$timeout_s' (positive integer seconds)";; esac
-[ "$timeout_s" -gt 0 ] 2>/dev/null || aib_die 64 "invalid --timeout '$timeout_s' (must be > 0)"
-[ -d "$cwd" ] || aib_die 2 "--cwd is not a directory: $cwd"
-if [ -n "$prompt_file" ]; then
-  [ "$have_prompt" -eq 0 ] || aib_die 64 "give only one prompt source (--prompt / --prompt-file / -)"
-  [ -f "$prompt_file" ] || aib_die 2 "--prompt-file not found: $prompt_file"
-  prompt="$(cat "$prompt_file")"; have_prompt=1
-fi
-[ "$have_prompt" -eq 1 ] && [ -n "$prompt" ] || aib_die 64 "no prompt (use --prompt <t>, --prompt-file <f>, or - for stdin)"
-
-hb() { "$LOG_SH" "$as" "$1" "$2" || aib_die 3 "heartbeat failed for '$as' (unresolvable agent_uid? check registry)"; }
-
-lbl="${label:-codex-run}"
-hb busy "codex-run: $model/$sandbox effort=$effort — $lbl"
-
-# --- run under watchdog -------------------------------------------------------
-set +e
-out="$( cd "$cwd" && timeout -k 10 "$timeout_s" "$CODEX_RUN_BIN" exec \
-          -m "$model" -s "$sandbox" \
-          -c "model_reasoning_effort=\"$effort\"" \
-          -c 'approval_policy="never"' \
-          "$prompt" 2>&1 )"
-rc=$?
-set -e
-
-if [ "$rc" -eq 124 ]; then
-  hb blocked "codex-run TIMEOUT after ${timeout_s}s — $lbl"
-  printf '%s\n' "$out" >&2
-  aib_die 124 "codex-run: timed out after ${timeout_s}s (watchdog killed the call)"
-elif [ "$rc" -ne 0 ]; then
-  hb blocked "codex-run FAILED rc=$rc — $lbl"
-  printf '%s\n' "$out" >&2
-  aib_die "$rc" "codex-run: codex exec failed (rc=$rc)"
-fi
-
-hb done "codex-run OK — $lbl"
-printf '%s\n' "$out"
+exec "$_dir/launch-agent" "$@"
