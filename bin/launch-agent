@@ -172,7 +172,7 @@ out="$(
     -m "$AIB_MODEL" -s "$sandbox" \
     -c "model_reasoning_effort=\"$AIB_EFFORT\"" \
     -c 'approval_policy="never"' \
-    "$prompt" 2>&1
+    -- "$prompt" 2>&1
 )"
 rc=$?
 set -e
