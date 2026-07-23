@@ -211,6 +211,22 @@ eq "standalone logger still succeeds" "$?" 0
 eq "standalone logger writes one physical record" "$(wc -l < "$HBLOG")" 1
 has "standalone logger uses shared encoding" "$(<"$HBLOG")" "standalone%7Cfield second"
 
+# Regression (hotfix #1): a prompt that begins with '-' must reach codex as the
+# prompt operand after an explicit end-of-options '--', never be parsed as a codex
+# option. Without the '--', a leading-dash prompt (e.g. a sandbox-bypass flag)
+# would be consumed as an option instead of prompt text.
+write_v3 "$REG" codex high
+: > "$HBLOG"
+INJ='--dangerously-bypass-approvals-and-sandbox'
+run_launch "$REG" --as acme-core --label argv-guard --prompt "$INJ"
+eq "leading-dash prompt launch succeeds" "$RUN_RC" 0
+argv="$(sed -n '1,100p' "$ARGV_OUT" 2>/dev/null)"
+has "leading-dash prompt passes after end-of-options --" "$argv" "[--]
+[$INJ]"
+has "argv-guard keeps read-only sandbox flag" "$argv" "[-s]
+[read-only]"
+has "argv-guard keeps approval_policy never" "$argv" '[approval_policy="never"]'
+
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
 [ "$fail" -eq 0 ]
