@@ -18,13 +18,26 @@ SENTINEL="$WORK/provider-called"
 POISON_SENTINEL="$WORK/poison-called"
 ARGV_OUT="$WORK/argv"
 PWD_OUT="$WORK/pwd"
+STUB_CONF="$STUB_BIN/stub.conf"
+
+# The absolute adapter the schema-4 map points at; the PEP exec's THIS path.
+ADAPTER="$STUB_BIN/codex"
 
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# Schema 4: managed launch requires the provider adapter map + declared capabilities.
 write_registry() {
   printf '%s\n' "{
-  \"schema_version\": 3,
+  \"schema_version\": 4,
+  \"providers\": {
+    \"codex\": {
+      \"adapter\": \"$ADAPTER\",
+      \"cap_sandbox\": \"workspace-write\",
+      \"cap_tier\": \"t3\",
+      \"cap_effort\": \"high\"
+    }
+  },
   \"projects\": {
     \"acme\": {
       \"home\": \"$STATE/acme\",
@@ -43,7 +56,22 @@ write_registry() {
 }
 write_registry
 
+# Instrumentation the stub reads from its own directory (survives the PEP's `env -i`).
+write_stub_conf() {
+  local mode="${1:-ok}" sleep_s="${2:-5}" rc="${3:-7}"
+  cat > "$STUB_CONF" <<EOF
+STUB_SENTINEL='$SENTINEL'
+STUB_ARGV_OUT='$ARGV_OUT'
+STUB_PWD_OUT='$PWD_OUT'
+STUB_MODE='$mode'
+STUB_SLEEP='$sleep_s'
+STUB_RC='$rc'
+EOF
+}
+
 printf '%s\n' '#!/usr/bin/env bash' \
+  '_cfg="$(cd "$(dirname "$0")" && pwd)/stub.conf"' \
+  '[ -f "$_cfg" ] && . "$_cfg"' \
   'printf "called\n" >> "$STUB_SENTINEL"' \
   ': > "$STUB_ARGV_OUT"' \
   'for arg in "$@"; do printf "[%s]\n" "$arg" >> "$STUB_ARGV_OUT"; done' \
@@ -54,6 +82,7 @@ printf '%s\n' '#!/usr/bin/env bash' \
   '  err) printf "stub failure\n" >&2; exit "${STUB_RC:-7}";;' \
   'esac' > "$STUB_BIN/codex"
 chmod +x "$STUB_BIN/codex"
+write_stub_conf ok
 
 printf '%s\n' '#!/usr/bin/env bash' \
   'printf "poison\n" >> "$POISON_SENTINEL"' \
@@ -77,12 +106,13 @@ not_called(){
 CR_OUT=""; CR_RC=0; CASE_MODE=ok; CASE_SLEEP=5; CASE_RC=7
 cr() {
   rm -f "$SENTINEL" "$POISON_SENTINEL" "$ARGV_OUT" "$PWD_OUT"
+  write_stub_conf "$CASE_MODE" "$CASE_SLEEP" "$CASE_RC"
   CR_OUT=""; CR_RC=0
+  # CODEX_RUN_BIN/POISON are injected to prove the PEP's `env -i` strips them; the stub
+  # takes its behaviour from the conf beside it, not the (now emptied) inherited env.
   CR_OUT="$(
     PATH="$STUB_BIN:$SYSTEM_PATH" AIBOBNET_REGISTRY="$REG" \
     CODEX_RUN_BIN="$WORK/codex-poison" POISON_SENTINEL="$POISON_SENTINEL" \
-    STUB_SENTINEL="$SENTINEL" STUB_ARGV_OUT="$ARGV_OUT" STUB_PWD_OUT="$PWD_OUT" \
-    STUB_MODE="$CASE_MODE" STUB_SLEEP="$CASE_SLEEP" STUB_RC="$CASE_RC" \
       "$CR" "$@" 2>&1
   )" || CR_RC=$?
 }
@@ -238,6 +268,7 @@ has "failure heartbeat is preserved" "$(sed -n '1,20p' "$HBLOG")" "| blocked | c
 
 # The compatibility entry performs no second resolution: a one-write FIFO suffices.
 write_registry
+write_stub_conf ok
 SNAPSHOT="$(<"$REG")"
 FIFO="$WORK/registry.fifo"
 mkfifo "$FIFO"

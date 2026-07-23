@@ -8,20 +8,26 @@ rebuilt on a clean, deterministic core.
 >
 > **Built and tested:** P0 identity/registry, schema-3 execution binding with per-field provenance,
 > P1 delivery, P2 wakeup/local adapter, P3 scoped memory, the serialized commit path for the current
-> delivery and memory journals, and the watchdogged Codex managed-launch path. **Specified, not yet
-> implemented:** the full serialized event spine,
-> provider-wide reference monitor, Gate/Grant/Effect state machines, profile provisioning, full
-> runtime lifecycle, external adapters, and dashboard projection. `docs/DOMAIN.md` is the normative
-> target contract; it is not a claim that every domain surface already exists in code.
+> delivery and memory journals, the watchdogged Codex managed-launch path, and the RM-1 **managed policy
+> gate** (schema-4 adapter map + declared capabilities, the pure Policy Decision Point with
+> `min(clearance, provider capabilities)` capping, absolute adapter resolution, and the `env -i`
+> allow-list child environment). **Specified, not yet implemented:** the full serialized event spine,
+> provider-wide reference monitor (non-bypassability), Gate/Grant/Effect state machines, durable Attempt
+> records and the provider-change audit event, profile provisioning, full runtime lifecycle, external
+> adapters, and dashboard projection. `docs/DOMAIN.md` is the normative target contract; it is not a claim
+> that every domain surface already exists in code.
 >
-> **Managed launch is NO ENFORCEMENT.** It deterministically resolves `provider`, `model`, and `effort`,
-> but does not mediate provider syscalls, shell children, network/VCS effects, or T4 actions. Raw provider
-> execution and `PATH`-selected executables remain possible. Durable Attempt records and provider-change
-> audit are specified but not yet built.
+> **The managed launch is a POLICY GATE for cooperating agents (RM-1), not containment.** It caps effective
+> authority, pins the adapter to an absolute registry path, and builds the child environment from an
+> allow-list — but it does not mediate provider syscalls, shell children, network/VCS effects, or T4
+> actions, and a hostile local process can still run a provider directly. Non-bypassability, durable Attempt
+> records, and the provider-change audit event are specified but not yet built.
 
-The [execution-binding contract](docs/CONTRACT-execution-binding.md) defines the schema-2/schema-3
-compatibility boundary, exact provenance interface, and managed-launch migration. The corresponding
-[managed-launch ADR](docs/decisions/0002-managed-launch-boundary.md) records the boundary decision.
+The [execution-binding contract](docs/CONTRACT-execution-binding.md) defines the schema-2/3/4
+compatibility boundary, the exact provenance interface, the managed-launch migration, and the RM-1
+policy-gate mechanics (§7). The [managed-launch ADR](docs/decisions/0002-managed-launch-boundary.md) records
+the RM-0 boundary decision; the [managed-policy-gate ADR](docs/decisions/0003-managed-policy-gate.md) records
+the RM-1 PDP/PEP split, effective-authority capping, absolute adapter map, and allow-list environment.
 
 ## Runtime requirements
 

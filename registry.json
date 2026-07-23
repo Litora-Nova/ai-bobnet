@@ -1,5 +1,13 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
+  "providers": {
+    "codex": {
+      "adapter": "/opt/acme/adapters/codex",
+      "cap_sandbox": "workspace-write",
+      "cap_tier": "t3",
+      "cap_effort": "high"
+    }
+  },
   "projects": {
     "acme": {
       "home": "/srv/acme",

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# ai-bobnet — RM-0 managed provider launcher (NO ENFORCEMENT).
-# Resolves one registry snapshot, then launches the selected adapter from that
-# immutable process-local bundle. Direct raw provider execution remains possible.
+# ai-bobnet — RM-1 managed provider launcher: the Policy Enforcement Point (PEP).
+# Resolves one registry snapshot, hands a request + snapshot to the pure Policy
+# Decision Point (aib_authorize_launch), then ENACTS the verdict — it re-decides no
+# authority of its own. It exec's the ABSOLUTE registry adapter (never a `codex` found
+# through PATH from the launch cwd) inside a child environment CONSTRUCTED from the
+# verdict's allow-list via `env -i` (never a denylist scrub).
+#
+# This is a policy gate for cooperating agents, NOT containment: a hostile local
+# process can still run a provider directly. Non-bypassability is RM-3's job.
 #
 # Usage: launch-agent --as <agent_uid> [runtime options]
 #                     (--prompt <text> | --prompt-file <file> | -)
@@ -97,6 +103,10 @@ done
 # --- validate runtime input before any provider can start --------------------
 [ "$seen_as" -eq 1 ] && [ -n "$as" ] || aib_die 64 "missing --as ($_usage)"
 aib_validate_agent_uid "$as"
+# Input hygiene at the sanctioned entry point (fail-closed): danger-full-access is
+# refused here before the PDP ever sees it. The PDP also has a danger->clamp branch,
+# but under launch-agent it is unreachable by design (this refusal fires first) — it
+# exists for the PDP's isolated unit tests. Do not "fix" the apparent redundancy.
 case "$sandbox" in
   read-only|workspace-write) ;;
   danger-full-access) aib_die 64 "refusing --sandbox danger-full-access (fail-closed; use workspace-write)";;
@@ -118,22 +128,41 @@ fi
 # --- exactly one managed resolution; everything below consumes this bundle ---
 aib_resolve_managed_agent "$as"
 
+# The PEP drives only a codex-CLI-shaped adapter (the `exec -m/-s/-c … -- <prompt>`
+# argv form). This is a support-shape limit, NOT an authority decision — all authority
+# lives in the PDP. A non-codex adapter would need a different argv contract.
 case "$AIB_PROVIDER" in
   codex) ;;
-  *) aib_die 64 "unsupported registry provider '$AIB_PROVIDER' (RM-0 supports only 'codex')";;
-esac
-case "$AIB_EFFORT" in
-  low|medium|high|max) ;;
-  *) aib_die 64 "unsupported Codex registry effort '$AIB_EFFORT' (expected: low|medium|high|max)";;
+  *) aib_die 64 "unsupported registry provider '$AIB_PROVIDER' (this launcher drives only the codex adapter CLI)";;
 esac
 
-# Resolve the adapter exactly where the provider will run. This is one
-# observability event, not executable pinning, durable audit, or enforcement.
-codex_path="$(cd "$cwd" && command -v codex)" ||
-  aib_die 127 "codex executable not found through PATH from cwd: $cwd"
-case "$codex_path" in
-  ""|*[[:cntrl:]]*) aib_die 127 "codex PATH lookup returned no usable single-line path";;
-esac
+# --- Policy Decision Point: the single authority for this launch --------------
+# Build the two serialisable records and hand them to the pure PDP; the PEP takes no
+# authority decision of its own. The requested sandbox/effort go in as-is — the PDP
+# returns min(request, provider ceiling). On deny the PDP has already chosen the exit
+# code; fail closed BEFORE any heartbeat or provider process starts.
+_pep_request="$(printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' \
+  "$AIB_AGENT_UID" "$sandbox" "$cwd" "$timeout_s" "$label")"
+_pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s' \
+  "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" "$AIB_ADAPTER_PATH" \
+  "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT")"
+if ! aib_authorize_launch "$_pep_request" "$_pep_snapshot"; then
+  aib_die "$AIB_VERDICT_CODE" "managed launch denied: $AIB_VERDICT_REASONS"
+fi
+
+# Enact the verdict: run at the effective (clamped) authority, and take the ABSOLUTE
+# adapter path from the registry map — cwd/PATH can no longer select the adapter.
+adapter_path="$AIB_VERDICT_ADAPTER_PATH"
+sandbox="$AIB_VERDICT_EFFECTIVE_SANDBOX"
+eff_effort="$AIB_VERDICT_EFFECTIVE_EFFORT"
+
+# IO hygiene (not authority): the PDP is pure and never stats the disk, so the PEP
+# confirms the resolved adapter is actually executable before committing to a
+# heartbeat — an absent/unresolvable adapter fails closed at exit 127.
+[ -x "$adapter_path" ] || aib_die 127 "resolved adapter is not executable: $adapter_path"
+
+# One observability event: the resolved binding + the ABSOLUTE adapter path taken
+# from the verdict (never a PATH/cwd lookup). Not durable audit or enforcement.
 launch_binding_event="$(
   printf '{"event":"managed_launch_binding","agent_uid":%s,"provider":%s,"provider_source":%s,"model":%s,"model_source":%s,"effort":%s,"effort_source":%s,"adapter_path":%s}' \
     "$(aib_json "$AIB_AGENT_UID")" \
@@ -143,38 +172,40 @@ launch_binding_event="$(
     "$(aib_json "$AIB_MODEL_SOURCE")" \
     "$(aib_json "$AIB_EFFORT")" \
     "$(aib_json "$AIB_EFFORT_SOURCE")" \
-    "$(aib_json "$codex_path")"
+    "$(aib_json "$adapter_path")"
 )"
 
-# Scrub inherited routing/binding claims only after the registry test seam has
-# supplied the snapshot. The provider child receives exactly the resolved bundle.
-for _v in $(compgen -v); do
-  case "$_v" in
-    STANDUP_DIR|STANDUP_DIR_*|INBOX*|MUX*|BOOT_*|PROJECT_*|AIBOBNET_*)
-      unset "$_v" 2>/dev/null || true
-      ;;
-  esac
+# Construct the child environment from the verdict's allow-list via `env -i`: the
+# provider inherits NOTHING but these named variables (values from the current env),
+# then the explicit managed exports below. An allow-list is complete by construction
+# where a denylist scrub never is, and it matches RM-3's confined env for free. The
+# allow set was derived empirically (env -i smoke launch): codex needs HOME (its
+# ~/.codex config + file-based auth.json) and a PATH (its node runtime + helpers); no
+# provider-auth env var is load-bearing here — the API key lives inside auth.json.
+_child_env=()
+for _n in $AIB_VERDICT_ENV_ALLOW; do
+  [ -n "${!_n+x}" ] && _child_env+=("$_n=${!_n}")
 done
-unset CODEX_RUN_BIN 2>/dev/null || true
-
-export AIBOBNET_AGENT_UID="$AIB_AGENT_UID"
-export AIBOBNET_PROJECT_UID="$AIB_PROJECT_UID"
-export AIBOBNET_AGENT_KEY="$AIB_AGENT_KEY"
-export AIBOBNET_PROFILE="$AIB_PROFILE"
-export AIBOBNET_CLEARANCE="$AIB_CLEARANCE"
-export AIBOBNET_TEAM_UID="$AIB_TEAM_UID"
-export AIBOBNET_HOME="$AIB_HOME"
-export AIBOBNET_STANDUP_DIR="$AIB_STANDUP_DIR"
-export AIBOBNET_INBOX_PATH="$AIB_INBOX_PATH"
-export AIBOBNET_MUX_SESSION="$AIB_MUX_SESSION"
-export AIBOBNET_PROVIDER="$AIB_PROVIDER"
-export AIBOBNET_PROVIDER_SOURCE="$AIB_PROVIDER_SOURCE"
-export AIBOBNET_MODEL="$AIB_MODEL"
-export AIBOBNET_MODEL_SOURCE="$AIB_MODEL_SOURCE"
-export AIBOBNET_EFFORT="$AIB_EFFORT"
-export AIBOBNET_EFFORT_SOURCE="$AIB_EFFORT_SOURCE"
-export AIBOBNET_REGISTRY_SCHEMA_VERSION="$AIB_REGISTRY_SCHEMA_VERSION"
-export STANDUP_DIR="$AIB_STANDUP_DIR"
+_child_env+=(
+  "AIBOBNET_AGENT_UID=$AIB_AGENT_UID"
+  "AIBOBNET_PROJECT_UID=$AIB_PROJECT_UID"
+  "AIBOBNET_AGENT_KEY=$AIB_AGENT_KEY"
+  "AIBOBNET_PROFILE=$AIB_PROFILE"
+  "AIBOBNET_CLEARANCE=$AIB_CLEARANCE"
+  "AIBOBNET_TEAM_UID=$AIB_TEAM_UID"
+  "AIBOBNET_HOME=$AIB_HOME"
+  "AIBOBNET_STANDUP_DIR=$AIB_STANDUP_DIR"
+  "AIBOBNET_INBOX_PATH=$AIB_INBOX_PATH"
+  "AIBOBNET_MUX_SESSION=$AIB_MUX_SESSION"
+  "AIBOBNET_PROVIDER=$AIB_PROVIDER"
+  "AIBOBNET_PROVIDER_SOURCE=$AIB_PROVIDER_SOURCE"
+  "AIBOBNET_MODEL=$AIB_MODEL"
+  "AIBOBNET_MODEL_SOURCE=$AIB_MODEL_SOURCE"
+  "AIBOBNET_EFFORT=$AIB_EFFORT"
+  "AIBOBNET_EFFORT_SOURCE=$AIB_EFFORT_SOURCE"
+  "AIBOBNET_REGISTRY_SCHEMA_VERSION=$AIB_REGISTRY_SCHEMA_VERSION"
+  "STANDUP_DIR=$AIB_STANDUP_DIR"
+)
 
 hb() {
   aib_log_resolved "$AIB_STANDUP_DIR" "$AIB_AGENT_UID" "$1" "$2"
@@ -183,15 +214,19 @@ hb() {
 printf '%s\n' "$launch_binding_event" >&2
 
 lbl="${label:-codex-run}"
-hb busy "codex-run: $AIB_MODEL/$sandbox effort=$AIB_EFFORT — $lbl"
+hb busy "codex-run: $AIB_MODEL/$sandbox effort=$eff_effort — $lbl"
 
-# RM-0 deliberately selects a literal executable through PATH. That testable
-# seam is also why this managed launch boundary is not an enforcement boundary.
+# Exec the adapter by ABSOLUTE path (from the verdict), inside the requested cwd, under
+# the allow-list env only. PATH/cwd cannot swap the adapter — that is why RM-1 is a
+# policy gate for cooperating agents, not an enforcement boundary. The watchdog binary
+# is resolved to an absolute path in the parent so it never depends on the child PATH.
+_timeout_bin="$(command -v timeout)" || aib_die 2 "timeout watchdog binary not found on PATH"
 set +e
 out="$(
-  cd "$cwd" && timeout -k 10 "$timeout_s" codex exec \
+  cd "$cwd" && env -i "${_child_env[@]}" \
+    "$_timeout_bin" -k 10 "$timeout_s" "$adapter_path" exec \
     -m "$AIB_MODEL" -s "$sandbox" \
-    -c "model_reasoning_effort=\"$AIB_EFFORT\"" \
+    -c "model_reasoning_effort=\"$eff_effort\"" \
     -c 'approval_policy="never"' \
     -- "$prompt" 2>&1
 )"
