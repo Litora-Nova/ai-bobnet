@@ -5,15 +5,18 @@ disagrees with this document, this document wins. Vocabulary and invariants here
 still open is listed explicitly in §12 — nothing is silently undecided.
 
 > **Implementation status:** this document defines the target contract, not the current feature set.
-> P0 identity/registry, P1 delivery, P2 wakeup/local adapter, P3 scoped memory, the legacy-journal
-> serialized commit protocol, and `codex-run` are built and tested. The full serialized event spine,
-> provider-wide reference monitor, Gate/Grant/Effect state machines, profile provisioning, full runtime
-> lifecycle, external adapters, and dashboard
-> projection remain specified but unimplemented. Until the reference monitor exists, `clearance`
-> is registry/audit data rather than an enforced authorization decision. The registry does not yet
-> carry the execution binding of §2.1 either: `codex-run` still takes `--model`/`--effort` as launcher
-> flags with tool-side defaults, so today those flags are the source rather than an override of a
-> registry-resolved value.
+> P0 identity/registry, schema-3 execution binding with per-field provenance, P1 delivery, P2 wakeup/local
+> adapter, P3 scoped memory, the legacy-journal serialized commit protocol, and the Codex managed-launch
+> path are built and tested. The full serialized event spine, provider-wide reference monitor,
+> Gate/Grant/Effect state machines, profile provisioning, full runtime lifecycle, external adapters, and
+> dashboard projection remain specified but unimplemented. Until the reference monitor exists,
+> `clearance` is registry/audit data rather than an enforced authorization decision.
+>
+> **The managed-launch path is NO ENFORCEMENT.** It resolves a binding and dispatches an adapter; it does
+> not apply §7's decision function, mediate provider syscalls or arbitrary children, constrain network/VCS
+> effects, protect `PATH`, prevent raw provider execution, or make T4 decisions. It does not yet implement
+> the target §7 environment allow-list. It also creates no durable Attempt record or provider-change audit;
+> a heartbeat that shows the binding is operational visibility, not historical proof.
 >
 > The delivery and memory contracts define the implemented intermediate legacy-journal commit protocol.
 > The protocol is a prelude to §6, not its implementation: it does not add sequence numbers, event
@@ -33,7 +36,7 @@ heuristics on top of an ambiguous core.* The cure is a small, deterministic doma
 | Term | Meaning |
 |---|---|
 | **Project** | A registered repository or logical working environment. The primary grouping. |
-| **Team** | Optional group inside a project (e.g. `api`, `web`). Invisible when unused. |
+| **Team** | Optional group inside a project (e.g. `api`, `web`). Invisible when unused. RM-0 supports one flat direct team; no nesting or rights inheritance. |
 | **Agent** | A durably addressable team member. A **registry object**, not a parsed string (§2). |
 | **Profile** | Reusable task/capability/instruction set (`infra`, `rails`, `review`, …). **Mutable.** |
 | **Session** | One concrete running provider process (a CLI process). Never the identity. |
@@ -86,27 +89,36 @@ Registry shape: `projects` · `agents` · `teams` · `profiles`.
 
 ### 2.1 Execution binding — `provider`, `model`, `effort`
 
-How an Agent is executed is **registry data on the agent object**, not a launcher flag and not a per-tool
-default. Without this, the same agent runs on a different model depending on who started it, and no
-projection can answer "what is this team actually running on".
+How an Agent is executed is **registry data resolved for the agent**, not a launcher flag and not a
+per-tool default. Without this, the same agent runs on a different model depending on who started it, and
+no projection can answer "what is this team actually running on". See the implemented interface and
+migration contract in `docs/CONTRACT-execution-binding.md`.
 
 - **`provider`** names the agent runtime binding (`claude-code`, `codex`, …) — the term the vocabulary
   already defines; there is no second word for it. **`model`** and **`effort`** are the settings inside
   that binding. All three are MUTABLE and MUST NOT affect `agent_uid`, routing, inbox, journal, or memory
   scope — swapping the runtime under an agent does not create a different agent.
-- **Resolution order is fixed and total:** `agent` → `team` → `project` default. The first level that
-  specifies a field wins; a resolved value is never assembled from several levels. An agent with no team,
-  or a team level that specifies nothing, falls through silently to the next level — teams stay invisible
-  when unused (§1). This is what makes the registry the *single* source of model truth rather than one
-  opinion among several.
+- **Resolution is field-wise, fixed, and total.** Each of `provider`, `model`, and `effort` independently
+  resolves from `agent` → direct `team` → `project` default. The first level where that field is present
+  supplies the complete scalar value; one scalar is never assembled from several levels. Cross-level
+  bindings are intentional: an agent may resolve `provider` from project, `model` from team, and `effort`
+  from agent. Only absence falls through. A present empty, malformed, or unusable value fails closed at
+  that level. An agent with no team falls through to project, so teams stay invisible when unused (§1).
+- **One launch uses one snapshot and one resolver.** Identity, clearance, direct-team membership, all three
+  values, and each value's `level:uid` provenance come from one validated registry read. The adapter and
+  managed heartbeat path consume that process-local bundle and MUST NOT reopen the registry or apply a
+  second precedence/default layer.
 - **An execution binding never grants clearance.** A `provider`/`model`/`effort` change MUST NOT alter
   clearance, for the same reason a `profile` swap must not (above).
 - **But it can cap it.** §7 bars `soft-enforcement` runtimes from high-tier and T4 work. That bar binds
   here: an agent's **effective** authority is `min(clearance, what its provider can actually enforce)`.
   Registry clearance is therefore a ceiling, never a promise. Because this is security-relevant,
-  `provider` changes are **audited events**, like clearance changes.
+  `provider` changes are **audited events**, like clearance changes. RM-0 does not implement this cap:
+  it resolves and records the binding but neither enforces `min(clearance, provider)` nor emits the
+  provider-change audit event.
 - **An Attempt records the resolved binding it actually ran with** (§5). The registry is mutable, so the
   current object cannot answer what executed last Tuesday; only the Attempt can. Audit reads the Attempt.
+  RM-0 does not implement this target: its heartbeat binding is not a durable Attempt or audit record.
 
 ---
 
@@ -219,6 +231,8 @@ for a high-risk action.
   takes effect. A provider-side permission callback is **defense in depth, not a reference monitor**: it
   cannot intercept a provider process's own syscalls. Where a runtime can only be advised, it is labelled
   **`soft-enforcement`** honestly and barred from high-tier and T4 work.
+- The current managed-launch seam is below neither raw provider execution nor provider syscalls. It only
+  resolves and dispatches a binding and is therefore labelled **NO ENFORCEMENT**, not a reference monitor.
 - There is no global "skip all restrictions" mode. At most `--unrestricted-within-tier`; T4, secret and
   deployment floors and the audit trail remain active.
 - **T4 is human-only and immutable.** No provider flag, CLI option or policy may silently cross it.
