@@ -95,7 +95,7 @@ expect_targeted_failure() {
 }
 
 expect_baseline_green "$SRC_ROOT/tests/managed_launch_spec.sh" \
-  "40 checks: 40 ok / 0 fail" "$WORK/clean-launch.out"
+  "41 checks: 41 ok / 0 fail" "$WORK/clean-launch.out"
 expect_baseline_green "$SRC_ROOT/tests/codex_run_spec.sh" \
   "74 checks: 74 ok / 0 fail" "$WORK/clean-codex-run.out"
 
