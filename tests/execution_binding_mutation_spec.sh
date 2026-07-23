@@ -39,7 +39,12 @@ replace_exact() {
     { print }
     END { if (count != 1) exit 42 }
   ' "$file" > "$tmp" || return $?
-  mv "$tmp" "$file"
+  # Overwrite in place so $file keeps its original mode. `mv` would give $file the
+  # temp file's 644, stripping +x from mutated executables (bin/, scripts/) so they
+  # fail with rc=126 — a false "kill" that fires the targeted assertion for a
+  # permission error instead of the mutated behavior under test.
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
 }
 
 record_mutation() {
