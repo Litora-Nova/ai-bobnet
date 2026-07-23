@@ -103,6 +103,10 @@ done
 # --- validate runtime input before any provider can start --------------------
 [ "$seen_as" -eq 1 ] && [ -n "$as" ] || aib_die 64 "missing --as ($_usage)"
 aib_validate_agent_uid "$as"
+# Input hygiene at the sanctioned entry point (fail-closed): danger-full-access is
+# refused here before the PDP ever sees it. The PDP also has a danger->clamp branch,
+# but under launch-agent it is unreachable by design (this refusal fires first) — it
+# exists for the PDP's isolated unit tests. Do not "fix" the apparent redundancy.
 case "$sandbox" in
   read-only|workspace-write) ;;
   danger-full-access) aib_die 64 "refusing --sandbox danger-full-access (fail-closed; use workspace-write)";;

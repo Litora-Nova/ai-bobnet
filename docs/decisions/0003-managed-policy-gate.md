@@ -188,6 +188,11 @@ line-oriented heartbeat is not the event spine.
   process boundary without touching its logic.
 - Schema 4 is a deliberate compatibility boundary. Managed launch from schema 3 fails closed (no adapter
   field); old readers reject 4. Migration adds a `providers` map with absolute adapters and declared caps.
+  **Rollback** reverses this: a schema-4 registry must be down-migrated to 3 before an old (2/3-only) reader
+  runs — the fail-closed rejection is the safety net. See `docs/CONTRACT-execution-binding.md` §6.
+- A schema-4 provider named in a binding but absent from the `providers` map (or missing declared caps) is
+  a resolution-time config error (**exit 3**), raised before the PDP — distinct from the PDP's missing-adapter
+  127. Both fail closed.
 - **RM-1 is still bypassable.** The cap binds only launches that go through the seam; a process that runs a
   provider directly is unaffected, and declared capabilities are trusted, not verified. Public documentation
   keeps the **policy gate, not containment** framing until RM-3 withholds raw capability and mediates

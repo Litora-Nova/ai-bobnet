@@ -267,8 +267,10 @@ The provider adapter is `providers.<name>.adapter`, an absolute path validated a
 non-absolute adapter is a config deny, code 2). This replaces the RM-0 `command -v codex` from cwd — cwd is
 attacker-influenceable, so adapter resolution no longer depends on it. `cap_sandbox` / `cap_tier` /
 `cap_effort` are declared capability data, resolved by the managed resolver, never runtime-probed. An
-unknown provider or an empty adapter entry resolves no adapter and is a fail-closed deny (code 127, which
-also subsumes the unknown-provider case).
+empty adapter entry resolves no adapter and is a fail-closed PDP deny (code 127). On schema 3 this also
+subsumes the unknown-provider case (there is no adapter map). On schema 4, a provider named but absent from
+the `providers` map, or missing its declared capabilities, is a resolution-time config error (**exit 3**)
+caught by the resolver before the PDP — not the PDP's 127.
 
 ```json
 {
@@ -302,11 +304,18 @@ auth) and a `PATH` (its runtime and helpers); no separate provider-auth environm
 load-bearing, because the credential lives in the adapter's own auth file. A denylist is never complete; an
 allow-list is complete by construction and matches RM-3's confined environment for free.
 
+**Deployment precondition:** provider auth must be **file-based**. An API key supplied only as an
+environment variable (e.g. `OPENAI_API_KEY`) is not in the allow-list, does not survive `env -i`, and the
+provider would fail authentication — a required deployment property, not a defect. The parent `PATH` is
+passed through verbatim (not filtered), acceptable here because the adapter is resolved to an absolute path
+and RM-1's threat model is cooperating agents.
+
 ### 7.6 Exit codes and verdict record
 
 Exit codes: `64` usage/refusal · `2` config/IO · `127` adapter-not-found · `124` watchdog timeout. The PDP
 orders deny checks by severity so the first deny fixes the code (`127 > 2 > 64`); the RM-3 broker returns
-the same codes. The `launch_verdict` record shares the shape family of the RM-0 `managed_launch_binding`
+the same codes. Separately, `3` is a registry resolution config error (e.g. a schema-4 provider absent from
+the `providers` map) raised by the resolver *before* the PDP, so it is not one of the PDP verdict codes. The `launch_verdict` record shares the shape family of the RM-0 `managed_launch_binding`
 observability event so RM-2's durable Attempt audit can reuse it — but RM-1 journals nothing; the record is
 transient observability, not durable audit.
 

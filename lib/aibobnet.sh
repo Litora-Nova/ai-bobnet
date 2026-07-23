@@ -815,12 +815,16 @@ aib_resolve_managed_agent() {
 #   AIB_VERDICT_RECORD               one-line JSON, managed_launch_binding shape family,
 #                                    so RM-2's durable Attempt audit reuses the schema.
 
-# Child environment is CONSTRUCTED from this allow-list (Lane B's `env -i`), never
-# scrubbed by denylist — a denylist is never complete, and RM-3's confined environment
-# is allow-list-constructed by definition. This default is the STRUCTURAL FLOOR only:
-# Lane B finalises the exact set from an empirical `env -i` smoke launch (at minimum
-# HOME, a sanitized PATH, and the provider-auth var that today leaks in SILENTLY by
-# inheritance — none named anywhere yet). TO BE FINALISED BY LANE B; not complete.
+# Child environment is CONSTRUCTED from this allow-list (`env -i`), never scrubbed by
+# denylist — a denylist is never complete, and RM-3's confined environment is
+# allow-list-constructed by definition. The set is FINALISED (empirical `env -i` smoke
+# launch): the codex adapter needs HOME (its ~/.codex config dir and file-based
+# auth.json) and PATH (its node runtime + helpers). The parent PATH is passed through
+# verbatim — acceptable under RM-1's cooperating-agent threat model because the adapter
+# itself is resolved to an absolute path. PRECONDITION: provider auth must be
+# FILE-BASED (auth.json); an env-var API key (e.g. OPENAI_API_KEY) is NOT in the
+# allow-list and does not survive `env -i`, so the provider would fail auth. This is a
+# documented deployment requirement (docs/CONTRACT-execution-binding.md), not a gap.
 AIB_ENV_ALLOW_DEFAULT="HOME PATH"
 
 # _aib_record_field <record> <key> -> value on stdout; rc 0 present, rc 1 absent.
@@ -891,8 +895,10 @@ aib_authorize_launch() {
 
   # --- deny checks, ordered by severity (adapter 127 > config 2 > refusal 64) --
   # Adapter map is the authority for what a provider may run: an absent adapter is a
-  # fail-closed missing-adapter deny (the PEP maps this to exit 127), and it also
-  # subsumes the "unknown provider" case (an unknown provider resolves no adapter).
+  # fail-closed missing-adapter deny (the PEP maps this to exit 127). On schema 3 this
+  # also subsumes the "unknown provider" case (no adapter map, so the adapter resolves
+  # empty). On schema 4 a provider named but absent from the `providers` map is caught
+  # earlier by the resolver (exit 3, config error) and never reaches this PDP branch.
   if [ -z "$adapter" ]; then
     _aib_verdict_deny 127 "provider '${provider:-?}' resolves no adapter path (unknown provider or empty adapter map entry)"
   else
