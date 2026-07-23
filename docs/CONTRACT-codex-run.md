@@ -5,10 +5,15 @@ thin `exec` delegator to the provider-neutral `bin/launch-agent`, which resolves
 execution-binding snapshot. `codex-run` does not reopen the registry, choose a model or effort, or apply a
 second default.
 
-> **Security status: NO ENFORCEMENT.** This adapter is not a reference monitor. It does not evaluate
-> `ALLOW | REQUIRE GATE | DENY`, mediate Codex syscalls or children, constrain network/VCS effects, make T4
-> decisions, protect executable selection through `PATH`, or prevent a caller from invoking `codex`
-> directly. It does not yet implement the target environment allow-list in `docs/DOMAIN.md` §7.
+> **Security status: POLICY GATE for cooperating agents (RM-1) — NOT containment.** Under RM-1 this
+> adapter path is driven by the pure Policy Decision Point (`aib_authorize_launch`): it caps effective
+> authority at `min(clearance, declared provider capabilities)`, resolves the adapter from an **absolute**
+> registry path (no longer `command -v codex`), and constructs the child environment from an allow-list via
+> `env -i`. It is still **not** a reference monitor: it does not mediate Codex syscalls or children,
+> constrain network/VCS effects, make T4 decisions, or prevent a caller from invoking `codex` directly, and
+> the capabilities it caps against are declared registry data, trusted rather than verified.
+> Non-bypassability is RM-3. See `docs/CONTRACT-execution-binding.md` §7 and
+> [ADR-0003](decisions/0003-managed-policy-gate.md).
 
 ## 1. Invocation
 
@@ -43,7 +48,7 @@ tool-local model or effort default. Provider has no CLI or environment option.
 
 These refusals — the rejected `--model`/`--effort` flags and the `danger-full-access` sandbox — are
 input hygiene at this one managed entry point, not a containment guarantee: a caller can still bypass
-`codex-run` and execute a provider directly (see NO ENFORCEMENT).
+`codex-run` and execute a provider directly (see the policy-gate, not containment security status above).
 
 ## 3. Resolution and delegation
 
@@ -66,25 +71,30 @@ the file used for the one initial snapshot; it is not a binding-field override o
 
 ## 4. Observable and bounded behavior
 
-After all pre-launch validation succeeds, and before the busy heartbeat, emit one
+Before dispatch, the pure Policy Decision Point (`aib_authorize_launch`) returns a verdict: allow/deny,
+the effective (clamped) sandbox/effort, and the absolute `adapter_path`. On deny the launch fails closed
+with the verdict's exit code before any heartbeat. On allow, and before the busy heartbeat, emit one
 `managed_launch_binding` JSON object to **stderr** carrying the resolved `agent_uid`,
-`provider`/`model`/`effort` with their `level:uid` sources, and `adapter_path` (the `codex` resolved via
-`command -v` from `--cwd`). This is a transient observability event for the launching operator/tooling; it
-is not written to any journal and is **not** the durable Attempt record or provider-change audit (still
-specified, not yet built). `adapter_path` reports which `codex` the PATH lookup found — it is not
-executable pinning, and the watchdog run below re-resolves `codex` through `PATH` independently.
+`provider`/`model`/`effort` with their `level:uid` sources, and `adapter_path` — under RM-1 the **absolute**
+`providers.<provider>.adapter` path taken from the verdict, not a `PATH`/cwd lookup. This is a transient
+observability event for the launching operator/tooling; it is not written to any journal and is **not** the
+durable Attempt record or provider-change audit (still specified, not yet built). The PDP additionally
+publishes a separate `launch_verdict` record shaped for RM-2 reuse.
 
 Then:
 
 1. Emit a `busy` heartbeat for the selected agent containing the resolved model, selected sandbox,
    resolved effort, and label. The managed heartbeat primitive uses the already-resolved `agent_uid` and
    `standup_dir`; it does not reopen the registry.
-2. Run from `--cwd` under the watchdog:
+2. Run from `--cwd` under the watchdog, inside a child environment constructed from the verdict's
+   allow-list via `env -i` (the provider inherits nothing but the allow-list plus the managed `AIBOBNET_*`
+   exports), executing the absolute adapter path at the effective (clamped) sandbox and effort:
 
    ```text
-   timeout <seconds> codex exec -m <resolved-model> -s <sandbox> \
-     -c model_reasoning_effort="<resolved-effort>" \
-     -c approval_policy="never" -- <prompt>
+   env -i <allow-list + managed exports> \
+     timeout <seconds> <absolute-adapter-path> exec -m <resolved-model> -s <effective-sandbox> \
+       -c model_reasoning_effort="<effective-effort>" \
+       -c approval_policy="never" -- <prompt>
    ```
 
 3. Report one terminal outcome:
@@ -102,18 +112,20 @@ pre-resolved primitive to preserve the one-snapshot launch invariant. That primi
 internal process-local bundle; no public option or ambient environment variable may inject its identity or
 path.
 
-## 5. Executable and test seam
+## 5. Executable and environment seam
 
-`CODEX_RUN_BIN` has no production or test-seam role and is removed before provider execution. The adapter
-executes the installed executable named exactly `codex` through `PATH`. If `codex` is not resolvable
-through `PATH` from `--cwd`, or the lookup yields no usable single-line path, managed launch fails closed
-and loud before any heartbeat or provider process (exit 127). Deterministic specs prepend a
-controlled directory containing a stub with that exact executable name to prove argument fidelity,
-timeout, error, success, heartbeat, cwd, and pre-launch refusal without network access.
+`CODEX_RUN_BIN` has no production or test-seam role and is removed before provider execution. Under RM-1 the
+adapter is the **absolute** `providers.codex.adapter` path from the registry, executed by absolute path —
+`command -v codex` from `--cwd` is gone, so cwd and `PATH` can no longer select which binary runs. A missing
+or non-absolute adapter is a fail-closed pre-launch deny before any heartbeat or provider process: a
+non-absolute path is a config error (exit 2), and an absent/unresolved/non-executable adapter is exit 127.
+Deterministic specs point the registry adapter map at a controlled stub to prove argument fidelity, timeout,
+error, success, heartbeat, cwd, and pre-launch refusal without network access.
 
-`PATH` selection is deliberately not a security claim. An operator-owned absolute adapter map belongs to
-the future enforcement phase. The wider inherited process environment is likewise not yet the target §7
-allow-list. These limits are reasons to label RM-0 **NO ENFORCEMENT**.
+The child environment is constructed from the verdict's allow-list via `env -i`, not scrubbed by denylist,
+delivering the `docs/DOMAIN.md` §7 environment allow-list **at the seam**. The absolute adapter map and the
+allow-list environment are RM-1 policy-gate mechanics, not containment: a caller can still bypass this
+adapter entirely, and the declared capabilities are trusted rather than verified. Non-bypassability is RM-3.
 
 ## 6. Migration from the legacy wrapper
 
@@ -151,9 +163,10 @@ defaults expected by the old wrapper before running the old code.
 ## 8. Relationship to the fleet
 
 `codex-run` is the compatibility surface for the Codex **Runner** pattern. `launch-agent` is the common
-provider dispatch seam. A Dispatcher may compose multiple calls and independently verify their results;
-that composition does not turn either command into a policy gate. Codex output remains subject to the same
-external review and merge ownership as any other builder output.
+provider dispatch seam and, under RM-1, the policy gate for cooperating agents. A Dispatcher may compose
+multiple calls and independently verify their results; that composition adds no containment and does not
+turn either command into a reference monitor. Codex output remains subject to the same external review and
+merge ownership as any other builder output.
 
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts.
