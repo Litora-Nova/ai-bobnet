@@ -90,7 +90,7 @@ expect_targeted_failure() {
 }
 
 expect_baseline_green "$SRC_ROOT/tests/managed_launch_spec.sh" \
-  "36 checks: 36 ok / 0 fail" "$WORK/clean-launch.out"
+  "40 checks: 40 ok / 0 fail" "$WORK/clean-launch.out"
 expect_baseline_green "$SRC_ROOT/tests/codex_run_spec.sh" \
   "74 checks: 74 ok / 0 fail" "$WORK/clean-codex-run.out"
 
@@ -192,6 +192,19 @@ expect_targeted_failure "terminal-heartbeat-reopens-registry" \
   "$HEARTBEAT_REOPEN/tests/managed_launch_spec.sh" \
   "registry removal still records terminal heartbeat at original path" \
   "$WORK/terminal-heartbeat-reopens-registry.out"
+
+# 9. Dropping the end-of-options -- before the prompt lets a leading-dash prompt be
+# parsed by codex as an option instead of prompt text (RM-0 hotfix #1). The regression
+# assertion pins the prompt operand immediately after a standalone -- in the argv.
+NO_EOO="$(make_mutant end-of-options-removed)"
+replace_exact "$NO_EOO/bin/launch-agent" \
+  '    -- "$prompt" 2>&1' \
+  '    "$prompt" 2>&1 # mutation: end-of-options -- removed'
+record_mutation "end-of-options-removed" "$?"
+expect_targeted_failure "end-of-options-removed" \
+  "$NO_EOO/tests/managed_launch_spec.sh" \
+  "leading-dash prompt passes after end-of-options --" \
+  "$WORK/end-of-options-removed.out"
 
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
