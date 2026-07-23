@@ -163,7 +163,7 @@ _aib_check_registry_with() {
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
     7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
     10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
-    11) aib_die 2 "registry schema_version must be the JSON number 2 or 3 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
+    11) aib_die 2 "registry schema_version must be the JSON number 2, 3, or 4 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
     12) aib_die 2 "registry contains a JSON string escape that decodes to an ASCII control character — refusing unsafe line/path data: $reg";;
     *) aib_die 2 "registry failed validation (code $rc): $reg";;
   esac
@@ -305,15 +305,17 @@ END {
   if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
 
   # schema_version is the compatibility gate, not decorative metadata. Only the
-  # exact JSON numbers 2 and 3 at depth 1 select grammars implemented by this reader;
-  # a nested lookalike, a string value, or an unknown version must fail closed.
+  # exact JSON numbers 2, 3, and 4 at depth 1 select grammars implemented by this
+  # reader; a nested lookalike, a string value, or an unknown version must fail
+  # closed. Schema 4 adds the provider adapter map + declared capabilities on top of
+  # the schema-3 execution binding — an old reader that knows only 2/3 still rejects it.
   schema_seen=0; sdepth=0
   for (j=1; j<=ntok; j++) {
     if (ty[j]=="P" && (tok[j]=="{" || tok[j]=="[")) { sdepth++; continue }
     if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) { sdepth--; continue }
     if (sdepth==1 && ty[j]=="S" && tok[j]=="schema_version" && ty[j+1]=="P" && tok[j+1]==":") {
       schema_seen=1
-      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3")) exit 11
+      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3" && tok[j+2]!="4")) exit 11
       schema_value=tok[j+2]
     }
   }
@@ -628,8 +630,15 @@ aib_resolve_agent_snapshot() {
   _aib_load_registry_snapshot
   _aib_check_registry_snapshot
   schema="$(_aib_snapshot_schema_version)" || aib_die 2 "registry: cannot read schema_version"
-  if [ "$mode" = managed ] && [ "$schema" != 3 ]; then
-    aib_die 3 "managed execution binding requires registry schema_version 3 (found $schema)"
+  # Execution binding lives in schema 3 and 4 alike. Schema 4 additionally carries the
+  # provider adapter map + declared capabilities (resolved below); whether the adapter
+  # is actually present is a POLICY question the PDP decides, not a schema-number branch
+  # here — a schema-3 registry simply resolves an empty adapter and the gate denies it.
+  if [ "$mode" = managed ]; then
+    case "$schema" in
+      3|4) ;;
+      *) aib_die 3 "managed execution binding requires registry schema_version 3 or 4 (found $schema)";;
+    esac
   fi
 
   _aib_split_agent_snapshot "$agent"
@@ -642,6 +651,13 @@ aib_resolve_agent_snapshot() {
   AIB_MODEL_SOURCE=""
   AIB_EFFORT=""
   AIB_EFFORT_SOURCE=""
+  # Schema-4 provider adapter map + declared capabilities. Empty on schema 2/3 (no
+  # adapter map): the PDP treats an empty adapter as a fail-closed missing-adapter deny.
+  AIB_ADAPTER_PATH=""
+  AIB_ADAPTER_SOURCE=""
+  AIB_CAP_SANDBOX=""
+  AIB_CAP_TIER=""
+  AIB_CAP_EFFORT=""
 
   AIB_HOME="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" home)"
   AIB_STANDUP_DIR="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" standup_dir)"
@@ -649,7 +665,10 @@ aib_resolve_agent_snapshot() {
   AIB_INBOX_PATH="${AIB_STANDUP_DIR}/inbox/${agent}.md"
 
   # Schema 2 remains a legacy identity/context format. It never invents binding.
-  [ "$schema" = 3 ] || return 0
+  case "$schema" in
+    3|4) ;;
+    *) return 0;;
+  esac
 
   if _aib_snapshot_field agents "$agent" team_uid "agent '$agent'"; then
     team="$AIB_SNAPSHOT_FIELD_VALUE"
@@ -685,10 +704,235 @@ aib_resolve_agent_snapshot() {
   AIB_MODEL_SOURCE="$model_source"
   AIB_EFFORT="$effort"
   AIB_EFFORT_SOURCE="$effort_source"
+
+  # Schema 4: resolve the provider's adapter path + declared capabilities from the
+  # top-level `providers` map (keyed by provider name). These are DECLARED registry
+  # data, never runtime-probed. They form the trusted half of the snapshot the PDP
+  # consumes; the PDP — not this resolver — decides whether they authorise a launch.
+  [ "$schema" = 4 ] || return 0
+  _aib_resolve_provider_caps "$provider"
+}
+
+# _aib_resolve_provider_caps <provider> — read providers.<provider>.{adapter,
+# cap_sandbox,cap_tier,cap_effort} from the active snapshot into AIB_ADAPTER_PATH /
+# AIB_CAP_*. A provider absent from the map is fail-closed (the map is the authority
+# for what a provider may do); each present field must be a decodable JSON string.
+_aib_resolve_provider_caps() {
+  local provider="$1"
+  if ! _aib_snapshot_query providers has "$provider"; then
+    aib_die 3 "registry: provider '$provider' is not declared in the schema-4 adapter map"
+  fi
+  _aib_snapshot_field providers "$provider" adapter "provider '$provider'" ||
+    aib_die 3 "registry: provider '$provider' has no adapter path in the adapter map"
+  AIB_ADAPTER_PATH="$AIB_SNAPSHOT_FIELD_VALUE"
+  AIB_ADAPTER_SOURCE="provider:$provider"
+  _aib_snapshot_field providers "$provider" cap_sandbox "provider '$provider'" ||
+    aib_die 3 "registry: provider '$provider' declares no cap_sandbox capability"
+  AIB_CAP_SANDBOX="$AIB_SNAPSHOT_FIELD_VALUE"
+  _aib_snapshot_field providers "$provider" cap_tier "provider '$provider'" ||
+    aib_die 3 "registry: provider '$provider' declares no cap_tier capability"
+  AIB_CAP_TIER="$AIB_SNAPSHOT_FIELD_VALUE"
+  _aib_snapshot_field providers "$provider" cap_effort "provider '$provider'" ||
+    aib_die 3 "registry: provider '$provider' declares no cap_effort capability"
+  AIB_CAP_EFFORT="$AIB_SNAPSHOT_FIELD_VALUE"
 }
 
 aib_resolve_managed_agent() {
   aib_resolve_agent_snapshot "$1" managed
+}
+
+# --- Policy Decision Point (PDP) ----------------------------------------------
+# aib_authorize_launch <request-record> <snapshot-record>
+#
+# The single authority for a managed launch, and a PURE decision function: it reads
+# NOTHING from disk, PATH, cwd, or the environment. Every input arrives in the two
+# newline-delimited key=value records; the verdict is deterministic over them. That
+# purity is what lets RM-3 move this identical function behind a process boundary
+# (broker daemon / own uid / container entrypoint): sourced today, exec'd tomorrow,
+# identical contract. It MUST NOT call aib_registry_file or any snapshot helper —
+# it consumes the already-resolved snapshot value it is handed, and nothing else.
+#
+#   request  keys:  agent_uid · sandbox (requested) · cwd · timeout · label
+#   snapshot keys:  clearance · provider · effort · adapter (absolute) ·
+#                   cap_sandbox (ceiling) · cap_tier · cap_effort  (all DECLARED
+#                   registry data, resolved by aib_resolve_managed_agent, never probed)
+#
+# Authority lives ONLY here: the sandbox ceiling, min(clearance, cap_tier), and the
+# effort cap are computed in this function and nowhere else — the PEP (launch-agent /
+# codex-run) consumes the verdict and does the launch, it never re-decides.
+#
+# Publishes the verdict via AIB_VERDICT_* globals (house style):
+#   AIB_VERDICT_DECISION             allow | deny
+#   AIB_VERDICT_CODE                 0 on allow; else the exit code the PEP should use
+#                                    (64 refusal · 2 config/IO · 127 adapter-not-found)
+#   AIB_VERDICT_REASONS              '; '-joined causes (deny reasons, or allow-time clamps)
+#   AIB_VERDICT_EFFECTIVE_CLEARANCE  min(clearance, cap_tier)      (empty on deny)
+#   AIB_VERDICT_EFFECTIVE_SANDBOX    min(requested, cap_sandbox)   (empty on deny)
+#   AIB_VERDICT_EFFECTIVE_EFFORT     min(effort, cap_effort)       (empty on deny)
+#   AIB_VERDICT_ADAPTER_PATH         the absolute adapter path     (empty on deny)
+#   AIB_VERDICT_ENV_ALLOW            child-env allow-list (see AIB_ENV_ALLOW_DEFAULT)
+#   AIB_VERDICT_PROVIDER · _AGENT_UID   echoed for the record
+#   AIB_VERDICT_RECORD               one-line JSON, managed_launch_binding shape family,
+#                                    so RM-2's durable Attempt audit reuses the schema.
+
+# Child environment is CONSTRUCTED from this allow-list (Lane B's `env -i`), never
+# scrubbed by denylist — a denylist is never complete, and RM-3's confined environment
+# is allow-list-constructed by definition. This default is the STRUCTURAL FLOOR only:
+# Lane B finalises the exact set from an empirical `env -i` smoke launch (at minimum
+# HOME, a sanitized PATH, and the provider-auth var that today leaks in SILENTLY by
+# inheritance — none named anywhere yet). TO BE FINALISED BY LANE B; not complete.
+AIB_ENV_ALLOW_DEFAULT="HOME PATH"
+
+# _aib_record_field <record> <key> -> value on stdout; rc 0 present, rc 1 absent.
+# Newline-delimited key=value; the FIRST '=' splits (a value may contain '='). Pure
+# parameter expansion: no here-string, no subshell, no temp file — deterministic over
+# the input string alone, so the purity claim holds even under `env -i`.
+_aib_record_field() {
+  local key="$2" rest="$1" line
+  while [ -n "$rest" ]; do
+    line="${rest%%$'\n'*}"
+    case "$rest" in
+      *$'\n'*) rest="${rest#*$'\n'}";;
+      *) rest="";;
+    esac
+    case "$line" in
+      "$key="*) printf '%s' "${line#"$key="}"; return 0;;
+    esac
+  done
+  return 1
+}
+
+# _aib_rank <tier|sandbox|effort> <token> -> sets _AIB_RANK (0 = unknown/invalid).
+# The three total orders the PDP takes minima over. Forkless (no subshell).
+_aib_rank() {
+  case "$1:$2" in
+    tier:t1) _AIB_RANK=1;; tier:t2) _AIB_RANK=2;; tier:t3) _AIB_RANK=3;; tier:t4) _AIB_RANK=4;;
+    sandbox:read-only) _AIB_RANK=1;; sandbox:workspace-write) _AIB_RANK=2;;
+    sandbox:danger-full-access) _AIB_RANK=3;;
+    effort:low) _AIB_RANK=1;; effort:medium) _AIB_RANK=2;; effort:high) _AIB_RANK=3;;
+    effort:max) _AIB_RANK=4;;
+    *) _AIB_RANK=0;;
+  esac
+}
+
+# Deny/clamp accumulators mutate the caller's dynamically-scoped locals (deny, code,
+# reasons) — the same dynamic-scope idiom the journal decider uses. First deny wins
+# the code because the checks are ordered by severity (127 > 2 > 64).
+_aib_verdict_deny() {
+  reasons="${reasons:+$reasons; }$2"
+  [ "$deny" -eq 1 ] || code="$1"
+  deny=1
+}
+_aib_verdict_note() {
+  reasons="${reasons:+$reasons; }$1"
+}
+
+aib_authorize_launch() {
+  local request="${1-}" snapshot="${2-}"
+  local agent_uid req_sandbox cwd timeout label
+  local clearance provider effort adapter cap_sandbox cap_tier cap_effort
+  local deny=0 code=0 reasons=""
+  local eff_clearance="" eff_sandbox="" eff_effort=""
+  local rreq rcap
+
+  # --- unpack both records (pure; an absent optional field is empty) -----------
+  agent_uid="$(_aib_record_field "$request" agent_uid)"   || agent_uid=""
+  req_sandbox="$(_aib_record_field "$request" sandbox)"   || req_sandbox=""
+  cwd="$(_aib_record_field "$request" cwd)"               || cwd=""
+  timeout="$(_aib_record_field "$request" timeout)"       || timeout=""
+  label="$(_aib_record_field "$request" label)"           || label=""
+  clearance="$(_aib_record_field "$snapshot" clearance)"  || clearance=""
+  provider="$(_aib_record_field "$snapshot" provider)"    || provider=""
+  effort="$(_aib_record_field "$snapshot" effort)"        || effort=""
+  adapter="$(_aib_record_field "$snapshot" adapter)"      || adapter=""
+  cap_sandbox="$(_aib_record_field "$snapshot" cap_sandbox)" || cap_sandbox=""
+  cap_tier="$(_aib_record_field "$snapshot" cap_tier)"    || cap_tier=""
+  cap_effort="$(_aib_record_field "$snapshot" cap_effort)" || cap_effort=""
+
+  # --- deny checks, ordered by severity (adapter 127 > config 2 > refusal 64) --
+  # Adapter map is the authority for what a provider may run: an absent adapter is a
+  # fail-closed missing-adapter deny (the PEP maps this to exit 127), and it also
+  # subsumes the "unknown provider" case (an unknown provider resolves no adapter).
+  if [ -z "$adapter" ]; then
+    _aib_verdict_deny 127 "provider '${provider:-?}' resolves no adapter path (unknown provider or empty adapter map entry)"
+  else
+    case "$adapter" in
+      /*) ;;
+      *) _aib_verdict_deny 2 "adapter path '$adapter' is not absolute (the adapter map must hold an absolute, cwd-independent path)";;
+    esac
+  fi
+
+  # Declared capabilities must be present and well-formed — they bound the authority.
+  _aib_rank sandbox "$cap_sandbox"
+  [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid sandbox capability (cap_sandbox='$cap_sandbox')"
+  _aib_rank tier "$cap_tier"
+  [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid tier capability (cap_tier='$cap_tier')"
+  _aib_rank effort "$cap_effort"
+  [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid effort capability (cap_effort='$cap_effort')"
+
+  # Request/identity form (input hygiene the caller also enforces; re-checked here so
+  # the PDP is safe to call in isolation and under RM-3's process boundary).
+  [ -n "$agent_uid" ] || _aib_verdict_deny 64 "request names no agent_uid"
+  _aib_rank sandbox "$req_sandbox"
+  [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 64 "requested sandbox '$req_sandbox' is not a recognised mode"
+  _aib_rank tier "$clearance"
+  [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 64 "agent clearance '$clearance' is not a recognised tier"
+  _aib_rank effort "$effort"
+  [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 64 "resolved effort '$effort' is not a recognised level"
+
+  if [ "$deny" -eq 0 ]; then
+    # --- allow path: every effective value is a min(request/registry, capability) --
+    # Clamping (not denial) is the whole point of a min: the launch proceeds at the
+    # lower, safer bound. A request above a ceiling never GRANTS the higher value.
+    local rc1 rc2
+    _aib_rank tier "$clearance"; rc1="$_AIB_RANK"
+    _aib_rank tier "$cap_tier";  rc2="$_AIB_RANK"
+    if [ "$rc1" -le "$rc2" ]; then eff_clearance="$clearance"
+    else eff_clearance="$cap_tier"; _aib_verdict_note "clearance '$clearance' exceeds provider tier ceiling '$cap_tier'; clamped to '$cap_tier'"; fi
+
+    _aib_rank sandbox "$req_sandbox"; rreq="$_AIB_RANK"
+    _aib_rank sandbox "$cap_sandbox"; rcap="$_AIB_RANK"
+    if [ "$rreq" -le "$rcap" ]; then eff_sandbox="$req_sandbox"
+    else eff_sandbox="$cap_sandbox"; _aib_verdict_note "requested sandbox '$req_sandbox' exceeds provider ceiling '$cap_sandbox'; clamped to '$cap_sandbox'"; fi
+
+    _aib_rank effort "$effort";     rc1="$_AIB_RANK"
+    _aib_rank effort "$cap_effort"; rc2="$_AIB_RANK"
+    if [ "$rc1" -le "$rc2" ]; then eff_effort="$effort"
+    else eff_effort="$cap_effort"; _aib_verdict_note "effort '$effort' exceeds provider cap '$cap_effort'; clamped to '$cap_effort'"; fi
+  fi
+
+  # --- publish the verdict -----------------------------------------------------
+  AIB_VERDICT_AGENT_UID="$agent_uid"
+  AIB_VERDICT_PROVIDER="$provider"
+  AIB_VERDICT_REASONS="$reasons"
+  AIB_VERDICT_ENV_ALLOW="$AIB_ENV_ALLOW_DEFAULT"
+  if [ "$deny" -eq 1 ]; then
+    AIB_VERDICT_DECISION="deny"
+    AIB_VERDICT_CODE="$code"
+    AIB_VERDICT_EFFECTIVE_CLEARANCE=""
+    AIB_VERDICT_EFFECTIVE_SANDBOX=""
+    AIB_VERDICT_EFFECTIVE_EFFORT=""
+    AIB_VERDICT_ADAPTER_PATH=""
+  else
+    AIB_VERDICT_DECISION="allow"
+    AIB_VERDICT_CODE=0
+    AIB_VERDICT_EFFECTIVE_CLEARANCE="$eff_clearance"
+    AIB_VERDICT_EFFECTIVE_SANDBOX="$eff_sandbox"
+    AIB_VERDICT_EFFECTIVE_EFFORT="$eff_effort"
+    AIB_VERDICT_ADAPTER_PATH="$adapter"
+  fi
+
+  AIB_VERDICT_RECORD="$(printf '{"event":"launch_verdict","agent_uid":%s,"provider":%s,"decision":%s,"code":%s,"effective_clearance":%s,"effective_sandbox":%s,"effective_effort":%s,"adapter_path":%s}' \
+    "$(aib_json "$AIB_VERDICT_AGENT_UID")" \
+    "$(aib_json "$AIB_VERDICT_PROVIDER")" \
+    "$(aib_json "$AIB_VERDICT_DECISION")" \
+    "$AIB_VERDICT_CODE" \
+    "$(aib_json "$AIB_VERDICT_EFFECTIVE_CLEARANCE")" \
+    "$(aib_json "$AIB_VERDICT_EFFECTIVE_SANDBOX")" \
+    "$(aib_json "$AIB_VERDICT_EFFECTIVE_EFFORT")" \
+    "$(aib_json "$AIB_VERDICT_ADAPTER_PATH")")"
+
+  [ "$deny" -eq 0 ]
 }
 
 # --- optional actor label (on_behalf_of; DOMAIN §2 "Ephemeral helpers") -------
