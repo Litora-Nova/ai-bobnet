@@ -113,7 +113,9 @@ migration contract in `docs/CONTRACT-execution-binding.md`.
 - **But it can cap it.** §7 bars `soft-enforcement` runtimes from high-tier and T4 work. That bar binds
   here: an agent's **effective** authority is `min(clearance, what its provider can actually enforce)`.
   Registry clearance is therefore a ceiling, never a promise. Because this is security-relevant,
-  `provider` changes are **audited events**, like clearance changes.
+  `provider` changes are **audited events**, like clearance changes. RM-0 does not implement this cap:
+  it resolves and records the binding but neither enforces `min(clearance, provider)` nor emits the
+  provider-change audit event.
 - **An Attempt records the resolved binding it actually ran with** (§5). The registry is mutable, so the
   current object cannot answer what executed last Tuesday; only the Attempt can. Audit reads the Attempt.
   RM-0 does not implement this target: its heartbeat binding is not a durable Attempt or audit record.

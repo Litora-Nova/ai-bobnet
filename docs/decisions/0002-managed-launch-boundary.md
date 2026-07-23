@@ -56,7 +56,7 @@ Introduce registry schema 3 and a provider-neutral managed launch seam.
 - New readers continue to support schema 2 for legacy identity/context and command execution, but managed
   provider launch requires schema 3. Old readers continue to reject schema 3.
 
-This boundary is explicitly **NO ENFORCEMENT**. It does not apply the domain policy decision function,
+This managed-launch seam is explicitly **NO ENFORCEMENT**. It does not apply the domain policy decision function,
 mediate syscalls or children, constrain network/VCS effects, protect `PATH`, implement the target §7
 environment allow-list, prevent direct raw provider execution, or make a T4 decision. It creates no Gate,
 Grant, Effect, or durable Attempt record. Heartbeat binding text is operational visibility only, not
@@ -123,6 +123,11 @@ provide the immutable Attempt history required by the target contract.
 - `codex-run` remains recognizable to existing callers but its model/effort flags become explicit errors.
 - Provider changes still do not change registry clearance. Provider-change audit, effective-authority
   capping, and durable binding history remain unimplemented with the event spine/reference monitor.
+- `launch-agent` resolves the binding before scrubbing the environment, so it honors an ambient
+  `AIBOBNET_REGISTRY` locating the registry to read; `run-agent` scrubs first. This is intentional — the
+  managed launch is the trusted entry point and the child it `exec`s is fully scrubbed and re-exported
+  from the resolved bundle — and consistent with NO ENFORCEMENT, but the divergence is a known limitation
+  a future reference monitor must close.
 - The launcher adds no runtime dependency, network call, daemon, or server. Existing Bash/Unix/coreutils
   requirements remain.
 - The managed path is easier to wrap with a future reference monitor, but it is bypassable today. Public

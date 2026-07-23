@@ -41,6 +41,10 @@ The former `--model` and `--effort` flags are accepted only far enough to return
 error with exit 64. They never override the registry and never start a provider process. There is no
 tool-local model or effort default. Provider has no CLI or environment option.
 
+These refusals — the rejected `--model`/`--effort` flags and the `danger-full-access` sandbox — are
+input hygiene at this one managed entry point, not a containment guarantee: a caller can still bypass
+`codex-run` and execute a provider directly (see NO ENFORCEMENT).
+
 ## 3. Resolution and delegation
 
 For one call:
