@@ -88,15 +88,71 @@ aib_journal_commit() {
 # Encodes a shell string as a JSON string literal. It escapes backslash and quote
 # AND every JSON control byte (U+0000–U+001F): the well-known ones via their short
 # escapes (\n \t \r \b \f) and any remaining control byte via \u00XX. A NUL can never
-# reach here (bash cannot hold one in a variable). Bytes ≥ U+0020 — including raw UTF-8
-# multibyte sequences — pass through verbatim (valid JSON). Nothing is ever passed
+# reach here (bash cannot hold one in a variable). Valid UTF-8 bytes ≥ U+0020 pass
+# through verbatim; invalid UTF-8 is rejected fail-closed. Nothing is ever passed
 # through raw that JSON requires escaped: the RM-2 audit payloads carry arbitrary
 # label/reason text, so a control byte MUST be encoded, never emitted literally (which
 # would also forge a second physical line and break the framed stream). LC_ALL=C makes
 # the scan byte-deterministic; correctness does not depend on the locale switch taking
 # effect (a lone control byte is a single byte and sorts below space in any locale).
+_aib_utf8_is_valid() {
+  local input="$1" LC_ALL=C length index char byte second third fourth
+  case "$input" in
+    *[$'\200'-$'\377']*) ;;
+    *) return 0;;
+  esac
+  length=${#input}
+  index=0
+  while [ "$index" -lt "$length" ]; do
+    char="${input:index:1}"
+    printf -v byte '%d' "'$char"
+    if [ "$byte" -le 127 ]; then
+      index=$((index + 1))
+      continue
+    fi
+    if [ "$byte" -ge 194 ] && [ "$byte" -le 223 ]; then
+      [ $((index + 1)) -lt "$length" ] || return 1
+      printf -v second '%d' "'${input:index+1:1}"
+      [ "$second" -ge 128 ] && [ "$second" -le 191 ] || return 1
+      index=$((index + 2))
+      continue
+    fi
+    if [ "$byte" -ge 224 ] && [ "$byte" -le 239 ]; then
+      [ $((index + 2)) -lt "$length" ] || return 1
+      printf -v second '%d' "'${input:index+1:1}"
+      printf -v third '%d' "'${input:index+2:1}"
+      [ "$third" -ge 128 ] && [ "$third" -le 191 ] || return 1
+      case "$byte" in
+        224) [ "$second" -ge 160 ] && [ "$second" -le 191 ] || return 1;;
+        237) [ "$second" -ge 128 ] && [ "$second" -le 159 ] || return 1;;
+        *) [ "$second" -ge 128 ] && [ "$second" -le 191 ] || return 1;;
+      esac
+      index=$((index + 3))
+      continue
+    fi
+    if [ "$byte" -ge 240 ] && [ "$byte" -le 244 ]; then
+      [ $((index + 3)) -lt "$length" ] || return 1
+      printf -v second '%d' "'${input:index+1:1}"
+      printf -v third '%d' "'${input:index+2:1}"
+      printf -v fourth '%d' "'${input:index+3:1}"
+      [ "$third" -ge 128 ] && [ "$third" -le 191 ] || return 1
+      [ "$fourth" -ge 128 ] && [ "$fourth" -le 191 ] || return 1
+      case "$byte" in
+        240) [ "$second" -ge 144 ] && [ "$second" -le 191 ] || return 1;;
+        244) [ "$second" -ge 128 ] && [ "$second" -le 143 ] || return 1;;
+        *) [ "$second" -ge 128 ] && [ "$second" -le 191 ] || return 1;;
+      esac
+      index=$((index + 4))
+      continue
+    fi
+    return 1
+  done
+  return 0
+}
+
 aib_json() {
   local s="$1" out="" ch esc i len LC_ALL=C
+  _aib_utf8_is_valid "$s" || aib_die 2 "JSON string input is not valid UTF-8"
   len=${#s}
   for (( i=0; i<len; i++ )); do
     ch="${s:i:1}"
@@ -1057,6 +1113,9 @@ aib_inbox_path() {
 #   rest     json  the event object, starting at `{`; contains no LF/CR
 #   term     LF    the LF is the commit marker: an unterminated final record is
 #                  uncommitted (never ACKed), not a committed-but-corrupt one.
+# The encoded JSON record is capped at AIB_EVENT_MAX_RECORD_BYTES before framing and
+# append. Payload JSON crossing the broker seam must come from the frozen composers
+# below; they are the JSON-validity authority because the runtime has no JSON parser.
 # Both crc AND len must match: len catches a chance CRC collision or a shifted SP in
 # the prefix. seq is NOT a §5 envelope field (§6 only requires it live in the source
 # records — it does, in the framing layer); the reader cross-checks it against the
@@ -1088,7 +1147,9 @@ aib_inbox_path() {
 #
 # PAYLOAD — attempt.decided (write-ahead intent for allow; the single record for deny):
 #   decision  allow|deny · code (int) · reasons (the verdict's '; '-joined text; ""=none)
-#   provider/model/effort: each a {resolved, source, effective} triple. NULL/EMPTY
+#   provider/model/effort: each a {requested, resolved, source, effective} object.
+#     requested is frozen as null in RM-2 because no direct CLI request exists today.
+#     NULL/EMPTY
 #     SEMANTICS (§B7): `resolved` is always populated (the binding is resolved before
 #     the PDP), so a DENY that BLANKS `effective` to null is distinguishable from a
 #     genuinely UNRESOLVED value (where `resolved` is null too). `requested` is not a
@@ -1098,7 +1159,7 @@ aib_inbox_path() {
 #     deny), source}.
 #   pid: the PEP parent PID (reader-side presumed-dead check) · prompt: {len, sha256}
 #     — the prompt NEVER enters a record, only its length + hash (§6) · label + label_len
-#     (label is user input: length-capped + sanitised by the caller, control-byte-encoded
+#     (label is user input: capped at AIB_EVENT_MAX_LABEL_BYTES and control-byte-encoded
 #     here).
 #   There is NO exit field on attempt.decided (omitted, not null, §B7).
 #
@@ -1125,6 +1186,8 @@ aib_inbox_path() {
 
 AIB_EVENT_SCHEMA_VERSION=1
 AIB_EVENT_STREAM_NAME="main"
+AIB_EVENT_MAX_LABEL_BYTES=256
+AIB_EVENT_MAX_RECORD_BYTES=65536
 
 # aib_event_stream_paths <standup_dir> — freeze the stream path convention in ONE place
 # so the writer (Lane B) and the reader (Lane C) never disagree.
@@ -1180,13 +1243,18 @@ _aib_kv_num_or_null() {
 }
 
 aib_event_compose_decided_payload() {
-  local kv="${1-}" decision code reasons
+  local kv="${1-}" decision code reasons label LC_ALL=C
+  _aib_utf8_is_valid "$kv" || aib_die 2 "decided payload input is not valid UTF-8"
   decision="$(_aib_record_field "$kv" decision)" || decision=""
   case "$decision" in allow|deny) ;; *) aib_die 2 "decided payload requires decision allow|deny (got '$decision')";; esac
   code="$(_aib_record_field "$kv" code)" || code=""
   case "$code" in ''|*[!0-9]*) aib_die 2 "decided payload requires a numeric code (got '$code')";; esac
   reasons="$(_aib_record_field "$kv" reasons)" || reasons=""
-  printf '{"decision":%s,"code":%s,"reasons":%s,"provider":{"resolved":%s,"source":%s,"effective":%s},"model":{"resolved":%s,"source":%s,"effective":%s},"effort":{"resolved":%s,"source":%s,"effective":%s},"sandbox":{"requested":%s,"effective":%s},"adapter":{"raw":%s,"effective_path":%s,"source":%s},"pid":%s,"prompt":{"len":%s,"sha256":%s},"label":%s,"label_len":%s}' \
+  if label="$(_aib_record_field "$kv" label)"; then
+    [ "${#label}" -le "$AIB_EVENT_MAX_LABEL_BYTES" ] ||
+      aib_die 2 "event label exceeds ${AIB_EVENT_MAX_LABEL_BYTES}-byte cap"
+  fi
+  printf '{"decision":%s,"code":%s,"reasons":%s,"provider":{"requested":null,"resolved":%s,"source":%s,"effective":%s},"model":{"requested":null,"resolved":%s,"source":%s,"effective":%s},"effort":{"requested":null,"resolved":%s,"source":%s,"effective":%s},"sandbox":{"requested":%s,"effective":%s},"adapter":{"raw":%s,"effective_path":%s,"source":%s},"pid":%s,"prompt":{"len":%s,"sha256":%s},"label":%s,"label_len":%s}' \
     "$(aib_json "$decision")" "$code" "$(aib_json "$reasons")" \
     "$(_aib_kv_json_or_null "$kv" provider_resolved)" "$(_aib_kv_json_or_null "$kv" provider_source)" "$(_aib_kv_json_or_null "$kv" provider_effective)" \
     "$(_aib_kv_json_or_null "$kv" model_resolved)" "$(_aib_kv_json_or_null "$kv" model_source)" "$(_aib_kv_json_or_null "$kv" model_effective)" \
@@ -1199,6 +1267,7 @@ aib_event_compose_decided_payload() {
 
 aib_event_compose_ended_payload() {
   local kv="${1-}" exit_class
+  _aib_utf8_is_valid "$kv" || aib_die 2 "ended payload input is not valid UTF-8"
   exit_class="$(_aib_record_field "$kv" exit_class)" || exit_class=""
   case "$exit_class" in
     ok|provider-failure|timeout|io-refused|aborted) ;;
@@ -1285,6 +1354,7 @@ aib_event_field() {
 #       AIB_EVENT_SCAN_NEXT_SEQ    highest+1 (or 1)
 #       AIB_EVENT_SCAN_TORN_TAIL   1 if an uncommitted (unterminated final) record exists
 #       AIB_EVENT_SCAN_TRUNCATE_AT byte offset of the last intact LF boundary
+#       AIB_EVENT_SCAN_DECIDED_IDS newline list of persisted attempt.decided event_ids
 #       AIB_EVENT_SCAN_ENDED_IDS   newline list of attempt_ids that already have an ended
 #       AIB_EVENT_SCAN_CORRUPT_REASON  human-readable cause when corrupt
 # With emit=1 it prints `<seq>\t<json>` per intact record (for the fold), skipping the
@@ -1297,6 +1367,7 @@ _aib_event_scan_core() {
   AIB_EVENT_SCAN_NEXT_SEQ=1
   AIB_EVENT_SCAN_TORN_TAIL=0
   AIB_EVENT_SCAN_TRUNCATE_AT=0
+  AIB_EVENT_SCAN_DECIDED_IDS=""
   AIB_EVENT_SCAN_ENDED_IDS=""
   AIB_EVENT_SCAN_CORRUPT_REASON=""
   [ -e "$path" ] || return 0
@@ -1361,9 +1432,10 @@ _aib_event_scan_core() {
       if [ "${fev_id##*-}" != "$seq" ]; then
         AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_CORRUPT_REASON="event_id/seq mismatch (seq $seq, event_id $fev_id)"; return 0
       fi
-      if [ "$fev_type" = "attempt.ended" ]; then
-        AIB_EVENT_SCAN_ENDED_IDS="${AIB_EVENT_SCAN_ENDED_IDS}${fatt_id}"$'\n'
-      fi
+      case "$fev_type" in
+        attempt.decided) AIB_EVENT_SCAN_DECIDED_IDS="${AIB_EVENT_SCAN_DECIDED_IDS}${fev_id}"$'\n';;
+        attempt.ended) AIB_EVENT_SCAN_ENDED_IDS="${AIB_EVENT_SCAN_ENDED_IDS}${fatt_id}"$'\n';;
+      esac
     fi
     [ "$emit" -eq 1 ] && printf '%s\t%s\n' "$seq" "$json"
     offset=$((offset + ${#line} + 1))
@@ -1403,6 +1475,10 @@ _aib_event_compose_record() {
 # --- aib_event_commit — the serialising append broker ------------------------
 # aib_event_commit <events_path> <lock_path> <event_type> <envelope_kv> <payload_json> [decided_event_id]
 #
+# `payload_json` is trusted composer output from aib_event_compose_decided_payload or
+# aib_event_compose_ended_payload. The broker enforces object/one-line shape, identity,
+# framing, size, and stream invariants; it deliberately does not duplicate a JSON parser.
+#
 # The caller passes payload + envelope fields WITHOUT any identity field. INSIDE the
 # exclusive sidecar lock the broker: validates the whole stream fail-closed, truncates
 # an uncommitted tail, allocates `seq`, COMPOSES the identity from that seq (§B4 — no
@@ -1414,7 +1490,7 @@ _aib_event_compose_record() {
 aib_event_commit() {
   local events_path="${1:-}" lock_path="${2:-}" event_type="${3:-}"
   local envelope_kv="${4-}" payload_json="${5-}" decided_id="${6-}"
-  local _fd timeout k
+  local _fd timeout k LC_ALL=C
   local project_uid actor_type actor_id agent_uid team_uid session_id run_id task_id gate_id grant_id effect_id occurred_at
 
   [ "$#" -ge 5 ] || aib_die 2 "event commit requires events path, lock path, event_type, envelope, payload"
@@ -1480,11 +1556,7 @@ aib_event_commit() {
   local AIB_EVENT_ACTIVE_LOCK="$lock_path"
   local AIB_EVENT_LOCK_FD="$_fd"
 
-  # in-lock stream validation. Extract fields only for an ended (it needs the ended-index
-  # for the at-most-one revalidation); the common decided path skips per-record extraction.
-  local need_extract=0
-  [ "$event_type" = attempt.ended ] && need_extract=1
-  _aib_event_scan_core "$events_path" "$need_extract" 0
+  _aib_event_scan_core "$events_path" 1 0
   if [ "$AIB_EVENT_SCAN_STATUS" = corrupt ]; then
     aib_die 2 "event stream is corrupt (${AIB_EVENT_SCAN_CORRUPT_REASON}) — refusing append: $events_path"
   fi
@@ -1500,7 +1572,10 @@ aib_event_commit() {
   if [ "$event_type" = attempt.decided ]; then
     attempt_id="$event_id"; correlation_id="$event_id"; causation_id="$event_id"
   else
-    # at-most-one attempt.ended per attempt_id — revalidated UNDER the lock (§B3).
+    case $'\n'"${AIB_EVENT_SCAN_DECIDED_IDS}" in
+      *$'\n'"$decided_id"$'\n'*) ;;
+      *) aib_die 2 "attempt.ended requires a persisted prior attempt.decided event_id";;
+    esac
     case $'\n'"${AIB_EVENT_SCAN_ENDED_IDS}" in
       *$'\n'"$decided_id"$'\n'*)
         aib_die 2 "attempt '$decided_id' already has an attempt.ended — refusing a second terminal record";;
@@ -1518,6 +1593,8 @@ aib_event_commit() {
   case "$record" in
     *$'\n'*|*$'\r'*) aib_die 2 "composed event record is not a single physical line";;
   esac
+  [ "${#record}" -le "$AIB_EVENT_MAX_RECORD_BYTES" ] ||
+    aib_die 2 "encoded event record exceeds ${AIB_EVENT_MAX_RECORD_BYTES}-byte cap"
 
   local crc len
   set -- $(printf '%s' "$record" | cksum); crc="$1"; len="$2"

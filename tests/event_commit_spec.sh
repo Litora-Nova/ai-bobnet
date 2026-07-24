@@ -27,6 +27,7 @@ assert_nonzero() { if [ "$2" -ne 0 ]; then ok "$1"; else no "$1 (got rc 0)"; fi;
 assert_zero()    { if [ "$2" -eq 0 ]; then ok "$1"; else no "$1 (got rc $2)"; fi; }
 assert_contains(){ case "$2" in *"$3"*) ok "$1";; *) no "$1 ('$2' has no '$3')";; esac; }
 assert_missing() { case "$2" in *"$3"*) no "$1 ('$2' still has '$3')";; *) ok "$1";; esac; }
+command -v jq >/dev/null 2>&1 || { printf 'FAIL - required test dependency missing: jq\n'; exit 1; }
 
 # json part of a framed record line -> stdout
 frame_json() {
@@ -48,6 +49,9 @@ enc_ctrl="$(aib_json "$(printf 'x\001y')")"
 assert_streq 'aib_json encodes U+0001 as backslash-u-0001' "$enc_ctrl" '"x\u0001y"'
 case "$enc_ctrl" in *$'\001'*) no 'aib_json leaks a raw control byte';; *) ok 'aib_json leaks no raw control byte';; esac
 assert_streq 'aib_json passes UTF-8 through' "$(aib_json 'grüße-λ')" '"grüße-λ"'
+invalid_utf8="$(printf '\377')"
+( aib_event_compose_decided_payload $'decision=allow\ncode=0\nlabel='"$invalid_utf8"$'\nlabel_len=1' ) >/dev/null 2>&1
+assert_nonzero 'decided composer rejects invalid UTF-8 in label' "$?"
 
 # -----------------------------------------------------------------------------
 # 2. %N guard (display-only occurred_at; identity never depends on the clock)
@@ -69,6 +73,9 @@ assert_missing 'aib_event_now has no literal N' "$now" 'N'
 allow_kv=$'decision=allow\ncode=0\nreasons=\nprovider_resolved=codex\nprovider_source=agent:acme-worker\nprovider_effective=codex\nmodel_resolved=gpt-5\nmodel_source=team:acme-core\nmodel_effective=gpt-5\neffort_resolved=high\neffort_source=project:acme\neffort_effective=high\nsandbox_requested=workspace-write\nsandbox_effective=read-only\nadapter_raw=/abs/codex\nadapter_effective=/abs/codex\nadapter_source=provider:codex\npid=4242\nprompt_len=17\nprompt_sha256=deadbeef\nlabel=hello world\nlabel_len=11'
 allow_pay="$(aib_event_compose_decided_payload "$allow_kv")"
 assert_contains 'decided allow carries decision' "$allow_pay" '"decision":"allow"'
+assert_contains 'decided allow provider requested slot is frozen null' "$allow_pay" '"provider":{"requested":null,"resolved":"codex"'
+assert_contains 'decided allow model requested slot is frozen null' "$allow_pay" '"model":{"requested":null,"resolved":"gpt-5"'
+assert_contains 'decided allow effort requested slot is frozen null' "$allow_pay" '"effort":{"requested":null,"resolved":"high"'
 assert_contains 'decided allow effective effort present' "$allow_pay" '"effective":"high"'
 assert_contains 'decided allow sandbox clamped' "$allow_pay" '"sandbox":{"requested":"workspace-write","effective":"read-only"}'
 assert_contains 'decided allow adapter effective path present' "$allow_pay" '"effective_path":"/abs/codex"'
@@ -87,6 +94,15 @@ assert_contains 'deny adapter effective_path null' "$deny_pay" '"effective_path"
 assert_nonzero 'decided rejects unknown decision' "$?"
 ( aib_event_compose_decided_payload $'decision=allow\ncode=x' ) >/dev/null 2>&1
 assert_nonzero 'decided rejects non-numeric code' "$?"
+validity_kv=$'decision=deny\ncode=2\nreasons=tab\tcontrol\001 utf8 grüße-λ\nlabel=control\001 utf8 grüße-λ\nlabel_len=23'
+validity_payload="$(aib_event_compose_decided_payload "$validity_kv")"
+printf '%s' "$validity_payload" | jq -e 'type == "object" and .decision == "deny" and .label == "control\u0001 utf8 grüße-λ"' >/dev/null 2>&1
+assert_zero 'decided composer emits valid JSON for control and multibyte input' "$?"
+
+printf -v overlong_label '%*s' 257 ''
+overlong_label="${overlong_label// /x}"
+( aib_event_compose_decided_payload $'decision=allow\ncode=0\nlabel='"$overlong_label"$'\nlabel_len=257' ) >/dev/null 2>&1
+assert_nonzero 'decided composer rejects a label above 256 bytes' "$?"
 
 # -----------------------------------------------------------------------------
 # 4. ended payload composer — closed exit enum, presumed-dead forbidden
@@ -101,6 +117,8 @@ assert_contains 'ended ok code null when absent' "$ended_ok" '"code":null'
 assert_nonzero 'ended rejects presumed-dead fail-closed' "$?"
 ( aib_event_compose_ended_payload $'exit_class=bogus' ) >/dev/null 2>&1
 assert_nonzero 'ended rejects unknown exit class' "$?"
+printf '%s' "$ended_pay" | jq -e 'type == "object" and .exit.class == "provider-failure" and .exit.code == 7' >/dev/null 2>&1
+assert_zero 'ended composer emits valid JSON' "$?"
 
 # -----------------------------------------------------------------------------
 # 5. top-level field extractor ignores a nested spoof in payload
@@ -189,6 +207,15 @@ printf '1 0 5 hello\n' >> "$EV3b"
 aib_event_scan "$EV3b" >/dev/null 2>&1 || true
 assert_streq 'non-object body is corrupt' "$AIB_EVENT_SCAN_STATUS" 'corrupt'
 
+S3c="$WORK/s3c"; mkdir -p "$S3c"; aib_event_stream_paths "$S3c"; EV3c="$AIB_EVENT_FILE"; LK3c="$AIB_EVENT_LOCK"
+mkdir -p "$(dirname "$EV3c")"
+mismatch_json='{"event_id":"acme-main-9","event_type":"attempt.decided","attempt_id":"acme-main-9","payload":{}}'
+set -- $(printf '%s' "$mismatch_json" | cksum); mismatch_crc="$1"; mismatch_len="$2"
+printf '1 %s %s %s\n' "$mismatch_crc" "$mismatch_len" "$mismatch_json" > "$EV3c"
+( aib_event_commit "$EV3c" "$LK3c" attempt.decided "$env_dec" "$pay_dec" ) >/dev/null 2>&1
+assert_nonzero 'decided writer refuses an event_id/seq-mismatched stream' "$?"
+assert_streq 'decided writer appends nothing after event_id/seq mismatch' "$(wc -l < "$EV3c")" '1'
+
 # -----------------------------------------------------------------------------
 # 9. at-most-one attempt.ended per attempt_id (in-lock broker rule)
 # -----------------------------------------------------------------------------
@@ -215,6 +242,12 @@ aib_event_commit "$EV4" "$LK4" attempt.ended "$env_dec" "$end_pay" "$did2"   # s
 assert_streq 'a different attempt may end (seq 4)' "$AIB_EVENT_COMMIT_SEQ" '4'
 ( aib_event_commit "$EV4" "$LK4" attempt.ended "$env_dec" "$end_pay" ) >/dev/null 2>&1
 assert_nonzero 'attempt.ended without a decided id is refused' "$?"
+
+S4b="$WORK/s4b"; mkdir -p "$S4b"; aib_event_stream_paths "$S4b"; EV4b="$AIB_EVENT_FILE"; LK4b="$AIB_EVENT_LOCK"
+( aib_event_commit "$EV4b" "$LK4b" attempt.ended "$env_dec" "$end_pay" acme-main-999 ) >/dev/null 2>&1
+assert_nonzero 'attempt.ended with an orphan decided id is refused' "$?"
+[ ! -e "$EV4b" ] || [ "$(wc -l < "$EV4b")" -eq 0 ]
+assert_zero 'orphan attempt.ended writes no record' "$?"
 
 # -----------------------------------------------------------------------------
 # 10. lost inner seq gap -> degraded, non-blocking; writer resumes above highest
@@ -264,6 +297,14 @@ assert_nonzero 'missing actor_type is refused' "$?"
 assert_nonzero 'missing actor_id is refused (§B7)' "$?"
 ( aib_event_commit "$EV" "$LK" attempt.decided "$env_dec" 'not-an-object' ) >/dev/null 2>&1
 assert_nonzero 'non-object payload is refused' "$?"
+
+S7="$WORK/s7"; mkdir -p "$S7"; aib_event_stream_paths "$S7"; EV7="$AIB_EVENT_FILE"; LK7="$AIB_EVENT_LOCK"
+printf -v huge_reason '%*s' 66000 ''
+huge_payload='{"reason":"'"$huge_reason"'"}'
+( aib_event_commit "$EV7" "$LK7" attempt.decided "$env_dec" "$huge_payload" ) >/dev/null 2>&1
+assert_nonzero 'encoded record above the 64-KiB cap is refused' "$?"
+[ ! -e "$EV7" ] || [ "$(wc -l < "$EV7")" -eq 0 ]
+assert_zero 'oversized record writes no journal line' "$?"
 
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
