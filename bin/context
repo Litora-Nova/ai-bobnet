@@ -60,7 +60,10 @@ if [ "$json" -eq 1 ]; then
   printf '"standup_dir":%s,' "$(aib_json "$standup_dir")"
   printf '"inbox_path":%s,'  "$(aib_json "$inbox_path")"
   printf '"mux_session":%s'  "$(aib_json "$mux_session")"
-  if [ "$AIB_REGISTRY_SCHEMA_VERSION" = 3 ]; then
+  # Emit the execution binding whenever the resolver populated it — a schema-number
+  # branch (= 3) silently drops it under schema 4, whose resolver fills these fields
+  # identically (see lib/aibobnet.sh case 3|4). Gate on field presence, not version.
+  if [ -n "$AIB_PROVIDER" ]; then
     printf ',"provider":%s'                "$(aib_json "$AIB_PROVIDER")"
     printf ',"provider_source":%s'         "$(aib_json "$AIB_PROVIDER_SOURCE")"
     printf ',"model":%s'                   "$(aib_json "$AIB_MODEL")"
@@ -78,7 +81,8 @@ else
   printf 'standup_dir=%s\n' "$standup_dir"
   printf 'inbox_path=%s\n'  "$inbox_path"
   printf 'mux_session=%s\n' "$mux_session"
-  if [ "$AIB_REGISTRY_SCHEMA_VERSION" = 3 ]; then
+  # Field-presence gate (see JSON branch above): schema 3 and 4 both carry binding.
+  if [ -n "$AIB_PROVIDER" ]; then
     printf 'provider=%s\n'                "$AIB_PROVIDER"
     printf 'provider_source=%s\n'         "$AIB_PROVIDER_SOURCE"
     printf 'model=%s\n'                   "$AIB_MODEL"
