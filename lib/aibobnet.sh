@@ -84,12 +84,41 @@ aib_journal_commit() {
   AIB_JOURNAL_COMMIT_RESULT="$commit_result"
 }
 
-# --- minimal JSON string encoder (for context --json) -------------------------
+# --- JSON string encoder (audit-grade) ----------------------------------------
+# Encodes a shell string as a JSON string literal. It escapes backslash and quote
+# AND every JSON control byte (U+0000–U+001F): the well-known ones via their short
+# escapes (\n \t \r \b \f) and any remaining control byte via \u00XX. A NUL can never
+# reach here (bash cannot hold one in a variable). Bytes ≥ U+0020 — including raw UTF-8
+# multibyte sequences — pass through verbatim (valid JSON). Nothing is ever passed
+# through raw that JSON requires escaped: the RM-2 audit payloads carry arbitrary
+# label/reason text, so a control byte MUST be encoded, never emitted literally (which
+# would also forge a second physical line and break the framed stream). LC_ALL=C makes
+# the scan byte-deterministic; correctness does not depend on the locale switch taking
+# effect (a lone control byte is a single byte and sorts below space in any locale).
 aib_json() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  printf '"%s"' "$s"
+  local s="$1" out="" ch esc i len LC_ALL=C
+  len=${#s}
+  for (( i=0; i<len; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\n') out+='\n' ;;
+      $'\t') out+='\t' ;;
+      $'\r') out+='\r' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      *)
+        if [[ "$ch" < " " ]]; then
+          printf -v esc '\\u%04x' "'$ch"
+          out+="$esc"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf '"%s"' "$out"
 }
 
 # Append a heartbeat from an already-resolved managed bundle without reopening
@@ -1000,4 +1029,502 @@ aib_inbox_path() {
   aib_split_agent "$agent"
   sd="$(aib_project_field "$AIB_PROJECT_UID" standup_dir)"
   printf '%s/inbox/%s.md\n' "$sd" "$agent"
+}
+
+# =============================================================================
+# RM-2 — framed event primitive (the first spine-conformant stream)
+# =============================================================================
+# This section is the durable-attempt-audit foundation. It is the writer AND the
+# read-only scan/validate interface for one framed, sequenced stream per project.
+# The legacy journals (Delivery/Memory/Heartbeat, ADR-0001) are NOT retrofitted —
+# they keep their unframed line protocol. This stream is the envelope's first real
+# customer, not a third ad-hoc line format.
+#
+# --- FROZEN SCHEMA (envelope + payload) --------------------------------------
+# Stream identity: (project_uid, "main"). File: <standup_dir>/events/main.events
+# with a separate sidecar lock <...>/main.events.lock. The `.events` (not `.jsonl`)
+# name is deliberate: a record is NOT bare JSON, it is framed.
+#
+# FRAME (§B5, Tim decision B) — pure transport, parsed strictly positionally from
+# line-start; a crafted body cannot push bytes before the line start, so there is no
+# forgery vector, and the reader never reconstructs an envelope field from the prefix:
+#
+#     <seq> SP <crc> SP <len> SP <json> LF
+#
+#   token 1  seq   decimal, writer-assigned, monotonic +1 within the stream
+#   token 2  crc   POSIX `cksum` CRC over EXACTLY the <json> bytes
+#   token 3  len   byte count of EXACTLY the <json> bytes (one `cksum` yields both)
+#   rest     json  the event object, starting at `{`; contains no LF/CR
+#   term     LF    the LF is the commit marker: an unterminated final record is
+#                  uncommitted (never ACKed), not a committed-but-corrupt one.
+# Both crc AND len must match: len catches a chance CRC collision or a shifted SP in
+# the prefix. seq is NOT a §5 envelope field (§6 only requires it live in the source
+# records — it does, in the framing layer); the reader cross-checks it against the
+# seq embedded in the crc-protected event_id, tying prefix to body.
+#
+# ENVELOPE (DOMAIN §5, additive-only) — every field present, absent optionals emitted
+# as JSON null so the shape is stable for readers:
+#   event_id        "<project_uid>-main-<seq>" — deterministic from (stream, seq),
+#                   host- and restart-unique WITHOUT a clock. COMPOSED IN-LOCK by the
+#                   broker after seq allocation; the caller never pre-composes it (§B4).
+#   event_type      "attempt.decided" | "attempt.ended"
+#   occurred_at     ISO-8601 UTC, DISPLAY ONLY (§6); uniqueness never depends on it.
+#   actor_type      human|agent|service|provider  (RM-2 attempts: service)
+#   actor_id        REQUIRED (§B7) — the service/actor that observed the decision.
+#   project_uid     the stream's project.
+#   team_uid, agent_uid, session_id, run_id, task_id, gate_id, grant_id, effect_id
+#                   optional envelope fields; null when not applicable (agent_uid MAY
+#                   be null when actor_type≠agent, §5).
+#   attempt_id      the grouping identity. For attempt.decided it EQUALS its own
+#                   event_id; for attempt.ended it equals the decided event_id passed
+#                   in by the caller. Inherits the under-lock seq uniqueness (§B4) —
+#                   the wall-clock/PID label some callers keep is display only, never
+#                   the grouping authority.
+#   correlation_id  = attempt_id (groups the attempt's records).
+#   causation_id    decided: its own event_id (root). ended: the decided event_id
+#                   (the persisted id returned by the broker, never re-guessed, §B4).
+#   schema_version  AIB_EVENT_SCHEMA_VERSION (the ENVELOPE version, not the registry's).
+#   payload         the per-type object below.
+#
+# PAYLOAD — attempt.decided (write-ahead intent for allow; the single record for deny):
+#   decision  allow|deny · code (int) · reasons (the verdict's '; '-joined text; ""=none)
+#   provider/model/effort: each a {resolved, source, effective} triple. NULL/EMPTY
+#     SEMANTICS (§B7): `resolved` is always populated (the binding is resolved before
+#     the PDP), so a DENY that BLANKS `effective` to null is distinguishable from a
+#     genuinely UNRESOLVED value (where `resolved` is null too). `requested` is not a
+#     CLI input for these three today; the schema slot is reserved additively.
+#   sandbox: {requested, effective} — the one dimension with a real CLI request.
+#   adapter: {raw (the map value), effective_path (the verdict's absolute path, null on
+#     deny), source}.
+#   pid: the PEP parent PID (reader-side presumed-dead check) · prompt: {len, sha256}
+#     — the prompt NEVER enters a record, only its length + hash (§6) · label + label_len
+#     (label is user input: length-capped + sanitised by the caller, control-byte-encoded
+#     here).
+#   There is NO exit field on attempt.decided (omitted, not null, §B7).
+#
+# PAYLOAD — attempt.ended (allow-path terminal only):
+#   exit: {class, code, signal}. class ∈ ok|provider-failure|timeout|io-refused|aborted
+#     — a genuinely observed terminal value only. `presumed-dead` is NEVER a payload
+#     value (§B7): it is exclusively a reader-side fold classification of an open
+#     decided(allow) whose recorded PID has vanished. The composer rejects it fail-closed.
+#
+# QUARANTINE (§B6, fail-closed):
+#   uncommitted tail — ONLY the last record AND only unterminated (no trailing LF): the
+#     writer truncates main.events in place at the last intact LF boundary (the file
+#     stays the single authoritative path — no rename, no second file), the bytes were
+#     never ACKed so are never replayed, and the writer resumes at last-intact seq+1.
+#   corrupt (fail-closed) — any TERMINATED record with crc/len mismatch, a non-object
+#     body, or an unparsable line: the stream is corrupt; the fold refuses a verdict AND
+#     the writer refuses the append (tail-validation under the lock fails → launch
+#     fail-closed). Audit corruption is a launch-stopper by doctrine; the DoS facet is
+#     bounded by the finite lock timeout below.
+#   lost (inner seq gaps) — reported as `degraded` (a gap is loss, not corruption); the
+#     writer resumes above the highest valid seq and does NOT block.
+#   NOT detectable without an external cursor: whole-suffix / file replacement (a
+#     persistent high-water anchor sits in the same trust domain — it is the RM-3 close).
+
+AIB_EVENT_SCHEMA_VERSION=1
+AIB_EVENT_STREAM_NAME="main"
+
+# aib_event_stream_paths <standup_dir> — freeze the stream path convention in ONE place
+# so the writer (Lane B) and the reader (Lane C) never disagree.
+# Sets AIB_EVENT_DIR / AIB_EVENT_FILE / AIB_EVENT_LOCK.
+aib_event_stream_paths() {
+  local standup_dir="${1:-}"
+  [ -n "$standup_dir" ] || aib_die 2 "event stream requires a standup_dir"
+  case "$standup_dir" in
+    *$'\n'*|*$'\r'*) aib_die 2 "invalid standup_dir (contains a line break)";;
+  esac
+  AIB_EVENT_DIR="$standup_dir/events"
+  AIB_EVENT_FILE="$AIB_EVENT_DIR/${AIB_EVENT_STREAM_NAME}.events"
+  AIB_EVENT_LOCK="$AIB_EVENT_DIR/${AIB_EVENT_STREAM_NAME}.events.lock"
+}
+
+# --- occurred_at helper + %N guard (display only) ----------------------------
+# `date +%N` is GNU-specific. A non-GNU date emits the literal string `N`; that must
+# fail closed rather than silently poison the timestamp. Uniqueness hangs on the
+# writer-assigned seq, NEVER on the clock — so this guard is about honesty of a display
+# field, not identity. Kept as a pure, directly-testable unit.
+_aib_guard_ns() {
+  local ns="$1"
+  case "$ns" in
+    ''|*[!0-9]*) aib_die 6 "date +%N did not expand to nanoseconds (non-GNU date?) — refusing a non-numeric timestamp fraction";;
+  esac
+  printf '%s' "$ns"
+}
+aib_event_now() {
+  local t frac
+  t="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')" || aib_die 2 "cannot read the clock"
+  frac="${t#*.}"; frac="${frac%Z}"
+  _aib_guard_ns "$frac" >/dev/null
+  printf '%s\n' "$t"
+}
+
+# --- payload composers (freeze the payload shape in Lane A) -------------------
+# Callers pass a newline-delimited key=value record; ABSENT key => JSON null, present
+# key (even empty) => encoded value. This is how a DENY blanks an `effective` field:
+# the caller simply omits it (null), while `resolved` stays present (distinguishable
+# from unresolved). All string values go through the audit-grade encoder.
+_aib_kv_json_or_null() {
+  local kv="$1" key="$2" v
+  if v="$(_aib_record_field "$kv" "$key")"; then aib_json "$v"; else printf 'null'; fi
+}
+_aib_kv_num_or_null() {
+  local kv="$1" key="$2" v
+  if v="$(_aib_record_field "$kv" "$key")"; then
+    case "$v" in ''|*[!0-9]*) aib_die 2 "event payload field '$key' must be a non-negative integer (got '$v')";; esac
+    printf '%s' "$v"
+  else
+    printf 'null'
+  fi
+}
+
+aib_event_compose_decided_payload() {
+  local kv="${1-}" decision code reasons
+  decision="$(_aib_record_field "$kv" decision)" || decision=""
+  case "$decision" in allow|deny) ;; *) aib_die 2 "decided payload requires decision allow|deny (got '$decision')";; esac
+  code="$(_aib_record_field "$kv" code)" || code=""
+  case "$code" in ''|*[!0-9]*) aib_die 2 "decided payload requires a numeric code (got '$code')";; esac
+  reasons="$(_aib_record_field "$kv" reasons)" || reasons=""
+  printf '{"decision":%s,"code":%s,"reasons":%s,"provider":{"resolved":%s,"source":%s,"effective":%s},"model":{"resolved":%s,"source":%s,"effective":%s},"effort":{"resolved":%s,"source":%s,"effective":%s},"sandbox":{"requested":%s,"effective":%s},"adapter":{"raw":%s,"effective_path":%s,"source":%s},"pid":%s,"prompt":{"len":%s,"sha256":%s},"label":%s,"label_len":%s}' \
+    "$(aib_json "$decision")" "$code" "$(aib_json "$reasons")" \
+    "$(_aib_kv_json_or_null "$kv" provider_resolved)" "$(_aib_kv_json_or_null "$kv" provider_source)" "$(_aib_kv_json_or_null "$kv" provider_effective)" \
+    "$(_aib_kv_json_or_null "$kv" model_resolved)" "$(_aib_kv_json_or_null "$kv" model_source)" "$(_aib_kv_json_or_null "$kv" model_effective)" \
+    "$(_aib_kv_json_or_null "$kv" effort_resolved)" "$(_aib_kv_json_or_null "$kv" effort_source)" "$(_aib_kv_json_or_null "$kv" effort_effective)" \
+    "$(_aib_kv_json_or_null "$kv" sandbox_requested)" "$(_aib_kv_json_or_null "$kv" sandbox_effective)" \
+    "$(_aib_kv_json_or_null "$kv" adapter_raw)" "$(_aib_kv_json_or_null "$kv" adapter_effective)" "$(_aib_kv_json_or_null "$kv" adapter_source)" \
+    "$(_aib_kv_num_or_null "$kv" pid)" "$(_aib_kv_num_or_null "$kv" prompt_len)" "$(_aib_kv_json_or_null "$kv" prompt_sha256)" \
+    "$(_aib_kv_json_or_null "$kv" label)" "$(_aib_kv_num_or_null "$kv" label_len)"
+}
+
+aib_event_compose_ended_payload() {
+  local kv="${1-}" exit_class
+  exit_class="$(_aib_record_field "$kv" exit_class)" || exit_class=""
+  case "$exit_class" in
+    ok|provider-failure|timeout|io-refused|aborted) ;;
+    presumed-dead) aib_die 2 "'presumed-dead' is a reader-side fold classification, never an event payload value (§B7)";;
+    *) aib_die 2 "invalid exit_class '$exit_class' (ok|provider-failure|timeout|io-refused|aborted)";;
+  esac
+  printf '{"exit":{"class":%s,"code":%s,"signal":%s}}' \
+    "$(aib_json "$exit_class")" \
+    "$(_aib_kv_num_or_null "$kv" exit_code)" \
+    "$(_aib_kv_json_or_null "$kv" signal)"
+}
+
+# --- top-level JSON field extractor (the shared reader primitive) -------------
+# The runtime has no general JSON parser beyond the registry awk. This is a small,
+# depth-tracking tokeniser that returns TOP-LEVEL (depth-1) string field values only —
+# a nested `"attempt_id":"spoof"` inside `payload` can NEVER be mistaken for the real
+# top-level field (that is what makes the at-most-one-ended check trustworthy against
+# a crafted body). Strings are consumed correctly at every depth so braces inside a
+# value never miscount. Non-string top-level values (numbers/null/objects) yield empty.
+_AIB_EVENT_FIELD_AWK='
+{ data = data $0 }
+END {
+  n = length(data); i = 1; depth = 0; expect = ""; curkey = ""
+  while (i <= n) {
+    c = substr(data, i, 1)
+    if (c == "\"") {
+      s = ""; i++
+      while (i <= n) {
+        d = substr(data, i, 1)
+        if (d == "\\") {
+          e = substr(data, i+1, 1)
+          if (e == "n") s = s "\n"; else if (e == "t") s = s "\t"; else if (e == "r") s = s "\r"
+          else if (e == "b") s = s "\b"; else if (e == "f") s = s "\f"
+          else if (e == "\"") s = s "\""; else if (e == "\\") s = s "\\"; else if (e == "/") s = s "/"
+          else if (e == "u") { s = s "\\u" substr(data, i+2, 4); i += 6; continue }
+          else { s = s e }
+          i += 2; continue
+        }
+        if (d == "\"") { i++; break }
+        s = s d; i++
+      }
+      if (depth == 1) {
+        if (expect == "key") { curkey = s; expect = "colon" }
+        else if (expect == "value") { val[curkey] = s; curkey = ""; expect = "comma" }
+      }
+      continue
+    }
+    if (c == "{" || c == "[") {
+      if (depth == 0) { depth = 1; expect = "key" }
+      else { if (depth == 1 && expect == "value") { expect = "comma"; curkey = "" } depth++ }
+      i++; continue
+    }
+    if (c == "}" || c == "]") { depth--; i++; continue }
+    if (c == ":") { if (depth == 1 && expect == "colon") expect = "value"; i++; continue }
+    if (c == ",") { if (depth == 1 && expect == "comma") expect = "key"; i++; continue }
+    if (c == " " || c == "\t" || c == "\r" || c == "\n") { i++; continue }
+    s = ""
+    while (i <= n) {
+      d = substr(data, i, 1)
+      if (d == " " || d == "\t" || d == "\r" || d == "\n" || d == "," || d == "}" || d == "]" || d == ":") break
+      s = s d; i++
+    }
+    if (depth == 1 && expect == "value") { curkey = ""; expect = "comma" }
+    continue
+  }
+  printf "%s\t%s\t%s", val[k1], val[k2], val[k3]
+}'
+
+# aib_event_field <record-json> <top-level-key> -> the field value on stdout (empty if
+# absent or non-string). Public so Lane C's fold consumes it instead of duplicating a
+# parser. Decodes the standard short escapes; leaves \uXXXX raw (rare, not fold-relevant).
+aib_event_field() {
+  local json="${1-}" key="${2-}" res
+  res="$(printf '%s' "$json" | awk -v k1="$key" -v k2="__aib_none1__" -v k3="__aib_none2__" "$_AIB_EVENT_FIELD_AWK")"
+  printf '%s' "${res%%$'\t'*}"
+}
+
+# --- read-only frame scanner / validator (shared core) -----------------------
+# Classifies the whole stream fail-closed and computes the next writer seq. NEVER
+# mutates the file (the writer performs the truncation the classifier prescribes).
+# Args: <events_path> <extract_fields 0|1> <emit_records 0|1>
+# Sets: AIB_EVENT_SCAN_STATUS      ok | degraded | corrupt
+#       AIB_EVENT_SCAN_HIGHEST_SEQ highest valid seq (0 if none)
+#       AIB_EVENT_SCAN_NEXT_SEQ    highest+1 (or 1)
+#       AIB_EVENT_SCAN_TORN_TAIL   1 if an uncommitted (unterminated final) record exists
+#       AIB_EVENT_SCAN_TRUNCATE_AT byte offset of the last intact LF boundary
+#       AIB_EVENT_SCAN_ENDED_IDS   newline list of attempt_ids that already have an ended
+#       AIB_EVENT_SCAN_CORRUPT_REASON  human-readable cause when corrupt
+# With emit=1 it prints `<seq>\t<json>` per intact record (for the fold), skipping the
+# uncommitted tail and printing nothing once corrupt.
+_aib_event_scan_core() {
+  local path="$1" extract="${2:-0}" emit="${3:-0}"
+  local LC_ALL=C
+  AIB_EVENT_SCAN_STATUS=ok
+  AIB_EVENT_SCAN_HIGHEST_SEQ=0
+  AIB_EVENT_SCAN_NEXT_SEQ=1
+  AIB_EVENT_SCAN_TORN_TAIL=0
+  AIB_EVENT_SCAN_TRUNCATE_AT=0
+  AIB_EVENT_SCAN_ENDED_IDS=""
+  AIB_EVENT_SCAN_CORRUPT_REASON=""
+  [ -e "$path" ] || return 0
+  if [ ! -r "$path" ]; then
+    AIB_EVENT_SCAN_STATUS=corrupt
+    AIB_EVENT_SCAN_CORRUPT_REASON="events stream is not readable"
+    return 0
+  fi
+
+  local line rc terminated offset=0 prev_seq=0
+  local seq crc len json calc calclen fields rest fev_id fev_type fatt_id
+  while true; do
+    IFS= read -r line; rc=$?
+    if [ "$rc" -ne 0 ] && [ -z "$line" ]; then break; fi
+    if [ "$rc" -eq 0 ]; then terminated=1; else terminated=0; fi
+
+    # An unterminated final segment is the uncommitted tail — the LF is the commit
+    # marker, so this holds regardless of whether the bytes would otherwise parse.
+    if [ "$terminated" -eq 0 ]; then
+      AIB_EVENT_SCAN_TORN_TAIL=1
+      AIB_EVENT_SCAN_TRUNCATE_AT="$offset"
+      break
+    fi
+
+    # strict positional parse: exactly three single-SP-separated leading tokens
+    if [[ "$line" =~ ^([0-9]+)' '([0-9]+)' '([0-9]+)' '(.*)$ ]]; then
+      seq="${BASH_REMATCH[1]}"; crc="${BASH_REMATCH[2]}"; len="${BASH_REMATCH[3]}"; json="${BASH_REMATCH[4]}"
+    else
+      AIB_EVENT_SCAN_STATUS=corrupt
+      AIB_EVENT_SCAN_CORRUPT_REASON="unparsable framed record near offset $offset"
+      return 0
+    fi
+    case "$json" in
+      {*) ;;
+      *) AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_CORRUPT_REASON="record body is not a JSON object (seq $seq)"; return 0;;
+    esac
+    if [ "${#json}" -ne "$len" ]; then
+      AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_CORRUPT_REASON="len mismatch (seq $seq)"; return 0
+    fi
+    set -- $(printf '%s' "$json" | cksum); calc="$1"; calclen="$2"
+    if [ "$calc" != "$crc" ] || [ "$calclen" -ne "$len" ]; then
+      AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_CORRUPT_REASON="crc/len mismatch (seq $seq)"; return 0
+    fi
+    # monotonicity: a decreasing or duplicate seq on a TERMINATED record is tampering,
+    # not loss — corrupt. A forward gap is loss — degraded, non-blocking.
+    if [ "$prev_seq" -ne 0 ]; then
+      if [ "$seq" -le "$prev_seq" ]; then
+        AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_CORRUPT_REASON="non-monotonic seq $seq after $prev_seq"; return 0
+      fi
+      [ "$seq" -eq $((prev_seq + 1)) ] || AIB_EVENT_SCAN_STATUS=degraded
+    else
+      [ "$seq" -eq 1 ] || AIB_EVENT_SCAN_STATUS=degraded
+    fi
+    prev_seq="$seq"
+    AIB_EVENT_SCAN_HIGHEST_SEQ="$seq"
+
+    if [ "$extract" -eq 1 ]; then
+      fields="$(printf '%s' "$json" | awk -v k1=event_id -v k2=event_type -v k3=attempt_id "$_AIB_EVENT_FIELD_AWK")"
+      fev_id="${fields%%$'\t'*}"; rest="${fields#*$'\t'}"; fev_type="${rest%%$'\t'*}"; fatt_id="${rest##*$'\t'}"
+      # tie the framing prefix to the crc-protected body: the seq inside event_id must
+      # equal the prefix seq. Catches a shifted prefix that still crc-matches its body.
+      if [ "${fev_id##*-}" != "$seq" ]; then
+        AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_CORRUPT_REASON="event_id/seq mismatch (seq $seq, event_id $fev_id)"; return 0
+      fi
+      if [ "$fev_type" = "attempt.ended" ]; then
+        AIB_EVENT_SCAN_ENDED_IDS="${AIB_EVENT_SCAN_ENDED_IDS}${fatt_id}"$'\n'
+      fi
+    fi
+    [ "$emit" -eq 1 ] && printf '%s\t%s\n' "$seq" "$json"
+    offset=$((offset + ${#line} + 1))
+  done < "$path"
+
+  AIB_EVENT_SCAN_NEXT_SEQ=$((AIB_EVENT_SCAN_HIGHEST_SEQ + 1))
+  return 0
+}
+
+# aib_event_scan <events_path> — read-only public scan for the fold (Lane C). Sets the
+# AIB_EVENT_SCAN_* globals and prints `<seq>\t<json>` for each intact record. It does
+# NOT truncate (writer-only): an uncommitted tail is reported and skipped, a corrupt
+# stream sets status=corrupt and prints nothing so the fold can refuse a verdict.
+aib_event_scan() {
+  local path="${1:-}"
+  [ -n "$path" ] || aib_die 2 "event scan requires a stream path"
+  _aib_event_scan_core "$path" 1 1
+}
+
+# --- record composer (identity fields injected by the broker only) -----------
+_aib_json_or_null() { [ -n "$1" ] && aib_json "$1" || printf 'null'; }
+_aib_event_compose_record() {
+  local event_id="$1" event_type="$2" occurred_at="$3" actor_type="$4" actor_id="$5" project_uid="$6"
+  local team_uid="$7" agent_uid="$8" session_id="$9" run_id="${10}" task_id="${11}"
+  local gate_id="${12}" grant_id="${13}" effect_id="${14}"
+  local attempt_id="${15}" correlation_id="${16}" causation_id="${17}" schema_version="${18}" payload_json="${19}"
+  printf '{"event_id":%s,"event_type":%s,"occurred_at":%s,"actor_type":%s,"actor_id":%s,"project_uid":%s,"team_uid":%s,"agent_uid":%s,"session_id":%s,"run_id":%s,"task_id":%s,"gate_id":%s,"grant_id":%s,"effect_id":%s,"attempt_id":%s,"correlation_id":%s,"causation_id":%s,"schema_version":%s,"payload":%s}' \
+    "$(aib_json "$event_id")" "$(aib_json "$event_type")" "$(aib_json "$occurred_at")" \
+    "$(aib_json "$actor_type")" "$(aib_json "$actor_id")" "$(aib_json "$project_uid")" \
+    "$(_aib_json_or_null "$team_uid")" "$(_aib_json_or_null "$agent_uid")" "$(_aib_json_or_null "$session_id")" \
+    "$(_aib_json_or_null "$run_id")" "$(_aib_json_or_null "$task_id")" "$(_aib_json_or_null "$gate_id")" \
+    "$(_aib_json_or_null "$grant_id")" "$(_aib_json_or_null "$effect_id")" \
+    "$(aib_json "$attempt_id")" "$(aib_json "$correlation_id")" "$(aib_json "$causation_id")" \
+    "$schema_version" "$payload_json"
+}
+
+# --- aib_event_commit — the serialising append broker ------------------------
+# aib_event_commit <events_path> <lock_path> <event_type> <envelope_kv> <payload_json> [decided_event_id]
+#
+# The caller passes payload + envelope fields WITHOUT any identity field. INSIDE the
+# exclusive sidecar lock the broker: validates the whole stream fail-closed, truncates
+# an uncommitted tail, allocates `seq`, COMPOSES the identity from that seq (§B4 — no
+# pre-composed line ever crosses the seam), frames + checked-appends, and only THEN
+# publishes the result. Returns AIB_EVENT_COMMIT_SEQ / AIB_EVENT_COMMIT_EVENT_ID.
+# At most one attempt.ended per attempt_id is revalidated UNDER the lock (§B3). The lock
+# wait is FINITE (flock -w) so a stuck cooperating writer cannot silently freeze all
+# launches (§3/§5 DoS bound); a timeout fails loudly with a stable exit code (75).
+aib_event_commit() {
+  local events_path="${1:-}" lock_path="${2:-}" event_type="${3:-}"
+  local envelope_kv="${4-}" payload_json="${5-}" decided_id="${6-}"
+  local _fd timeout k
+  local project_uid actor_type actor_id agent_uid team_uid session_id run_id task_id gate_id grant_id effect_id occurred_at
+
+  [ "$#" -ge 5 ] || aib_die 2 "event commit requires events path, lock path, event_type, envelope, payload"
+  [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$event_type" ] ||
+    aib_die 2 "event commit requires events path, lock path, and event_type"
+  [ -z "${AIB_EVENT_ACTIVE_LOCK:-}" ] || aib_die 2 "nested event commits are not supported"
+  command -v flock >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: flock (util-linux)"
+  command -v cksum >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: cksum"
+
+  case "$event_type" in
+    attempt.decided|attempt.ended) ;;
+    *) aib_die 2 "unknown event_type '$event_type' (expected attempt.decided|attempt.ended)";;
+  esac
+  [ -n "$payload_json" ] || aib_die 2 "event commit requires a payload"
+  case "$payload_json" in
+    {*) ;;
+    *) aib_die 2 "event payload must be a JSON object";;
+  esac
+  case "$payload_json" in
+    *$'\n'*|*$'\r'*) aib_die 2 "event payload must be a single physical line";;
+  esac
+
+  # No pre-composed identity field may cross the seam (§B4/N1) — the broker owns them.
+  for k in event_id attempt_id correlation_id causation_id seq; do
+    if _aib_record_field "$envelope_kv" "$k" >/dev/null; then
+      aib_die 2 "envelope must not carry identity field '$k' (the broker composes identity under the lock)"
+    fi
+  done
+
+  project_uid="$(_aib_record_field "$envelope_kv" project_uid)" || project_uid=""
+  actor_type="$(_aib_record_field "$envelope_kv" actor_type)"   || actor_type=""
+  actor_id="$(_aib_record_field "$envelope_kv" actor_id)"       || actor_id=""
+  agent_uid="$(_aib_record_field "$envelope_kv" agent_uid)"     || agent_uid=""
+  team_uid="$(_aib_record_field "$envelope_kv" team_uid)"       || team_uid=""
+  session_id="$(_aib_record_field "$envelope_kv" session_id)"   || session_id=""
+  run_id="$(_aib_record_field "$envelope_kv" run_id)"           || run_id=""
+  task_id="$(_aib_record_field "$envelope_kv" task_id)"         || task_id=""
+  gate_id="$(_aib_record_field "$envelope_kv" gate_id)"         || gate_id=""
+  grant_id="$(_aib_record_field "$envelope_kv" grant_id)"       || grant_id=""
+  effect_id="$(_aib_record_field "$envelope_kv" effect_id)"     || effect_id=""
+  occurred_at="$(_aib_record_field "$envelope_kv" occurred_at)" || occurred_at=""
+
+  [ -n "$project_uid" ] || aib_die 2 "event envelope requires project_uid"
+  aib_validate_token "$project_uid" project_uid
+  [ -n "$actor_type" ] || aib_die 2 "event envelope requires actor_type"
+  case "$actor_type" in human|agent|service|provider) ;; *) aib_die 2 "invalid actor_type '$actor_type'";; esac
+  [ -n "$actor_id" ] || aib_die 2 "event envelope requires actor_id (§B7)"
+  if [ "$event_type" = attempt.ended ]; then
+    [ -n "$decided_id" ] || aib_die 2 "attempt.ended requires the decided event_id (causation)"
+  fi
+
+  timeout="${AIBOBNET_EVENT_LOCK_TIMEOUT:-10}"
+  case "$timeout" in ''|*[!0-9.]*) aib_die 2 "invalid event lock timeout '$timeout'";; esac
+
+  mkdir -p -- "$(dirname -- "$events_path")" || aib_die 2 "cannot create events directory for: $events_path"
+  AIB_EVENT_COMMIT_SEQ=""
+  AIB_EVENT_COMMIT_EVENT_ID=""
+
+  exec {_fd}>>"$lock_path" || aib_die 2 "cannot open event lock: $lock_path"
+  if ! flock -w "$timeout" -x "$_fd"; then
+    aib_die 75 "event stream lock not acquired within ${timeout}s (contention or a stuck writer): $lock_path"
+  fi
+  local AIB_EVENT_ACTIVE_LOCK="$lock_path"
+  local AIB_EVENT_LOCK_FD="$_fd"
+
+  # in-lock stream validation. Extract fields only for an ended (it needs the ended-index
+  # for the at-most-one revalidation); the common decided path skips per-record extraction.
+  local need_extract=0
+  [ "$event_type" = attempt.ended ] && need_extract=1
+  _aib_event_scan_core "$events_path" "$need_extract" 0
+  if [ "$AIB_EVENT_SCAN_STATUS" = corrupt ]; then
+    aib_die 2 "event stream is corrupt (${AIB_EVENT_SCAN_CORRUPT_REASON}) — refusing append: $events_path"
+  fi
+  if [ "$AIB_EVENT_SCAN_TORN_TAIL" -eq 1 ]; then
+    command -v truncate >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: truncate (coreutils) — needed to remove an uncommitted tail"
+    truncate -s "$AIB_EVENT_SCAN_TRUNCATE_AT" "$events_path" ||
+      aib_die 2 "cannot truncate the uncommitted tail of: $events_path"
+  fi
+
+  local seq="$AIB_EVENT_SCAN_NEXT_SEQ"
+  local event_id="${project_uid}-${AIB_EVENT_STREAM_NAME}-${seq}"
+  local attempt_id correlation_id causation_id
+  if [ "$event_type" = attempt.decided ]; then
+    attempt_id="$event_id"; correlation_id="$event_id"; causation_id="$event_id"
+  else
+    # at-most-one attempt.ended per attempt_id — revalidated UNDER the lock (§B3).
+    case $'\n'"${AIB_EVENT_SCAN_ENDED_IDS}" in
+      *$'\n'"$decided_id"$'\n'*)
+        aib_die 2 "attempt '$decided_id' already has an attempt.ended — refusing a second terminal record";;
+    esac
+    attempt_id="$decided_id"; correlation_id="$decided_id"; causation_id="$decided_id"
+  fi
+
+  [ -n "$occurred_at" ] || occurred_at="$(aib_event_now)"
+
+  local record
+  record="$(_aib_event_compose_record \
+    "$event_id" "$event_type" "$occurred_at" "$actor_type" "$actor_id" "$project_uid" \
+    "$team_uid" "$agent_uid" "$session_id" "$run_id" "$task_id" "$gate_id" "$grant_id" "$effect_id" \
+    "$attempt_id" "$correlation_id" "$causation_id" "$AIB_EVENT_SCHEMA_VERSION" "$payload_json")"
+  case "$record" in
+    *$'\n'*|*$'\r'*) aib_die 2 "composed event record is not a single physical line";;
+  esac
+
+  local crc len
+  set -- $(printf '%s' "$record" | cksum); crc="$1"; len="$2"
+  if ! printf '%s %s %s %s\n' "$seq" "$crc" "$len" "$record" >> "$events_path"; then
+    aib_die 2 "cannot append event record: $events_path"
+  fi
+  exec {_fd}>&- || aib_die 2 "cannot close event lock: $lock_path"
+  AIB_EVENT_COMMIT_SEQ="$seq"
+  AIB_EVENT_COMMIT_EVENT_ID="$event_id"
 }
