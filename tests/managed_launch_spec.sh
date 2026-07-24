@@ -28,6 +28,9 @@ ENV_OUT="$WORK/env"
 FULLENV_OUT="$WORK/fullenv"
 PWD_OUT="$WORK/pwd"
 STUB_CONF="$STUB_BIN/stub.conf"
+# Synthetic HOME for the child-env passthrough assertion â€” never the runner's real
+# $HOME, so a pasted fail log cannot leak the username/home layout (LOW-4).
+AIB_TEST_HOME="$WORK/child-home"
 
 # The absolute adapter the schema-4 map points at. Authority is registry data; the PEP
 # exec's THIS path, so PATH/cwd cannot substitute a different `codex`.
@@ -178,8 +181,12 @@ run_launch() {
   RUN_OUT=""; RUN_ERR=""; RUN_RC=0
   # Ambient AIBOBNET_*, LEAKME_SENTINEL and CODEX_RUN_BIN are deliberately injected to
   # prove `env -i` strips them: the resolved binding wins and nothing inherited crosses.
+  # HOME is a SYNTHETIC sentinel, not the runner's real $HOME: the allow-list passes
+  # its value through verbatim, so asserting on a fixed value proves the passthrough
+  # without leaking the real username/home layout into a pasted fail log (LOW-4).
   RUN_OUT="$(
     PATH="$STUB_BIN:$SYSTEM_PATH" \
+    HOME="$AIB_TEST_HOME" \
     AIBOBNET_REGISTRY="$registry" \
     AIBOBNET_PROVIDER=ambient-provider AIBOBNET_PROVIDER_SOURCE=agent:ambient \
     AIBOBNET_MODEL=ambient-model AIBOBNET_MODEL_SOURCE=agent:ambient \
@@ -228,7 +235,7 @@ has "terminal heartbeat records success" "$(<"$HBLOG")" "| done | codex-run OK â
 # allow-list (HOME PATH) passes through; the explicit managed exports are re-added;
 # every other inherited variable is gone. Nothing scrubbed-by-denylist can survive.
 fullenv="$(<"$FULLENV_OUT")"
-has "child env passes through allow-listed HOME"        "$fullenv" "HOME=$HOME"
+has "child env passes through allow-listed HOME"        "$fullenv" "HOME=$AIB_TEST_HOME"
 has "child env passes through allow-listed PATH"         "$fullenv" "PATH=$STUB_BIN:"
 has "child env keeps the explicit managed export"        "$fullenv" "AIBOBNET_AGENT_UID=acme-core"
 hasnt "child env drops non-allow-listed inherited vars"  "$fullenv" "LEAKME_SENTINEL"
