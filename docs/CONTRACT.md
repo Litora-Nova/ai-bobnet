@@ -94,10 +94,11 @@ JSON error.
   declares must match — a stale env pair cannot outvote the registry.
 - **Fail-closed:** unknown agent / missing / inconsistent context → non-zero exit + clear error.
   Never guess, never default to a foreign path.
-- Under schema 3 it additionally exposes `provider`, `model`, `effort`, their exact per-field
-  `agent:<uid> | team:<uid> | project:<uid>` sources, and `registry_schema_version=3`. The same resolved
-  bundle is used for one launch; an adapter must not reopen the registry. Under schema 2 the legacy output
-  remains available, but it is not a managed-launch binding.
+- Whenever a registry resolves a provider binding (schema 3 and 4), it additionally exposes `provider`,
+  `model`, `effort`, their exact per-field `agent:<uid> | team:<uid> | project:<uid>` sources, and
+  `registry_schema_version` (the resolved version). The trigger is the resolved binding, not the schema
+  number. The same resolved bundle is used for one launch; an adapter must not reopen the registry. Under
+  schema 2 the legacy output remains available, but it is not a managed-launch binding.
 
 `bin/inbox <agent_uid>` → prints the **recipient's** inbox path (deterministic; used when writing TO another agent).
 
@@ -141,8 +142,8 @@ Exported: `AIBOBNET_PROJECT_UID · AIBOBNET_AGENT_KEY · AIBOBNET_AGENT_UID · A
 AIBOBNET_CLEARANCE · AIBOBNET_HOME · AIBOBNET_STANDUP_DIR · AIBOBNET_MUX_SESSION ·
 AIBOBNET_INBOX_PATH · STANDUP_DIR` (+ `AIBOBNET_ACTOR` when `--as` is given).
 
-For schema 3, it also exports `AIBOBNET_PROVIDER · AIBOBNET_PROVIDER_SOURCE · AIBOBNET_MODEL ·
-AIBOBNET_MODEL_SOURCE · AIBOBNET_EFFORT · AIBOBNET_EFFORT_SOURCE ·
+Whenever a provider binding resolves (schema 3 and 4), it also exports `AIBOBNET_PROVIDER ·
+AIBOBNET_PROVIDER_SOURCE · AIBOBNET_MODEL · AIBOBNET_MODEL_SOURCE · AIBOBNET_EFFORT · AIBOBNET_EFFORT_SOURCE ·
 AIBOBNET_REGISTRY_SCHEMA_VERSION`. Inherited values in this namespace are scrubbed before resolution.
 `bin/run-agent` remains an arbitrary-command context wrapper, not a provider security boundary. Managed
 provider entry and its non-enforcement limits are defined in `docs/CONTRACT-execution-binding.md`.

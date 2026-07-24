@@ -132,8 +132,10 @@ there is no public flag or ambient environment input for supplying a pre-resolve
 path. Standalone `scripts/log.sh` remains registry-authenticated for callers that do not already hold a
 managed-resolution bundle.
 
-For schema 3, `bin/context` text and JSON output and the environment produced by `bin/run-agent` add these
-exact fields:
+For any registry that resolves a provider binding (schema 3 and 4), `bin/context` text and JSON output and
+the environment produced by `bin/run-agent` add these exact fields. The trigger is the resolved binding
+itself, not the schema number: whenever a provider is resolved the fields appear, and a schema-2 registry
+resolves none and emits nothing here.
 
 | Text/JSON field | Environment variable | Value |
 |---|---|---|
