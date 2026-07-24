@@ -91,7 +91,7 @@ expect_targeted_failure() {
 
 BASE_OUT="$WORK/clean.out"
 expect_baseline_green "$SRC_ROOT/tests/execution_binding_spec.sh" \
-  "54 checks: 54 ok / 0 fail" "$BASE_OUT"
+  "75 checks: 75 ok / 0 fail" "$BASE_OUT"
 
 # 1. Managed resolution must never silently downgrade to the schema-2 legacy mode:
 # a schema-2 registry has no binding, so a managed launch from it must fail closed.

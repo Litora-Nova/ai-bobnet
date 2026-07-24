@@ -123,6 +123,67 @@ assert_has "env poison: effort comes from agent" "$run_env" "effort=high"
 assert_has "env poison: schema comes from snapshot" "$run_env" "registry_schema_version=3"
 assert_lacks "env poison: no ambient binding survives" "$run_env" "evil"
 
+# Schema 4 carries the SAME execution binding as schema 3 (RM-1 added the provider
+# adapter map on top; it did not remove the binding). V4 is byte-for-byte V3 with the
+# version bumped and a `providers` map added — so any output difference is a pure
+# schema-number regression. The binding output surfaces (context text/JSON, run-agent
+# env) must therefore emit all seven fields under 4 exactly as they do under 3.
+V4="$WORK/v4.json"
+write_file "$V4" '{
+  "schema_version": 4,
+  "projects": {
+    "acme": { "home": "/srv/acme", "standup_dir": "/srv/acme/standup", "mux_session": "acme",
+      "provider": "codex", "model": "project-model", "effort": "low" }
+  },
+  "teams": {
+    "acme-engine": { "project": "acme", "model": "team/model-v2" }
+  },
+  "providers": {
+    "codex": { "adapter": "/opt/acme/adapters/codex", "cap_sandbox": "workspace-write",
+      "cap_tier": "t3", "cap_effort": "high" }
+  },
+  "agents": {
+    "acme-mixed": { "project": "acme", "team_uid": "acme-engine", "profile": "engine-dev", "clearance": "t2", "effort": "high" }
+  }
+}'
+
+ctx4_text="$(context_for "$V4" mixed 2>/dev/null)"
+assert_has "schema4 context text: provider" "$ctx4_text" "provider=codex"
+assert_has "schema4 context text: provider provenance" "$ctx4_text" "provider_source=project:acme"
+assert_has "schema4 context text: model" "$ctx4_text" "model=team/model-v2"
+assert_has "schema4 context text: model provenance" "$ctx4_text" "model_source=team:acme-engine"
+assert_has "schema4 context text: effort" "$ctx4_text" "effort=high"
+assert_has "schema4 context text: effort provenance" "$ctx4_text" "effort_source=agent:acme-mixed"
+assert_has "schema4 context text: schema version" "$ctx4_text" "registry_schema_version=4"
+
+ctx4_json="$(context_for "$V4" mixed --json 2>/dev/null)"
+assert_has "schema4 context json: provider key" "$ctx4_json" '"provider":"codex"'
+assert_has "schema4 context json: provider_source key" "$ctx4_json" '"provider_source":"project:acme"'
+assert_has "schema4 context json: model key" "$ctx4_json" '"model":"team/model-v2"'
+assert_has "schema4 context json: model_source key" "$ctx4_json" '"model_source":"team:acme-engine"'
+assert_has "schema4 context json: effort key" "$ctx4_json" '"effort":"high"'
+assert_has "schema4 context json: effort_source key" "$ctx4_json" '"effort_source":"agent:acme-mixed"'
+assert_has "schema4 context json: registry schema key" "$ctx4_json" '"registry_schema_version":"4"'
+
+# run-agent scrubs AIBOBNET_* (incl. AIBOBNET_REGISTRY) before resolving, so it always
+# reads the canonical registry.json — point that at V4 for this leg, then restore V3.
+cp "$V4" "$ENGINE/registry.json"
+run4_env="$(
+  "$RUN" acme-mixed -- sh -c '
+    printf "provider=%s\nprovider_source=%s\nmodel=%s\nmodel_source=%s\neffort=%s\neffort_source=%s\nregistry_schema_version=%s\n" \
+      "$AIBOBNET_PROVIDER" "$AIBOBNET_PROVIDER_SOURCE" "$AIBOBNET_MODEL" "$AIBOBNET_MODEL_SOURCE" \
+      "$AIBOBNET_EFFORT" "$AIBOBNET_EFFORT_SOURCE" "$AIBOBNET_REGISTRY_SCHEMA_VERSION"
+  ' 2>/dev/null
+)"
+cp "$V3" "$ENGINE/registry.json"
+assert_has "schema4 run-agent env: provider" "$run4_env" "provider=codex"
+assert_has "schema4 run-agent env: provider provenance" "$run4_env" "provider_source=project:acme"
+assert_has "schema4 run-agent env: model" "$run4_env" "model=team/model-v2"
+assert_has "schema4 run-agent env: model provenance" "$run4_env" "model_source=team:acme-engine"
+assert_has "schema4 run-agent env: effort" "$run4_env" "effort=high"
+assert_has "schema4 run-agent env: effort provenance" "$run4_env" "effort_source=agent:acme-mixed"
+assert_has "schema4 run-agent env: schema version" "$run4_env" "registry_schema_version=4"
+
 # Resolver snapshots are process-local state, never an ambient registry authority.
 # Both a direct legacy entrypoint and a run-agent child must reopen the canonical
 # file-backed registry rather than consume an attacker-supplied shell variable.

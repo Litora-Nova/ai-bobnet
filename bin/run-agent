@@ -78,9 +78,11 @@ export AIBOBNET_MUX_SESSION="$mux_session"
 export AIBOBNET_INBOX_PATH="$inbox_path"
 export STANDUP_DIR="$standup_dir"   # validated value, for ported tools that read it
 
-# Schema 3 supplies one registry-resolved execution bundle. These values remain
-# observability/context only here; run-agent does not enforce provider behavior.
-if [ "$AIB_REGISTRY_SCHEMA_VERSION" = 3 ]; then
+# Schema 3 and 4 both supply one registry-resolved execution bundle. These values
+# remain observability/context only here; run-agent does not enforce provider behavior.
+# Gate on field presence, not the schema number: a `= 3` branch drops the bundle under
+# schema 4, whose resolver populates these identically (lib/aibobnet.sh case 3|4).
+if [ -n "$AIB_PROVIDER" ]; then
   export AIBOBNET_PROVIDER="$AIB_PROVIDER"
   export AIBOBNET_PROVIDER_SOURCE="$AIB_PROVIDER_SOURCE"
   export AIBOBNET_MODEL="$AIB_MODEL"
