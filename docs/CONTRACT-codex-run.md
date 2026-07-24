@@ -1,9 +1,9 @@
 # ai-bobnet — Codex Managed-Launch Adapter Contract
 
 `bin/codex-run` remains the compatibility name for a watchdogged, heartbeat-owning Codex call. It is a
-thin `exec` delegator to the provider-neutral `bin/launch-agent`, which resolves one schema-3
-execution-binding snapshot. `codex-run` does not reopen the registry, choose a model or effort, or apply a
-second default.
+thin `exec` delegator to the provider-neutral `bin/launch-agent`, which resolves one schema-3-or-4
+execution-binding snapshot; under RM-1 a managed launch additionally requires the schema-4 adapter map.
+`codex-run` does not reopen the registry, choose a model or effort, or apply a second default.
 
 > **Security status: POLICY GATE for cooperating agents (RM-1) — NOT containment.** Under RM-1 this
 > adapter path is driven by the pure Policy Decision Point (`aib_authorize_launch`): it caps effective
@@ -21,13 +21,13 @@ second default.
 bin/codex-run --as <agent_uid> [options] (--prompt <text> | --prompt-file <file> | -)
 ```
 
-- `--as <agent_uid>` is required. It selects the registered agent whose schema-3 binding is launched and
+- `--as <agent_uid>` is required. It selects the registered agent whose registry binding is launched and
   whose heartbeat is written. It is not the actor-label meaning of `bin/run-agent --as`.
 - Exactly one prompt source is required: `--prompt`, `--prompt-file`, or standard input selected by `-`.
 
 `bin/launch-agent` accepts the same identity, runtime-option, and prompt-source surface and dispatches by
-the resolved provider. RM-0 implements only `provider=codex`; unknown or unimplemented providers fail
-before a process starts.
+the resolved provider. Through RM-1 only `provider=codex` is implemented; unknown or unimplemented
+providers fail before a process starts.
 
 ## 2. Runtime options and binding authority
 
@@ -39,8 +39,7 @@ before a process starts.
 | `--label <text>` | `codex-run` | operational heartbeat label |
 
 These controls describe one invocation; they do not select the execution binding. `provider`, `model`,
-and `effort` come only from the schema-3 registry resolution defined by
-`docs/CONTRACT-execution-binding.md`.
+and `effort` come only from the registry resolution defined by `docs/CONTRACT-execution-binding.md`.
 
 The former `--model` and `--effort` flags are accepted only far enough to return an explicit migration
 error with exit 64. They never override the registry and never start a provider process. There is no
@@ -55,8 +54,9 @@ input hygiene at this one managed entry point, not a containment guarantee: a ca
 For one call:
 
 1. `codex-run` delegates its arguments to `launch-agent`; it does not read the registry.
-2. The managed resolver requires schema 3 and obtains identity, clearance, optional direct team, resolved
-   provider/model/effort, and per-field `level:uid` provenance from one validated registry snapshot.
+2. The managed resolver requires schema 3 or 4 and obtains identity, clearance, optional direct team,
+   resolved provider/model/effort, and per-field `level:uid` provenance from one validated registry
+   snapshot; on schema 4 the adapter path and declared capabilities come from the same snapshot.
 3. `launch-agent` rejects a missing binding, invalid membership, unknown/unimplemented provider, provider
    mismatch, or invalid Codex effort before dispatch.
 4. The Codex adapter consumes that process-local bundle. It must not reopen the registry or replace any
@@ -65,7 +65,7 @@ For one call:
 Schema 2 remains valid for legacy context and arbitrary `run-agent` commands but cannot reach this managed
 adapter. Inherited `AIBOBNET_PROVIDER`, `AIBOBNET_MODEL`, `AIBOBNET_EFFORT`, provenance, and schema-version
 variables cannot override the resolved bundle. Managed launch replaces the child `AIBOBNET_*` context with
-the resolved schema-3 values, including direct-team membership, and removes `CODEX_RUN_BIN` and the
+the resolved registry values, including direct-team membership, and removes `CODEX_RUN_BIN` and the
 registry locator before execution. The pre-existing `AIBOBNET_REGISTRY` advanced/test locator may select
 the file used for the one initial snapshot; it is not a binding-field override or an enforcement boundary.
 
@@ -80,6 +80,14 @@ with the verdict's exit code before any heartbeat. On allow, and before the busy
 observability event for the launching operator/tooling; it is not written to any journal and is **not** the
 durable Attempt record or provider-change audit (still specified, not yet built). The PDP additionally
 publishes a separate `launch_verdict` record shaped for RM-2 reuse.
+
+**Operational note — redact before publication.** This event and the pre-launch deny messages carry
+host-local deployment detail by design. `adapter_path` is the literal absolute registry value, because its
+absoluteness is precisely the RM-1 property being reported, and the same path appears in the non-absolute
+(exit 2) and adapter-not-found (exit 127) deny reasons. The `provider_source` / `model_source` /
+`effort_source` fields name real project, team, and agent uids. Redact both before pasting launcher output
+into a public issue, log excerpt, or artifact; the seam deliberately does not obfuscate them, so redaction
+at the point of publication is the operating rule.
 
 Then:
 
@@ -103,8 +111,8 @@ Then:
    - success: heartbeat `done`, relay Codex output to stdout.
 
 The heartbeat proves that the wrapper observed a start and terminal result. Binding text in that mutable
-file is operational visibility only. RM-0 emits no durable Attempt record, provider-change audit, or Event
-Spine event, so it cannot prove later what ran.
+file is operational visibility only. Through RM-1 the engine emits no durable Attempt record,
+provider-change audit, or Event Spine event, so it cannot prove later what ran (RM-2).
 
 Managed heartbeat writes retain the standalone logger's fixed status validation and its LF/CR/pipe
 sanitization. Standalone `scripts/log.sh` remains registry-authenticated; only the managed path uses the
@@ -131,15 +139,19 @@ adapter entirely, and the declared capabilities are trusted rather than verified
 
 Before upgrading a caller:
 
-1. migrate its registry to schema 3;
+1. migrate its registry to schema 4 (schema 3 resolves the binding but carries no adapter map, so a managed
+   launch fails closed at exit 127);
 2. place `provider=codex` and the intended model and effort at project, direct-team, or agent level;
-3. inspect the resolved value and source for each field;
-4. remove caller-supplied `--model` and `--effort` arguments;
-5. invoke `codex-run` or `launch-agent` with only runtime options and one prompt source.
+3. add the top-level `providers.<provider>` entry with an **absolute** `adapter` path and the declared
+   `cap_sandbox` / `cap_tier` / `cap_effort` capabilities;
+4. inspect the resolved value and source for each field;
+5. remove caller-supplied `--model` and `--effort` arguments;
+6. invoke `codex-run` or `launch-agent` with only runtime options and one prompt source.
 
 An upgraded wrapper fails loudly on schema 2 or former model/effort flags; it does not preserve behavior by
-guessing the old defaults. Rollback requires restoring a schema-2 registry and the caller-owned flags or
-defaults expected by the old wrapper before running the old code.
+guessing the old defaults. Rollback requires down-migrating the registry to the version the old reader knows
+and restoring the caller-owned flags or defaults expected by the old wrapper before running the old code; a
+schema-4 registry must never be handed to a reader that knows only 2/3.
 
 ## 7. Acceptance — example id `acme`
 

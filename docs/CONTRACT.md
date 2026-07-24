@@ -27,7 +27,7 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 - The word `task` is reserved for the *Project → Run → Task → Attempt* work unit. It is **never** an
   identity token — not in an env var, not in output.
 
-### Registry versions (`schema_version: 2 | 3`)
+### Registry versions (`schema_version: 2 | 3 | 4`)
 
 ```json
 {
@@ -39,7 +39,7 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 
 - The **object key IS the `agent_uid`**. `project`, `profile` and `clearance` are mandatory;
   `project` is authoritative and is never guessed from the prefix.
-- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2` or `3`.
+- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2`, `3`, or `4`.
   Missing, mistyped, nested-only, or unsupported versions fail closed before any identity resolves.
 - **Schema 2 is the legacy identity/context shape above.** Its existing commands remain supported, but it
   cannot start a managed provider because it has no authoritative execution binding.
@@ -47,12 +47,17 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
   optional `provider`, `model`, and `effort` fields at project/team/agent level. Field-wise resolution,
   validation, provenance, migration, and rollback are normative in
   `docs/CONTRACT-execution-binding.md`.
+- **Schema 4 adds the RM-1 policy-gate data.** It adds a top-level `providers.<name>` map carrying the
+  absolute `adapter` path and the declared `cap_sandbox` / `cap_tier` / `cap_effort` capabilities. A managed
+  launch requires the adapter field, so schema 4 is the shipped default (`registry.json`); a schema-3
+  registry still resolves identity and binding but fails closed at the missing-adapter path. Normative in
+  `docs/CONTRACT-execution-binding.md` §7.
 - `display_name` is optional and free text (may contain spaces/unicode); it never routes.
 - Unknown extra fields are ignored (forward-compatible) and never load-bearing. Schema-3 binding and team
   fields are known and load-bearing, so they are validated when consumed.
 - Registry writes are the identity *and* clearance authority — gated at a high tier and audited in the
-  target contract (DOMAIN §2). RM-0 adds no registry writer or durable audit path. Credential material is
-  never co-located with the registry.
+  target contract (DOMAIN §2). RM-0 and RM-1 add no registry writer or durable audit path. Credential
+  material is never co-located with the registry.
 
 **A malformed registry never resolves.** Because this file is the identity *and* clearance source,
 a half-written or hand-edited file must fail closed rather than hand out a wrong value:
@@ -89,10 +94,11 @@ JSON error.
   declares must match — a stale env pair cannot outvote the registry.
 - **Fail-closed:** unknown agent / missing / inconsistent context → non-zero exit + clear error.
   Never guess, never default to a foreign path.
-- Under schema 3 it additionally exposes `provider`, `model`, `effort`, their exact per-field
-  `agent:<uid> | team:<uid> | project:<uid>` sources, and `registry_schema_version=3`. The same resolved
-  bundle is used for one launch; an adapter must not reopen the registry. Under schema 2 the legacy output
-  remains available, but it is not a managed-launch binding.
+- Whenever a registry resolves a provider binding (schema 3 and 4), it additionally exposes `provider`,
+  `model`, `effort`, their exact per-field `agent:<uid> | team:<uid> | project:<uid>` sources, and
+  `registry_schema_version` (the resolved version). The trigger is the resolved binding, not the schema
+  number. The same resolved bundle is used for one launch; an adapter must not reopen the registry. Under
+  schema 2 the legacy output remains available, but it is not a managed-launch binding.
 
 `bin/inbox <agent_uid>` → prints the **recipient's** inbox path (deterministic; used when writing TO another agent).
 
@@ -136,8 +142,8 @@ Exported: `AIBOBNET_PROJECT_UID · AIBOBNET_AGENT_KEY · AIBOBNET_AGENT_UID · A
 AIBOBNET_CLEARANCE · AIBOBNET_HOME · AIBOBNET_STANDUP_DIR · AIBOBNET_MUX_SESSION ·
 AIBOBNET_INBOX_PATH · STANDUP_DIR` (+ `AIBOBNET_ACTOR` when `--as` is given).
 
-For schema 3, it also exports `AIBOBNET_PROVIDER · AIBOBNET_PROVIDER_SOURCE · AIBOBNET_MODEL ·
-AIBOBNET_MODEL_SOURCE · AIBOBNET_EFFORT · AIBOBNET_EFFORT_SOURCE ·
+Whenever a provider binding resolves (schema 3 and 4), it also exports `AIBOBNET_PROVIDER ·
+AIBOBNET_PROVIDER_SOURCE · AIBOBNET_MODEL · AIBOBNET_MODEL_SOURCE · AIBOBNET_EFFORT · AIBOBNET_EFFORT_SOURCE ·
 AIBOBNET_REGISTRY_SCHEMA_VERSION`. Inherited values in this namespace are scrubbed before resolution.
 `bin/run-agent` remains an arbitrary-command context wrapper, not a provider security boundary. Managed
 provider entry and its non-enforcement limits are defined in `docs/CONTRACT-execution-binding.md`.

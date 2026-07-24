@@ -5,7 +5,7 @@ disagrees with this document, this document wins. Vocabulary and invariants here
 still open is listed explicitly in §12 — nothing is silently undecided.
 
 > **Implementation status:** this document defines the target contract, not the current feature set.
-> P0 identity/registry, schema-3 execution binding with per-field provenance, P1 delivery, P2 wakeup/local
+> P0 identity/registry, schema-3/4 execution binding with per-field provenance, P1 delivery, P2 wakeup/local
 > adapter, P3 scoped memory, the legacy-journal serialized commit protocol, and the Codex managed-launch
 > path are built and tested. The full serialized event spine, provider-wide reference monitor,
 > Gate/Grant/Effect state machines, profile provisioning, full runtime lifecycle, external adapters, and
