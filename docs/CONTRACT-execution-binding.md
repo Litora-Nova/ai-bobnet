@@ -157,10 +157,10 @@ source variable in the table above, and `AIBOBNET_TEAM_UID` (empty when the agen
 
 The pre-existing `AIBOBNET_REGISTRY` advanced/test locator can select the registry file that is read before
 the snapshot is created. It is not a per-field provider/model/effort override and is not forwarded to the
-provider child. RM-0 does not turn that caller-controlled registry locator into a security boundary.
+provider child. RM-0 and RM-1 do not turn that caller-controlled registry locator into a security boundary.
 
-RM-0 exposes no registry generation or digest. It also creates no durable Attempt record or
-provider-change audit. Both remain specified target behavior. The effective binding may appear in a
+Through RM-1 the engine exposes no registry generation or digest. It also creates no durable Attempt record
+or provider-change audit. Both remain specified target behavior. The effective binding may appear in a
 heartbeat for operator visibility, but a mutable heartbeat is neither a durable audit event nor historical
 proof of what ran.
 
@@ -172,8 +172,8 @@ The provider-neutral entry point is:
 bin/launch-agent --as <agent_uid> [runtime options] (--prompt <text> | --prompt-file <file> | -)
 ```
 
-`--as` identifies the registered agent to launch; it is not `bin/run-agent --as <actor-label>`. RM-0
-implements only the `codex` adapter. Provider, model, and effort have no CLI or environment override.
+`--as` identifies the registered agent to launch; it is not `bin/run-agent --as <actor-label>`. Through
+RM-1 only the `codex` adapter is implemented. Provider, model, and effort have no CLI or environment override.
 The only runtime options are `--sandbox`, `--cwd`, `--timeout`, and `--label`; they do not select the
 execution binding. Exactly one prompt source is required: `--prompt`, `--prompt-file`, or standard input
 selected by `-`.
@@ -193,7 +193,7 @@ remain adapter-specific and are defined in `docs/CONTRACT-codex-run.md`.
 
 ## 5. Acceptance
 
-A conforming RM-0 implementation proves:
+A conforming implementation proves, from RM-0 onward:
 
 - schema 2 still serves legacy identity/context operations but cannot launch a provider;
 - schema 3 resolves project fallback, direct-team fallback, agent overrides, no-team fallback, and the
@@ -216,15 +216,20 @@ A conforming RM-0 implementation proves:
 ## 6. Migration and rollback
 
 To migrate without changing the intended runtime, copy each existing Codex model and effort choice into
-schema-3 project, direct-team, or agent fields, add `provider: codex`, validate the mixed-level result for
-every managed agent, and only then move callers from raw `codex-run` defaults/overrides to managed launch.
-Existing schema-2 commands remain available during this preparation, but schema-2 managed launch does not.
+schema-3 project, direct-team, or agent fields, add `provider: codex`, and validate the mixed-level result
+for every managed agent. A managed launch additionally requires the schema-4 policy-gate data (§7): raise
+the registry to `schema_version: 4` and add the top-level `providers.<name>` map with an absolute `adapter`
+path and declared `cap_sandbox` / `cap_tier` / `cap_effort` capabilities — a schema-3 registry resolves the
+binding but carries no adapter map, so the launch fails closed at the missing-adapter path (exit 127). Only
+then move callers from raw `codex-run` defaults/overrides to managed launch. Existing schema-2 commands
+remain available during this preparation, but schema-2 managed launch does not.
 
-This is an intentional compatibility boundary: old readers reject schema 3, and upgraded `codex-run`
-rejects its former model/effort flags. Rollback therefore requires stopping managed launches, converting
-the registry back to schema 2, restoring any caller-owned model/effort arguments expected by the old
-wrapper, and only then running an old reader. A schema-3 registry must never be handed to an old reader.
-A schema-4 registry likewise must never be handed to a reader that knows only 2/3.
+This is an intentional compatibility boundary: old readers reject schema 3 and 4, readers that know only
+2/3 reject 4, and upgraded `codex-run` rejects its former model/effort flags. Rollback therefore requires
+stopping managed launches, down-migrating the registry to the version the target reader knows, restoring
+any caller-owned model/effort arguments expected by the old wrapper, and only then running the old reader.
+A schema-3 registry must never be handed to an old (schema-2) reader; a schema-4 registry likewise must
+never be handed to a reader that knows only 2/3.
 
 ## 7. RM-1 policy gate — PDP/PEP split (ADR-0003)
 
@@ -315,9 +320,11 @@ and RM-1's threat model is cooperating agents.
 Exit codes: `64` usage/refusal · `2` config/IO · `127` adapter-not-found · `124` watchdog timeout. The PDP
 orders deny checks by severity so the first deny fixes the code (`127 > 2 > 64`); the RM-3 broker returns
 the same codes. Separately, `3` is a registry resolution config error (e.g. a schema-4 provider absent from
-the `providers` map) raised by the resolver *before* the PDP, so it is not one of the PDP verdict codes. The `launch_verdict` record shares the shape family of the RM-0 `managed_launch_binding`
-observability event so RM-2's durable Attempt audit can reuse it — but RM-1 journals nothing; the record is
-transient observability, not durable audit.
+the `providers` map) raised by the resolver *before* the PDP, so it is not one of the PDP verdict codes.
+Outside the launch path, `6` is the missing-runtime-dependency refusal: a journal commit on a host without
+util-linux `flock` fails loudly with exit 6 rather than committing unserialized. The `launch_verdict` record
+shares the shape family of the `managed_launch_binding` observability event so RM-2's durable Attempt audit
+can reuse it — but RM-1 journals nothing; the record is transient observability, not durable audit.
 
 ### 7.7 Deferred RM-0 findings folded in
 
