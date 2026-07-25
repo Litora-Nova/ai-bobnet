@@ -72,47 +72,61 @@ the file used for the one initial snapshot; it is not a binding-field override o
 ## 4. Observable and bounded behavior
 
 Before dispatch, the pure Policy Decision Point (`aib_authorize_launch`) returns a verdict: allow/deny,
-the effective (clamped) sandbox/effort, and the absolute `adapter_path`. On deny the launch fails closed
-with the verdict's exit code before any heartbeat. On allow, and before the busy heartbeat, emit one
-`managed_launch_binding` JSON object to **stderr** carrying the resolved `agent_uid`,
-`provider`/`model`/`effort` with their `level:uid` sources, and `adapter_path` — under RM-1 the **absolute**
-`providers.<provider>.adapter` path taken from the verdict, not a `PATH`/cwd lookup. This is a transient
-observability event for the launching operator/tooling; it is not written to any journal and is **not** the
-durable Attempt record or provider-change audit (still specified, not yet built). The PDP additionally
-publishes a separate `launch_verdict` record shaped for RM-2 reuse.
+the effective (clamped) sandbox/effort, and the absolute `adapter_path`.
 
-**Operational note — redact before publication.** This event and the pre-launch deny messages carry
-host-local deployment detail by design. `adapter_path` is the literal absolute registry value, because its
-absoluteness is precisely the RM-1 property being reported, and the same path appears in the non-absolute
-(exit 2) and adapter-not-found (exit 127) deny reasons. The `provider_source` / `model_source` /
-`effort_source` fields name real project, team, and agent uids. Redact both before pasting launcher output
-into a public issue, log excerpt, or artifact; the seam deliberately does not obfuscate them, so redaction
-at the point of publication is the operating rule.
+1. **Durable write-ahead decision (RM-2).** Immediately after the PDP returns and **before any enactment**,
+   the PEP commits a durable `attempt.decided` record to the framed event stream
+   (`docs/CONTRACT-execution-binding.md` §8). A **deny** writes exactly one record and then fails closed
+   with the verdict's exit code — closing the RM-1 hole where a deny left no trace. An **allow** writes it
+   as a write-ahead statement of intent and proceeds. A failure to commit the record stops the launch before
+   enactment (fail-closed); the provider never starts without a committed `decided` record.
+2. **Observability event.** On allow, and before the busy heartbeat, emit one `managed_launch_binding` JSON
+   object to **stderr** carrying the resolved `agent_uid`, `provider`/`model`/`effort` with their
+   `level:uid` sources, and the **absolute** `providers.<provider>.adapter` path from the verdict (not a
+   `PATH`/cwd lookup). This stderr line is transient operator/tooling observability; the durable record is
+   the §8 stream, not this line.
 
-Then:
+**Operational note — redact before publication.** The persisted `attempt.decided`/`attempt.ended` records,
+this stderr event, and the pre-launch deny messages all carry host-local deployment detail by design.
+`adapter_path` is the literal absolute registry value, because its absoluteness is precisely the RM-1
+property being reported, and the same path appears in the non-absolute (exit 2) and adapter-not-found
+(exit 127) deny reasons. The `provider_source` / `model_source` / `effort_source` fields (and their
+persisted counterparts) name real project, team, and agent uids. Redact before pasting launcher output or a
+stream excerpt into a public issue, log excerpt, or artifact; the seam deliberately does not obfuscate them,
+so redaction at the point of publication is the operating rule.
 
-1. Emit a `busy` heartbeat for the selected agent containing the resolved model, selected sandbox,
+Then, on allow:
+
+3. Emit a `busy` heartbeat for the selected agent containing the resolved model, selected sandbox,
    resolved effort, and label. The managed heartbeat primitive uses the already-resolved `agent_uid` and
    `standup_dir`; it does not reopen the registry.
-2. Run from `--cwd` under the watchdog, inside a child environment constructed from the verdict's
-   allow-list via `env -i` (the provider inherits nothing but the allow-list plus the managed `AIBOBNET_*`
-   exports), executing the absolute adapter path at the effective (clamped) sandbox and effort:
+4. Run from `--cwd` inside a child environment constructed from the verdict's allow-list via `env -i` (the
+   provider inherits nothing but the allow-list plus the managed `AIBOBNET_*` exports, including
+   `AIBOBNET_ATTEMPT_ID`), executing the absolute adapter path at the effective (clamped) sandbox and
+   effort. The provider runs as a **managed background child with a known PID**; the parent forwards
+   HUP/INT/TERM to it and runs a **`sleep`-based watchdog** (not the coreutils `timeout` wrapper), so the
+   true reaped status can be established before any terminal record:
 
    ```text
    env -i <allow-list + managed exports> \
-     timeout <seconds> <absolute-adapter-path> exec -m <resolved-model> -s <effective-sandbox> \
+     <absolute-adapter-path> exec -m <resolved-model> -s <effective-sandbox> \
        -c model_reasoning_effort="<effective-effort>" \
        -c approval_policy="never" -- <prompt>
    ```
 
-3. Report one terminal outcome:
-   - watchdog timeout (exit 124): heartbeat `blocked`, relay captured output to stderr, exit 124;
-   - Codex error: heartbeat `blocked`, relay captured output to stderr, propagate the provider exit code;
-   - success: heartbeat `done`, relay Codex output to stdout.
+5. Once the reaped status is established, commit exactly one durable `attempt.ended` record and report one
+   terminal outcome:
+   - watchdog timeout (exit 124): `attempt.ended(timeout)`, heartbeat `blocked`, relay output to stderr;
+   - Codex error: `attempt.ended(provider-failure, rc)`, heartbeat `blocked`, propagate the provider code;
+   - killed by a forwarded signal (`128+signal`): `attempt.ended(aborted, signal)` — only when the child's
+     abort is actually established; a signal at the parent with the child still unconfirmed stays an open
+     `decided(allow)`, not `aborted`;
+   - success: `attempt.ended(ok)`, heartbeat `done`, relay Codex output to stdout.
 
-The heartbeat proves that the wrapper observed a start and terminal result. Binding text in that mutable
-file is operational visibility only. Through RM-1 the engine emits no durable Attempt record,
-provider-change audit, or Event Spine event, so it cannot prove later what ran (RM-2).
+The heartbeat proves that the wrapper observed a start and terminal result but stays mutable operational
+visibility. The durable proof of what the launcher decided and observed is the RM-2 `attempt.decided`/
+`attempt.ended` stream — for attempts that go through the seam; a bypassing process still leaves nothing,
+and the provider-change audit and the rest of the event spine are still unbuilt.
 
 Managed heartbeat writes retain the standalone logger's fixed status validation and its LF/CR/pipe
 sanitization. Standalone `scripts/log.sh` remains registry-authenticated; only the managed path uses the

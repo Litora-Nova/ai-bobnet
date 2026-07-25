@@ -198,9 +198,12 @@ line-oriented heartbeat is not the event spine.
   keeps the **policy gate, not containment** framing until RM-3 withholds raw capability and mediates
   effects.
 - No durable Attempt record or provider-change audit exists yet (RM-2). The verdict record is shaped for
-  that reuse but is transient observability today, not historical proof of what ran.
+  that reuse but is transient observability today, not historical proof of what ran. *(Superseded by
+  ADR-0004: RM-2 adds the durable `attempt.decided`/`attempt.ended` records.)*
 - No new runtime dependency, daemon, network call, or server. Existing Bash/awk/coreutils requirements
-  hold; the watchdog still uses `timeout`.
+  hold; the watchdog still uses `timeout`. *(Superseded by ADR-0004: RM-2 replaces the `timeout` wrapper
+  with a `sleep`-based watchdog around a managed child and adds `cksum`/`truncate`/`sha256sum`/`sleep`/
+  `mktemp`.)*
 
 This ADR extends ADR-002; it does not reverse it. The managed seam remains provider-neutral and
 single-snapshot; RM-1 adds the decision function, the effective-authority cap, the absolute adapter map,
