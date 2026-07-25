@@ -1345,6 +1345,130 @@ aib_event_field() {
   printf '%s' "${res%%$'\t'*}"
 }
 
+# aib_event_payload_field <record-json> <decision|pid|exit.class|exit.code>
+#
+# Additive scanner-owned access to the frozen Attempt payload fields Lane C needs.
+# The reader remains a thin consumer: it never parses JSON itself. This tokenizer
+# follows object paths, so top-level or sibling/nested spoof keys cannot shadow the
+# canonical payload path. String escapes match aib_event_field; JSON null/absence
+# produce empty output, while numeric pid/code are emitted as decimal tokens.
+_AIB_EVENT_PAYLOAD_FIELD_AWK='
+function full_path(depth, key, base) {
+  base = objpath[depth]
+  return base == "" ? key : base "." key
+}
+function capture(path, value) {
+  if (!found && path == target) {
+    if (value != "null") printf "%s", value
+    found = 1
+  }
+}
+{ data = data $0 }
+END {
+  n = length(data); i = 1; depth = 0; found = 0
+  while (i <= n) {
+    c = substr(data, i, 1)
+    if (c == "\"") {
+      s = ""; i++
+      while (i <= n) {
+        d = substr(data, i, 1)
+        if (d == "\\") {
+          e = substr(data, i+1, 1)
+          if (e == "n") s = s "\n"; else if (e == "t") s = s "\t"; else if (e == "r") s = s "\r"
+          else if (e == "b") s = s "\b"; else if (e == "f") s = s "\f"
+          else if (e == "\"") s = s "\""; else if (e == "\\") s = s "\\"; else if (e == "/") s = s "/"
+          else if (e == "u") { s = s "\\u" substr(data, i+2, 4); i += 6; continue }
+          else { s = s e }
+          i += 2; continue
+        }
+        if (d == "\"") { i++; break }
+        s = s d; i++
+      }
+      if (kind[depth] == "object") {
+        if (expect[depth] == "key") {
+          curkey[depth] = s
+          expect[depth] = "colon"
+        } else if (expect[depth] == "value") {
+          capture(full_path(depth, curkey[depth]), s)
+          curkey[depth] = ""
+          expect[depth] = "comma"
+        }
+      }
+      continue
+    }
+    if (c == "{") {
+      if (depth == 0) {
+        depth = 1
+        kind[depth] = "object"
+        objpath[depth] = ""
+        expect[depth] = "key"
+      } else {
+        p = full_path(depth, curkey[depth])
+        if (kind[depth] == "object" && expect[depth] == "value") {
+          curkey[depth] = ""
+          expect[depth] = "comma"
+        }
+        depth++
+        kind[depth] = "object"
+        objpath[depth] = p
+        expect[depth] = "key"
+      }
+      i++; continue
+    }
+    if (c == "[") {
+      p = full_path(depth, curkey[depth])
+      if (kind[depth] == "object" && expect[depth] == "value") {
+        curkey[depth] = ""
+        expect[depth] = "comma"
+      }
+      depth++
+      kind[depth] = "array"
+      objpath[depth] = p
+      expect[depth] = ""
+      i++; continue
+    }
+    if (c == "}" || c == "]") {
+      delete kind[depth]
+      delete objpath[depth]
+      delete expect[depth]
+      delete curkey[depth]
+      depth--
+      i++; continue
+    }
+    if (c == ":") {
+      if (kind[depth] == "object" && expect[depth] == "colon") expect[depth] = "value"
+      i++; continue
+    }
+    if (c == ",") {
+      if (kind[depth] == "object" && expect[depth] == "comma") expect[depth] = "key"
+      i++; continue
+    }
+    if (c == " " || c == "\t" || c == "\r" || c == "\n") { i++; continue }
+    s = ""
+    while (i <= n) {
+      d = substr(data, i, 1)
+      if (d == " " || d == "\t" || d == "\r" || d == "\n" || d == "," || d == "}" || d == "]" || d == ":") break
+      s = s d
+      i++
+    }
+    if (kind[depth] == "object" && expect[depth] == "value") {
+      capture(full_path(depth, curkey[depth]), s)
+      curkey[depth] = ""
+      expect[depth] = "comma"
+    }
+  }
+}'
+
+aib_event_payload_field() {
+  local json="${1-}" key="${2-}" target
+  case "$key" in
+    decision|pid) target="payload.$key";;
+    exit.class|exit.code) target="payload.$key";;
+    *) aib_die 64 "unknown event payload field '$key' (decision|pid|exit.class|exit.code)";;
+  esac
+  printf '%s' "$json" | awk -v target="$target" "$_AIB_EVENT_PAYLOAD_FIELD_AWK"
+}
+
 # --- read-only frame scanner / validator (shared core) -----------------------
 # Classifies the whole stream fail-closed and computes the next writer seq. NEVER
 # mutates the file (the writer performs the truncation the classifier prescribes).
