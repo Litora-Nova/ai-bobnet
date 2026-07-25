@@ -8,35 +8,43 @@ rebuilt on a clean, deterministic core.
 >
 > **Built and tested:** P0 identity/registry, schema-3/4 execution binding with per-field provenance,
 > P1 delivery, P2 wakeup/local adapter, P3 scoped memory, the serialized commit path for the current
-> delivery and memory journals, the watchdogged Codex managed-launch path, and the RM-1 **managed policy
+> delivery and memory journals, the watchdogged Codex managed-launch path, the RM-1 **managed policy
 > gate** (schema-4 adapter map + declared capabilities, the pure Policy Decision Point with
 > `min(clearance, provider capabilities)` capping, absolute adapter resolution, and the `env -i`
-> allow-list child environment). **Specified, not yet implemented:** the full serialized event spine,
-> provider-wide reference monitor (non-bypassability), Gate/Grant/Effect state machines, durable Attempt
-> records and the provider-change audit event, profile provisioning, full runtime lifecycle, external
-> adapters, and dashboard projection. `docs/DOMAIN.md` is the normative target contract; it is not a claim
-> that every domain surface already exists in code.
+> allow-list child environment), and the RM-2 **durable attempt audit** (the first framed event stream:
+> a write-ahead `attempt.decided` plus an `attempt.ended` per managed launch, closing the deny-has-no-trace
+> hole and the post-decision crash window — for attempts that go through the seam). **Specified, not yet
+> implemented:** the full serialized event spine beyond this first stream, provider-wide reference monitor
+> (non-bypassability), Gate/Grant/Effect state machines, the provider-change audit event, profile
+> provisioning, full runtime lifecycle, external adapters, and dashboard projection. `docs/DOMAIN.md` is the
+> normative target contract; it is not a claim that every domain surface already exists in code.
 >
 > **The managed launch is a POLICY GATE for cooperating agents (RM-1), not containment.** It caps effective
 > authority, pins the adapter to an absolute registry path, and builds the child environment from an
 > allow-list — but it does not mediate provider syscalls, shell children, network/VCS effects, or T4
-> actions, and a hostile local process can still run a provider directly. Non-bypassability, durable Attempt
-> records, and the provider-change audit event are specified but not yet built.
+> actions, and a hostile local process can still run a provider directly. **RM-2 audits attempts through
+> the seam, not completeness:** a process that bypasses the launcher leaves no record. Non-bypassability
+> and the provider-change audit event are specified but not yet built.
 
 The [execution-binding contract](docs/CONTRACT-execution-binding.md) defines the schema-2/3/4
 compatibility boundary, the exact provenance interface, the managed-launch migration, and the RM-1
 policy-gate mechanics (§7). The [managed-launch ADR](docs/decisions/0002-managed-launch-boundary.md) records
 the RM-0 boundary decision; the [managed-policy-gate ADR](docs/decisions/0003-managed-policy-gate.md) records
-the RM-1 PDP/PEP split, effective-authority capping, absolute adapter map, and allow-list environment.
+the RM-1 PDP/PEP split, effective-authority capping, absolute adapter map, and allow-list environment; the
+[attempt-audit ADR](docs/decisions/0004-durable-attempt-audit.md) records the RM-2 durable attempt records,
+the framed event stream, and the honesty boundary (audit through the seam, not completeness).
 
 ## Runtime requirements
 
 The core commands require Bash, `awk`, standard Unix tools, and `flock` from util-linux. `flock`
-serializes commits to the current line-oriented delivery and memory journals on a single host; a journal
-mutation on a host without it refuses loudly with exit 6 rather than committing unserialized. The managed
-launcher additionally uses `timeout` and `env` from coreutils — it runs the adapter under a `timeout`
-watchdog and constructs the child environment with `env -i`. The optional localhost HTTP adapter uses the
-Python 3 standard library only; it has no pip dependency. RM-0 and RM-1 add no daemon, network call, or
+serializes commits to the current line-oriented delivery and memory journals — and to the RM-2 event
+stream — on a single host; a journal or stream mutation on a host without it refuses loudly with exit 6
+rather than committing unserialized. The RM-2 durable attempt audit adds POSIX `cksum` (record framing) and
+coreutils `truncate` (used only when removing an uncommitted stream tail). The managed launcher constructs
+the child environment with `env -i` and adds coreutils `sha256sum`, `sleep`, and `mktemp`; its watchdog is a
+`sleep`-based timer around a managed provider child and does **not** use the coreutils `timeout` wrapper. A
+missing runtime dependency fails closed with exit 6. The optional localhost HTTP adapter uses the Python 3
+standard library only; it has no pip dependency. RM-0 through RM-2 add no daemon, network call, or
 development server of their own.
 
 **Deployment precondition (RM-1): provider authentication must be file-based.** The managed launcher builds

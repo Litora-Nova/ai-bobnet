@@ -161,10 +161,11 @@ The pre-existing `AIBOBNET_REGISTRY` advanced/test locator can select the regist
 the snapshot is created. It is not a per-field provider/model/effort override and is not forwarded to the
 provider child. RM-0 and RM-1 do not turn that caller-controlled registry locator into a security boundary.
 
-Through RM-1 the engine exposes no registry generation or digest. It also creates no durable Attempt record
-or provider-change audit. Both remain specified target behavior. The effective binding may appear in a
-heartbeat for operator visibility, but a mutable heartbeat is neither a durable audit event nor historical
-proof of what ran.
+The engine exposes no registry generation or digest. **RM-2 adds a durable Attempt record** (§8): a
+write-ahead `attempt.decided` and a terminal `attempt.ended` per managed launch, over a framed event
+stream. The **provider-change audit event** is still specified, not built. A mutable heartbeat remains
+neither a durable audit event nor historical proof of what ran — that role now belongs to the §8 stream,
+for attempts that go through the seam.
 
 ## 4. Managed launch interfaces
 
@@ -319,20 +320,120 @@ and RM-1's threat model is cooperating agents.
 
 ### 7.6 Exit codes and verdict record
 
-Exit codes: `64` usage/refusal · `2` config/IO · `127` adapter-not-found · `124` watchdog timeout. The PDP
-orders deny checks by severity so the first deny fixes the code (`127 > 2 > 64`); the RM-3 broker returns
-the same codes. Separately, `3` is a registry resolution config error (e.g. a schema-4 provider absent from
-the `providers` map) raised by the resolver *before* the PDP, so it is not one of the PDP verdict codes.
-Outside the launch path, `6` is the missing-runtime-dependency refusal: a journal commit on a host without
-util-linux `flock` fails loudly with exit 6 rather than committing unserialized. The `launch_verdict` record
-shares the shape family of the `managed_launch_binding` observability event so RM-2's durable Attempt audit
-can reuse it — but RM-1 journals nothing; the record is transient observability, not durable audit.
+PDP verdict codes: `64` usage/refusal · `2` config/IO · `127` adapter-not-found · `124` watchdog timeout.
+The PDP orders deny checks by severity so the first deny fixes the code (`127 > 2 > 64`); the RM-3 broker
+returns the same codes. Separately, `3` is a registry resolution config error (e.g. a schema-4 provider
+absent from the `providers` map) raised by the resolver *before* the PDP, so it is not one of the PDP
+verdict codes. The full launcher exit-code set, including the RM-2 audit and lifecycle codes (`6`, `75`,
+`126`, `128+signal`, and provider-code passthrough), is in §8.4. The `launch_verdict` record shares the
+shape family of the `managed_launch_binding` observability event; under RM-1 it was transient, and RM-2's
+durable `attempt.decided`/`attempt.ended` records (§8) now carry the same provenance to the framed stream.
 
 ### 7.7 Deferred RM-0 findings folded in
 
 Raw-NUL registry rejection within a single open (`IFS= read -r -d ''`; rc=0 means a NUL was found → loud
 refusal, no second open); load-time validation of **every** team key, not only referenced ones; and
 exit-127 coverage for a resolvable-but-absent adapter.
+
+## 8. RM-2 durable attempt audit — the first framed stream (ADR-0004)
+
+RM-2 makes the launch **decision durable**. The design and rationale are in
+[ADR-0004](decisions/0004-durable-attempt-audit.md); this section is the implemented interface.
+
+> **Honesty boundary: audit through the seam, not completeness, not containment.** RM-2 records attempts
+> that pass through `bin/launch-agent`, from identity resolution onward. A process that bypasses the
+> launcher and runs a provider directly leaves **nothing** in the stream. Non-bypassability is RM-3; RM-2
+> adds a record, not a boundary. The stream proves what the launcher decided and observed, never an
+> OS-attested fact about the provider process.
+
+### 8.1 Two records per attempt
+
+The PEP parent commits over the framed stream, never the PDP (which stays pure):
+
+- **`attempt.decided`** — written immediately after the PDP returns, **before any enactment**. Carries the
+  verdict (`decision`, `code`, `reasons`) and the complete binding provenance. A **deny** produces exactly
+  one record — closing the RM-1 hole where a PDP deny left no trace at all. An **allow** produces this as a
+  write-ahead statement of intent.
+- **`attempt.ended`** — the allow-path terminal record, `exit.class` ∈
+  `ok` · `provider-failure` · `timeout` · `io-refused` · `aborted`. Written only once the reaped provider
+  status is established.
+
+An open `attempt.decided(allow)` with no `attempt.ended` whose recorded PID has vanished is folded by a
+reader as **`presumed-dead`**. That is a reader-side classification only: there is no recovery writer, and
+`presumed-dead` is rejected fail-closed as a payload value — it can be derived, never stored.
+
+### 8.2 Framed stream (decision B: framed non-`.jsonl`)
+
+Stream `(project_uid, "main")`, file `<standup_dir>/events/main.events`, sidecar lock `main.events.lock`.
+Each record is `<seq> SP <crc> SP <len> SP <json> LF`:
+
+- `seq` writer-assigned, monotonic +1, allocated **under the stream lock**;
+- `crc` / `len` POSIX `cksum` CRC and byte count over exactly the `<json>` bytes (both must match);
+- `json` the event object from `{`, no LF/CR; the trailing `LF` is the commit marker.
+
+The `.jsonl` name was rejected as a lie — a record is framed, not bare JSON. Envelope fields are parsed
+**exclusively from the JSON part**; the reader reconstructs no envelope field from the prefix, and a crafted
+body cannot push bytes before the line start (no forgery vector). `event_id` is `<project_uid>-main-<seq>`,
+composed in-lock, host- and restart-unique **without a clock**; `occurred_at` is display only. For a
+`decided` record `attempt_id = correlation_id = its own event_id`; for an `ended` record
+`causation_id = attempt_id = the persisted decided event_id`. The prompt never enters a record (only its
+`{len, sha256}`); `label` is user input, capped and control-byte-encoded. The JSON encoder encodes every
+control byte or fails closed. The envelope version is `AIB_EVENT_SCHEMA_VERSION` (the envelope's own
+version, distinct from the registry `schema_version`).
+
+### 8.3 Fail-closed and quarantine
+
+Every failure of lock, tail-validation, encoding, cap, checksum, or append stops the launch **before
+enactment** — best-effort audit is an invariant break, and the provider never starts without a committed
+`decided` record. The stream lock uses a **finite** `flock -w`; a timeout fails loudly with exit **75**
+(`EX_TEMPFAIL`) rather than freezing launches behind a stuck writer. Tail classification:
+
+- **uncommitted tail** (last record only, unterminated): the writer truncates `main.events` in place at the
+  last intact LF boundary — the file stays the single authoritative path — and resumes at `seq+1`; the
+  never-ACKed bytes are never replayed.
+- **corrupt** (any *terminated* crc/len mismatch, non-object body, unparsable line): the stream is marked
+  corrupt, the fold refuses a verdict **and** the writer refuses the append. Audit corruption is a
+  launch-stopper by doctrine; the DoS facet is bounded by the finite lock timeout.
+- **lost** (inner seq gaps): reported as `degraded`; a gap is loss, not corruption, so the writer resumes
+  above the highest valid seq and does not block.
+- **whole-suffix / file replacement is NOT detectable** without an external cursor — a same-trust-domain
+  high-water anchor would only guard accidents. The broker-held anchor is the intended RM-3 close.
+
+### 8.4 Launcher exit codes (full set)
+
+| Code | Meaning |
+|---|---|
+| `2` | config/IO error or generic fail-closed reject (invalid payload, corrupt stream refusal, unconfirmed provider status, buffer-create failure) |
+| `6` | missing runtime dependency (`flock`, `cksum`, `truncate`, `sha256sum`, `env`, `sleep`, `mktemp`; also a non-GNU `date +%N`) |
+| `64` | usage/refusal — including an **unsupported provider**, which records `attempt.decided(allow)` then `attempt.ended(io-refused)` before exiting 64 (B1 option b) |
+| `75` | event-stream lock timeout (`EX_TEMPFAIL`) |
+| `124` | watchdog timeout (`attempt.ended(timeout)`) |
+| `126` / `127` | resolved adapter not runnable / not found (`attempt.ended(io-refused)`); `127` is also the PDP adapter-not-found deny |
+| `128+signal` | aborted by signal (`attempt.ended(aborted, signal)`), e.g. `143` TERM, `130` INT, `137` KILL, `129` HUP |
+| provider rc | a provider failure passes the provider's own exit code through (`attempt.ended(provider-failure, rc)`) |
+
+### 8.5 Child export
+
+The managed child additionally receives `AIBOBNET_ATTEMPT_ID` (the persisted `decided` `event_id`), joining
+the explicit managed `AIBOBNET_*` exports. It does **not** widen the `env -i` allow-list (`HOME PATH`).
+RM-2 only propagates the export; child-side consumption (heartbeats or messages referencing the attempt) is
+future work — `run-agent` scrubs `AIBOBNET_*`, so no ambient authority is sneaked in.
+
+### 8.6 Known limits (documented, not hidden)
+
+SIGKILL/OOM of the parent fires no trap → an open `decided(allow)` folds to `presumed-dead` (no recovery
+writer). The 0600 `mktemp` lifecycle buffers can leak on SIGKILL. No `fsync` — power-loss durability is out
+of scope. PID reuse can make a dead attempt look alive. A provider exiting exactly at the watchdog boundary
+can be classified `timeout`/124 rather than its true rc. The full-stream scan per append is O(n²) —
+low-volume-safe, and the reason the persistent cursor is an RM-3 anchor — and the signal-truth lifecycle
+costs roughly 2.4× the RM-1 per-launch runtime, the accepted price of a trustworthy terminal classification.
+
+### 8.7 Operational — redact before publication
+
+The persisted records and the launcher's stderr carry host-local absolute paths (`adapter_path`) and
+deployment uids (`*_source`) by design. Redact before publishing launcher output or a stream excerpt into a
+public artifact. `requested` is a frozen `null` schema slot for provider/model/effort (no direct CLI request
+exists today), reserved additively — distinct from a `null` `effective` on a deny.
 
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts.
