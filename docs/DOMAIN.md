@@ -6,11 +6,14 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 
 > **Implementation status:** this document defines the target contract, not the current feature set.
 > P0 identity/registry, schema-3/4 execution binding with per-field provenance, P1 delivery, P2 wakeup/local
-> adapter, P3 scoped memory, the legacy-journal serialized commit protocol, and the Codex managed-launch
-> path are built and tested. The full serialized event spine, provider-wide reference monitor,
-> Gate/Grant/Effect state machines, profile provisioning, full runtime lifecycle, external adapters, and
-> dashboard projection remain specified but unimplemented. Until the reference monitor exists,
-> `clearance` is registry/audit data rather than an enforced authorization decision.
+> adapter, P3 scoped memory, the legacy-journal serialized commit protocol, the Codex managed-launch path,
+> and the RM-2 durable attempt audit (the first framed §6 event stream — `attempt.decided`/`attempt.ended`
+> per managed launch) are built and tested. The **rest** of the serialized event spine (cursors,
+> projections, rebuild tooling, the other streams), the provider-wide reference monitor, the
+> provider-change audit event, Gate/Grant/Effect state machines, profile provisioning, full runtime
+> lifecycle, external adapters, and dashboard projection remain specified but unimplemented. Until the
+> reference monitor exists, `clearance` is registry/audit data rather than an enforced authorization
+> decision.
 >
 > **The managed-launch path is a POLICY GATE for cooperating agents (RM-1), not containment.** A pure
 > Policy Decision Point (`aib_authorize_launch`) caps effective authority at `min(clearance, declared
@@ -19,8 +22,11 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > monitor: it does not mediate provider syscalls or arbitrary children, constrain network/VCS effects,
 > prevent a hostile local process from running a provider directly, or make T4 decisions, and the
 > capabilities it caps against are declared data, trusted rather than verified — non-bypassability is the
-> later reference monitor. It also creates no durable Attempt record or provider-change audit event; a
-> heartbeat that shows the binding is operational visibility, not historical proof. See ADR-0003.
+> later reference monitor. **RM-2 adds a durable Attempt record through the seam** (`attempt.decided`/
+> `attempt.ended`, ADR-0004): a heartbeat is still only operational visibility, but the framed stream is
+> now historical proof of what the launcher decided and observed — for attempts that go through the seam; a
+> bypassing process leaves nothing, and the provider-change audit event is still unbuilt. See ADR-0003 and
+> ADR-0004.
 >
 > The delivery and memory contracts define the implemented intermediate legacy-journal commit protocol.
 > The protocol is a prelude to §6, not its implementation: it does not add sequence numbers, event
