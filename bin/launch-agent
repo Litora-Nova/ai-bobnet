@@ -124,17 +124,13 @@ if [ "$prompt_source" = file ]; then
   prompt="$(<"$prompt_file")" || aib_die 2 "cannot read --prompt-file: $prompt_file"
 fi
 [ -n "$prompt" ] || aib_die 64 "prompt must not be empty"
+_sha256_bin="$(command -v sha256sum)" || aib_die 6 "required runtime dependency not found: sha256sum (coreutils)"
+_env_bin="$(command -v env)" || aib_die 6 "required runtime dependency not found: env (coreutils)"
+_sleep_bin="$(command -v sleep)" || aib_die 6 "required runtime dependency not found: sleep (coreutils)"
+_mktemp_bin="$(command -v mktemp)" || aib_die 6 "required runtime dependency not found: mktemp (coreutils)"
 
 # --- exactly one managed resolution; everything below consumes this bundle ---
 aib_resolve_managed_agent "$as"
-
-# The PEP drives only a codex-CLI-shaped adapter (the `exec -m/-s/-c … -- <prompt>`
-# argv form). This is a support-shape limit, NOT an authority decision — all authority
-# lives in the PDP. A non-codex adapter would need a different argv contract.
-case "$AIB_PROVIDER" in
-  codex) ;;
-  *) aib_die 64 "unsupported registry provider '$AIB_PROVIDER' (this launcher drives only the codex adapter CLI)";;
-esac
 
 # --- Policy Decision Point: the single authority for this launch --------------
 # Build the two serialisable records and hand them to the pure PDP; the PEP takes no
@@ -146,7 +142,63 @@ _pep_request="$(printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' 
 _pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s' \
   "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" "$AIB_ADAPTER_PATH" \
   "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT")"
-if ! aib_authorize_launch "$_pep_request" "$_pep_snapshot"; then
+aib_authorize_launch "$_pep_request" "$_pep_snapshot" || true
+
+# --- durable write-ahead decision --------------------------------------------
+# The frozen Lane-A composers are the JSON-validity authority. The broker allocates
+# identity under the stream lock; the PEP never composes or guesses an attempt id.
+LC_ALL=C
+_prompt_len=${#prompt}
+_label_len=${#label}
+_audit_label="${label//$'\n'/ }"
+_audit_label="${_audit_label//$'\r'/ }"
+_prompt_sha_output="$(printf '%s' "$prompt" | "$_sha256_bin")" ||
+  aib_die 2 "cannot compute prompt sha256"
+_prompt_sha256="${_prompt_sha_output%% *}"
+
+aib_event_stream_paths "$AIB_STANDUP_DIR"
+_event_envelope="$(printf 'project_uid=%s\nactor_type=service\nactor_id=launch-agent\nagent_uid=%s\nteam_uid=%s\nsession_id=%s' \
+  "$AIB_PROJECT_UID" "$AIB_AGENT_UID" "$AIB_TEAM_UID" "$AIB_MUX_SESSION")"
+_decided_kv="$(printf 'decision=%s\ncode=%s\nreasons=%s\nprovider_resolved=%s\nprovider_source=%s\nmodel_resolved=%s\nmodel_source=%s\neffort_resolved=%s\neffort_source=%s\nsandbox_requested=%s\nadapter_raw=%s\nadapter_source=%s\npid=%s\nprompt_len=%s\nprompt_sha256=%s\nlabel=%s\nlabel_len=%s' \
+  "$AIB_VERDICT_DECISION" "$AIB_VERDICT_CODE" "$AIB_VERDICT_REASONS" \
+  "$AIB_PROVIDER" "$AIB_PROVIDER_SOURCE" "$AIB_MODEL" "$AIB_MODEL_SOURCE" \
+  "$AIB_EFFORT" "$AIB_EFFORT_SOURCE" "$sandbox" "$AIB_ADAPTER_PATH" \
+  "$AIB_ADAPTER_SOURCE" "$$" "$_prompt_len" "$_prompt_sha256" "$_audit_label" "$_label_len")"
+if [ "$AIB_VERDICT_DECISION" = allow ]; then
+  _decided_kv="${_decided_kv}"$'\n'"$(printf 'provider_effective=%s\nmodel_effective=%s\neffort_effective=%s\nsandbox_effective=%s\nadapter_effective=%s' \
+    "$AIB_PROVIDER" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_EFFORT" \
+    "$AIB_VERDICT_EFFECTIVE_SANDBOX" "$AIB_VERDICT_ADAPTER_PATH")"
+fi
+_decided_payload="$(aib_event_compose_decided_payload "$_decided_kv")"
+set +e
+aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided \
+  "$_event_envelope" "$_decided_payload"
+_event_commit_rc=$?
+set -e
+[ "$_event_commit_rc" -eq 0 ] ||
+  aib_die "$_event_commit_rc" "attempt.decided commit failed"
+_decided_event_id="$AIB_EVENT_COMMIT_EVENT_ID"
+_terminal_written=0
+
+_pep_commit_ended() {
+  local exit_class="$1" exit_code="${2-}" signal="${3-}" ended_kv ended_payload
+  [ "$_terminal_written" -eq 0 ] ||
+    aib_die 2 "attempt '$_decided_event_id' already entered a terminal path"
+  ended_kv="exit_class=$exit_class"
+  [ -z "$exit_code" ] || ended_kv="${ended_kv}"$'\n'"exit_code=$exit_code"
+  [ -z "$signal" ] || ended_kv="${ended_kv}"$'\n'"signal=$signal"
+  ended_payload="$(aib_event_compose_ended_payload "$ended_kv")"
+  set +e
+  aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.ended \
+    "$_event_envelope" "$ended_payload" "$_decided_event_id"
+  _event_commit_rc=$?
+  set -e
+  [ "$_event_commit_rc" -eq 0 ] ||
+    aib_die "$_event_commit_rc" "attempt.ended commit failed"
+  _terminal_written=1
+}
+
+if [ "$AIB_VERDICT_DECISION" = deny ]; then
   aib_die "$AIB_VERDICT_CODE" "managed launch denied: $AIB_VERDICT_REASONS"
 fi
 
@@ -156,10 +208,27 @@ adapter_path="$AIB_VERDICT_ADAPTER_PATH"
 sandbox="$AIB_VERDICT_EFFECTIVE_SANDBOX"
 eff_effort="$AIB_VERDICT_EFFECTIVE_EFFORT"
 
+# The PEP drives only a codex-CLI-shaped adapter. The pure PDP cannot derive that
+# launcher-specific argv support from its frozen snapshot, so B1 uses option (b):
+# persist allow intent first, then close the unsupported enactment as io-refused.
+case "$AIB_PROVIDER" in
+  codex) ;;
+  *)
+    _pep_commit_ended io-refused 64
+    ;;
+esac
+case "$AIB_PROVIDER" in
+  codex) ;;
+  *) aib_die 64 "unsupported registry provider '$AIB_PROVIDER' (this launcher drives only the codex adapter CLI)";;
+esac
+
 # IO hygiene (not authority): the PDP is pure and never stats the disk, so the PEP
-# confirms the resolved adapter is actually executable before committing to a
-# heartbeat — an absent/unresolvable adapter fails closed at exit 127.
-[ -x "$adapter_path" ] || aib_die 127 "resolved adapter is not executable: $adapter_path"
+# confirms the resolved adapter is actually executable before heartbeat/provider
+# enactment. The write-ahead decision already exists, so this refusal closes it.
+if [ ! -x "$adapter_path" ]; then
+  _pep_commit_ended io-refused 127
+  aib_die 127 "resolved adapter is not executable: $adapter_path"
+fi
 
 # One observability event: the resolved binding + the ABSOLUTE adapter path taken
 # from the verdict (never a PATH/cwd lookup). Not durable audit or enforcement.
@@ -204,6 +273,7 @@ _child_env+=(
   "AIBOBNET_EFFORT=$AIB_EFFORT"
   "AIBOBNET_EFFORT_SOURCE=$AIB_EFFORT_SOURCE"
   "AIBOBNET_REGISTRY_SCHEMA_VERSION=$AIB_REGISTRY_SCHEMA_VERSION"
+  "AIBOBNET_ATTEMPT_ID=$_decided_event_id"
   "STANDUP_DIR=$AIB_STANDUP_DIR"
 )
 
@@ -211,37 +281,208 @@ hb() {
   aib_log_resolved "$AIB_STANDUP_DIR" "$AIB_AGENT_UID" "$1" "$2"
 }
 
+_provider_manager_pid=""
+_provider_status=""
+_provider_status_confirmed=0
+_provider_status_file=""
+_provider_output=""
+
+_pep_status_signal() {
+  case "$1" in
+    129) printf 'HUP';;
+    130) printf 'INT';;
+    137) printf 'KILL';;
+    143) printf 'TERM';;
+    *) printf 'SIGNAL-%s' "$(($1 - 128))";;
+  esac
+}
+
+_pep_commit_status() {
+  local status="$1"
+  case "$status" in
+    0) _pep_commit_ended ok;;
+    124) _pep_commit_ended timeout 124;;
+    126|127) _pep_commit_ended io-refused "$status";;
+    *)
+      if [ "$status" -ge 128 ]; then
+        _pep_commit_ended aborted "" "$(_pep_status_signal "$status")"
+      else
+        _pep_commit_ended provider-failure "$status"
+      fi
+      ;;
+  esac
+}
+
+_pep_exec_provider() {
+  exec "$_env_bin" -i "${_child_env[@]}" \
+    "$adapter_path" exec \
+    -m "$AIB_MODEL" -s "$sandbox" \
+    -c "model_reasoning_effort=\"$eff_effort\"" \
+    -c 'approval_policy="never"' \
+    -- "$prompt" 2>&1
+}
+
+_pep_provider_manager() {
+  set +e
+  local provider_pid="" timer_pid="" killer_pid="" provider_rc=1 confirmed_rc=1
+  local timed_out=0 wait_interrupted=0
+  local manager_pid="$BASHPID"
+
+  _pep_manager_forward() {
+    local signal="$1"
+    wait_interrupted=1
+    [ -z "$provider_pid" ] || kill -s "$signal" "$provider_pid" 2>/dev/null || true
+  }
+  _pep_manager_timeout() {
+    timed_out=1
+    wait_interrupted=1
+    [ -z "$provider_pid" ] || kill -TERM "$provider_pid" 2>/dev/null || true
+    if [ -n "$provider_pid" ]; then
+      (
+        "$_sleep_bin" 10
+        kill -KILL "$provider_pid" 2>/dev/null || true
+      ) &
+      killer_pid=$!
+    fi
+  }
+
+  trap '_pep_manager_forward HUP' HUP
+  trap '_pep_manager_forward INT' INT
+  trap '_pep_manager_forward TERM' TERM
+  trap '_pep_manager_timeout' USR1
+
+  cd "$cwd" || exit 127
+  _pep_exec_provider &
+  provider_pid=$!
+  (
+    "$_sleep_bin" "$timeout_s"
+    kill -USR1 "$manager_pid" 2>/dev/null || true
+  ) &
+  timer_pid=$!
+
+  wait "$provider_pid"
+  provider_rc=$?
+  if [ "$wait_interrupted" -eq 1 ]; then
+    while kill -0 "$provider_pid" 2>/dev/null; do
+      wait "$provider_pid"
+      confirmed_rc=$?
+      [ "$confirmed_rc" -eq 127 ] || provider_rc="$confirmed_rc"
+      kill -0 "$provider_pid" 2>/dev/null && "$_sleep_bin" 0.01
+    done
+  fi
+
+  kill "$timer_pid" 2>/dev/null || true
+  wait "$timer_pid" 2>/dev/null || true
+  if [ -n "$killer_pid" ]; then
+    kill "$killer_pid" 2>/dev/null || true
+    wait "$killer_pid" 2>/dev/null || true
+  fi
+  [ "$timed_out" -eq 0 ] || provider_rc=124
+  printf '%s\n' "$provider_rc" > "$_provider_status_file" || exit 125
+  exit "$provider_rc"
+}
+
+_pep_reap_manager() {
+  local wait_status
+  set +e
+  wait "$_provider_manager_pid"
+  wait_status=$?
+  _provider_status="$wait_status"
+  _provider_status_confirmed=0
+  if [ -r "$_provider_status_file" ]; then
+    IFS= read -r _provider_status < "$_provider_status_file"
+    case "$_provider_status" in
+      ''|*[!0-9]*) _provider_status="$wait_status";;
+      *) _provider_status_confirmed=1;;
+    esac
+  fi
+  set -e
+  _provider_manager_pid=""
+}
+
+_pep_cleanup_output() {
+  [ -z "$_provider_output" ] || rm -f -- "$_provider_output" 2>/dev/null || true
+  [ -z "$_provider_status_file" ] || rm -f -- "$_provider_status_file" 2>/dev/null || true
+  _provider_output=""
+  _provider_status_file=""
+}
+
+_pep_signal_handler() {
+  trap - EXIT INT TERM HUP
+  local signal="$1" original_status="$2"
+  if [ "$_terminal_written" -eq 0 ] && [ -n "$_provider_manager_pid" ]; then
+    kill -s "$signal" "$_provider_manager_pid" 2>/dev/null || true
+    _pep_reap_manager
+    [ "$_provider_status_confirmed" -eq 0 ] || ( _pep_commit_status "$_provider_status" ) || true
+  fi
+  [ -z "$_provider_output" ] || cat "$_provider_output" >&2 2>/dev/null || true
+  _pep_cleanup_output
+  exit "$original_status"
+}
+
+_pep_exit_handler() {
+  trap - EXIT INT TERM HUP
+  local original_status="$1"
+  if [ "$_terminal_written" -eq 0 ]; then
+    if [ -n "$_provider_manager_pid" ]; then
+      kill -TERM "$_provider_manager_pid" 2>/dev/null || true
+      _pep_reap_manager
+    fi
+    if [ "$_provider_status_confirmed" -eq 1 ]; then
+      ( _pep_commit_status "$_provider_status" ) || true
+    fi
+  fi
+  [ -z "$_provider_output" ] || cat "$_provider_output" >&2 2>/dev/null || true
+  _pep_cleanup_output
+  exit "$original_status"
+}
+
+if ! _provider_output="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-launch.XXXXXX")" ||
+   ! _provider_status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-status.XXXXXX")"; then
+  _pep_cleanup_output
+  _pep_commit_ended io-refused 2
+  aib_die 2 "cannot create provider lifecycle buffers"
+fi
+
+trap '_pep_exit_handler "$?"' EXIT
+trap '_pep_signal_handler HUP "$?"' HUP
+trap '_pep_signal_handler INT "$?"' INT
+trap '_pep_signal_handler TERM "$?"' TERM
+
 printf '%s\n' "$launch_binding_event" >&2
 
 lbl="${label:-codex-run}"
 hb busy "codex-run: $AIB_MODEL/$sandbox effort=$eff_effort — $lbl"
 
-# Exec the adapter by ABSOLUTE path (from the verdict), inside the requested cwd, under
-# the allow-list env only. PATH/cwd cannot swap the adapter — that is why RM-1 is a
-# policy gate for cooperating agents, not an enforcement boundary. The watchdog binary
-# is resolved to an absolute path in the parent so it never depends on the child PATH.
-_timeout_bin="$(command -v timeout)" || aib_die 2 "timeout watchdog binary not found on PATH"
+# Run the absolute adapter as a managed child. A small manager owns the direct provider
+# PID, forwards parent signals, implements the finite watchdog, and reports the actual
+# reaped provider status. The PEP writes no terminal record before that status exists.
 set +e
-out="$(
-  cd "$cwd" && env -i "${_child_env[@]}" \
-    "$_timeout_bin" -k 10 "$timeout_s" "$adapter_path" exec \
-    -m "$AIB_MODEL" -s "$sandbox" \
-    -c "model_reasoning_effort=\"$eff_effort\"" \
-    -c 'approval_policy="never"' \
-    -- "$prompt" 2>&1
-)"
-rc=$?
+_pep_provider_manager >"$_provider_output" 2>&1 &
+_provider_manager_pid=$!
+_pep_reap_manager
+rc="$_provider_status"
 set -e
+trap - EXIT INT TERM HUP
+if [ "$_provider_status_confirmed" -ne 1 ]; then
+  _pep_cleanup_output
+  aib_die 2 "provider exited without a confirmed reaped status"
+fi
+out="$(<"$_provider_output")"
+_pep_cleanup_output
 
 if [ "$rc" -eq 124 ]; then
+  _pep_commit_status "$rc"
   hb blocked "codex-run TIMEOUT after ${timeout_s}s — $lbl"
   printf '%s\n' "$out" >&2
   aib_die 124 "codex-run: timed out after ${timeout_s}s (watchdog killed the call)"
 elif [ "$rc" -ne 0 ]; then
+  _pep_commit_status "$rc"
   hb blocked "codex-run FAILED rc=$rc — $lbl"
   printf '%s\n' "$out" >&2
   aib_die "$rc" "codex-run: codex exec failed (rc=$rc)"
 fi
 
+_pep_commit_status "$rc"
 hb done "codex-run OK — $lbl"
 printf '%s\n' "$out"
