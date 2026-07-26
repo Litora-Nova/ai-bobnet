@@ -7,15 +7,29 @@
 # proves a NAMED acceptance check turns RED. A silent survivor is a regression hole.
 #
 # NEWLY pinned here (not covered elsewhere): the UTF-8 boundary. event_commit_spec
-# exercises only a loose 0xff byte, so a regression that weakened just the overlong or
-# surrogate boundary — while still rejecting 0xff — would slip through. Those two legs
-# pin C0 80 (overlong) and ED A0 80 (surrogate) directly, and prove a boundary-scoped
-# mutant flips them without touching the loose-0xff rejection.
+# exercises only a loose 0xff byte, so a regression that weakened just the overlong,
+# surrogate, or above-max boundary — while still rejecting 0xff — would slip through.
+# These three legs pin C0 80 (overlong), ED A0 80 (surrogate), and F4 90 80 80
+# (above U+10FFFF) directly, and prove a boundary-scoped mutant flips each one without
+# touching the loose-0xff rejection (or the other two boundaries).
 #
 # REFERENCED (not restated): every cross-stack leg re-runs the sister spec that already
 # owns the named assertion and asserts the mutation makes THAT assertion fail. This
 # gate does not duplicate the sister assertions; it guarantees the invariants they
 # protect cannot be quietly removed across the stack.
+#
+# DELIBERATELY NOT pinned here: the signal handler's trap disarm (bin/launch-agent,
+# _pep_signal_handler's first line). attempt_audit_spec.sh already protects it with an
+# exact-text pin plus its own self-built no-disarm mutant. Every other anchor tried here
+# survived silently: the main-path disarm outside any handler and the near-identical
+# disarm in _pep_exit_handler both leave that sister spec fully green (42/42) when
+# neutralized — neither is on a path any of its assertions actually exercises. The one
+# anchor that DID flip the sister's own named assertion (_pep_signal_handler's own trap
+# line) shares the exact same line the sister spec's self-built mutant also targets, so
+# mutating it first quietly redirects that internal mutant onto _pep_exit_handler instead
+# — a "kill" whose own proof mechanism moved out from under it. A leg that can't
+# independently confirm the invariant is worse than no leg at all, so this one is
+# skipped rather than faked.
 #
 # Lane E attacks the code; it never edits lib/ or bin/. All mutation is on throwaway
 # copies under $WORK. Style mirrors tests/execution_binding_mutation_spec.sh.
@@ -101,6 +115,7 @@ utf8_probe() {
     _p loose     '\377'              # bare 0xff — the only case event_commit_spec covers
     _p overlong  '\300\200'          # C0 80 — overlong encoding of U+0000
     _p surrogate '\355\240\200'      # ED A0 80 — UTF-16 surrogate U+D800, illegal in UTF-8
+    _p above_max '\364\220\200\200'  # F4 90 80 80 — U+110000, above the Unicode maximum
     _p valid2    '\303\244'          # ä  U+00E4
     _p valid3    '\342\202\254'      # €  U+20AC
     _p valid4    '\360\237\230\200'  # 😀 U+1F600
@@ -111,9 +126,10 @@ utf8_probe() {
 # Part 1 — NEWLY pinned: the UTF-8 boundary (RFC 3629)
 # ===========================================================================
 REAL="$(utf8_probe "$SRC_ROOT/lib/aibobnet.sh")"
-has "real validator rejects overlong C0 80"     "$REAL" "overlong=reject"
-has "real validator rejects surrogate ED A0 80" "$REAL" "surrogate=reject"
-has "real validator rejects loose 0xff"         "$REAL" "loose=reject"
+has "real validator rejects overlong C0 80"       "$REAL" "overlong=reject"
+has "real validator rejects surrogate ED A0 80"   "$REAL" "surrogate=reject"
+has "real validator rejects above-max F4 90 80 80" "$REAL" "above_max=reject"
+has "real validator rejects loose 0xff"           "$REAL" "loose=reject"
 has "real validator accepts valid 2-byte"       "$REAL" "valid2=accept"
 has "real validator accepts valid 3-byte"       "$REAL" "valid3=accept"
 has "real validator accepts valid 4-byte"       "$REAL" "valid4=accept"
@@ -147,6 +163,24 @@ case "$MU2_OUT" in
   *)                 no "utf8-overlong-accepted: overlong still rejected (silent survivor)";;
 esac
 has "utf8-overlong-accepted stays boundary-scoped (0xff still rejected)" "$MU2_OUT" "loose=reject"
+
+# Mutant: widen the F4 (244) second-byte upper bound from 143 to 191, so F4 90 80 80
+# (U+110000, one past the Unicode maximum U+10FFFF) is wrongly accepted as a valid
+# 4-byte sequence. The other three boundaries (loose 0xff, overlong, surrogate) must
+# stay rejected — this mutant only touches the above-max lead byte's second-byte range.
+MU3="$(make_mutant utf8-above-max-accepted)"
+replace_exact "$MU3/lib/aibobnet.sh" \
+  '        244) [ "$second" -ge 128 ] && [ "$second" -le 143 ] || return 1;;' \
+  '        244) [ "$second" -ge 128 ] && [ "$second" -le 191 ] || return 1;;'
+record_mutation "utf8-above-max-accepted" "$?"
+MU3_OUT="$(utf8_probe "$MU3/lib/aibobnet.sh")"
+case "$MU3_OUT" in
+  *above_max=accept*) ok "utf8-above-max-accepted: above-max codepoint now accepted -> flips 'rejects above-max F4 90 80 80'";;
+  *)                  no "utf8-above-max-accepted: above-max codepoint still rejected (silent survivor)";;
+esac
+has "utf8-above-max-accepted stays boundary-scoped (0xff still rejected)"      "$MU3_OUT" "loose=reject"
+has "utf8-above-max-accepted stays boundary-scoped (overlong still rejected)"  "$MU3_OUT" "overlong=reject"
+has "utf8-above-max-accepted stays boundary-scoped (surrogate still rejected)" "$MU3_OUT" "surrogate=reject"
 
 # ===========================================================================
 # Part 2 — cross-stack invariants (each references a named sister assertion)
@@ -202,6 +236,20 @@ expect_targeted_failure "frame-prefix-seq-tie-disabled" \
   "$M6/tests/event_commit_spec.sh" \
   "decided writer refuses an event_id/seq-mismatched stream" \
   "$WORK/frame-prefix-seq-tie-disabled.out"
+
+# At-most-one attempt.ended per attempt_id: the in-lock broker rule refuses a second
+# terminal record for an attempt that already has one. Neutralizing the refusal lets a
+# second attempt.ended for the same decided id through — a double-terminal-write hole.
+# (event_commit_spec, Fall 9 — at-most-one attempt.ended)
+M7="$(make_mutant broker-second-ended-allowed)"
+replace_exact "$M7/lib/aibobnet.sh" \
+  '        aib_die 2 "attempt '"'"'$decided_id'"'"' already has an attempt.ended — refusing a second terminal record";;' \
+  '        : ;;'
+record_mutation "broker-second-ended-allowed" "$?"
+expect_targeted_failure "broker-second-ended-allowed" \
+  "$M7/tests/event_commit_spec.sh" \
+  "second attempt.ended is refused fail-closed" \
+  "$WORK/broker-second-ended-allowed.out"
 
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"
