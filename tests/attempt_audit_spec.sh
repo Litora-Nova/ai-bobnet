@@ -327,6 +327,7 @@ mkdir -p "$MUTANT_ROOT/bin" "$MUTANT_ROOT/lib"
 cp "$SRC_ROOT/lib/aibobnet.sh" "$MUTANT_ROOT/lib/aibobnet.sh"
 if awk '
   /^_pep_signal_handler\(\) \{/ { in_handler=1; print; next }
+  /^_pep_exit_handler\(\) \{/ { in_handler=0; print; next }
   in_handler && $0 == "  trap - EXIT INT TERM HUP" { print "  : # mutation: trap disarm removed"; changed++; in_handler=0; next }
   { print }
   END { if (changed != 1) exit 42 }
