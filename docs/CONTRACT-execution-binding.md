@@ -434,6 +434,11 @@ components. All guarantees in §7 and §8 therefore assume a cooperating agent t
 monitor: the policy-gate assumption applies to integrity as well as invocation. Integrity precedes
 non-bypassability. Separating those accounts is RM-3's precondition, not optional hardening.
 
+Separating those accounts does not by itself make the recorded actor trustworthy. Where a deployment
+runs every agent under one shared agent account, the `agent_uid` in these records is an assertion the
+launcher accepts rather than a fact it verifies, so the stream must not be read as proof of identity
+*between* agents. `CONTRACT-mediation.md` §4 states that limit and its remedy.
+
 ### 8.7 Operational — redact before publication
 
 The persisted records and the launcher's stderr carry host-local absolute paths (`adapter_path`) and
