@@ -428,6 +428,17 @@ can be classified `timeout`/124 rather than its true rc. The full-stream scan pe
 low-volume-safe, and the reason the persistent cursor is an RM-3 anchor — and the signal-truth lifecycle
 costs roughly 2.4× the RM-1 per-launch runtime, the accepted price of a trustworthy terminal classification.
 
+The monitor itself — including its PDP, PEP, adapter map, registry, and event stream — is not
+write-protected from the agent when the deployment runs the agent under the same uid that owns those
+components. All guarantees in §7 and §8 therefore assume a cooperating agent that does not modify the
+monitor: the policy-gate assumption applies to integrity as well as invocation. Integrity precedes
+non-bypassability. Separating those accounts is RM-3's precondition, not optional hardening.
+
+Separating those accounts does not by itself make the recorded actor trustworthy. Where a deployment
+runs every agent under one shared agent account, the `agent_uid` in these records is an assertion the
+launcher accepts rather than a fact it verifies, so the stream must not be read as proof of identity
+*between* agents. `CONTRACT-mediation.md` §4 states that limit and its remedy.
+
 ### 8.7 Operational — redact before publication
 
 The persisted records and the launcher's stderr carry host-local absolute paths (`adapter_path`) and
