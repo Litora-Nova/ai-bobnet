@@ -1,0 +1,25 @@
+[Unit]
+Description=BobNet broker connection %i
+Documentation=file:/opt/aib/engine/docs/CONTRACT-mediation.md
+
+[Service]
+ExecStart=/opt/aib/engine/bin/aib-broker-handler
+User=aib-broker
+Group=aib-broker
+
+# EXPLICIT, and this is the trap: with Accept=yes systemd does NOT hand the connection to the
+# handler by itself. Measured on 2026-08-10 - without these two lines the handler received
+# nothing on stdin and wrote its answer to the journal. Six connections, six empty replies,
+# client rc=0 each time: a silently non-functional service.
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/aib /run/aib

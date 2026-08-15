@@ -91,7 +91,13 @@ assert_grep  "stdin is EXPLICITLY the socket"  "$svc"  "StandardInput=socket"
 assert_grep  "stdout is EXPLICITLY the socket" "$svc"  "StandardOutput=socket"
 assert_grep  "one instance per connection"     "$sock" "Accept=yes"
 assert_grep  "connection limit is set"         "$sock" "MaxConnections="
-assert_ngrep "MaxConnectionsPerSource is NOT used" "$sock" "MaxConnectionsPerSource"
+# Check for the DIRECTIVE, not the string: the unit documents in a comment why the option is
+# avoided, and that comment is worth keeping. A bare substring match would forbid the explanation.
+if printf '%s\n' "$sock" | grep -qE '^[[:space:]]*MaxConnectionsPerSource[[:space:]]*='; then
+  no "MaxConnectionsPerSource is NOT used as a directive"
+else
+  ok "MaxConnectionsPerSource is NOT used as a directive"
+fi
 assert_ngrep "no daemon loop is shipped"       "$svc"  "Type=simple"
 
 printf '\nbroker_wire_spec: %d passed, %d failed\n' "$pass" "$fail"

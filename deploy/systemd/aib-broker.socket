@@ -1,0 +1,23 @@
+[Unit]
+Description=BobNet broker socket - one instance per connection
+Documentation=file:/opt/aib/engine/docs/CONTRACT-mediation.md
+
+[Socket]
+ListenStream=/run/aib/broker.sock
+# Socket activation instead of a daemon loop (contract §6): crashes stay per connection and the
+# registry is read fresh per connection, which keeps clearance changes from going stale.
+Accept=yes
+SocketUser=aib-broker
+SocketGroup=aib-shared
+SocketMode=0660
+# A caller in a connect loop must not be able to produce a fork storm. Over the limit systemd
+# accepts and immediately closes the connection - the client sees an EMPTY body and rc=0, which
+# is exactly why every response carries a terminal status line.
+MaxConnections=16
+# Deliberately NOT MaxConnectionsPerSource. The documentation presents it as an IP-level option,
+# but on AF_UNIX it bites (measured on systemd 257, 2026-08-10: with a limit of 2, only 2 of 6
+# connections got through). In a single-uid deployment the WHOLE fleet is one source, so it would
+# throttle every agent together.
+
+[Install]
+WantedBy=sockets.target

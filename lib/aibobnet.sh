@@ -1729,3 +1729,71 @@ aib_event_commit() {
   AIB_EVENT_COMMIT_SEQ="$seq"
   AIB_EVENT_COMMIT_EVENT_ID="$event_id"
 }
+
+# --- RM-3 broker transport (mediated launch contract §6) ---------------------
+# The wire carries token fields as record lines and free text length-prefixed. The parser
+# COUNTS BYTES for the free text instead of searching for a separator — that is what makes a
+# prompt containing "\nagent_uid=root" arrive as payload rather than as a forged field.
+#
+# These functions REFUSE by return code and set AIB_WIRE_ERROR; they never aib_die. The caller
+# is one connection instance and has to answer with a terminal status line before it exits —
+# a refusal the client cannot read is indistinguishable from a dead broker (spike, 2026-08-10).
+AIB_WIRE_PROMPT_MAX="${AIB_WIRE_PROMPT_MAX:-65536}"
+
+# Fields whose value is composed under the commit lock and is NEVER accepted from a caller (§3).
+AIB_WIRE_FORBIDDEN_FIELDS="event_id attempt_id seq"
+
+# aib_wire_read_request  <stdin: request frame> -> AIB_REQ_<FIELD> … + AIB_REQ_PROMPT
+aib_wire_read_request() {
+  AIB_WIRE_ERROR=""
+  local line key val prompt="" bytes="" f
+  # Record lines first, terminated by an empty line. Values are single-line by construction.
+  while IFS= read -r line; do
+    [ -z "$line" ] && break
+    case "$line" in
+      *=*) : ;;
+      *) AIB_WIRE_ERROR="malformed record line"; return 2 ;;
+    esac
+    key="${line%%=*}"; val="${line#*=}"
+    case "$key" in
+      [a-z]|[a-z][a-z0-9_]*) : ;;
+      *) AIB_WIRE_ERROR="invalid field name '$key'"; return 2 ;;
+    esac
+    # The protocol never carries environment fields — that is what keeps the credential
+    # directory selector off the attack surface (§3).
+    case "$key" in env_*|env) AIB_WIRE_ERROR="environment field '$key' does not cross the seam"; return 2 ;; esac
+    for f in $AIB_WIRE_FORBIDDEN_FIELDS; do
+      [ "$key" = "$f" ] && { AIB_WIRE_ERROR="identity field '$key' is composed under the lock, not accepted"; return 2; }
+    done
+    case "$val" in *[[:cntrl:]]*) AIB_WIRE_ERROR="control character in field '$key'"; return 2 ;; esac
+    if [ "$key" = "prompt_bytes" ]; then bytes="$val"; continue; fi
+    printf -v "AIB_REQ_$(printf '%s' "$key" | tr 'a-z' 'A-Z')" '%s' "$val"
+  done
+
+  case "$bytes" in
+    ''|*[!0-9]*) AIB_WIRE_ERROR="prompt_bytes missing or not a number"; return 2 ;;
+  esac
+  [ "$bytes" -le "$AIB_WIRE_PROMPT_MAX" ] || {
+    AIB_WIRE_ERROR="prompt of $bytes bytes exceeds the cap of $AIB_WIRE_PROMPT_MAX"; return 2; }
+
+  if [ "$bytes" -gt 0 ]; then
+    # LC_ALL=C so that read -N counts BYTES, not characters. A prompt containing NUL loses those
+    # bytes (bash cannot hold them) and then fails the length check below — fail-closed, on purpose.
+    LC_ALL=C IFS= read -r -N "$bytes" prompt
+    [ "${#prompt}" -eq "$bytes" ] || {
+      AIB_WIRE_ERROR="short read: declared $bytes bytes, got ${#prompt}"; return 2; }
+  fi
+  AIB_REQ_PROMPT="$prompt"
+  return 0
+}
+
+# aib_wire_write_response <ok|denied|error> [field=value …] -> response frame on stdout
+# The terminal line is the contract: without it the caller cannot tell a refusal from a broker
+# that died mid-connection, or from a connection the socket dropped over MaxConnections.
+aib_wire_write_response() {
+  local status="$1"; shift
+  case "$status" in ok|denied|error) : ;; *) status=error ;; esac
+  local kv
+  for kv in "$@"; do printf '%s\n' "$kv"; done
+  printf 'end=%s\n' "$status"
+}
