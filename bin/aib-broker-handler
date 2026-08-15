@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ai-bobnet — RM-3 broker, one connection instance (mediated launch contract §6).
+#
+# systemd spawns one of these per accepted connection; the connection is stdin AND stdout,
+# which the unit has to say EXPLICITLY (see deploy/systemd/aib-broker@.service).
+#
+# Slice 1 scope: transport only. The frame is parsed and then REFUSED, because authorize/commit
+# have not moved behind the seam yet. That refusal is the correct behaviour, not a placeholder:
+# a broker that cannot decide must not enact. Every path answers with a terminal status line
+# before exiting — a refusal the caller cannot read is indistinguishable from a dead broker.
+set -uo pipefail
+
+AIB_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
+# shellcheck source=lib/aibobnet.sh
+. "$AIB_ROOT/lib/aibobnet.sh"
+
+if ! aib_wire_read_request; then
+  # The reason is our own text, never caller-controlled content echoed back.
+  aib_wire_write_response error "reason=malformed_request" "detail=${AIB_WIRE_ERROR:-unspecified}"
+  exit 2
+fi
+
+case "${AIB_REQ_OP:-}" in
+  launch) : ;;
+  *) aib_wire_write_response denied "reason=unknown_operation"; exit 2 ;;
+esac
+
+# Slice 2 puts authorize behind this line. Until then: fail closed, and say so plainly.
+aib_wire_write_response denied "reason=not_implemented" "detail=authorize has not moved behind the seam yet"
+exit 3
