@@ -1746,10 +1746,14 @@ AIB_WIRE_FORBIDDEN_FIELDS="event_id attempt_id seq"
 # aib_wire_read_request  <stdin: request frame> -> AIB_REQ_<FIELD> … + AIB_REQ_PROMPT
 aib_wire_read_request() {
   AIB_WIRE_ERROR=""
-  local line key val prompt="" bytes="" f
+  # LC_ALL=C belongs on the local line, not just in front of `read` — the length check below runs
+  # AFTER the read and would otherwise count characters under the ambient locale. Gate finding
+  # 2026-08-15 (Riker, HIGH): a byte-exact prompt containing "ö" was refused as a short read.
+  # Same idiom as _aib_utf8_is_valid, aib_json and three other places in this file.
+  local line key val prompt="" bytes="" f seen="" sep=0 extra="" LC_ALL=C
   # Record lines first, terminated by an empty line. Values are single-line by construction.
   while IFS= read -r line; do
-    [ -z "$line" ] && break
+    [ -z "$line" ] && { sep=1; break; }
     case "$line" in
       *=*) : ;;
       *) AIB_WIRE_ERROR="malformed record line"; return 2 ;;
@@ -1759,16 +1763,39 @@ aib_wire_read_request() {
       [a-z]|[a-z][a-z0-9_]*) : ;;
       *) AIB_WIRE_ERROR="invalid field name '$key'"; return 2 ;;
     esac
-    # The protocol never carries environment fields — that is what keeps the credential
-    # directory selector off the attack surface (§3).
-    case "$key" in env_*|env) AIB_WIRE_ERROR="environment field '$key' does not cross the seam"; return 2 ;; esac
+    # Identity fields get their own message before the allowlist, so the refusal stays diagnosable.
     for f in $AIB_WIRE_FORBIDDEN_FIELDS; do
       [ "$key" = "$f" ] && { AIB_WIRE_ERROR="identity field '$key' is composed under the lock, not accepted"; return 2; }
     done
+    # ALLOWLIST, not a blocklist (gate finding 2026-08-15, Riker, MEDIUM): a blocklist has to be
+    # remembered every time the contract grows a field. The contract enumerates what crosses (§3),
+    # so the wire accepts exactly that and nothing else — including no environment fields, without
+    # needing a rule about them. Slice 1 needs three; cwd/sandbox/timeout/label follow in slice 2
+    # once it is decided how a PATH and a free-form LABEL cross a token-only record line (§6).
+    case "$key" in
+      op|agent_uid|prompt_bytes) : ;;
+      *) AIB_WIRE_ERROR="field '$key' is not accepted at this seam"; return 2 ;;
+    esac
+    # A repeated field must not silently win with its last value — for agent_uid that would be a
+    # HIGH-severity ambiguity (gate finding 2026-08-15, Riker LOW / Marvin coverage gap).
+    case " $seen " in *" $key "*) AIB_WIRE_ERROR="field '$key' given more than once"; return 2 ;; esac
+    seen="$seen $key"
     case "$val" in *[[:cntrl:]]*) AIB_WIRE_ERROR="control character in field '$key'"; return 2 ;; esac
+    # §6: token fields are validated against the EXISTING token rules. The validators aib_die, so
+    # they run in a subshell and their exit code becomes a refusal (gate finding, Marvin).
+    case "$key" in
+      agent_uid) ( aib_validate_agent_uid "$val" ) >/dev/null 2>&1 || {
+                   AIB_WIRE_ERROR="agent_uid is not a valid token"; return 2; } ;;
+      op)        ( aib_validate_token "$val" op ) >/dev/null 2>&1 || {
+                   AIB_WIRE_ERROR="op is not a valid token"; return 2; } ;;
+    esac
     if [ "$key" = "prompt_bytes" ]; then bytes="$val"; continue; fi
     printf -v "AIB_REQ_$(printf '%s' "$key" | tr 'a-z' 'A-Z')" '%s' "$val"
   done
+
+  # Without the blank line the record lines and the free text are not separated at all. Saying
+  # "short read" there sent the reader hunting in the wrong place (gate finding, Marvin).
+  [ "$sep" = 1 ] || { AIB_WIRE_ERROR="missing blank line between record lines and free text"; return 2; }
 
   case "$bytes" in
     ''|*[!0-9]*) AIB_WIRE_ERROR="prompt_bytes missing or not a number"; return 2 ;;
@@ -1783,6 +1810,13 @@ aib_wire_read_request() {
     [ "${#prompt}" -eq "$bytes" ] || {
       AIB_WIRE_ERROR="short read: declared $bytes bytes, got ${#prompt}"; return 2; }
   fi
+  # Bytes beyond the declared length were silently ignored before (gate finding, Marvin). A frame
+  # that carries more than it declares is malformed, and accepting it would let a caller smuggle
+  # trailing content past a length the broker has already reasoned about.
+  if IFS= read -r -N 1 extra; then
+    AIB_WIRE_ERROR="frame carries more bytes than the declared $bytes"; return 2
+  fi
+
   AIB_REQ_PROMPT="$prompt"
   return 0
 }

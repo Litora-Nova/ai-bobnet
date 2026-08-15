@@ -34,8 +34,10 @@ assert_grep(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else no "
 assert_ngrep(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then no "$1 (unexpected '$3')"; else ok "$1"; fi; }
 
 # frame <freetext> <token-line>...  -> writes a request frame to stdout
-frame(){ local t="$1"; shift; local l; for l in "$@"; do printf '%s\n' "$l"; done
-         printf 'prompt_bytes=%s\n\n' "${#t}"; printf '%s' "$t"; }
+# The length MUST be counted in bytes. ${#t} counts characters under a UTF-8 locale — the harness
+# had the very defect it is meant to catch (found when the multibyte case below went red).
+frame(){ local t="$1"; shift; local l n; for l in "$@"; do printf '%s\n' "$l"; done
+         n=$(printf '%s' "$t" | wc -c); printf 'prompt_bytes=%s\n\n' "$n"; printf '%s' "$t"; }
 
 read_req(){ aib_wire_read_request; }   # reads stdin, sets AIB_REQ_*, rc!=0 on refusal
 
@@ -72,6 +74,37 @@ assert_fail "control character in a token field is refused" \
   bash -c 'printf "op=launch\nagent_uid=acme\x01dev\nprompt_bytes=2\n\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
 assert_fail "the protocol carries no environment fields" \
   bash -c 'printf "op=launch\nenv_HOME=/tmp\nprompt_bytes=2\n\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+
+# --- 5b. gate findings 2026-08-15 (Riker HIGH/MEDIUM/LOW, Marvin coverage) ---
+# The multibyte case is the one that matters most: removing LC_ALL=C from the function was a
+# mutant the spec did NOT catch (Marvin, probe b). ASCII-only fixtures cannot see this bug.
+mb="$(printf 'h\xc3\xa9llo w\xc3\xb6rld')"       # 13 bytes, 11 characters
+out="$(frame "$mb" "op=launch" "agent_uid=acme-dev" | { read_req && printf '%s' "${AIB_REQ_PROMPT:-}"; })"
+assert_streq "a byte-exact multibyte prompt is accepted" "$out" "$mb"
+out="$(printf 'op=launch\nagent_uid=acme-dev\nprompt_bytes=13\n\n%s' "$mb" | { read_req && printf 'ok'; })"
+assert_streq "the length is counted in BYTES, not characters" "$out" "ok"
+
+assert_fail "an invalid agent_uid is refused at the wire (§6 token rules)" \
+  bash -c 'printf "op=launch\nagent_uid=Not A Valid Token!!\nprompt_bytes=2\n\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+assert_fail "an agent_uid without project prefix is refused" \
+  bash -c 'printf "op=launch\nagent_uid=solo\nprompt_bytes=2\n\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+assert_fail "an unknown field is refused (allowlist, not blocklist)" \
+  bash -c 'printf "op=launch\nagent_uid=acme-dev\nsurprise=1\nprompt_bytes=2\n\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+assert_fail "a repeated field is refused, never last-wins" \
+  bash -c 'printf "op=launch\nagent_uid=acme-dev\nagent_uid=acme-evil\nprompt_bytes=2\n\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+assert_fail "more bytes than declared is refused, not ignored" \
+  bash -c 'printf "op=launch\nagent_uid=acme-dev\nprompt_bytes=2\n\nhi-und-noch-viel-mehr" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+assert_fail "a frame without the blank separator is refused" \
+  bash -c 'printf "op=launch\nagent_uid=acme-dev\nprompt_bytes=2\nhi" | { . "'"$SRC_ROOT"'/lib/aibobnet.sh"; aib_wire_read_request; }'
+# ... and with the RIGHT reason, so the reader does not hunt in the wrong place.
+err="$(printf 'op=launch\nagent_uid=acme-dev\nprompt_bytes=2\nhi' | { read_req; printf '%s' "${AIB_WIRE_ERROR:-}"; })"
+assert_grep "the missing separator is named as such" "$err" "missing blank line"
+
+out="$(frame "" "op=launch" "agent_uid=acme-dev" | { read_req && printf 'ok:[%s]' "${AIB_REQ_PROMPT:-}"; })"
+assert_streq "an empty prompt is legal and stays empty" "$out" "ok:[]"
+cr="$(printf 'zeile1\rzeile2')"
+out="$(frame "$cr" "op=launch" "agent_uid=acme-dev" | { read_req && printf '%s' "${AIB_REQ_PROMPT:-}"; })"
+assert_streq "a carriage return inside free text is payload, not structure" "$out" "$cr"
 
 # --- 6. every response ends with a terminal status line ---------------------
 resp="$(aib_wire_write_response ok "exit_class=success")"
