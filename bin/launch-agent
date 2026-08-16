@@ -103,10 +103,17 @@ done
 # --- validate runtime input before any provider can start --------------------
 [ "$seen_as" -eq 1 ] && [ -n "$as" ] || aib_die 64 "missing --as ($_usage)"
 aib_validate_agent_uid "$as"
-# Input hygiene at the sanctioned entry point (fail-closed): danger-full-access is
-# refused here before the PDP ever sees it. The PDP also has a danger->clamp branch,
-# but under launch-agent it is unreachable by design (this refusal fires first) — it
-# exists for the PDP's isolated unit tests. Do not "fix" the apparent redundancy.
+# Input hygiene at THIS entry point (fail-closed): danger-full-access is refused here
+# before the PDP ever sees it. The PDP has a danger->clamp branch instead, which allows
+# the request with the sandbox clamped to the capability.
+#
+# This refusal is therefore policy that lives in the wrapper, NOT behind the boundary.
+# It was previously described here as "unreachable by design"; that described the
+# absence of a second caller, not an enforced property, and the absence is ending:
+# bin/aib-broker-handler already sources this library, and slice 2 moves authorize
+# behind the socket. Verified against the PDP on 2026-08-16 — a direct call with
+# danger-full-access returns decision=allow with the sandbox clamped.
+# See docs/SPEC-wire-format.md, "Assurances that must move with authorize".
 case "$sandbox" in
   read-only|workspace-write) ;;
   danger-full-access) aib_die 64 "refusing --sandbox danger-full-access (fail-closed; use workspace-write)";;

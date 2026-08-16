@@ -73,12 +73,44 @@ inventing a single character rule.
 
 If `cwd` is absent, the derived root applies.
 
-## `timeout` — the cap the contract promises must exist
+## `timeout` — TWO checks are missing, not one
 
 §3 states that the broker caps `timeout` and that "resource authority does not belong to the caller".
-For that sentence to be true, a declared `cap_timeout` belongs in the provider capability record, and
-the PDP applies `min(requested, cap)` — the same shape already used for sandbox, tier and effort.
-**Never `max`.**
+Verified empirically on 2026-08-16 (audit: `standup/audit-ai-bobnet-tests-tim-claims.md`), that
+assurance is **unimplemented** — not false as a contract statement, since the broker it describes does
+not exist yet, but nothing in today's path provides it either:
+
+- `cap_timeout` appears nowhere in the repository.
+- The PDP does not check the **form** of `timeout` either: `1200`, `999999999999`, `-5` and `banana`
+  all return `decision=allow`, and none of them reaches the verdict record. `sandbox`, `clearance` and
+  `effort` all pass through a ranking function; `timeout` has no equivalent.
+
+So the repair needs **two** additions to the PDP, not one:
+
+1. a **form** check — digits plus a range — which today exists only in `bin/launch-agent`;
+2. the **cap**: a declared `cap_timeout` in the provider capability record and `min(requested, cap)`
+   in the PDP, the shape already used for sandbox, tier and effort. **Never `max`.**
+
+Building only the cap would move the wrong-house defect below rather than fix it.
+
+## Assurances that must move with `authorize`
+
+Slice 2 moves `authorize` behind the socket. Every assurance that lives only in `bin/launch-agent`
+disappears silently at that moment, because the wrapper stops being the only entry point. The
+following were verified against the PDP directly on 2026-08-16 and are **not** enforced behind the
+seam today:
+
+| Assurance | Where it lives now | What the PDP does today |
+|---|---|---|
+| refuse `sandbox=danger-full-access` | `bin/launch-agent` only | **clamps** to the capability and allows (`decision=allow`) — the clamp branch is even unit-tested |
+| `timeout` numeric and in range | `bin/launch-agent` only | nothing; `banana` is accepted |
+| `cwd` exists | `bin/launch-agent` only | nothing; a missing path, an empty string and `../../../../etc` all return `decision=allow`. `cwd` is unpacked and never referenced again |
+
+Each of the three must exist behind the boundary before slice 2 is finished, or be recorded as
+deliberately given up. Clamping and refusing are **not** the same decision: a clamp turns a request
+for more authority into a quieter grant, a refusal ends it. Which of the two the boundary owes the
+caller is a decision for slice 2, and it must be made explicitly rather than inherited from whichever
+file happens to run first.
 
 ## `label` — free text with a length cap and nothing else
 
