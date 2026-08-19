@@ -23,6 +23,14 @@ rule; they do not replace it. Narrowing a floor has never been a contract violat
 would be. Whenever a new field appears, this sentence answers "do we need to change §6?" without a
 debate.
 
+**A mechanism the contract names is not a strictness dial.** Where the contract or this document
+states *how* a boundary reacts — §3 has the PDP **clamp** `sandbox` against declared capabilities and
+the broker **cap** `timeout` — that mechanism is part of the settlement, not a floor to be tightened.
+Refusing instead of clamping looks stricter and is in fact a different promise to the caller: a clamp
+returns a degraded success, a refusal returns nothing. Swapping one for the other is a behaviour
+change, not a more careful enforcement of the same rule. See "Assurances that must move with
+`authorize`", which is the same distinction seen from the other end.
+
 **The qualifier is not decoration.** The contract also states **ceilings**, and there the sentence
 inverts. §3 says `label` is checked for form but **not for content** — that is an upper bound, not
 merely the absence of a lower one. A reader who applies "stricter is always allowed" to `label` and
