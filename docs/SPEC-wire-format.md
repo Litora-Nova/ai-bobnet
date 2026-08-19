@@ -36,7 +36,7 @@ inverts. §3 says `label` is checked for form but **not for content** — that i
 merely the absence of a lower one. A reader who applies "stricter is always allowed" to `label` and
 adds a content check would violate §3 while believing they were being careful: exactly the mistake
 this rule exists to prevent. So before invoking it, establish which kind of statement the contract is
-making about the field. Floors take narrowing; ceilings do not.
+making about the field. Floors take narrowing; ceilings do not; named mechanisms are neither.
 
 A second rule, from the same family as the confinement work:
 
@@ -138,7 +138,9 @@ Each of the three must exist behind the boundary before slice 2 is finished, or 
 deliberately given up. Clamping and refusing are **not** the same decision: a clamp turns a request
 for more authority into a quieter grant, a refusal ends it. Which of the two the boundary owes the
 caller is a decision for slice 2, and it must be made explicitly rather than inherited from whichever
-file happens to run first.
+file happens to run first. This is the same distinction the narrowing rule above marks as its third
+category, seen from the other end: a named mechanism is part of the settlement, not a dial to be
+turned tighter.
 
 ## `label` — free text with a length cap and nothing else
 
