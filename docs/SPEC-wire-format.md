@@ -15,12 +15,20 @@ over a silence would be the most expensive possible way to handle it.
 
 ## The rule that settles the recurring question
 
-> **A validator may be stricter than the contract, never looser.**
+> **Where the contract states a floor, a validator may be stricter — never looser.**
 
 §6 requires token fields to be "validated against the existing token rules". That is a **floor, not a
 ceiling**. An enum check on `sandbox` and a digits-plus-range check on `timeout` *narrow* the token
-rule; they do not replace it. Narrowing has never been a contract violation — only loosening would
-be. Whenever a new field appears, this sentence answers "do we need to change §6?" without a debate.
+rule; they do not replace it. Narrowing a floor has never been a contract violation — only loosening
+would be. Whenever a new field appears, this sentence answers "do we need to change §6?" without a
+debate.
+
+**The qualifier is not decoration.** The contract also states **ceilings**, and there the sentence
+inverts. §3 says `label` is checked for form but **not for content** — that is an upper bound, not
+merely the absence of a lower one. A reader who applies "stricter is always allowed" to `label` and
+adds a content check would violate §3 while believing they were being careful: exactly the mistake
+this rule exists to prevent. So before invoking it, establish which kind of statement the contract is
+making about the field. Floors take narrowing; ceilings do not.
 
 A second rule, from the same family as the confinement work:
 
@@ -46,7 +54,20 @@ counting bytes, never by searching for a separator. Their order in the frame is 
 below, because a reader that counts bytes has no way to recover from an unexpected order.
 
 **Frame order:** record lines, blank line, then the length-prefixed blocks in this order:
-`cwd`, `label`, `prompt`. A block whose `<field>_bytes` header is absent is absent from the stream.
+`cwd`, `label`, `prompt`. The order is required because the headers say how *long* each block is, not
+*where* it sits in the byte stream — a reader that counts bytes cannot recover from an unexpected
+sequence.
+
+Two edges, so that no one has to infer them:
+
+- **A block whose `<field>_bytes` header is absent is absent from the stream, and
+  `<field>_bytes=0` behaves exactly as absent.** For `prompt` an empty value is a legal empty string
+  either way. For `cwd` the distinction would otherwise matter: an explicitly empty path handed to
+  the resolution step below is an unspecified edge case, and it resolves here instead — an empty
+  `cwd` means the derived root, the same as omitting it.
+- **An unrecognised `<field>_bytes` header is refused**, by the same allowlist that governs the other
+  record-line fields. A length header is a field like any other; it does not get a side entrance
+  because it happens to describe bytes.
 
 ## `cwd` — the field that stops carrying authority
 
@@ -76,8 +97,7 @@ If `cwd` is absent, the derived root applies.
 ## `timeout` — TWO checks are missing, not one
 
 §3 states that the broker caps `timeout` and that "resource authority does not belong to the caller".
-Verified empirically on 2026-08-16 (audit: `standup/audit-ai-bobnet-tests-tim-claims.md`), that
-assurance is **unimplemented** — not false as a contract statement, since the broker it describes does
+Verified by calling the PDP directly rather than by reading it, that assurance is **unimplemented** — not false as a contract statement, since the broker it describes does
 not exist yet, but nothing in today's path provides it either:
 
 - `cap_timeout` appears nowhere in the repository.
@@ -97,8 +117,8 @@ Building only the cap would move the wrong-house defect below rather than fix it
 
 Slice 2 moves `authorize` behind the socket. Every assurance that lives only in `bin/launch-agent`
 disappears silently at that moment, because the wrapper stops being the only entry point. The
-following were verified against the PDP directly on 2026-08-16 and are **not** enforced behind the
-seam today:
+following were established by calling the PDP directly, and are **not** enforced behind the seam
+today. The inputs are given so that any reader can repeat the calls rather than take this on trust:
 
 | Assurance | Where it lives now | What the PDP does today |
 |---|---|---|
@@ -132,6 +152,11 @@ makes the audit record harder to find, and findability is the entire point of th
 
 ## Provenance
 
-Advisor consult, 2026-08-15 (`standup/_arch_wire_fields_tim_verdikt.md`). The classification, the
-narrowing rule and the registry-derived positive list are the advisor's; the framing question that
-prompted them was posed wrongly by the maintainer, and the advisor said so first.
+The classification, the narrowing rule and the registry-derived positive list come from an
+architecture consult; the framing question that prompted them was posed wrongly by the maintainer,
+and the advisor said so first. The empirical statements above were produced by a separate reviewer
+calling the code, not by the author of this document.
+
+Working notes behind both live outside this repository and are deliberately not linked: a citation a
+reader cannot resolve is not evidence. Everything asserted here is either reproducible from the
+inputs given or visible in this repository's own source.
