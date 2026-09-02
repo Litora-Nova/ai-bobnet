@@ -25,9 +25,10 @@ The registry has two supported reader modes:
   and optional `provider`, `model`, and `effort` fields at project, team, and agent level. A complete valid
   binding must resolve before an adapter process starts.
 - **Schema 4 adds the RM-1 policy-gate data** (see §7): a top-level `providers.<name>` map carrying the
-  absolute `adapter` path and declared `cap_sandbox` / `cap_tier` / `cap_effort` capabilities. Managed
-  launch requires the adapter field; a schema-3 registry lacks it and fails closed with the same
-  missing-adapter path (exit 127), so the gate is field-presence, not a version branch.
+  absolute `adapter` path and declared `cap_sandbox` / `cap_tier` / `cap_effort` / `cap_timeout`
+  capabilities (`cap_timeout` added in RM-3 slice 2, resolved and required the same way as the other
+  three). Managed launch requires the adapter field; a schema-3 registry lacks it and fails closed with
+  the same missing-adapter path (exit 127), so the gate is field-presence, not a version branch.
 
 Old schema-2 readers reject schema 3 and 4; readers that know only 2/3 reject 4. Unknown extra fields remain
 forward-compatible only when they are not consumed. Schema-3 execution fields and schema-4 policy-gate
@@ -222,8 +223,9 @@ To migrate without changing the intended runtime, copy each existing Codex model
 schema-3 project, direct-team, or agent fields, add `provider: codex`, and validate the mixed-level result
 for every managed agent. A managed launch additionally requires the schema-4 policy-gate data (§7): raise
 the registry to `schema_version: 4` and add the top-level `providers.<name>` map with an absolute `adapter`
-path and declared `cap_sandbox` / `cap_tier` / `cap_effort` capabilities — a schema-3 registry resolves the
-binding but carries no adapter map, so the launch fails closed at the missing-adapter path (exit 127). Only
+path and declared `cap_sandbox` / `cap_tier` / `cap_effort` / `cap_timeout` capabilities — a schema-3
+registry resolves the binding but carries no adapter map, so the launch fails closed at the missing-adapter
+path (exit 127). Only
 then move callers from raw `codex-run` defaults/overrides to managed launch. Existing schema-2 commands
 remain available during this preparation, but schema-2 managed launch does not.
 
@@ -249,36 +251,38 @@ reopen the registry (that would route through the `AIBOBNET_REGISTRY` locator an
 
 - `request` keys: `agent_uid`, requested `sandbox`, `cwd`, `timeout`, `label`.
 - `snapshot` keys: `clearance`, `provider`, `effort`, the absolute `adapter`, and `cap_sandbox` /
-  `cap_tier` / `cap_effort` — all resolved by `aib_resolve_managed_agent` before the call, never probed.
+  `cap_tier` / `cap_effort` / `cap_timeout` — all resolved by `aib_resolve_managed_agent` before the
+  call, never probed.
 
 The verdict is published through `AIB_VERDICT_*` globals: `DECISION` (`allow`/`deny`), `CODE`, `REASONS`,
-`EFFECTIVE_CLEARANCE` / `EFFECTIVE_SANDBOX` / `EFFECTIVE_EFFORT`, `ADAPTER_PATH`, `ENV_ALLOW`, and a
-one-line JSON `AIB_VERDICT_RECORD` (`event: launch_verdict`). Purity is what lets RM-3 relocate this
-identical function behind a process boundary without a rewrite.
+`EFFECTIVE_CLEARANCE` / `EFFECTIVE_SANDBOX` / `EFFECTIVE_EFFORT` / `EFFECTIVE_TIMEOUT`, `ADAPTER_PATH`,
+`ENV_ALLOW`, and a one-line JSON `AIB_VERDICT_RECORD` (`event: launch_verdict`). Purity is what lets RM-3
+relocate this identical function behind a process boundary without a rewrite.
 
-**Authority lives only in the PDP.** The sandbox ceiling, `min(clearance, cap_tier)`, and the effort cap
-are computed there and nowhere else. The launcher's argument-parsing checks remain input hygiene (form),
-not a second authority.
+**Authority lives only in the PDP.** The sandbox ceiling, `min(clearance, cap_tier)`, the effort cap, and
+(RM-3 slice 2) the timeout cap are computed there and nowhere else. The launcher's argument-parsing checks
+remain input hygiene (form), not a second authority.
 
 ### 7.2 Effective authority = `min(clearance, provider capabilities)`
 
-Each effective value is a minimum over a total order (`t1<t2<t3<t4`;
-`read-only<workspace-write<danger-full-access`; `low<medium<high<max`). A request above a ceiling is
-**clamped, not denied**: the launch proceeds at the lower, safer bound and a deny reason records the clamp.
-This delivers the `docs/DOMAIN.md` §2.1 promise **at the seam**. The capabilities are declared registry
-data, trusted rather than runtime-verified — RM-1 hands the provider the clamped values and trusts it to
-honor them; it does not itself confine the provider.
+Each effective value is a minimum: `clearance`, `sandbox`, and `effort` over a total order (`t1<t2<t3<t4`;
+`read-only<workspace-write<danger-full-access`; `low<medium<high<max`); `timeout` numerically, with an
+absent request timeout taking the cap outright. A request above a ceiling is **clamped, not denied**: the
+launch proceeds at the lower, safer bound and a deny reason records the clamp — never `max`, resource
+authority does not belong to the caller. This delivers the `docs/DOMAIN.md` §2.1 promise **at the seam**.
+The capabilities are declared registry data, trusted rather than runtime-verified — RM-1 hands the provider
+the clamped values and trusts it to honor them; it does not itself confine the provider.
 
 ### 7.3 Absolute adapter map + declared capabilities (schema 4)
 
 The provider adapter is `providers.<name>.adapter`, an absolute path validated absolute by the PDP (a
 non-absolute adapter is a config deny, code 2). This replaces the RM-0 `command -v codex` from cwd — cwd is
 attacker-influenceable, so adapter resolution no longer depends on it. `cap_sandbox` / `cap_tier` /
-`cap_effort` are declared capability data, resolved by the managed resolver, never runtime-probed. An
-empty adapter entry resolves no adapter and is a fail-closed PDP deny (code 127). On schema 3 this also
-subsumes the unknown-provider case (there is no adapter map). On schema 4, a provider named but absent from
-the `providers` map, or missing its declared capabilities, is a resolution-time config error (**exit 3**)
-caught by the resolver before the PDP — not the PDP's 127.
+`cap_effort` / `cap_timeout` are declared capability data, resolved by the managed resolver, never
+runtime-probed. An empty adapter entry resolves no adapter and is a fail-closed PDP deny (code 127). On
+schema 3 this also subsumes the unknown-provider case (there is no adapter map). On schema 4, a provider
+named but absent from the `providers` map, or missing its declared capabilities (`cap_timeout` included),
+is a resolution-time config error (**exit 3**) caught by the resolver before the PDP — not the PDP's 127.
 
 ```json
 {
@@ -288,7 +292,8 @@ caught by the resolver before the PDP — not the PDP's 127.
       "adapter": "/opt/acme/adapters/codex",
       "cap_sandbox": "workspace-write",
       "cap_tier": "t3",
-      "cap_effort": "high"
+      "cap_effort": "high",
+      "cap_timeout": "900"
     }
   }
 }
