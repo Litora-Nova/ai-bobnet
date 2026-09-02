@@ -99,6 +99,22 @@ then no "a NUL inside a _bytes header value is refused"
 else ok "a NUL inside a _bytes header value is refused"
 fi
 
+# ADDED (gate delta R3, Marvin surviving mutant): a NUL placed exactly ONE byte past
+# the last declared block is the one shape the length comparison alone cannot catch.
+# `read -r -d ''` stops AT the NUL, so a mutant that dropped the explicit
+# "rc=0 -> refuse" check would still see a `frame` containing exactly the legitimate
+# header+body bytes (the NUL and everything after it — "EXTRA" here — silently
+# discarded, never even read from the pipe) and every length would still match: the
+# frame would be WRONGLY accepted instead of refused. Verified against a throwaway
+# mutant copy with that check reverted: it returned rc=0 prompt=<hi>, discarding
+# "EXTRA" silently. This fixture proves the explicit NUL-found check is doing real
+# work, not merely duplicating the length check.
+if { printf 'op=launch\nagent_uid=acme-dev\nprompt_bytes=2\n\nhi'; printf '\0EXTRA'; } \
+   | ( aib_wire_read_request ) >/dev/null 2>&1
+then no "a NUL exactly one byte past the last declared block is refused, not silently truncated"
+else ok "a NUL exactly one byte past the last declared block is refused, not silently truncated"
+fi
+
 # --- 2. sandbox is an enum at the wire, narrower than the token rule ----------
 if printf 'op=launch\nagent_uid=acme-dev\nsandbox=wide-open\nprompt_bytes=2\n\nhi' \
    | ( aib_wire_read_request ) >/dev/null 2>&1; then no "an unknown sandbox value is refused"; else ok "an unknown sandbox value is refused"; fi
