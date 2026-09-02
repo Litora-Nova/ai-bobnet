@@ -42,7 +42,7 @@ trap cleanup EXIT
 # Schema 4 carries the provider adapter map + declared capabilities. Managed launch
 # REQUIRES the adapter field; the provider key mirrors the project's provider.
 write_v4() {
-  local path="$1" provider="$2" effort="$3" standup_dir="${4:-$STATE/acme/standup}" adapter="${5:-$ADAPTER}"
+  local path="$1" provider="$2" effort="$3" standup_dir="${4:-$STATE/acme/standup}" adapter="${5:-$ADAPTER}" cap_timeout="${6:-900}"
   printf '%s\n' "{
   \"schema_version\": 4,
   \"providers\": {
@@ -51,7 +51,7 @@ write_v4() {
       \"cap_sandbox\": \"workspace-write\",
       \"cap_tier\": \"t3\",
       \"cap_effort\": \"high\",
-      \"cap_timeout\": \"900\"
+      \"cap_timeout\": \"$cap_timeout\"
     }
   },
   \"projects\": {
@@ -242,6 +242,21 @@ has "child env keeps the explicit managed export"        "$fullenv" "AIBOBNET_AG
 hasnt "child env drops non-allow-listed inherited vars"  "$fullenv" "LEAKME_SENTINEL"
 hasnt "child env never inherits ambient provenance"      "$fullenv" "ambient-provider"
 hasnt "child env never inherits the poison binary path"  "$fullenv" "CODEX_RUN_BIN"
+
+# --- 1b. gate delta D4: the watchdog and audit trail use the EFFECTIVE (capped)
+# timeout, never the caller-requested one (Ikarus, HIGH: bin/launch-agent:371 slept
+# $timeout_s — caller-requested — while the verdict said AIB_VERDICT_EFFECTIVE_TIMEOUT).
+# Observable without waiting for an actual timeout: the stub provider (STUB_MODE=ok)
+# returns immediately, so the watchdog's background sleep is spawned and killed long
+# before it could ever fire regardless of which value it holds; what is asserted here
+# is the value ITSELF, printed to stderr as soon as the verdict is known and before
+# any provider process starts.
+CAPPED="$WORK/capped.json"; write_v4 "$CAPPED" codex high "$STATE/acme/standup" "$ADAPTER" 2
+: > "$HBLOG"
+run_launch "$CAPPED" --as acme-core --timeout 9999 --label capped-timeout --prompt x
+eq "capped-timeout launch still succeeds" "$RUN_RC" 0
+has "the watchdog is armed with the EFFECTIVE (capped) timeout" "$RUN_ERR" "effective_timeout=2"
+hasnt "…never the caller-requested timeout"                     "$RUN_ERR" "effective_timeout=9999"
 
 # --- 2. exit-127: a missing adapter fails closed BEFORE any heartbeat or provider ---
 # Schema 3 carries execution binding but no adapter map -> empty adapter -> the PDP's
