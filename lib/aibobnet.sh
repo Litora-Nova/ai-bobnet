@@ -1121,36 +1121,65 @@ aib_authorize_launch() {
 }
 
 # aib_contain_cwd <root> <cwd> -> AIB_CWD_RESOLVED; rc 0 accepted, rc 1 refused.
+# On refusal, AIB_CONTAIN_CWD_REASON is one of:
+#   not_found     — root or (resolved) cwd does not exist, or `realpath` is missing
+#   outside_root  — both exist, but the resolved cwd is not inside the resolved root
 #
 # RM-3 slice 2 (SPEC-wire-format, "cwd — the field that stops carrying authority").
 # `root` is the registry-derived writable area (AIB_HOME from the managed resolver);
 # the REQUEST NEVER CHOOSES IT — a cage whose bars the prisoner picks is not a cage.
 # `cwd` only selects where inside that already-fixed area the child starts.
 #
-# Both paths are resolved (GNU `realpath -m`: resolves symlinks and `..` without
-# requiring the path to exist yet — the child directory may not exist until later
-# machinery creates it) and the resolved cwd must sit inside the resolved root on a
+# RM-3 slice 2 delta (gate finding, Ikarus D2, HIGH): resolution used `realpath -m`,
+# which resolves a path LEXICALLY without requiring it to exist. A `cwd` naming a
+# not-yet-existing path was authorised against that lexical resolution; if a symlink
+# was then planted at that exact path before the later `cd`, the child would land
+# wherever the symlink pointed — outside the root — a TOCTOU the authorisation step
+# itself created room for. Decision (maintainer): resolution now REQUIRES existence
+# (`realpath -e`), which also fully resolves any symlink components, so cwd/root are
+# compared as their real, current targets, not as strings that merely look contained.
+# A cwd that does not exist yet is refused (`not_found`) rather than lexically
+# accepted — this is the "cwd exists" assurance moving behind the seam, exactly as
+# SPEC-wire-format's "Assurances that must move with authorize" table anticipated.
+#
+# This closes the PLANT-BEFORE-AUTHORISE window. It does NOT close a REPLACE-AFTER-
+# AUTHORISE window: a symlink swapped in at the resolved path after this function
+# returns and before the later `cd` would still redirect it. That window is closed at
+# enactment (slice 3), not here — see the handler header and SPEC-wire-format's
+# "Order is part of the requirement" for the re-check this function's caller owes
+# after `cd`, before `exec`.
+#
+# Both paths are resolved and the resolved cwd must sit inside the resolved root on a
 # PATH-COMPONENT boundary: "/srv/ws2" is NOT inside "/srv/ws", even though it shares
-# the string prefix "/srv/ws". A character-class path grammar would be a guessing
-# game against symlinks and normalisation; comparing resolved paths is a decision
+# the string prefix "/srv/ws" — and root "/" DOES contain "/etc" even though "/etc"
+# does not share the (empty, after stripping the trailing slash) string prefix
+# character-for-character (gate finding, Ikarus D3, MEDIUM: the naive
+# "$resolved_root/*" pattern built "//*' for root "/", which nothing starting with a
+# single "/" can ever match). A character-class path grammar would be a guessing game
+# against symlinks and normalisation; comparing resolved paths is a decision
 # (SPEC-wire-format, "What containment can decide, no character class should have to
 # guess"). This function decides only inside/outside; it does not install Landlock or
 # change directory — those are enactment (slice 3).
 aib_contain_cwd() {
-  local root="${1-}" cwd="${2-}" realpath_bin resolved_root resolved_cwd
+  local root="${1-}" cwd="${2-}" realpath_bin resolved_root resolved_cwd root_prefix
   AIB_CWD_RESOLVED=""
-  realpath_bin="$(command -v realpath)" || return 1
-  [ -n "$root" ] || return 1
+  AIB_CONTAIN_CWD_REASON=""
+  realpath_bin="$(command -v realpath)" || { AIB_CONTAIN_CWD_REASON="not_found"; return 1; }
+  [ -n "$root" ] || { AIB_CONTAIN_CWD_REASON="not_found"; return 1; }
   # An absent cwd means the derived root, the same as an explicit empty cwd_bytes
   # block (SPEC-wire-format, "Two edges") — both resolve here rather than being an
   # unspecified edge case one layer up.
   [ -n "$cwd" ] || cwd="$root"
-  resolved_root="$("$realpath_bin" -m -- "$root")" || return 1
-  resolved_cwd="$("$realpath_bin" -m -- "$cwd")" || return 1
+  resolved_root="$("$realpath_bin" -e -- "$root" 2>/dev/null)" || { AIB_CONTAIN_CWD_REASON="not_found"; return 1; }
+  resolved_cwd="$("$realpath_bin" -e -- "$cwd" 2>/dev/null)" || { AIB_CONTAIN_CWD_REASON="not_found"; return 1; }
+  # Root "/" resolves to "/" itself; treat it as the empty prefix so the descendant
+  # pattern becomes "/*", not "//*" (which nothing with a single leading "/" matches).
+  root_prefix="$resolved_root"
+  [ "$root_prefix" != "/" ] || root_prefix=""
   case "$resolved_cwd" in
-    "$resolved_root")   : ;;
-    "$resolved_root"/*) : ;;
-    *) return 1 ;;
+    "$resolved_root") : ;;
+    "$root_prefix"/*) : ;;
+    *) AIB_CONTAIN_CWD_REASON="outside_root"; return 1 ;;
   esac
   AIB_CWD_RESOLVED="$resolved_cwd"
   return 0
