@@ -778,6 +778,7 @@ aib_resolve_agent_snapshot() {
   AIB_CAP_SANDBOX=""
   AIB_CAP_TIER=""
   AIB_CAP_EFFORT=""
+  AIB_CAP_TIMEOUT=""
 
   AIB_HOME="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" home)"
   AIB_STANDUP_DIR="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" standup_dir)"
@@ -860,6 +861,12 @@ _aib_resolve_provider_caps() {
   _aib_snapshot_field providers "$provider" cap_effort "provider '$provider'" ||
     aib_die 3 "registry: provider '$provider' declares no cap_effort capability"
   AIB_CAP_EFFORT="$AIB_SNAPSHOT_FIELD_VALUE"
+  # RM-3 slice 2: resource authority does not belong to the caller (§3), so the cap
+  # is declared registry data like the other three, resolved the same way and
+  # required the same way — not a slice-2-only special case.
+  _aib_snapshot_field providers "$provider" cap_timeout "provider '$provider'" ||
+    aib_die 3 "registry: provider '$provider' declares no cap_timeout capability"
+  AIB_CAP_TIMEOUT="$AIB_SNAPSHOT_FIELD_VALUE"
 }
 
 aib_resolve_managed_agent() {
@@ -879,12 +886,14 @@ aib_resolve_managed_agent() {
 #
 #   request  keys:  agent_uid · sandbox (requested) · cwd · timeout · label
 #   snapshot keys:  clearance · provider · effort · adapter (absolute) ·
-#                   cap_sandbox (ceiling) · cap_tier · cap_effort  (all DECLARED
-#                   registry data, resolved by aib_resolve_managed_agent, never probed)
+#                   cap_sandbox (ceiling) · cap_tier · cap_effort · cap_timeout
+#                   (all DECLARED registry data, resolved by aib_resolve_managed_agent,
+#                   never probed)
 #
-# Authority lives ONLY here: the sandbox ceiling, min(clearance, cap_tier), and the
-# effort cap are computed in this function and nowhere else — the PEP (launch-agent /
-# codex-run) consumes the verdict and does the launch, it never re-decides.
+# Authority lives ONLY here: the sandbox ceiling, min(clearance, cap_tier), the
+# effort cap, and (RM-3 slice 2) the timeout cap are computed in this function and
+# nowhere else — the PEP (launch-agent / codex-run) consumes the verdict and does the
+# launch, it never re-decides.
 #
 # Publishes the verdict via AIB_VERDICT_* globals (house style):
 #   AIB_VERDICT_DECISION             allow | deny
@@ -894,6 +903,9 @@ aib_resolve_managed_agent() {
 #   AIB_VERDICT_EFFECTIVE_CLEARANCE  min(clearance, cap_tier)      (empty on deny)
 #   AIB_VERDICT_EFFECTIVE_SANDBOX    min(requested, cap_sandbox)   (empty on deny)
 #   AIB_VERDICT_EFFECTIVE_EFFORT     min(effort, cap_effort)       (empty on deny)
+#   AIB_VERDICT_EFFECTIVE_TIMEOUT    min(requested, cap_timeout); cap alone if absent
+#                                    (empty on deny) — never max (§3: resource
+#                                    authority does not belong to the caller)
 #   AIB_VERDICT_ADAPTER_PATH         the absolute adapter path     (empty on deny)
 #   AIB_VERDICT_ENV_ALLOW            child-env allow-list (see AIB_ENV_ALLOW_DEFAULT)
 #   AIB_VERDICT_PROVIDER · _AGENT_UID   echoed for the record
@@ -944,6 +956,18 @@ _aib_rank() {
   esac
 }
 
+# _aib_valid_positive_int <value> -> rc 0 if value is one or more digits and > 0.
+# `timeout` has no enum, so it does not go through _aib_rank; this is its equivalent
+# form check (SPEC-wire-format: "digits + range"), used identically for the request
+# value and the declared cap. No upper bound here — the cap IS the upper bound, and
+# the PDP takes min(requested, cap), never max.
+_aib_valid_positive_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 0 ] 2>/dev/null
+}
+
 # Deny/clamp accumulators mutate the caller's dynamically-scoped locals (deny, code,
 # reasons) — the same dynamic-scope idiom the journal decider uses. First deny wins
 # the code because the checks are ordered by severity (127 > 2 > 64).
@@ -959,9 +983,9 @@ _aib_verdict_note() {
 aib_authorize_launch() {
   local request="${1-}" snapshot="${2-}"
   local agent_uid req_sandbox cwd timeout label
-  local clearance provider effort adapter cap_sandbox cap_tier cap_effort
+  local clearance provider effort adapter cap_sandbox cap_tier cap_effort cap_timeout
   local deny=0 code=0 reasons=""
-  local eff_clearance="" eff_sandbox="" eff_effort=""
+  local eff_clearance="" eff_sandbox="" eff_effort="" eff_timeout=""
   local rreq rcap
 
   # --- unpack both records (pure; an absent optional field is empty) -----------
@@ -977,6 +1001,7 @@ aib_authorize_launch() {
   cap_sandbox="$(_aib_record_field "$snapshot" cap_sandbox)" || cap_sandbox=""
   cap_tier="$(_aib_record_field "$snapshot" cap_tier)"    || cap_tier=""
   cap_effort="$(_aib_record_field "$snapshot" cap_effort)" || cap_effort=""
+  cap_timeout="$(_aib_record_field "$snapshot" cap_timeout)" || cap_timeout=""
 
   # --- deny checks, ordered by severity (adapter 127 > config 2 > refusal 64) --
   # Adapter map is the authority for what a provider may run: an absent adapter is a
@@ -1000,6 +1025,11 @@ aib_authorize_launch() {
   [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid tier capability (cap_tier='$cap_tier')"
   _aib_rank effort "$cap_effort"
   [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid effort capability (cap_effort='$cap_effort')"
+  # RM-3 slice 2: cap_timeout joins the other three provider capabilities. Absent or
+  # malformed is a config deny, exactly like an absent/invalid cap_sandbox above —
+  # resource authority does not belong to the caller, so there is no "no cap" default.
+  _aib_valid_positive_int "$cap_timeout" ||
+    _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid timeout capability (cap_timeout='$cap_timeout')"
 
   # Request/identity form (input hygiene the caller also enforces; re-checked here so
   # the PDP is safe to call in isolation and under RM-3's process boundary).
@@ -1010,6 +1040,14 @@ aib_authorize_launch() {
   [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 64 "agent clearance '$clearance' is not a recognised tier"
   _aib_rank effort "$effort"
   [ "$_AIB_RANK" -ne 0 ] || _aib_verdict_deny 64 "resolved effort '$effort' is not a recognised level"
+  # timeout is the one OPTIONAL request field: absent means "use the cap outright",
+  # not "malformed". Only a PRESENT, malformed value is a form deny (SPEC-wire-format,
+  # "timeout: TWO checks are missing, not one" — this is the PDP's own half, re-checked
+  # independently of whatever the wire already validated).
+  if [ -n "$timeout" ]; then
+    _aib_valid_positive_int "$timeout" ||
+      _aib_verdict_deny 64 "requested timeout '$timeout' is not a positive integer"
+  fi
 
   if [ "$deny" -eq 0 ]; then
     # --- allow path: every effective value is a min(request/registry, capability) --
@@ -1030,6 +1068,19 @@ aib_authorize_launch() {
     _aib_rank effort "$cap_effort"; rc2="$_AIB_RANK"
     if [ "$rc1" -le "$rc2" ]; then eff_effort="$effort"
     else eff_effort="$cap_effort"; _aib_verdict_note "effort '$effort' exceeds provider cap '$cap_effort'; clamped to '$cap_effort'"; fi
+
+    # timeout has no rank table (it is not an enum): compare numerically. An absent
+    # request means "no opinion", so the cap applies outright — that is still a min,
+    # just over a one-element set. Never max: a request above the cap is a clamp,
+    # never a grant of more time than the provider declared.
+    if [ -z "$timeout" ]; then
+      eff_timeout="$cap_timeout"
+    elif [ "$timeout" -le "$cap_timeout" ]; then
+      eff_timeout="$timeout"
+    else
+      eff_timeout="$cap_timeout"
+      _aib_verdict_note "timeout '$timeout' exceeds provider cap '$cap_timeout'; clamped to '$cap_timeout'"
+    fi
   fi
 
   # --- publish the verdict -----------------------------------------------------
@@ -1043,6 +1094,7 @@ aib_authorize_launch() {
     AIB_VERDICT_EFFECTIVE_CLEARANCE=""
     AIB_VERDICT_EFFECTIVE_SANDBOX=""
     AIB_VERDICT_EFFECTIVE_EFFORT=""
+    AIB_VERDICT_EFFECTIVE_TIMEOUT=""
     AIB_VERDICT_ADAPTER_PATH=""
   else
     AIB_VERDICT_DECISION="allow"
@@ -1050,10 +1102,11 @@ aib_authorize_launch() {
     AIB_VERDICT_EFFECTIVE_CLEARANCE="$eff_clearance"
     AIB_VERDICT_EFFECTIVE_SANDBOX="$eff_sandbox"
     AIB_VERDICT_EFFECTIVE_EFFORT="$eff_effort"
+    AIB_VERDICT_EFFECTIVE_TIMEOUT="$eff_timeout"
     AIB_VERDICT_ADAPTER_PATH="$adapter"
   fi
 
-  AIB_VERDICT_RECORD="$(printf '{"event":"launch_verdict","agent_uid":%s,"provider":%s,"decision":%s,"code":%s,"effective_clearance":%s,"effective_sandbox":%s,"effective_effort":%s,"adapter_path":%s}' \
+  AIB_VERDICT_RECORD="$(printf '{"event":"launch_verdict","agent_uid":%s,"provider":%s,"decision":%s,"code":%s,"effective_clearance":%s,"effective_sandbox":%s,"effective_effort":%s,"effective_timeout":%s,"adapter_path":%s}' \
     "$(aib_json "$AIB_VERDICT_AGENT_UID")" \
     "$(aib_json "$AIB_VERDICT_PROVIDER")" \
     "$(aib_json "$AIB_VERDICT_DECISION")" \
@@ -1061,9 +1114,46 @@ aib_authorize_launch() {
     "$(aib_json "$AIB_VERDICT_EFFECTIVE_CLEARANCE")" \
     "$(aib_json "$AIB_VERDICT_EFFECTIVE_SANDBOX")" \
     "$(aib_json "$AIB_VERDICT_EFFECTIVE_EFFORT")" \
+    "$(aib_json "$AIB_VERDICT_EFFECTIVE_TIMEOUT")" \
     "$(aib_json "$AIB_VERDICT_ADAPTER_PATH")")"
 
   [ "$deny" -eq 0 ]
+}
+
+# aib_contain_cwd <root> <cwd> -> AIB_CWD_RESOLVED; rc 0 accepted, rc 1 refused.
+#
+# RM-3 slice 2 (SPEC-wire-format, "cwd — the field that stops carrying authority").
+# `root` is the registry-derived writable area (AIB_HOME from the managed resolver);
+# the REQUEST NEVER CHOOSES IT — a cage whose bars the prisoner picks is not a cage.
+# `cwd` only selects where inside that already-fixed area the child starts.
+#
+# Both paths are resolved (GNU `realpath -m`: resolves symlinks and `..` without
+# requiring the path to exist yet — the child directory may not exist until later
+# machinery creates it) and the resolved cwd must sit inside the resolved root on a
+# PATH-COMPONENT boundary: "/srv/ws2" is NOT inside "/srv/ws", even though it shares
+# the string prefix "/srv/ws". A character-class path grammar would be a guessing
+# game against symlinks and normalisation; comparing resolved paths is a decision
+# (SPEC-wire-format, "What containment can decide, no character class should have to
+# guess"). This function decides only inside/outside; it does not install Landlock or
+# change directory — those are enactment (slice 3).
+aib_contain_cwd() {
+  local root="${1-}" cwd="${2-}" realpath_bin resolved_root resolved_cwd
+  AIB_CWD_RESOLVED=""
+  realpath_bin="$(command -v realpath)" || return 1
+  [ -n "$root" ] || return 1
+  # An absent cwd means the derived root, the same as an explicit empty cwd_bytes
+  # block (SPEC-wire-format, "Two edges") — both resolve here rather than being an
+  # unspecified edge case one layer up.
+  [ -n "$cwd" ] || cwd="$root"
+  resolved_root="$("$realpath_bin" -m -- "$root")" || return 1
+  resolved_cwd="$("$realpath_bin" -m -- "$cwd")" || return 1
+  case "$resolved_cwd" in
+    "$resolved_root")   : ;;
+    "$resolved_root"/*) : ;;
+    *) return 1 ;;
+  esac
+  AIB_CWD_RESOLVED="$resolved_cwd"
+  return 0
 }
 
 # --- optional actor label (on_behalf_of; DOMAIN §2 "Ephemeral helpers") -------
@@ -1739,18 +1829,28 @@ aib_event_commit() {
 # is one connection instance and has to answer with a terminal status line before it exits —
 # a refusal the client cannot read is indistinguishable from a dead broker (spike, 2026-08-10).
 AIB_WIRE_PROMPT_MAX="${AIB_WIRE_PROMPT_MAX:-65536}"
+# RM-3 slice 2 (SPEC-wire-format): cwd and label join prompt as length-prefixed
+# blocks, each with its own cap. 4096 mirrors PATH_MAX; 256 is generous for a
+# display label (§3: label form is checked, content is not — length is form).
+AIB_WIRE_CWD_MAX="${AIB_WIRE_CWD_MAX:-4096}"
+AIB_WIRE_LABEL_MAX="${AIB_WIRE_LABEL_MAX:-256}"
+# A wire-level sanity ceiling on `timeout`, independent of any provider's cap_timeout
+# (which the PDP alone enforces). 86400s (24h) is generous enough never to be the
+# real limit in practice; its job is only to keep an absurd value from parsing at all.
+AIB_WIRE_TIMEOUT_MAX="${AIB_WIRE_TIMEOUT_MAX:-86400}"
 
 # Fields whose value is composed under the commit lock and is NEVER accepted from a caller (§3).
 AIB_WIRE_FORBIDDEN_FIELDS="event_id attempt_id seq"
 
-# aib_wire_read_request  <stdin: request frame> -> AIB_REQ_<FIELD> … + AIB_REQ_PROMPT
+# aib_wire_read_request  <stdin: request frame> -> AIB_REQ_<FIELD> … + AIB_REQ_{CWD,LABEL,PROMPT}
 aib_wire_read_request() {
   AIB_WIRE_ERROR=""
   # LC_ALL=C belongs on the local line, not just in front of `read` — the length check below runs
   # AFTER the read and would otherwise count characters under the ambient locale. Gate finding
   # 2026-08-15 (Riker, HIGH): a byte-exact prompt containing "ö" was refused as a short read.
   # Same idiom as _aib_utf8_is_valid, aib_json and three other places in this file.
-  local line key val prompt="" bytes="" f seen="" sep=0 extra="" LC_ALL=C
+  local line key val f seen="" sep=0 extra="" LC_ALL=C
+  local n_cwd="" n_label="" n_prompt="" cwd="" label="" prompt=""
   # Record lines first, terminated by an empty line. Values are single-line by construction.
   while IFS= read -r line; do
     [ -z "$line" ] && { sep=1; break; }
@@ -1770,10 +1870,12 @@ aib_wire_read_request() {
     # ALLOWLIST, not a blocklist (gate finding 2026-08-15, Riker, MEDIUM): a blocklist has to be
     # remembered every time the contract grows a field. The contract enumerates what crosses (§3),
     # so the wire accepts exactly that and nothing else — including no environment fields, without
-    # needing a rule about them. Slice 1 needs three; cwd/sandbox/timeout/label follow in slice 2
-    # once it is decided how a PATH and a free-form LABEL cross a token-only record line (§6).
+    # needing a rule about them. Slice 2 adds sandbox/timeout (token fields) and the cwd_bytes/
+    # label_bytes headers for the two new length-prefixed blocks (SPEC-wire-format); cwd and label
+    # themselves are never record-line keys, only their byte-count headers are. Everything else
+    # (clearance, cap_*, env) stays refused without needing a rule about it.
     case "$key" in
-      op|agent_uid|prompt_bytes) : ;;
+      op|agent_uid|prompt_bytes|sandbox|timeout|cwd_bytes|label_bytes) : ;;
       *) AIB_WIRE_ERROR="field '$key' is not accepted at this seam"; return 2 ;;
     esac
     # A repeated field must not silently win with its last value — for agent_uid that would be a
@@ -1781,15 +1883,32 @@ aib_wire_read_request() {
     case " $seen " in *" $key "*) AIB_WIRE_ERROR="field '$key' given more than once"; return 2 ;; esac
     seen="$seen $key"
     case "$val" in *[[:cntrl:]]*) AIB_WIRE_ERROR="control character in field '$key'"; return 2 ;; esac
-    # §6: token fields are validated against the EXISTING token rules. The validators aib_die, so
+    # §6: token fields are validated against the EXISTING token rules — a FLOOR, which `sandbox`
+    # and `timeout` narrow (SPEC-wire-format: "a floor, not a ceiling"). The validators aib_die, so
     # they run in a subshell and their exit code becomes a refusal (gate finding, Marvin).
     case "$key" in
       agent_uid) ( aib_validate_agent_uid "$val" ) >/dev/null 2>&1 || {
                    AIB_WIRE_ERROR="agent_uid is not a valid token"; return 2; } ;;
       op)        ( aib_validate_token "$val" op ) >/dev/null 2>&1 || {
                    AIB_WIRE_ERROR="op is not a valid token"; return 2; } ;;
+      sandbox)   _aib_rank sandbox "$val"
+                 [ "$_AIB_RANK" -ne 0 ] || {
+                   AIB_WIRE_ERROR="sandbox '$val' is not a recognised mode"; return 2; } ;;
+      timeout)   case "$val" in
+                   ''|*[!0-9]*) AIB_WIRE_ERROR="timeout '$val' is not a positive integer"; return 2 ;;
+                 esac
+                 [ "$val" -gt 0 ] 2>/dev/null || {
+                   AIB_WIRE_ERROR="timeout '$val' must be a positive integer"; return 2; }
+                 [ "$val" -le "$AIB_WIRE_TIMEOUT_MAX" ] 2>/dev/null || {
+                   AIB_WIRE_ERROR="timeout '$val' exceeds the wire maximum of $AIB_WIRE_TIMEOUT_MAX seconds"; return 2; } ;;
     esac
-    if [ "$key" = "prompt_bytes" ]; then bytes="$val"; continue; fi
+    # The three <field>_bytes headers are consumed here, never published as AIB_REQ_* — they
+    # describe the length-prefixed blocks read below, they are not request fields themselves.
+    case "$key" in
+      cwd_bytes)    n_cwd="$val";    continue ;;
+      label_bytes)  n_label="$val";  continue ;;
+      prompt_bytes) n_prompt="$val"; continue ;;
+    esac
     printf -v "AIB_REQ_$(printf '%s' "$key" | tr 'a-z' 'A-Z')" '%s' "$val"
   done
 
@@ -1797,26 +1916,79 @@ aib_wire_read_request() {
   # "short read" there sent the reader hunting in the wrong place (gate finding, Marvin).
   [ "$sep" = 1 ] || { AIB_WIRE_ERROR="missing blank line between record lines and free text"; return 2; }
 
-  case "$bytes" in
-    ''|*[!0-9]*) AIB_WIRE_ERROR="prompt_bytes missing or not a number"; return 2 ;;
+  # Each <field>_bytes header is independent; an absent header means the block is absent from
+  # the stream, and an explicit `<field>_bytes=0` behaves exactly the same way (SPEC-wire-format,
+  # "Two edges"). For cwd this is also the empty-cwd-means-derived-root edge, resolved by
+  # aib_contain_cwd, not here.
+  case "$n_cwd" in
+    '') n_cwd=0 ;;
+    *[!0-9]*) AIB_WIRE_ERROR="cwd_bytes missing or not a number"; return 2 ;;
   esac
-  [ "$bytes" -le "$AIB_WIRE_PROMPT_MAX" ] || {
-    AIB_WIRE_ERROR="prompt of $bytes bytes exceeds the cap of $AIB_WIRE_PROMPT_MAX"; return 2; }
+  [ "$n_cwd" -le "$AIB_WIRE_CWD_MAX" ] || {
+    AIB_WIRE_ERROR="cwd of $n_cwd bytes exceeds the cap of $AIB_WIRE_CWD_MAX"; return 2; }
 
-  if [ "$bytes" -gt 0 ]; then
+  case "$n_label" in
+    '') n_label=0 ;;
+    *[!0-9]*) AIB_WIRE_ERROR="label_bytes missing or not a number"; return 2 ;;
+  esac
+  [ "$n_label" -le "$AIB_WIRE_LABEL_MAX" ] || {
+    AIB_WIRE_ERROR="label of $n_label bytes exceeds the cap of $AIB_WIRE_LABEL_MAX"; return 2; }
+
+  case "$n_prompt" in
+    '') n_prompt=0 ;;
+    *[!0-9]*) AIB_WIRE_ERROR="prompt_bytes missing or not a number"; return 2 ;;
+  esac
+  [ "$n_prompt" -le "$AIB_WIRE_PROMPT_MAX" ] || {
+    AIB_WIRE_ERROR="prompt of $n_prompt bytes exceeds the cap of $AIB_WIRE_PROMPT_MAX"; return 2; }
+
+  # Fixed frame order: cwd, label, prompt (SPEC-wire-format, "Frame order"). The headers say how
+  # LONG each block is, not WHERE it sits — a reader that counts bytes cannot recover from an
+  # unexpected order, so the three are read in exactly this order and no other.
+  if [ "$n_cwd" -gt 0 ]; then
+    # LC_ALL=C so that read -N counts BYTES, not characters (same reasoning as prompt below).
+    LC_ALL=C IFS= read -r -N "$n_cwd" cwd
+    [ "${#cwd}" -eq "$n_cwd" ] || {
+      AIB_WIRE_ERROR="short read: declared $n_cwd cwd bytes, got ${#cwd}"; return 2; }
+  fi
+  case "$cwd" in
+    *[[:cntrl:]]*)
+      # FORM check, not content: the internal PDP record is line-oriented
+      # (_aib_record_field), so a newline in cwd would split the record into two
+      # fields. Containment (aib_contain_cwd) decides everything else about cwd.
+      AIB_WIRE_ERROR="control character in cwd"; return 2 ;;
+  esac
+
+  if [ "$n_label" -gt 0 ]; then
+    LC_ALL=C IFS= read -r -N "$n_label" label
+    [ "${#label}" -eq "$n_label" ] || {
+      AIB_WIRE_ERROR="short read: declared $n_label label bytes, got ${#label}"; return 2; }
+  fi
+  case "$label" in
+    *[[:cntrl:]]*)
+      # Same line-oriented-record reason as cwd. Label CONTENT is otherwise never
+      # checked (§3: form yes, content no) — length and control characters are all
+      # the wire ever decides about it.
+      AIB_WIRE_ERROR="control character in label"; return 2 ;;
+  esac
+
+  if [ "$n_prompt" -gt 0 ]; then
     # LC_ALL=C so that read -N counts BYTES, not characters. A prompt containing NUL loses those
     # bytes (bash cannot hold them) and then fails the length check below — fail-closed, on purpose.
-    LC_ALL=C IFS= read -r -N "$bytes" prompt
-    [ "${#prompt}" -eq "$bytes" ] || {
-      AIB_WIRE_ERROR="short read: declared $bytes bytes, got ${#prompt}"; return 2; }
+    LC_ALL=C IFS= read -r -N "$n_prompt" prompt
+    [ "${#prompt}" -eq "$n_prompt" ] || {
+      AIB_WIRE_ERROR="short read: declared $n_prompt bytes, got ${#prompt}"; return 2; }
   fi
-  # Bytes beyond the declared length were silently ignored before (gate finding, Marvin). A frame
+  # Bytes beyond the declared totals were silently ignored before (gate finding, Marvin). A frame
   # that carries more than it declares is malformed, and accepting it would let a caller smuggle
-  # trailing content past a length the broker has already reasoned about.
+  # trailing content past a length the broker has already reasoned about. The check applies ONCE,
+  # to the whole frame, after all three length-prefixed blocks (SPEC-wire-format) — the frame's own
+  # end is only known once the last declared block has been read.
   if IFS= read -r -N 1 extra; then
-    AIB_WIRE_ERROR="frame carries more bytes than the declared $bytes"; return 2
+    AIB_WIRE_ERROR="frame carries more bytes than the declared total"; return 2
   fi
 
+  AIB_REQ_CWD="$cwd"
+  AIB_REQ_LABEL="$label"
   AIB_REQ_PROMPT="$prompt"
   return 0
 }
@@ -1830,4 +2002,20 @@ aib_wire_write_response() {
   local kv
   for kv in "$@"; do printf '%s\n' "$kv"; done
   printf 'end=%s\n' "$status"
+}
+
+# aib_build_pdp_request_record <agent_uid> <sandbox> <cwd> <timeout> <label>
+#   -> the request record aib_authorize_launch expects, on stdout.
+# Factored out so bin/aib-broker-handler (RM-3 slice 2) does not reinvent the field
+# order and shape bin/launch-agent's PEP already builds inline for the same PDP call.
+aib_build_pdp_request_record() {
+  printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' "$1" "$2" "$3" "$4" "$5"
+}
+
+# aib_build_pdp_snapshot_record <clearance> <provider> <effort> <adapter> <cap_sandbox>
+#                                <cap_tier> <cap_effort> <cap_timeout>
+#   -> the snapshot record aib_authorize_launch expects, on stdout.
+aib_build_pdp_snapshot_record() {
+  printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
 }

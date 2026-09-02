@@ -146,9 +146,15 @@ aib_resolve_managed_agent "$as"
 # code; fail closed BEFORE any heartbeat or provider process starts.
 _pep_request="$(printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' \
   "$AIB_AGENT_UID" "$sandbox" "$cwd" "$timeout_s" "$label")"
-_pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s' \
+# RM-3 slice 2 added cap_timeout as a fourth provider capability, resolved by
+# aib_resolve_managed_agent exactly like the other three; passing it through here is
+# not a new behaviour, only the wrapper catching up to a shared PDP that now checks
+# it. --timeout is validated above by this wrapper already; the PDP re-checks the
+# same shape independently (it must be safe to call in isolation) and takes
+# min(timeout_s, cap_timeout), never max.
+_pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
   "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" "$AIB_ADAPTER_PATH" \
-  "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT")"
+  "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" "$AIB_CAP_TIMEOUT")"
 aib_authorize_launch "$_pep_request" "$_pep_snapshot" || true
 
 # --- durable write-ahead decision --------------------------------------------
