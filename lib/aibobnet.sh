@@ -1878,11 +1878,54 @@ aib_wire_read_request() {
   # AFTER the read and would otherwise count characters under the ambient locale. Gate finding
   # 2026-08-15 (Riker, HIGH): a byte-exact prompt containing "ö" was refused as a short read.
   # Same idiom as _aib_utf8_is_valid, aib_json and three other places in this file.
-  local line key val f seen="" sep=0 LC_ALL=C
+  local key val f seen="" LC_ALL=C
   local n_cwd="" n_label="" n_prompt="" cwd="" label="" prompt=""
-  # Record lines first, terminated by an empty line. Values are single-line by construction.
-  while IFS= read -r line; do
-    [ -z "$line" ] && { sep=1; break; }
+  local frame="" header="" body="" rest="" line=""
+
+  # RM-3 slice 2 delta (gate finding, Ikarus R1, HIGH — same class as D1, the other
+  # path through this function): reading record lines one at a time with `read -r`
+  # per line is not NUL-safe either. Bash's `read -r` silently drops a NUL byte from
+  # the line it returns, so the bytes `agent_uid=acme-<NUL>dev` arrived as the VALUE
+  # "acme-dev" — one byte short of what the caller actually sent, and already past
+  # the point where the control-character check on that value could ever see the
+  # missing byte. Fix: read the ENTIRE frame — record lines and free text together —
+  # in ONE `read -r -d ''` call, the same NUL-delimiter idiom the body-only fix
+  # already uses below. rc=0 means a NUL was found ANYWHERE in the frame (refused
+  # here, before a single byte of it is interpreted as a field); rc>0 is the ordinary
+  # EOF case and `frame` holds every byte sent, exactly once. The header/record-line
+  # section is then split out and iterated IN-PROCESS, by string slicing — never by a
+  # second read — so no byte can go missing between this point and validation.
+  if LC_ALL=C IFS= read -r -d '' frame; then
+    AIB_WIRE_ERROR="control byte in frame"; return 2
+  fi
+
+  # The blank line separating record lines from free text is, in bytes, either a
+  # leading newline (a frame with zero record lines) or the first "\n\n" anywhere in
+  # the frame — record lines are each newline-terminated, so the blank line itself is
+  # the second consecutive newline. Splitting on the FIRST such marker is required
+  # (SPEC-wire-format, "Frame order"): a later "\n\n" inside the free text (e.g. a
+  # multi-paragraph prompt) must stay part of the body, never end the header early.
+  case "$frame" in
+    $'\n'*)    header=""; body="${frame#$'\n'}" ;;
+    *$'\n\n'*) header="${frame%%$'\n\n'*}"; body="${frame#*$'\n\n'}" ;;
+    *)
+      # Without the blank line the record lines and the free text are not separated
+      # at all. Saying "short read" there sent the reader hunting in the wrong place
+      # (gate finding, Marvin).
+      AIB_WIRE_ERROR="missing blank line between record lines and free text"; return 2
+      ;;
+  esac
+
+  # Record lines, iterated from the already-read, already-NUL-checked header string.
+  # Same manual newline split idiom as _aib_record_field — pure parameter expansion,
+  # no further `read` of any kind for the header section.
+  rest="$header"
+  while [ -n "$rest" ]; do
+    line="${rest%%$'\n'*}"
+    case "$rest" in
+      *$'\n'*) rest="${rest#*$'\n'}" ;;
+      *) rest="" ;;
+    esac
     case "$line" in
       *=*) : ;;
       *) AIB_WIRE_ERROR="malformed record line"; return 2 ;;
@@ -1941,10 +1984,6 @@ aib_wire_read_request() {
     printf -v "AIB_REQ_$(printf '%s' "$key" | tr 'a-z' 'A-Z')" '%s' "$val"
   done
 
-  # Without the blank line the record lines and the free text are not separated at all. Saying
-  # "short read" there sent the reader hunting in the wrong place (gate finding, Marvin).
-  [ "$sep" = 1 ] || { AIB_WIRE_ERROR="missing blank line between record lines and free text"; return 2; }
-
   # RM-3 slice 2 delta (gate finding, Riker, D6): a frame missing `op` or `agent_uid`
   # is a malformed CALLER frame, not something a downstream resolver failure should
   # ever have to explain. Refusing it HERE, at the wire, keeps a caller mistake from
@@ -1982,26 +2021,15 @@ aib_wire_read_request() {
   # LONG each block is, not WHERE it sits — a reader that counts bytes cannot recover from an
   # unexpected order.
   #
-  # RM-3 slice 2 delta (gate finding, Ikarus D1, HIGH): reading each block separately with
-  # `read -N n` is not NUL-safe. Bash's `read -N` drops a NUL byte from the variable WITHOUT
-  # counting it toward N — it keeps consuming input until N bytes have actually been STORED.
-  # A NUL anywhere in the body therefore silently shifts every field after it by one byte
-  # while the total bytes consumed can still match the declared total, so neither a per-block
-  # short-read check nor the old single trailing-byte peek ever caught it (repro: body `\0ABC`
-  # against `cwd_bytes=1 label_bytes=1 prompt_bytes=1` returned cwd=A label=B prompt=C, rc=0).
-  #
-  # Fix: read the ENTIRE remaining body in ONE `read -r -d ''` call — the same idiom
-  # `_aib_load_registry_snapshot` already uses (~L233). `read -d ''` delimits on NUL: rc=0
-  # means a NUL WAS found (refused below — a NUL can never legally appear in a frame body,
-  # whichever field it would fall in), rc>0 is the ordinary EOF case and `body` holds every
-  # byte that followed the blank line, exactly once, with none lost or miscounted. The three
-  # per-block short-read checks and the old trailing "more bytes than declared" peek both fall
-  # out of a single length comparison against the declared total; the blocks are then sliced
-  # from `body` by offset, never re-read byte-by-byte.
-  local body="" total=$((n_cwd + n_label + n_prompt))
-  if LC_ALL=C IFS= read -r -d '' body; then
-    AIB_WIRE_ERROR="control byte in body"; return 2
-  fi
+  # `body` (the frame's free-text tail, everything after the blank line) was already sliced
+  # from the single whole-frame read above (gate delta R1) — no second read here, and no
+  # opportunity for a NUL to shift anything: the one read at the top of this function already
+  # refused if the frame contained a NUL anywhere, headers or body alike. What remains is a
+  # single length comparison against the declared total (RM-3 slice 2 delta D1's original
+  # insight, still true): the three per-block short-read checks and the old trailing
+  # "more bytes than declared" peek both fall out of comparing `body`'s length once; the
+  # blocks are then sliced from `body` by offset, never re-read byte-by-byte.
+  local total=$((n_cwd + n_label + n_prompt))
   if [ "${#body}" -ne "$total" ]; then
     AIB_WIRE_ERROR="frame declares $total bytes (cwd+label+prompt) but carries ${#body}"
     return 2
