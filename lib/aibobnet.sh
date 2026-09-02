@@ -1878,7 +1878,7 @@ aib_wire_read_request() {
   # AFTER the read and would otherwise count characters under the ambient locale. Gate finding
   # 2026-08-15 (Riker, HIGH): a byte-exact prompt containing "ö" was refused as a short read.
   # Same idiom as _aib_utf8_is_valid, aib_json and three other places in this file.
-  local line key val f seen="" sep=0 extra="" LC_ALL=C
+  local line key val f seen="" sep=0 LC_ALL=C
   local n_cwd="" n_label="" n_prompt="" cwd="" label="" prompt=""
   # Record lines first, terminated by an empty line. Values are single-line by construction.
   while IFS= read -r line; do
@@ -1945,6 +1945,14 @@ aib_wire_read_request() {
   # "short read" there sent the reader hunting in the wrong place (gate finding, Marvin).
   [ "$sep" = 1 ] || { AIB_WIRE_ERROR="missing blank line between record lines and free text"; return 2; }
 
+  # RM-3 slice 2 delta (gate finding, Riker, D6): a frame missing `op` or `agent_uid`
+  # is a malformed CALLER frame, not something a downstream resolver failure should
+  # ever have to explain. Refusing it HERE, at the wire, keeps a caller mistake from
+  # being reported as a broker incident (registry_config/registry_unavailable) three
+  # layers downstream, where nothing can tell the two apart any more.
+  [ -n "${AIB_REQ_OP:-}" ] || { AIB_WIRE_ERROR="missing required field 'op'"; return 2; }
+  [ -n "${AIB_REQ_AGENT_UID:-}" ] || { AIB_WIRE_ERROR="missing required field 'agent_uid'"; return 2; }
+
   # Each <field>_bytes header is independent; an absent header means the block is absent from
   # the stream, and an explicit `<field>_bytes=0` behaves exactly the same way (SPEC-wire-format,
   # "Two edges"). For cwd this is also the empty-cwd-means-derived-root edge, resolved by
@@ -1972,13 +1980,36 @@ aib_wire_read_request() {
 
   # Fixed frame order: cwd, label, prompt (SPEC-wire-format, "Frame order"). The headers say how
   # LONG each block is, not WHERE it sits — a reader that counts bytes cannot recover from an
-  # unexpected order, so the three are read in exactly this order and no other.
-  if [ "$n_cwd" -gt 0 ]; then
-    # LC_ALL=C so that read -N counts BYTES, not characters (same reasoning as prompt below).
-    LC_ALL=C IFS= read -r -N "$n_cwd" cwd
-    [ "${#cwd}" -eq "$n_cwd" ] || {
-      AIB_WIRE_ERROR="short read: declared $n_cwd cwd bytes, got ${#cwd}"; return 2; }
+  # unexpected order.
+  #
+  # RM-3 slice 2 delta (gate finding, Ikarus D1, HIGH): reading each block separately with
+  # `read -N n` is not NUL-safe. Bash's `read -N` drops a NUL byte from the variable WITHOUT
+  # counting it toward N — it keeps consuming input until N bytes have actually been STORED.
+  # A NUL anywhere in the body therefore silently shifts every field after it by one byte
+  # while the total bytes consumed can still match the declared total, so neither a per-block
+  # short-read check nor the old single trailing-byte peek ever caught it (repro: body `\0ABC`
+  # against `cwd_bytes=1 label_bytes=1 prompt_bytes=1` returned cwd=A label=B prompt=C, rc=0).
+  #
+  # Fix: read the ENTIRE remaining body in ONE `read -r -d ''` call — the same idiom
+  # `_aib_load_registry_snapshot` already uses (~L233). `read -d ''` delimits on NUL: rc=0
+  # means a NUL WAS found (refused below — a NUL can never legally appear in a frame body,
+  # whichever field it would fall in), rc>0 is the ordinary EOF case and `body` holds every
+  # byte that followed the blank line, exactly once, with none lost or miscounted. The three
+  # per-block short-read checks and the old trailing "more bytes than declared" peek both fall
+  # out of a single length comparison against the declared total; the blocks are then sliced
+  # from `body` by offset, never re-read byte-by-byte.
+  local body="" total=$((n_cwd + n_label + n_prompt))
+  if LC_ALL=C IFS= read -r -d '' body; then
+    AIB_WIRE_ERROR="control byte in body"; return 2
   fi
+  if [ "${#body}" -ne "$total" ]; then
+    AIB_WIRE_ERROR="frame declares $total bytes (cwd+label+prompt) but carries ${#body}"
+    return 2
+  fi
+  cwd="${body:0:n_cwd}"
+  label="${body:n_cwd:n_label}"
+  prompt="${body:$((n_cwd + n_label)):n_prompt}"
+
   case "$cwd" in
     *[[:cntrl:]]*)
       # FORM check, not content: the internal PDP record is line-oriented
@@ -1986,12 +2017,6 @@ aib_wire_read_request() {
       # fields. Containment (aib_contain_cwd) decides everything else about cwd.
       AIB_WIRE_ERROR="control character in cwd"; return 2 ;;
   esac
-
-  if [ "$n_label" -gt 0 ]; then
-    LC_ALL=C IFS= read -r -N "$n_label" label
-    [ "${#label}" -eq "$n_label" ] || {
-      AIB_WIRE_ERROR="short read: declared $n_label label bytes, got ${#label}"; return 2; }
-  fi
   case "$label" in
     *[[:cntrl:]]*)
       # Same line-oriented-record reason as cwd. Label CONTENT is otherwise never
@@ -1999,22 +2024,6 @@ aib_wire_read_request() {
       # the wire ever decides about it.
       AIB_WIRE_ERROR="control character in label"; return 2 ;;
   esac
-
-  if [ "$n_prompt" -gt 0 ]; then
-    # LC_ALL=C so that read -N counts BYTES, not characters. A prompt containing NUL loses those
-    # bytes (bash cannot hold them) and then fails the length check below — fail-closed, on purpose.
-    LC_ALL=C IFS= read -r -N "$n_prompt" prompt
-    [ "${#prompt}" -eq "$n_prompt" ] || {
-      AIB_WIRE_ERROR="short read: declared $n_prompt bytes, got ${#prompt}"; return 2; }
-  fi
-  # Bytes beyond the declared totals were silently ignored before (gate finding, Marvin). A frame
-  # that carries more than it declares is malformed, and accepting it would let a caller smuggle
-  # trailing content past a length the broker has already reasoned about. The check applies ONCE,
-  # to the whole frame, after all three length-prefixed blocks (SPEC-wire-format) — the frame's own
-  # end is only known once the last declared block has been read.
-  if IFS= read -r -N 1 extra; then
-    AIB_WIRE_ERROR="frame carries more bytes than the declared total"; return 2
-  fi
 
   AIB_REQ_CWD="$cwd"
   AIB_REQ_LABEL="$label"
