@@ -36,16 +36,19 @@ req() {
   printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' \
     "${1:-acme-core}" "${2:-read-only}" "${3:-/w}" "${4:-1200}" "${5:-l}"
 }
-# snap <clearance> <provider> <effort> <adapter> <cap_sandbox> <cap_tier> <cap_effort>
+# snap <clearance> <provider> <effort> <adapter> <cap_sandbox> <cap_tier> <cap_effort> [cap_timeout]
+# cap_timeout defaults to 900 (RM-3 slice 2): this spec's authority is the sandbox/
+# clearance/effort caps, not the timeout cap, which broker_authorize_spec.sh owns —
+# the default keeps every existing call site here well-formed without restating it.
 snap() {
-  printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+  printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-900}"
 }
 # Serialise the resolver's globals into a snapshot record — documents, for Lane B,
 # precisely which resolved values become the PDP's trusted input.
 snap_from_resolved() {
   snap "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" "$AIB_ADAPTER_PATH" \
-    "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT"
+    "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" "$AIB_CAP_TIMEOUT"
 }
 # Run the PDP; RC captures the return status (0 allow, non-zero deny).
 pdp() { if aib_authorize_launch "$1" "$2"; then RC=0; else RC=$?; fi; }
@@ -102,7 +105,7 @@ assert_grep  "effort above cap: the clamp is reported"       "$AIB_VERDICT_REASO
 # Absent adapter (== unknown provider): the same missing-adapter fail-closed the PEP
 # turns into exit 127. Built by hand so the adapter key is genuinely absent.
 pdp "$(printf 'agent_uid=acme-core\nsandbox=read-only\ncwd=/w\ntimeout=1\nlabel=l')" \
-    "$(printf 'clearance=t2\nprovider=ghost\neffort=low\ncap_sandbox=read-only\ncap_tier=t3\ncap_effort=high')"
+    "$(printf 'clearance=t2\nprovider=ghost\neffort=low\ncap_sandbox=read-only\ncap_tier=t3\ncap_effort=high\ncap_timeout=900')"
 assert_streq "absent adapter: denied"                        "$AIB_VERDICT_DECISION" "deny"
 assert_streq "absent adapter: exit hint is adapter-not-found (127)" "$AIB_VERDICT_CODE" "127"
 assert_grep  "absent adapter: the reason names the provider" "$AIB_VERDICT_REASONS" "provider 'ghost'"
@@ -174,7 +177,8 @@ effort=high
 adapter=/opt/acme/adapters/codex
 cap_sandbox=workspace-write
 cap_tier=t3
-cap_effort=high'
+cap_effort=high
+cap_timeout=900'
 pure_out="$(env -i "$(command -v bash)" -c '
   . "'"$SRC_ROOT"'/lib/aibobnet.sh"
   aib_authorize_launch "$1" "$2" && printf "%s\n" "$AIB_VERDICT_DECISION"
@@ -190,7 +194,7 @@ cat > "$reg4" <<'JSON'
 {
   "schema_version": 4,
   "providers": {
-    "codex": { "adapter": "/opt/acme/adapters/codex", "cap_sandbox": "workspace-write", "cap_tier": "t3", "cap_effort": "high" }
+    "codex": { "adapter": "/opt/acme/adapters/codex", "cap_sandbox": "workspace-write", "cap_tier": "t3", "cap_effort": "high", "cap_timeout": "900" }
   },
   "projects": {
     "acme": { "home": "/srv/acme", "standup_dir": "/srv/acme/standup", "mux_session": "acme", "provider": "codex", "model": "example-model", "effort": "max" }
@@ -205,6 +209,7 @@ assert_streq "schema 4: adapter resolved (absolute, from the map)" "$AIB_ADAPTER
 assert_streq "schema 4: cap_sandbox resolved"                "$AIB_CAP_SANDBOX" "workspace-write"
 assert_streq "schema 4: cap_tier resolved"                   "$AIB_CAP_TIER" "t3"
 assert_streq "schema 4: cap_effort resolved"                 "$AIB_CAP_EFFORT" "high"
+assert_streq "schema 4: cap_timeout resolved"                "$AIB_CAP_TIMEOUT" "900"
 
 # End to end: the resolved schema-4 snapshot authorises, clamping t4->t3 and max->high.
 pdp "$(req)" "$(snap_from_resolved)"
@@ -217,7 +222,7 @@ reg4_noprov="$WORK/reg4-noprov.json"
 cat > "$reg4_noprov" <<'JSON'
 {
   "schema_version": 4,
-  "providers": { "other": { "adapter": "/opt/acme/adapters/other", "cap_sandbox": "read-only", "cap_tier": "t2", "cap_effort": "low" } },
+  "providers": { "other": { "adapter": "/opt/acme/adapters/other", "cap_sandbox": "read-only", "cap_tier": "t2", "cap_effort": "low", "cap_timeout": "300" } },
   "projects": { "acme": { "home": "/srv/acme", "standup_dir": "/srv/acme/standup", "mux_session": "acme", "provider": "codex", "model": "m", "effort": "low" } },
   "teams": {},
   "agents": { "acme-core": { "project": "acme", "profile": "engine-dev", "clearance": "t2" } }

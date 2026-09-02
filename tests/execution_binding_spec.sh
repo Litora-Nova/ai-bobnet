@@ -140,7 +140,7 @@ write_file "$V4" '{
   },
   "providers": {
     "codex": { "adapter": "/opt/acme/adapters/codex", "cap_sandbox": "workspace-write",
-      "cap_tier": "t3", "cap_effort": "high" }
+      "cap_tier": "t3", "cap_effort": "high", "cap_timeout": "900" }
   },
   "agents": {
     "acme-mixed": { "project": "acme", "team_uid": "acme-engine", "profile": "engine-dev", "clearance": "t2", "effort": "high" }

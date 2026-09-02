@@ -146,9 +146,15 @@ aib_resolve_managed_agent "$as"
 # code; fail closed BEFORE any heartbeat or provider process starts.
 _pep_request="$(printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' \
   "$AIB_AGENT_UID" "$sandbox" "$cwd" "$timeout_s" "$label")"
-_pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s' \
+# RM-3 slice 2 added cap_timeout as a fourth provider capability, resolved by
+# aib_resolve_managed_agent exactly like the other three; passing it through here is
+# not a new behaviour, only the wrapper catching up to a shared PDP that now checks
+# it. --timeout is validated above by this wrapper already; the PDP re-checks the
+# same shape independently (it must be safe to call in isolation) and takes
+# min(timeout_s, cap_timeout), never max.
+_pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
   "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" "$AIB_ADAPTER_PATH" \
-  "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT")"
+  "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" "$AIB_CAP_TIMEOUT")"
 aib_authorize_launch "$_pep_request" "$_pep_snapshot" || true
 
 # --- durable write-ahead decision --------------------------------------------
@@ -214,6 +220,18 @@ fi
 adapter_path="$AIB_VERDICT_ADAPTER_PATH"
 sandbox="$AIB_VERDICT_EFFECTIVE_SANDBOX"
 eff_effort="$AIB_VERDICT_EFFECTIVE_EFFORT"
+# Gate delta D4 (Ikarus, HIGH): the watchdog below sleeps $timeout_s, and the
+# timeout/failure heartbeat and die messages print it — all of that must reflect the
+# CAPPED authority, never the caller-requested value, or the audit trail (and the
+# watchdog itself) would claim a cap the process does not actually enforce. This is
+# the same clamp-not-max rule §3 states for every other effective value; timeout was
+# simply never reassigned to its effective form the way sandbox/effort are above.
+timeout_s="$AIB_VERDICT_EFFECTIVE_TIMEOUT"
+# Gate delta R2 (Ikarus/Riker, MEDIUM): the capped value's observability lives in the
+# managed_launch_binding JSON event below (effective_timeout field), not in a second,
+# bare stderr line — docs/CONTRACT-codex-run.md §4 requires EXACTLY one JSON object
+# on stderr before the busy heartbeat, and a bare "effective_timeout=<n>" line ahead
+# of it (on every allow, including paths that go on to refuse enactment) broke that.
 
 # The PEP drives only a codex-CLI-shaped adapter. The pure PDP cannot derive that
 # launcher-specific argv support from its frozen snapshot, so B1 uses option (b):
@@ -238,9 +256,15 @@ if [ ! -x "$adapter_path" ]; then
 fi
 
 # One observability event: the resolved binding + the ABSOLUTE adapter path taken
-# from the verdict (never a PATH/cwd lookup). Not durable audit or enforcement.
+# from the verdict (never a PATH/cwd lookup). Not durable audit or enforcement. This
+# is NOT the frozen attempt.decided composer (Lane A) — adding a field here is not a
+# schema change to the durable audit trail, only to this transient stderr line.
+#
+# effective_timeout (gate delta R2) is the verdict's capped value, the same one the
+# watchdog below is armed with — a JSON NUMBER (the PDP guarantees digits-only on
+# allow), not a string, unlike every other field here.
 launch_binding_event="$(
-  printf '{"event":"managed_launch_binding","agent_uid":%s,"provider":%s,"provider_source":%s,"model":%s,"model_source":%s,"effort":%s,"effort_source":%s,"adapter_path":%s}' \
+  printf '{"event":"managed_launch_binding","agent_uid":%s,"provider":%s,"provider_source":%s,"model":%s,"model_source":%s,"effort":%s,"effort_source":%s,"adapter_path":%s,"effective_timeout":%s}' \
     "$(aib_json "$AIB_AGENT_UID")" \
     "$(aib_json "$AIB_PROVIDER")" \
     "$(aib_json "$AIB_PROVIDER_SOURCE")" \
@@ -248,7 +272,8 @@ launch_binding_event="$(
     "$(aib_json "$AIB_MODEL_SOURCE")" \
     "$(aib_json "$AIB_EFFORT")" \
     "$(aib_json "$AIB_EFFORT_SOURCE")" \
-    "$(aib_json "$adapter_path")"
+    "$(aib_json "$adapter_path")" \
+    "$timeout_s"
 )"
 
 # Construct the child environment from the verdict's allow-list via `env -i`: the

@@ -90,7 +90,7 @@ expect_targeted_failure() {
 }
 
 expect_baseline_green "$SRC_ROOT/tests/authorize_launch_spec.sh" \
-  "54 checks: 54 ok / 0 fail" "$WORK/clean-pdp.out"
+  "55 checks: 55 ok / 0 fail" "$WORK/clean-pdp.out"
 
 # 1. Breaking the clearance min: inverting min(clearance, cap_tier) lets an agent whose
 # clearance exceeds the provider tier ceiling keep the HIGHER clearance instead of

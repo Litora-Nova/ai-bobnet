@@ -42,7 +42,7 @@ trap cleanup EXIT
 # Schema 4 carries the provider adapter map + declared capabilities. Managed launch
 # REQUIRES the adapter field; the provider key mirrors the project's provider.
 write_v4() {
-  local path="$1" provider="$2" effort="$3" standup_dir="${4:-$STATE/acme/standup}" adapter="${5:-$ADAPTER}"
+  local path="$1" provider="$2" effort="$3" standup_dir="${4:-$STATE/acme/standup}" adapter="${5:-$ADAPTER}" cap_timeout="${6:-900}"
   printf '%s\n' "{
   \"schema_version\": 4,
   \"providers\": {
@@ -50,7 +50,8 @@ write_v4() {
       \"adapter\": \"$adapter\",
       \"cap_sandbox\": \"workspace-write\",
       \"cap_tier\": \"t3\",
-      \"cap_effort\": \"high\"
+      \"cap_effort\": \"high\",
+      \"cap_timeout\": \"$cap_timeout\"
     }
   },
   \"projects\": {
@@ -225,8 +226,10 @@ has "child gets resolved binding and provenance" "$env_out" $'provider=codex\npr
 has "child sees CODEX_RUN_BIN removed" "$env_out" "codex_run_bin=unset"
 
 # §8.1: the emitted adapter path is the ABSOLUTE registry adapter (from the verdict),
-# no longer a `command -v codex` resolved at launch cwd.
-binding_emit="{\"event\":\"managed_launch_binding\",\"agent_uid\":\"acme-core\",\"provider\":\"codex\",\"provider_source\":\"project:acme\",\"model\":\"team/model-v2\",\"model_source\":\"team:acme-engine\",\"effort\":\"high\",\"effort_source\":\"agent:acme-core\",\"adapter_path\":\"$ADAPTER\"}"
+# no longer a `command -v codex` resolved at launch cwd. effective_timeout (gate
+# delta R2) is min(default --timeout 1200, this fixture's cap_timeout 900) = 900 —
+# folded into this ONE JSON event rather than a second, bare stderr line.
+binding_emit="{\"event\":\"managed_launch_binding\",\"agent_uid\":\"acme-core\",\"provider\":\"codex\",\"provider_source\":\"project:acme\",\"model\":\"team/model-v2\",\"model_source\":\"team:acme-engine\",\"effort\":\"high\",\"effort_source\":\"agent:acme-core\",\"adapter_path\":\"$ADAPTER\",\"effective_timeout\":900}"
 has "launch emits structured resolved binding and absolute adapter path on stderr" "$RUN_ERR" "$binding_emit"
 has "busy heartbeat uses resolved model and effective effort" "$(<"$HBLOG")" "| busy | codex-run: team/model-v2/read-only effort=high — managed"
 has "terminal heartbeat records success" "$(<"$HBLOG")" "| done | codex-run OK — managed"
@@ -241,6 +244,30 @@ has "child env keeps the explicit managed export"        "$fullenv" "AIBOBNET_AG
 hasnt "child env drops non-allow-listed inherited vars"  "$fullenv" "LEAKME_SENTINEL"
 hasnt "child env never inherits ambient provenance"      "$fullenv" "ambient-provider"
 hasnt "child env never inherits the poison binary path"  "$fullenv" "CODEX_RUN_BIN"
+
+# --- 1b. gate delta D4: the watchdog and audit trail use the EFFECTIVE (capped)
+# timeout, never the caller-requested one (Ikarus, HIGH: bin/launch-agent:371 slept
+# $timeout_s — caller-requested — while the verdict said AIB_VERDICT_EFFECTIVE_TIMEOUT).
+# Observable without waiting for an actual timeout: the stub provider (STUB_MODE=ok)
+# returns immediately, so the watchdog's background sleep is spawned and killed long
+# before it could ever fire regardless of which value it holds; what is asserted here
+# is the value ITSELF.
+#
+# Gate delta R2 (Ikarus/Riker MEDIUM): the value is read out of the existing
+# managed_launch_binding JSON event's "effective_timeout" field, not a second bare
+# stderr line — docs/CONTRACT-codex-run.md §4 requires EXACTLY one JSON object on
+# stderr before the busy heartbeat, and a bare line broke that on every allow.
+CAPPED="$WORK/capped.json"; write_v4 "$CAPPED" codex high "$STATE/acme/standup" "$ADAPTER" 2
+: > "$HBLOG"
+run_launch "$CAPPED" --as acme-core --timeout 9999 --label capped-timeout --prompt x
+eq "capped-timeout launch still succeeds" "$RUN_RC" 0
+has "the watchdog is armed with the EFFECTIVE (capped) timeout, in the JSON event" \
+  "$RUN_ERR" '"effective_timeout":2'
+hasnt "…never the caller-requested timeout"                     "$RUN_ERR" '"effective_timeout":9999'
+hasnt "…and no second, bare effective_timeout= stderr line ships beside it" \
+  "$RUN_ERR" "effective_timeout="$'\n'
+binding_count="$(printf '%s' "$RUN_ERR" | grep -oF '"event":"managed_launch_binding"' | wc -l)"
+eq "exactly one managed_launch_binding JSON object is emitted (§4)" "$binding_count" "1"
 
 # --- 2. exit-127: a missing adapter fails closed BEFORE any heartbeat or provider ---
 # Schema 3 carries execution binding but no adapter map -> empty adapter -> the PDP's

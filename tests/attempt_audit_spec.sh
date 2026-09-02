@@ -49,7 +49,8 @@ write_registry() {
       "adapter": "$adapter",
       "cap_sandbox": "workspace-write",
       "cap_tier": "t3",
-      "cap_effort": "high"
+      "cap_effort": "high",
+      "cap_timeout": "900"
     }
   },
   "projects": {

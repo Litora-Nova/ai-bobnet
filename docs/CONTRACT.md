@@ -48,9 +48,10 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
   validation, provenance, migration, and rollback are normative in
   `docs/CONTRACT-execution-binding.md`.
 - **Schema 4 adds the RM-1 policy-gate data.** It adds a top-level `providers.<name>` map carrying the
-  absolute `adapter` path and the declared `cap_sandbox` / `cap_tier` / `cap_effort` capabilities. A managed
-  launch requires the adapter field, so schema 4 is the shipped default (`registry.json`); a schema-3
-  registry still resolves identity and binding but fails closed at the missing-adapter path. Normative in
+  absolute `adapter` path and the declared `cap_sandbox` / `cap_tier` / `cap_effort` / `cap_timeout`
+  capabilities (`cap_timeout` added in RM-3 slice 2). A managed launch requires the adapter field, so
+  schema 4 is the shipped default (`registry.json`); a schema-3 registry still resolves identity and
+  binding but fails closed at the missing-adapter path. Normative in
   `docs/CONTRACT-execution-binding.md` §7.
 - `display_name` is optional and free text (may contain spaces/unicode); it never routes.
 - Unknown extra fields are ignored (forward-compatible) and never load-bearing. Schema-3 binding and team

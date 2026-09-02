@@ -82,9 +82,11 @@ the effective (clamped) sandbox/effort, and the absolute `adapter_path`.
    enactment (fail-closed); the provider never starts without a committed `decided` record.
 2. **Observability event.** On allow, and before the busy heartbeat, emit one `managed_launch_binding` JSON
    object to **stderr** carrying the resolved `agent_uid`, `provider`/`model`/`effort` with their
-   `level:uid` sources, and the **absolute** `providers.<provider>.adapter` path from the verdict (not a
-   `PATH`/cwd lookup). This stderr line is transient operator/tooling observability; the durable record is
-   the §8 stream, not this line.
+   `level:uid` sources, the **absolute** `providers.<provider>.adapter` path from the verdict (not a
+   `PATH`/cwd lookup), and the verdict's `effective_timeout` (RM-3 slice 2: `min(requested, cap_timeout)`,
+   the value the watchdog is armed with, as a JSON number). This is the ONE JSON object this launcher emits
+   to stderr — no second, bare observability line ships alongside it. This stderr line is transient
+   operator/tooling observability; the durable record is the §8 stream, not this line.
 
 **Operational note — redact before publication.** The persisted `attempt.decided`/`attempt.ended` records,
 this stderr event, and the pre-launch deny messages all carry host-local deployment detail by design.

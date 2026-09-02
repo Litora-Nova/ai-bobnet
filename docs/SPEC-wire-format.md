@@ -102,6 +102,16 @@ inventing a single character rule.
 
 If `cwd` is absent, the derived root applies.
 
+**Step 4 must be followed by a re-check of `pwd -P` against the root, before step 5.**
+Resolution at step 1 (`realpath -e`, existence required) closes the window where a
+symlink is planted at `cwd` *before* authorisation — the resolved, existence-checked
+path is compared, not a lexical guess. It does not close the window between
+authorisation and `exec`: a symlink swapped in at the already-authorised path after
+step 2 and before step 4 would still redirect the `cd`. The re-check at step 4 catches
+exactly that swap, inside the same enactment that installs Landlock — a check
+performed anywhere earlier, or skipped, leaves the window open one step later than
+where slice 2 closed it.
+
 ## `timeout` — TWO checks are missing, not one
 
 §3 states that the broker caps `timeout` and that "resource authority does not belong to the caller".
