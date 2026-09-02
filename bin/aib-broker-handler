@@ -17,6 +17,17 @@
 #   - The wrapper's extra refusal of --sandbox danger-full-access. The PDP's own
 #     clamp-to-capability is the contracted behaviour (§3) and stays a clamp, not a
 #     refusal (SPEC-wire-format, "Assurances that must move with authorize").
+#
+# OBLIGATION FOR SLICE 3 (gate delta D2, Ikarus, stated now so it cannot be forgotten):
+# aib_contain_cwd closes the window where a symlink is planted at a cwd BEFORE this
+# handler authorises it (resolution now requires existence, realpath -e, which fully
+# resolves symlinks). It does NOT close the window where a symlink is swapped in
+# AFTER authorisation and BEFORE the provider actually starts — this handler and the
+# PDP both run well before enactment exists. Whoever performs step 4 (`cd`) of
+# SPEC-wire-format's five-step containment order MUST re-check `pwd -P` against the
+# registry-derived root before step 5 (`exec`), inside the same enactment that
+# installs Landlock. A re-check anywhere earlier than immediately-before-exec still
+# leaves a window; a re-check skipped entirely reopens D2 one step later.
 set -uo pipefail
 
 AIB_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
@@ -31,7 +42,10 @@ fi
 
 case "${AIB_REQ_OP:-}" in
   launch) : ;;
-  *) aib_wire_write_response denied "reason=unknown_operation"; exit 2 ;;
+  # Gate delta (should-fix LOW, Riker): exit 3 for every `denied`, exit 2 for every
+  # `error` — the discipline this diff formalises everywhere else in this file. This
+  # was the one denied answer still exiting 2, a leftover from slice 1.
+  *) aib_wire_write_response denied "reason=unknown_operation"; exit 3 ;;
 esac
 
 # --- resolve the snapshot from the BROKER'S OWN registry (§2), never the caller's ---
@@ -102,8 +116,17 @@ _snapshot="${_resolve_out#*$'\n'}"
 # request (SPEC-wire-format). cwd only selects where inside that fixed area the child
 # starts; outside it, the request is a rejection, not a security problem needing a
 # character-class rule.
+#
+# RM-3 slice 2 delta (gate finding, Ikarus D2): aib_contain_cwd now requires cwd to
+# EXIST (realpath -e) and distinguishes why it refused, via AIB_CONTAIN_CWD_REASON.
+# A cwd that simply does not exist is a distinct, nameable outcome from one that
+# exists but sits outside the root — collapsing them into one reason would hide which
+# problem the caller actually has.
 if ! aib_contain_cwd "$_home" "${AIB_REQ_CWD:-}"; then
-  aib_wire_write_response denied "reason=cwd_outside_root"
+  case "${AIB_CONTAIN_CWD_REASON:-}" in
+    not_found) aib_wire_write_response denied "reason=cwd_not_found" ;;
+    *)         aib_wire_write_response denied "reason=cwd_outside_root" ;;
+  esac
   exit 3
 fi
 
