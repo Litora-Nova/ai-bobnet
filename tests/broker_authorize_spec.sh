@@ -78,6 +78,27 @@ then no "a NUL inside a prompt-only frame is refused"
 else ok "a NUL inside a prompt-only frame is refused"
 fi
 
+# ADDED (gate delta R1, Ikarus HIGH: same class as D1, the OTHER path through this
+# function): a NUL inside a RECORD-LINE TOKEN was silently dropped by `read -r` per
+# line, before the control-character check ever saw it — `agent_uid=acme-<NUL>dev`
+# arrived as the different token "acme-dev". Ikarus' exact repro below returned
+# rc=0 agent_uid=<acme-dev>.
+if { printf 'op=launch\nagent_uid=acme-'; printf '\0'; printf 'dev\nprompt_bytes=2\n\nhi'; } \
+   | ( aib_wire_read_request ) >/dev/null 2>&1
+then no "Ikarus' exact NUL-in-record-line-token frame is refused"
+else ok "Ikarus' exact NUL-in-record-line-token frame is refused"
+fi
+if { printf 'op=lau'; printf '\0'; printf 'nch\nagent_uid=acme-dev\nprompt_bytes=2\n\nhi'; } \
+   | ( aib_wire_read_request ) >/dev/null 2>&1
+then no "a NUL inside the op= token is refused"
+else ok "a NUL inside the op= token is refused"
+fi
+if { printf 'op=launch\nagent_uid=acme-dev\nprompt_bytes=1'; printf '\0'; printf '\n\nhi'; } \
+   | ( aib_wire_read_request ) >/dev/null 2>&1
+then no "a NUL inside a _bytes header value is refused"
+else ok "a NUL inside a _bytes header value is refused"
+fi
+
 # --- 2. sandbox is an enum at the wire, narrower than the token rule ----------
 if printf 'op=launch\nagent_uid=acme-dev\nsandbox=wide-open\nprompt_bytes=2\n\nhi' \
    | ( aib_wire_read_request ) >/dev/null 2>&1; then no "an unknown sandbox value is refused"; else ok "an unknown sandbox value is refused"; fi
