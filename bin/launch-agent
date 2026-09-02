@@ -220,6 +220,16 @@ fi
 adapter_path="$AIB_VERDICT_ADAPTER_PATH"
 sandbox="$AIB_VERDICT_EFFECTIVE_SANDBOX"
 eff_effort="$AIB_VERDICT_EFFECTIVE_EFFORT"
+# Gate delta D4 (Ikarus, HIGH): the watchdog below sleeps $timeout_s, and the
+# timeout/failure heartbeat and die messages print it — all of that must reflect the
+# CAPPED authority, never the caller-requested value, or the audit trail (and the
+# watchdog itself) would claim a cap the process does not actually enforce. This is
+# the same clamp-not-max rule §3 states for every other effective value; timeout was
+# simply never reassigned to its effective form the way sandbox/effort are above.
+timeout_s="$AIB_VERDICT_EFFECTIVE_TIMEOUT"
+# Cheap, non-blocking observability for the capped value (never printed by waiting
+# for an actual timeout): the PDP verdict is final before any provider process starts.
+printf 'effective_timeout=%s\n' "$timeout_s" >&2
 
 # The PEP drives only a codex-CLI-shaped adapter. The pure PDP cannot derive that
 # launcher-specific argv support from its frozen snapshot, so B1 uses option (b):
