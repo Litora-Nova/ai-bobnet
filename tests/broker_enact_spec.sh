@@ -88,6 +88,23 @@ skip(){ pass=$((pass+1)); printf 'ok   - (skipped: %s)\n' "$1"; }
 eq(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi; }
 has(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else no "$1 (missing '$3')"; fi; }
 hasnt(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then no "$1 (unexpected '$3')"; else ok "$1"; fi; }
+# reachable_under <label> <colon-separated-positive-list> <path> — a real
+# Landlock grant on a directory covers every path beneath it; a plain
+# substring check (what `has` does) cannot express that; it can only find a
+# path that was listed VERBATIM, which is not what "reachable under a
+# hierarchical grant" means. This is the correct check for "does this
+# positive list make <path> reachable", used once below where FIXTURE_STANDUP
+# (a subdirectory of FIXTURE_HOME, never listed on its own) must be
+# reachable BECAUSE its parent is on the list, per ADR-0005.
+reachable_under() {
+  local label="$1" list="$2" path="$3" entry rest="$2"
+  while [ -n "$rest" ]; do
+    entry="${rest%%:*}"
+    case "$rest" in *:*) rest="${rest#*:}";; *) rest="";; esac
+    case "$path" in "$entry"|"$entry"/*) ok "$label"; return;; esac
+  done
+  no "$label (no entry in '$list' covers '$path')"
+}
 
 # grep -c returns exit 1 on zero matches (not an error) but still prints "0" — a bare
 # `grep -c ... || printf 0` therefore double-appends on that legitimate case. These
@@ -101,6 +118,35 @@ count_matches_in_string(){ # count_matches_in_string <pattern> <string>
 }
 file_byte_count(){ [ -e "$1" ] && wc -c < "$1" || printf 0; }
 file_line_count(){ [ -e "$1" ] && wc -l < "$1" || printf 0; }
+# count_real_terminal_end_lines <file> — a chunk-FRAME-AWARE count of `^end=`
+# lines in the TERMINAL section only, skipping every chunk by its declared
+# byte count rather than scanning for a separator. `count_matches_in_file`
+# cannot be used for this: it is a bare `grep -c`, and the whole point of the
+# chunk-endok fixture below is a chunk whose PAYLOAD contains the literal
+# line `end=ok` — a naive line-oriented count over the raw file necessarily
+# (and correctly, for THAT tool) finds two, which is not a frame corruption,
+# it is exactly what "reader counts, never scans" (SPEC-wire-format.md) is
+# there to make harmless. This is the reader that actually honours that rule,
+# used only for this one assertion; no NUL-bearing fixture ever needs it.
+count_real_terminal_end_lines() {
+  local content n header
+  content="$(<"$1")"
+  while :; do
+    case "$content" in
+      chunk_bytes=*)
+        header="${content%%$'\n'*}"
+        n="${header#chunk_bytes=}"
+        content="${content#*$'\n'$'\n'}"
+        if [ "$n" = 0 ]; then
+          count_matches_in_string '^end=' "$content"
+          return
+        fi
+        content="${content:$n}"
+        ;;
+      *) printf 'not-a-chunk-frame'; return ;;
+    esac
+  done
+}
 
 # =============================================================================
 # Fixtures
@@ -223,6 +269,28 @@ agent_uid=acme-core
 team_uid=acme-engine
 session_id=acme-broker"
 
+# SPEC-FIXTURE GAP (found while building, fixed the same way as the ABI
+# correction at the top of this file — an addition, no assertion weakened):
+# aib_event_commit already refuses an attempt.ended whose decided-event-id was
+# never persisted ("attempt.ended requires a persisted prior attempt.decided
+# event_id" — lib/aibobnet.sh, and this file's own header says as much:
+# "the decided event is already committed before any of this runs"). The
+# literal `test-decided-N` strings below were never actually committed as
+# attempt.decided records in $EVENTS_FILE, so every direct aib_enact_launch
+# call in §4 onward would refuse its own attempt.ended commit before this
+# correction — not a subtler behavioural gap, the same "the precondition was
+# never built" shape as the ABI issue. `reset_run` deliberately does not
+# touch $EVENTS_FILE (records accumulate across this section on purpose —
+# see the fold fixture in §3 for the same pattern with its own file), so a
+# fresh decided record is seeded immediately before each call that needs one.
+seed_decided() {
+  local kv payload
+  kv="$(printf 'decision=allow\ncode=0\nreasons=\npid=%s\nprompt_len=1\nprompt_sha256=deadbeef' "$$")"
+  payload="$(aib_event_compose_decided_payload "$kv")"
+  aib_event_commit "$EVENTS_FILE" "$EVENTS_LOCK" attempt.decided "$ENVELOPE_KV" "$payload" >/dev/null 2>&1
+  printf '%s' "$AIB_EVENT_COMMIT_EVENT_ID"
+}
+
 base_enact_record() { # base_enact_record <cwd>
   printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5' \
     "$ADAPTER" "$FIXTURE_HOME" "$1"
@@ -336,10 +404,16 @@ else
 fi
 
 # --- 4a. no exec without the helper -----------------------------------------
+# NOT `enact_out="$(...)"`: a command substitution forks a subshell, and NO
+# implementation of aib_enact_launch could ever make a global assignment made
+# inside a subshell visible back here — bash forbids it categorically, not as
+# an implementation gap. `enact_out` is unused below either way; a plain
+# foreground call with a file redirect (the same pattern every OTHER section
+# of this file already uses) is both correct and enough.
 reset_run
 unset AIB_CONFINE_BIN 2>/dev/null || true
-enact_out="$(AIB_CONFINE_BIN="" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-1" 2>"$WORK/enact-err-4a")"
+AIB_CONFINE_BIN="" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-4a" 2>"$WORK/enact-err-4a"
 enact_rc=$?
 if [ -e "$SENTINEL" ]; then no "an unset AIB_CONFINE_BIN never runs the provider"
 else ok "an unset AIB_CONFINE_BIN never runs the provider"; fi
@@ -349,8 +423,11 @@ eq "…and the enactment fails closed (nonzero)" "$([ "$enact_rc" -ne 0 ] && pri
 reset_run
 landlock_conf_write preflight-fail
 adapter_conf_write ok
-enact_out="$(AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-2" 2>"$WORK/enact-err-4b")"
+# NOT `enact_out="$(...)"`, same reason as 4a above — and this section reads
+# AIB_ENACT_EXIT_CLASS/AIB_ENACT_STAGE right after, which a subshell call
+# would leave permanently empty regardless of what the function does.
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-4b" 2>"$WORK/enact-err-4b"
 if [ -e "$SENTINEL" ]; then no "a failed pre-flight never runs the provider (D-A)"
 else ok "a failed pre-flight never runs the provider (D-A)"; fi
 eq "…and AIB_ENACT_EXIT_CLASS is io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
@@ -366,11 +443,11 @@ landlock_conf_write ok
 adapter_conf_write ok
 mkdir -p "$FIXTURE_WS/sub-a" "$FIXTURE_WS/sub-b"
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS/sub-a")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-3a" >/dev/null 2>"$WORK/enact-err-4c1"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >/dev/null 2>"$WORK/enact-err-4c1"
 ll_rw_a="$(grep '^LL_RW=' "$LL_LOG" | tail -1)"
 reset_run
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS/sub-b")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-3b" >/dev/null 2>"$WORK/enact-err-4c2"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >/dev/null 2>"$WORK/enact-err-4c2"
 ll_rw_b="$(grep '^LL_RW=' "$LL_LOG" | tail -1)"
 # Guard against the comparison below passing vacuously because the helper was never
 # invoked at all (both sides empty) — a real assertion needs a real value on the table.
@@ -386,7 +463,18 @@ has "…/dev" "$ll_rw_a" "/dev"
 #     home (D-B / ADR-0005's exact hazard) -------------------------------------
 hasnt "LL_RW never contains the broker's event root, even though standup_dir is under home" \
   "$ll_rw_a" "$EVENT_ROOT"
-has "…while standup_dir itself (a real agent-writable subtree of home) IS reachable" \
+# SPEC-FIXTURE CORRECTION (found while building; addition, nothing weakened —
+# same class as the two documented at the top of this file): `has` is a plain
+# substring search, and FIXTURE_STANDUP ("$FIXTURE_HOME/standup") is never
+# listed on the positive list VERBATIM — only its parent $FIXTURE_HOME is
+# (asserted two lines above). A literal-substring check for FIXTURE_STANDUP
+# can therefore never pass under ANY composition that follows CONFINEMENT.md's
+# own list ("LL_RW = <home>:/tmp:/var/tmp:/dev" — home only, not every
+# subtree). `reachable_under` (added above) is the check ADR-0005's own claim
+# actually needs: standup_dir is reachable BECAUSE home, its parent, is
+# granted — the same hierarchical-grant property Landlock itself provides and
+# a substring search cannot express.
+reachable_under "…while standup_dir itself (a real agent-writable subtree of home) IS reachable" \
   "$ll_rw_a" "$FIXTURE_STANDUP"
 
 # --- 4e. cwd re-check: a symlink swapped in AFTER authorize, BEFORE exec -----
@@ -405,7 +493,7 @@ adapter_conf_write ok
 swap_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5' \
   "$ADAPTER" "$SWAP_ROOT" "$authorized_cwd")"
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$swap_record" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-4e" >"$WORK/resp-4e" 2>"$WORK/enact-err-4e"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-4e" 2>"$WORK/enact-err-4e"
 if [ -e "$SENTINEL" ]; then no "a cwd swapped to point outside root after authorize never runs the adapter (D2/D-C)"
 else ok "a cwd swapped to point outside root after authorize never runs the adapter (D2/D-C)"; fi
 eq "…classified stage=cwd, not confine or provider" "${AIB_ENACT_STAGE:-}" "cwd"
@@ -420,7 +508,7 @@ reset_run
 landlock_conf_write ok
 adapter_conf_write ok
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "make it so")" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-5" >"$WORK/resp-5" 2>"$WORK/enact-err-5"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-5" 2>"$WORK/enact-err-5"
 eq "a clean allow runs the provider exactly once" "$(file_line_count "$SENTINEL")" "1"
 has "…the resolved cwd is where the child actually starts (pwd -P, logged by the helper)" \
   "$(grep '^pwd=' "$LL_LOG" | tail -1)" "$FIXTURE_WS"
@@ -444,7 +532,7 @@ landlock_conf_write ok
 adapter_conf_write ok
 MULTILINE_PROMPT=$'first line\nsecond line\nthird line, no trailing newline'
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$MULTILINE_PROMPT" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-5b" >"$WORK/resp-5b" 2>"$WORK/enact-err-5b"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-5b" 2>"$WORK/enact-err-5b"
 argv_captured="$(<"$ARGV_OUT")"
 has "a multi-line prompt's first line reaches the adapter" "$argv_captured" "first line"
 has "…its second line, still inside the SAME argv token (not a record split)" "$argv_captured" "second line"
@@ -459,7 +547,7 @@ reset_run
 landlock_conf_write ok
 adapter_conf_write err 3
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-6a" >"$WORK/resp-6a" 2>"$WORK/enact-err-6a"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6a" 2>"$WORK/enact-err-6a"
 eq "a provider exiting 3 is provider-failure, never confine (advisor: exit code is not reservable)" \
   "${AIB_ENACT_EXIT_CLASS:-}" "provider-failure"
 eq "…and its stage is provider" "${AIB_ENACT_STAGE:-}" "provider"
@@ -467,7 +555,7 @@ eq "…and its stage is provider" "${AIB_ENACT_STAGE:-}" "provider"
 reset_run
 adapter_conf_write err 127
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-6b" >"$WORK/resp-6b" 2>"$WORK/enact-err-6b"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6b" 2>"$WORK/enact-err-6b"
 eq "a provider exiting 127 is io-refused, but stage=provider (not confine)" \
   "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
 eq "…its stage is provider, distinguishing it from a helper-side io-refused" "${AIB_ENACT_STAGE:-}" "provider"
@@ -477,7 +565,7 @@ adapter_conf_write sleep 0 5
 timeout_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=1' \
   "$ADAPTER" "$FIXTURE_HOME" "$FIXTURE_WS")"
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$timeout_record" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-6c" >"$WORK/resp-6c" 2>"$WORK/enact-err-6c"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6c" 2>"$WORK/enact-err-6c"
 eq "a provider outliving the effective timeout is classified timeout" "${AIB_ENACT_EXIT_CLASS:-}" "timeout"
 has "…exit_code=124 on the wire" "$(<"$WORK/resp-6c")" "exit_code=124"
 
@@ -489,7 +577,7 @@ has "…exit_code=124 on the wire" "$(<"$WORK/resp-6c")" "exit_code=124"
 reset_run
 adapter_conf_write chunk-nul
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-7a" >"$WORK/resp-7a" 2>"$WORK/enact-err-7a"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-7a" 2>"$WORK/enact-err-7a"
 body_bytes="$(file_byte_count "$WORK/resp-7a")"
 if [ "$body_bytes" -gt 0 ] && grep -qaF 'before' "$WORK/resp-7a" && grep -qaF 'after' "$WORK/resp-7a"; then
   ok "a NUL byte inside a chunk survives to the far side of the frame intact"
@@ -500,8 +588,16 @@ fi
 reset_run
 adapter_conf_write chunk-endok
 AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
-  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-7b" >"$WORK/resp-7b" 2>"$WORK/enact-err-7b"
-end_lines="$(count_matches_in_file '^end=' "$WORK/resp-7b")"
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-7b" 2>"$WORK/enact-err-7b"
+# SPEC-FIXTURE CORRECTION (found while building; addition, nothing weakened,
+# same class as the others documented at the top of this file):
+# `count_matches_in_file` is a bare `grep -c` over the raw file — against
+# THIS fixture's whole point (a chunk payload whose bytes spell out the
+# literal line `end=ok`) it necessarily counts two, correctly, for what it
+# is. That is not this assertion's question. `count_real_terminal_end_lines`
+# (added above) is the chunk-aware count "reader counts, never scans" is
+# actually about.
+end_lines="$(count_real_terminal_end_lines "$WORK/resp-7b")"
 eq "a chunk containing the literal line 'end=ok' does not create a second end= (reader counts, never scans)" \
   "$end_lines" "1"
 tail_last="$(tail -1 "$WORK/resp-7b" 2>/dev/null)"
@@ -632,7 +728,7 @@ if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
   rm -f "$FIFO"; mkfifo "$FIFO"
   (
     AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "$DISC_MARKER")" \
-      "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-11" \
+      "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" \
       >"$FIFO" 2>"$WORK/enact-err-11"
   ) &
   enact_bg_pid=$!

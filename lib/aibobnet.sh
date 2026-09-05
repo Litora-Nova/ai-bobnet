@@ -1754,6 +1754,304 @@ aib_enact_launch__run_direct() {
   _aib_enact_cleanup_direct
 }
 
+# --- confined mode: §2.1 confinement, response-frame chunks + terminal lines --
+aib_enact_launch__run_confined() {
+  local _dd_bin _timeout_bin _mkfifo_bin _realpath_bin _python_bin
+  _dd_bin="$(command -v dd)" || aib_die 6 "required runtime dependency not found: dd (coreutils)"
+  _timeout_bin="$(command -v timeout)" || aib_die 6 "required runtime dependency not found: timeout (coreutils)"
+  _mkfifo_bin="$(command -v mkfifo)" || aib_die 6 "required runtime dependency not found: mkfifo (coreutils)"
+  _realpath_bin="$(command -v realpath)" || aib_die 6 "required runtime dependency not found: realpath (coreutils)"
+  _python_bin="$(command -v python3 2>/dev/null || true)"
+
+  # --- D-A / D-A2: pre-flight, before ANYTHING else runs -----------------------
+  local _preflight_tmp _preflight_rc=1
+  if [ -n "${AIB_CONFINE_BIN:-}" ] && [ -x "$AIB_CONFINE_BIN" ]; then
+    _preflight_tmp="$("$_mktemp_bin" -d "${TMPDIR:-/tmp}/aibobnet-preflight.XXXXXX")" || aib_die 2 "cannot create pre-flight tmp dir"
+    LL_RO=/ LL_RW="$_preflight_tmp" "$AIB_CONFINE_BIN" /bin/true >/dev/null 2>&1
+    _preflight_rc=$?
+    rm -rf "$_preflight_tmp" 2>/dev/null || true
+  fi
+  if [ "$_preflight_rc" -ne 0 ]; then
+    _aib_enact_commit_ended io-refused confine 126
+    printf 'chunk_bytes=0\n\n'
+    aib_enact_launch__write_terminal
+    return 0
+  fi
+
+  # --- D-B2: positive lists, registry + constants only, request contributes nothing ---
+  local ll_ro="/" ll_rw="${resolved_root}:/tmp:/var/tmp:/dev"
+
+  local _internal_fifo _status_file _cwd_fail_marker _provider_status_file
+  _internal_fifo="$("$_mktemp_bin" -u "${TMPDIR:-/tmp}/aibobnet-relay.XXXXXX")"
+  "$_mkfifo_bin" "$_internal_fifo" || aib_die 2 "cannot create relay fifo"
+  _status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-status.XXXXXX")" || aib_die 2 "cannot create status buffer"
+  _cwd_fail_marker="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-cwdfail.XXXXXX")" || aib_die 2 "cannot create cwd-check marker"
+  _provider_status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-provstatus.XXXXXX")" || aib_die 2 "cannot create provider status buffer"
+  : > "$_cwd_fail_marker"
+
+  _aib_enact_cleanup_confined() {
+    rm -f -- "$_internal_fifo" "$_status_file" "$_cwd_fail_marker" "$_provider_status_file" 2>/dev/null || true
+  }
+
+  _aib_enact_exec_child_confined() {
+    exec "$_env_bin" -i "${_child_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" "LL_STATUS_FD=9" \
+      "$AIB_CONFINE_BIN" "$adapter" exec \
+      -m "$model" -s "$sandbox" \
+      -c "model_reasoning_effort=\"$effort\"" \
+      -c 'approval_policy="never"' \
+      -- "$prompt"
+  }
+
+  local _provider_manager_pid manager_pid_ref
+  _aib_enact_manager_confined() {
+    set +e
+    local provider_pid="" timer_pid="" killer_pid="" provider_rc=1 confirmed_rc=1
+    local timed_out=0 aborted_disc=0 wait_interrupted=0
+    local manager_pid="$BASHPID"
+
+    _aib_enact_forward() { local sig="$1"; wait_interrupted=1; [ -z "$provider_pid" ] || kill -s "$sig" "$provider_pid" 2>/dev/null || true; }
+    _aib_enact_escalate() {
+      [ -z "$provider_pid" ] || kill -TERM "$provider_pid" 2>/dev/null || true
+      if [ -n "$provider_pid" ]; then
+        # >&- : this job outlives the provider by design (the whole point of
+        # a 10s grace timer) and must not hold the relay fifo's write end
+        # open a moment past the provider's own real exit — a bystander fd
+        # on a pipe with no other writer left still blocks EOF for the
+        # reader on the far side (verified empirically: without this, the
+        # relay loop for a fast-exiting provider blocks until $timeout_s,
+        # not until the provider actually finished).
+        ( "$_sleep_bin" 10; kill -KILL "$provider_pid" 2>/dev/null || true ) >&- 2>&- &
+        killer_pid=$!
+      fi
+    }
+    _aib_enact_on_timeout() { timed_out=1; wait_interrupted=1; _aib_enact_escalate; }
+    _aib_enact_on_disconnect() { aborted_disc=1; wait_interrupted=1; _aib_enact_escalate; }
+    trap '_aib_enact_forward HUP' HUP
+    trap '_aib_enact_forward INT' INT
+    trap '_aib_enact_forward TERM' TERM
+    trap '_aib_enact_on_timeout' USR1
+    trap '_aib_enact_on_disconnect' USR2
+
+    if ! cd "$cwd_req" 2>/dev/null; then
+      printf 'cwd_moved\n' > "$_cwd_fail_marker" 2>/dev/null
+      exit 126
+    fi
+    case "$(pwd -P)" in
+      "$resolved_root"|"$resolved_root"/*) : ;;
+      *) printf 'cwd_moved\n' > "$_cwd_fail_marker" 2>/dev/null; exit 126 ;;
+    esac
+
+    _aib_enact_exec_child_confined 9>"$_status_file" &
+    provider_pid=$!
+    # >&- : same reasoning as the killer job above — this timer outlives a
+    # fast provider by design and must not be an extra open writer on the
+    # relay fifo once the provider itself is done with it.
+    ( "$_sleep_bin" "$timeout_s"; kill -USR1 "$manager_pid" 2>/dev/null || true ) >&- 2>&- &
+    timer_pid=$!
+
+    wait "$provider_pid"
+    provider_rc=$?
+    if [ "$wait_interrupted" -eq 1 ]; then
+      while kill -0 "$provider_pid" 2>/dev/null; do
+        wait "$provider_pid"
+        confirmed_rc=$?
+        [ "$confirmed_rc" -eq 127 ] || provider_rc="$confirmed_rc"
+        kill -0 "$provider_pid" 2>/dev/null && "$_sleep_bin" 0.01
+      done
+    fi
+
+    kill "$timer_pid" 2>/dev/null || true
+    wait "$timer_pid" 2>/dev/null || true
+    if [ -n "$killer_pid" ]; then kill "$killer_pid" 2>/dev/null || true; wait "$killer_pid" 2>/dev/null || true; fi
+    if [ "$aborted_disc" -eq 1 ]; then provider_rc=143
+    elif [ "$timed_out" -eq 1 ]; then provider_rc=124
+    fi
+    printf '%s\n' "$provider_rc" > "$_provider_status_file" || exit 125
+    exit "$provider_rc"
+  }
+
+  # _aib_enact_conn_alive — best-effort liveness probe of OUR OWN stdout (the
+  # connection), WITHOUT writing a byte: a poll(2) for POLLERR/POLLHUP. Bash has
+  # no poll/select builtin, and a zero-length write(2) never raises EPIPE on
+  # Linux (verified empirically — POSIX explicitly permits skipping error
+  # detection for a zero-length write, and this host's kernel takes that
+  # option), so "the next write" alone cannot detect a disconnect while the
+  # provider stays completely silent (docs/CONFINEMENT.md's silent-hang fixture).
+  # Falls back to "assume alive" (next-write detection only) when python3 is
+  # absent — a documented, graceful degradation, never a hard dependency.
+  _aib_enact_conn_alive() {
+    [ -n "$_python_bin" ] || return 0
+    "$_python_bin" -c '
+import select, sys
+try:
+    p = select.poll()
+    p.register(1, select.POLLOUT | select.POLLERR | select.POLLHUP)
+    for _fd, ev in p.poll(0):
+        if ev & (select.POLLERR | select.POLLHUP):
+            sys.exit(1)
+except Exception:
+    pass
+sys.exit(0)
+' 2>/dev/null
+  }
+
+  # --- wrapper-level safety net, same reasoning as the direct-mode one above:
+  # a signal reaching THIS connection's process (bin/aib-broker-handler) while
+  # the manager is still running must not strand the attempt `presumed-dead`
+  # or orphan the confined child. Reuses the disconnect-abort escalation
+  # (USR2) rather than duplicating a second TERM-then-KILL timer.
+  _aib_enact_signal_handler_confined() {
+    trap - EXIT INT TERM HUP
+    local original_status="$2"
+    if [ "$_terminal_written" -eq 0 ] && [ -n "$_provider_manager_pid" ]; then
+      kill -USR2 "$_provider_manager_pid" 2>/dev/null || true
+      wait "$_provider_manager_pid" 2>/dev/null || true
+      _aib_enact_commit_ended aborted provider "" TERM
+    fi
+    _aib_enact_cleanup_confined
+    exit "$original_status"
+  }
+  _aib_enact_exit_handler_confined() {
+    trap - EXIT INT TERM HUP
+    local original_status="$1"
+    if [ "$_terminal_written" -eq 0 ] && [ -n "$_provider_manager_pid" ]; then
+      kill -USR2 "$_provider_manager_pid" 2>/dev/null || true
+      wait "$_provider_manager_pid" 2>/dev/null || true
+      _aib_enact_commit_ended aborted provider "" TERM
+    fi
+    _aib_enact_cleanup_confined
+    exit "$original_status"
+  }
+  trap '_aib_enact_exit_handler_confined "$?"' EXIT
+  trap '_aib_enact_signal_handler_confined HUP "$?"' HUP
+  trap '_aib_enact_signal_handler_confined INT "$?"' INT
+  trap '_aib_enact_signal_handler_confined TERM "$?"' TERM
+
+  trap '' PIPE
+  local _had_errexit=0
+  case $- in *e*) _had_errexit=1;; esac
+  set +e
+  # NOT `2>&1`: the confinement helper's own pre-exec diagnostics land on
+  # fd2, and CONFINEMENT.md requires those to reach the broker's journal —
+  # "never merged into the provider's output stream and never appear in the
+  # wire response". The real unit already gives fd2 that home
+  # (`StandardError=journal` alongside `StandardOutput=socket`,
+  # deploy/systemd/aib-broker@.service): fd2 here is simply left as whatever
+  # this process already inherited, never redirected into the relay fifo.
+  # Only fd1 (the provider's stdout, once the helper's execvp hands off) is
+  # this function's job to relay.
+  _aib_enact_manager_confined >"$_internal_fifo" &
+  _provider_manager_pid=$!
+
+  local _relay_fd
+  exec {_relay_fd}<"$_internal_fifo"
+
+  local _chunk_tmp _disconnected=0
+  _chunk_tmp="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-chunk.XXXXXX")" || aib_die 2 "cannot create chunk buffer"
+  while :; do
+    : > "$_chunk_tmp"
+    # NOT `if=/dev/fd/$_relay_fd`: re-opening a fifo BY PATH through the
+    # /proc/self/fd magic-link — which is what an `if=` argument forces dd to
+    # do — starts a FRESH open() on the underlying fifo, which then waits for
+    # its OWN new writer forever, even after the real writer has already
+    # closed (verified empirically on this host: it hangs past a 0.3s
+    # `timeout` with the writer long gone). Redirecting the ALREADY-OPEN fd
+    # onto dd's stdin is a plain fd inheritance, not a fresh open, and sees
+    # EOF exactly when the writer closes, as it must.
+    "$_timeout_bin" 0.3 "$_dd_bin" of="$_chunk_tmp" bs=65536 count=1 status=none 2>/dev/null <&"$_relay_fd"
+    local _dd_rc=$? _n
+    _n="$("$_wc_bin" -c < "$_chunk_tmp")"
+    if [ "$_dd_rc" -eq 124 ]; then
+      # Idle tick: the provider produced nothing this round. The one moment a
+      # permanently silent provider (docs/CONFINEMENT.md's D-I fixture) can
+      # ever notice a gone client — see _aib_enact_conn_alive above.
+      if ! _aib_enact_conn_alive; then
+        _disconnected=1
+        kill -USR2 "$_provider_manager_pid" 2>/dev/null || true
+        break
+      fi
+      continue
+    fi
+    if [ "$_n" -eq 0 ]; then
+      break # true EOF: the provider's output side closed.
+    fi
+    if ! { printf 'chunk_bytes=%s\n\n' "$_n" && "$_cat_bin" "$_chunk_tmp"; } 2>/dev/null; then
+      _disconnected=1
+      kill -USR2 "$_provider_manager_pid" 2>/dev/null || true
+      break
+    fi
+  done
+  exec {_relay_fd}<&-
+  rm -f -- "$_chunk_tmp" 2>/dev/null || true
+
+  local wait_status
+  wait "$_provider_manager_pid"
+  wait_status=$?
+  local _provider_status="$wait_status" _provider_status_confirmed=0
+  if [ -r "$_provider_status_file" ]; then
+    IFS= read -r _provider_status < "$_provider_status_file"
+    case "$_provider_status" in ''|*[!0-9]*) _provider_status="$wait_status";; *) _provider_status_confirmed=1;; esac
+  fi
+  [ "$_had_errexit" -eq 0 ] || set -e
+  trap - EXIT INT TERM HUP
+
+  if [ "$_disconnected" -eq 1 ]; then
+    _aib_enact_commit_ended aborted provider "" TERM
+  elif [ -s "$_cwd_fail_marker" ]; then
+    _aib_enact_commit_ended io-refused cwd 126
+  elif [ "$_provider_status_confirmed" -ne 1 ]; then
+    _aib_enact_cleanup_confined
+    aib_die 2 "provider exited without a confirmed reaped status"
+  elif [ -s "$_status_file" ]; then
+    # Non-empty LL_STATUS_FD: the helper never reached a running provider
+    # (docs/CONFINEMENT.md, D-A2). code 127 is the helper's OWN "execvp itself
+    # failed" convention (CONTRACT-execution-binding.md §8.1's "(helper exit
+    # 127)" parenthetical) — anything else is a pre-exec ruleset/prctl refusal.
+    if [ "$_provider_status" -eq 127 ]; then
+      _aib_enact_commit_ended io-refused exec 127
+    else
+      _aib_enact_commit_ended io-refused confine 126
+    fi
+  else
+    _aib_enact_map_status "$_provider_status"
+  fi
+
+  # A disconnected client already got the abort it earned; nothing further on
+  # the wire could reach it, and every attempt would just re-discover the same
+  # EPIPE for no reader (D-I: "on EPIPE ... exit", not "on EPIPE ... keep
+  # writing"). The record is already committed above either way.
+  if [ "$_disconnected" -ne 1 ]; then
+    printf 'chunk_bytes=0\n\n'
+    aib_enact_launch__write_terminal
+  fi
+  trap - PIPE
+  _aib_enact_cleanup_confined
+}
+
+# aib_enact_launch__write_terminal — the terminal-line block of the response
+# frame (docs/SPEC-wire-format.md, "Response frame", §3): exit_class, exactly
+# one of exit_code=/signal= (neither, for class "ok" — matching the composer's
+# own convention of nulling both when the caller never supplies them), stage,
+# ended_event_id, and `end=ok` LAST — always "ok" here, because "end=ok on the
+# response means the broker did its job, regardless of the provider's own exit
+# class" (SPEC-wire-format.md, "Terminal lines"): a provider that failed, timed
+# out, was aborted, or was refused before it ever ran still got a correctly
+# observed-and-reported outcome. `end=error`/`end=denied` are the OTHER two
+# values that function covers, both on paths that never reach this function at
+# all (a wire-level incident, or a deny — bin/aib-broker-handler still calls
+# `aib_wire_write_response` directly for those, unchanged).
+aib_enact_launch__write_terminal() {
+  printf 'exit_class=%s\n' "$AIB_ENACT_EXIT_CLASS"
+  if [ -n "$AIB_ENACT_SIGNAL" ]; then
+    printf 'signal=%s\n' "$AIB_ENACT_SIGNAL"
+  elif [ -n "$AIB_ENACT_EXIT_CODE" ]; then
+    printf 'exit_code=%s\n' "$AIB_ENACT_EXIT_CODE"
+  fi
+  printf 'stage=%s\n' "$AIB_ENACT_STAGE"
+  printf 'ended_event_id=%s\n' "$AIB_ENACT_ENDED_EVENT_ID"
+  printf 'end=ok\n'
+}
+
 # --- top-level JSON field extractor (the shared reader primitive) -------------
 # The runtime has no general JSON parser beyond the registry awk. This is a small,
 # depth-tracking tokeniser that returns TOP-LEVEL (depth-1) string field values only —
