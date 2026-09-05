@@ -102,8 +102,10 @@ expect_targeted_failure() {
   fi
 }
 
+# 68, not 67: gate delta D5 added one assertion there (stage=exec on the
+# unsupported-provider refusal, never stage:null).
 expect_baseline_green "$SRC_ROOT/tests/managed_launch_spec.sh" \
-  "67 checks: 67 ok / 0 fail" "$WORK/clean-launch.out"
+  "68 checks: 68 ok / 0 fail" "$WORK/clean-launch.out"
 expect_baseline_green "$SRC_ROOT/tests/codex_run_spec.sh" \
   "74 checks: 74 ok / 0 fail" "$WORK/clean-codex-run.out"
 
