@@ -125,6 +125,11 @@ Then, on allow:
      `decided(allow)`, not `aborted`;
    - success: `attempt.ended(ok)`, heartbeat `done`, relay Codex output to stdout.
 
+RM-3 slice 3 adds `exit.stage` to every `attempt.ended` payload (schema version 2,
+`CONTRACT-execution-binding.md` §8.1). For this wrapper's own single-trust-domain path it is always
+`provider` — there is no confinement helper here to fail before the adapter runs, unlike
+`bin/aib-broker-handler`'s confined path, which is where `confine`/`cwd`/`exec` actually occur.
+
 The heartbeat proves that the wrapper observed a start and terminal result but stays mutable operational
 visibility. The durable proof of what the launcher decided and observed is the RM-2 `attempt.decided`/
 `attempt.ended` stream — for attempts that go through the seam; a bypassing process still leaves nothing,

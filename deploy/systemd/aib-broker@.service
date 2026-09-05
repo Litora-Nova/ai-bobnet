@@ -7,6 +7,16 @@ ExecStart=/opt/aib/engine/bin/aib-broker-handler
 User=aib-broker
 Group=aib-broker
 
+# RM-3 slice 3: unit-environment-only, per docs/CONFINEMENT.md and ADR-0005 —
+# never request- or registry-supplied. AIB_EVENT_ROOT names the broker's own
+# durable event stream location, outside every project home; AIB_CONFINE_BIN
+# is the absolute, install-time-compiled confinement helper the handler execs
+# the provider through and nothing else. Neither has a bash-level fallback if
+# omitted here: an unset AIB_EVENT_ROOT fails every launch closed
+# (reason=event_store_unavailable) rather than silently guessing a path.
+Environment=AIB_EVENT_ROOT=/var/lib/aib/events
+Environment=AIB_CONFINE_BIN=/opt/aib/engine/libexec/landlock-exec
+
 # EXPLICIT, and this is the trap: with Accept=yes systemd does NOT hand the connection to the
 # handler by itself. Measured on 2026-08-10 - without these two lines the handler received
 # nothing on stdin and wrote its answer to the journal. Six connections, six empty replies,
