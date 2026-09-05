@@ -192,10 +192,11 @@ STUB_SLEEP='$sleep_s'
 EOF
 }
 landlock_conf_write() {
-  local mode="${1:-ok}"
+  local mode="${1:-ok}" counter="${2:-}"
   cat > "$STUB_BIN/landlock.conf" <<EOF
 STUB_LL_MODE='$mode'
 STUB_LL_LOG='$LL_LOG'
+STUB_LL_COUNTER='$counter'
 EOF
 }
 
@@ -215,11 +216,37 @@ case "${STUB_LL_MODE:-ok}" in
   ok)
     # CLOEXEC on success: close the status fd, write nothing, THEN exec.
     if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
+    # D2 (gate delta): mirror the real helper's LL_STDERR_FD contract — dup2
+    # the named fd onto 2 LAST, after every diagnostic this stub itself could
+    # emit (the block above, already flushed to STUB_LL_LOG by this point).
+    if [ -n "${LL_STDERR_FD-}" ]; then eval "exec 2>&${LL_STDERR_FD}"; fi
     exec "$@"
     ;;
   preflight-fail)
     if [ -n "${LL_STATUS_FD-}" ]; then
       printf 'stub: confinement unavailable\n' >&"${LL_STATUS_FD}"
+    fi
+    exit 3
+    ;;
+  fail-second-call)
+    # Marvin (gate delta, should-fix): the pre-flight call (against a
+    # throwaway tmp dir) and the REAL launch call are two SEPARATE
+    # invocations of this same stub — succeed on the first (so the
+    # pre-flight passes and the real attempt is actually made), fail on
+    # every one after (so the post-preflight LL_STATUS_FD branch — "the
+    # helper installed confinement but failed independently of the
+    # pre-flight" — gets real coverage instead of always being caught
+    # earlier by the pre-flight itself).
+    _n=0
+    [ -f "${STUB_LL_COUNTER:-/dev/null}" ] && read -r _n < "$STUB_LL_COUNTER"
+    _n=$((_n+1))
+    printf '%s' "$_n" > "${STUB_LL_COUNTER:-/dev/null}"
+    if [ "$_n" -eq 1 ]; then
+      if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
+      exec "$@"
+    fi
+    if [ -n "${LL_STATUS_FD-}" ]; then
+      printf 'stub: restrict_self failed on the real launch\n' >&"${LL_STATUS_FD}"
     fi
     exit 3
     ;;
@@ -240,7 +267,15 @@ case "${STUB_MODE:-ok}" in
   err) printf 'stub failure\n' >&2; exit "${STUB_RC:-7}";;
   sleep) sleep "${STUB_SLEEP:-5}"; exit 0;;
   silent-hang)
-    # Proves no orphan: unique in argv/`ps` via $STUB_SENTINEL's own path.
+    # D3 (gate delta, Ikarus, HIGH): a single-process hang only tests "the
+    # direct child got killed" — the orphan class the fix targets is a
+    # GRANDCHILD surviving a single-pid TERM. Fork one, with the same
+    # marker in its own argv (so pgrep -f "$DISC_MARKER" finds it too), and
+    # hang here as well: a group-kill must catch both, a single-pid kill
+    # only ever caught the parent.
+    if [ "${1:-}" != --grandchild ]; then
+      "$0" --grandchild "$@" &
+    fi
     while :; do sleep 1; done
     ;;
   chunk-nul)
@@ -255,6 +290,20 @@ case "${STUB_MODE:-ok}" in
     if grep -qF "\"event_id\":\"${AIBOBNET_ATTEMPT_ID:-NOPE}\"" \
          "${AIBOBNET_STANDUP_DIR:-/nonexistent}/events/main.events" 2>/dev/null
     then printf 'DECIDED_FOUND\n'; else printf 'DECIDED_MISSING\n'; fi
+    exit 0
+    ;;
+  trickle)
+    # Marvin (gate delta, should-fix, Gap 5): a provider ACTIVELY producing
+    # chunks when the reader disconnects — the only existing disconnect
+    # fixture (silent-hang) never reaches a real write attempt at all, so
+    # `trap '' PIPE` and the write-checked relay loop it protects have no
+    # fixture that would notice their removal. Write real output on a fixed
+    # cadence, well past the reader's disconnect, so the relay's OWN next
+    # write (not the idle-tick poll) is what discovers the gone client.
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      printf 'trickle-%s\n' "$_i"
+      sleep 0.3
+    done
     exit 0
     ;;
 esac
@@ -345,6 +394,15 @@ exit_code=3
 stage=provider")"
 has "…for every exit class, not only confinement refusals" "$stage_payload_provider" '"stage":"provider"'
 
+# D5 (gate delta, Ikarus, MEDIUM): stage is REQUIRED, not merely accepted — a
+# missing/empty stage on a new record is a writer bug (direct-mode's two
+# pre-enactment IO-hygiene refusals were shipping stage:null), never a legal
+# "unknown". The composer fails closed rather than silently nulling it.
+( aib_event_compose_ended_payload "exit_class=ok" ) >/dev/null 2>&1
+eq "the composer refuses a missing stage, fail-closed (D5)" "$?" "2"
+( aib_event_compose_ended_payload $'exit_class=ok\nstage=' ) >/dev/null 2>&1
+eq "…and an explicitly empty stage, the same way" "$?" "2"
+
 # =============================================================================
 # 3. Old + new event schema fold (D-K) — a version-1 record and a hand-built
 #    version-2 record (exit.stage present) in the SAME stream, both foldable.
@@ -366,7 +424,12 @@ prompt_len=1
 prompt_sha256=deadbeef")"
 aib_event_commit "$FOLD_EVENTS" "$FOLD_LOCK" attempt.decided "$fold_envelope" "$old_decided_payload" >/dev/null 2>&1
 old_decided_id="$AIB_EVENT_COMMIT_EVENT_ID"
-old_ended_payload="$(aib_event_compose_ended_payload "exit_class=ok")"
+# D5 (gate delta, Ikarus, MEDIUM): the composer now REFUSES a missing/empty
+# stage (fail closed) — every real writer supplies one. A genuine schema-
+# version-1 record (pre-slice-3, no stage key at all) can no longer be built
+# through the composer, so this fold fixture builds the v1 shape by hand,
+# exactly like the v2 shape two lines below already does.
+old_ended_payload='{"exit":{"class":"ok","code":null,"signal":null}}'
 AIB_EVENT_SCHEMA_VERSION=1 aib_event_commit "$FOLD_EVENTS" "$FOLD_LOCK" attempt.ended "$fold_envelope" "$old_ended_payload" "$old_decided_id" >/dev/null 2>&1
 
 new_decided_payload="$(aib_event_compose_decided_payload "decision=allow
@@ -551,6 +614,13 @@ AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE
 eq "a provider exiting 3 is provider-failure, never confine (advisor: exit code is not reservable)" \
   "${AIB_ENACT_EXIT_CLASS:-}" "provider-failure"
 eq "…and its stage is provider" "${AIB_ENACT_STAGE:-}" "provider"
+# D2 (gate delta, Ikarus, HIGH): SPEC-wire-format's "stream" is stdout AND
+# stderr, both relayed to the caller as opaque chunks — only the HELPER's own
+# diagnostics (never the provider's) stay off the wire. LL_STDERR_FD makes
+# the stub dup2 its exec target's stderr onto fd 1 last, after every line the
+# stub itself already logged to STUB_LL_LOG.
+has "…and the provider's OWN stderr reaches the wire as a chunk (D2)" "$(<"$WORK/resp-6a")" "stub failure"
+hasnt "…while the helper's own diagnostics still never do" "$(<"$WORK/resp-6a")" "landlock-exec:"
 
 reset_run
 adapter_conf_write err 127
@@ -568,6 +638,28 @@ AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$timeout_record" "$(base_prom
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6c" 2>"$WORK/enact-err-6c"
 eq "a provider outliving the effective timeout is classified timeout" "${AIB_ENACT_EXIT_CLASS:-}" "timeout"
 has "…exit_code=124 on the wire" "$(<"$WORK/resp-6c")" "exit_code=124"
+
+# --- 6d. Marvin (gate delta, should-fix): the post-preflight LL_STATUS_FD
+#     discriminator, independent of the dedicated pre-flight call ------------
+reset_run
+LL_COUNTER="$WORK/ll-call-count"
+rm -f "$LL_COUNTER"
+landlock_conf_write fail-second-call "$LL_COUNTER"
+adapter_conf_write ok
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6d" 2>"$WORK/enact-err-6d"
+if [ -e "$SENTINEL" ]; then no "a helper that fails independently AFTER a successful pre-flight never runs the adapter"
+else ok "a helper that fails independently AFTER a successful pre-flight never runs the adapter"; fi
+eq "…and is classified io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
+eq "…stage=confine, never mistaken for the provider's own exit (the discriminator this slice adds)" \
+  "${AIB_ENACT_STAGE:-}" "confine"
+has "…the pre-flight itself still targeted /bin/true, not the adapter, before this failure" \
+  "$(grep '^argv=' "$LL_LOG" | head -1)" "/bin/true"
+# Every section from here on relies on the landlock stub's config carrying
+# over from whichever section last set it (none of them re-call
+# landlock_conf_write on their own) — restore "ok" explicitly so this
+# fixture's own state does not leak into everything after it.
+landlock_conf_write ok
 
 # =============================================================================
 # 7. Chunk bytes are opaque: a NUL inside a chunk, and a chunk containing the
@@ -691,6 +783,14 @@ else
 fi
 eq "exactly one end= on the full wire response too" \
   "$(count_matches_in_string '^end=' "$resp_allow")" "1"
+# Marvin (gate delta, should-fix): ADR-0005's whole reason to exist is that
+# LL_RW must never reach the event root — the ONLY existing assertion for
+# that (§4d) runs against a bare aib_enact_launch call where AIB_EVENT_ROOT
+# was never set at all, so it could not observe the hazard either way. This
+# one drives the REAL handler, with AIB_EVENT_ROOT genuinely exported exactly
+# as the systemd unit sets it, and inspects the stub's own logged LL_RW.
+hasnt "…and LL_RW composed through the REAL handler never contains AIB_EVENT_ROOT (ADR-0005, Marvin)" \
+  "$(grep '^LL_RW=' "$LL_LOG" | tail -1)" "$EVENT_ROOT"
 
 # =============================================================================
 # 10. Broker-created heartbeat log is group-writable (D-G): a broker-owned
@@ -716,9 +816,16 @@ else
 fi
 
 # =============================================================================
-# 11. Disconnect while the provider is silent -> aborted, and the reaped child
-#     leaves no orphan (D-I). Timing-sensitive by nature (advisor: detection is
-#     on the next write); generous sleeps to keep it deterministic under load.
+# 11. Disconnect while the provider is silent -> aborted, and the reaped
+#     manager tree leaves no orphan (D-I). D3 (gate delta, Ikarus, HIGH): the
+#     original fixture used FIXED SLEEPS as its only synchronisation, and
+#     failed 57/1 under load — flaky, not just slow. This version polls two
+#     real signals instead of guessing timing: $SENTINEL (written by every
+#     stub-adapter mode, including silent-hang, before it goes silent) to
+#     know the provider actually started, and the persisted ended record
+#     (bounded poll) to know the abort actually completed, BEFORE checking
+#     for an orphan — checking concurrently with the kill would race the
+#     escalation timer.
 # =============================================================================
 if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
   reset_run
@@ -726,20 +833,37 @@ if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
   adapter_conf_write silent-hang
   FIFO="$WORK/resp-fifo"
   rm -f "$FIFO"; mkfifo "$FIFO"
+  disc_decided="$(seed_decided)"
   (
     AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "$DISC_MARKER")" \
-      "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" \
+      "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$disc_decided" \
       >"$FIFO" 2>"$WORK/enact-err-11"
   ) &
   enact_bg_pid=$!
   exec 8<"$FIFO"
-  sleep 0.3        # let the provider actually start and go silent
+  disc_deadline=$((SECONDS+10))
+  while [ ! -s "$SENTINEL" ] && [ "$SECONDS" -lt "$disc_deadline" ]; do sleep 0.05; done
+  if [ -s "$SENTINEL" ]; then ok "…the provider actually started before the disconnect (deterministic sync)"
+  else no "…the provider actually started before the disconnect (deterministic sync) (never wrote its sentinel)"; fi
   exec 8<&-         # the client disconnects: reader closed, no end= ever read
-  sleep 2           # give the abort path time to notice on its next write attempt
+  disc_deadline=$((SECONDS+10))
+  disc_ended_seen=0
+  while [ "$SECONDS" -lt "$disc_deadline" ]; do
+    if aib_event_scan "$EVENTS_FILE" >/dev/null 2>&1 && \
+       printf '%s\n' "$AIB_EVENT_SCAN_ENDED_IDS" | grep -qxF "$disc_decided"; then
+      disc_ended_seen=1; break
+    fi
+    sleep 0.1
+  done
+  if [ "$disc_ended_seen" -eq 1 ]; then ok "…the ended record appears within a bounded poll after disconnect"
+  else no "…the ended record appears within a bounded poll after disconnect (timed out)"; fi
+  # pgrep runs AFTER the ended record is confirmed, never concurrently with the
+  # kill (D3) — and against BOTH the direct child and its grandchild, proving
+  # the fix is tree-wide, not single-pid.
   if pgrep -f "$DISC_MARKER" >/dev/null 2>&1; then
-    no "a client disconnect while the provider is silent leaves no orphaned provider (D-I)"
+    no "a client disconnect while the provider is silent leaves no orphaned provider, tree-wide (D-I, D3)"
   else
-    ok "a client disconnect while the provider is silent leaves no orphaned provider (D-I)"
+    ok "a client disconnect while the provider is silent leaves no orphaned provider, tree-wide (D-I, D3)"
   fi
   wait "$enact_bg_pid" 2>/dev/null || true
   fold_disc="$(aib_event_scan "$EVENTS_FILE")"
@@ -748,7 +872,100 @@ if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
 else
   skip "no pgrep/mkfifo on this host"
   skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
 fi
+
+# =============================================================================
+# 11b. Marvin (gate delta, should-fix, Gap 5): disconnect WHILE the provider
+#     is actively streaming, not silent — the other half of D-I. This is the
+#     one that actually exercises `trap '' PIPE` and the relay loop's checked
+#     write: without either, a write to the closed pipe would kill the whole
+#     function on an ordinary SIGPIPE instead of returning EPIPE.
+# =============================================================================
+if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
+  reset_run
+  TRICKLE_MARKER="$WORK/trickle-marker-$$"
+  adapter_conf_write trickle
+  FIFO2="$WORK/resp-fifo2"
+  rm -f "$FIFO2"; mkfifo "$FIFO2"
+  trickle_decided="$(seed_decided)"
+  (
+    AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "$TRICKLE_MARKER")" \
+      "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$trickle_decided" \
+      >"$FIFO2" 2>"$WORK/enact-err-11b"
+  ) &
+  trickle_bg_pid=$!
+  exec 9<"$FIFO2"
+  # Read exactly the FIRST chunk header + its bytes (deterministic: the
+  # adapter writes "trickle-1\n" then sleeps, well before writing more), then
+  # disconnect while it is still mid-stream.
+  IFS= read -r _hdr <&9
+  case "$_hdr" in
+    chunk_bytes=*) : ;;
+    *) no "trickle fixture: unexpected first line '$_hdr'" ;;
+  esac
+  IFS= read -r _blank <&9 || true
+  IFS= read -r _first_chunk_line <&9 || true
+  exec 9<&-   # disconnect mid-stream, provider still producing output
+  trickle_deadline=$((SECONDS+10))
+  trickle_ended_seen=0
+  while [ "$SECONDS" -lt "$trickle_deadline" ]; do
+    if aib_event_scan "$EVENTS_FILE" >/dev/null 2>&1 && \
+       printf '%s\n' "$AIB_EVENT_SCAN_ENDED_IDS" | grep -qxF "$trickle_decided"; then
+      trickle_ended_seen=1; break
+    fi
+    sleep 0.1
+  done
+  if [ "$trickle_ended_seen" -eq 1 ]; then ok "a mid-stream disconnect still reaches a terminal ended record (Gap 5)"
+  else no "a mid-stream disconnect still reaches a terminal ended record (Gap 5) (timed out)"; fi
+  if pgrep -f "$TRICKLE_MARKER" >/dev/null 2>&1; then
+    no "…and leaves no orphaned provider either"
+  else
+    ok "…and leaves no orphaned provider either"
+  fi
+  wait "$trickle_bg_pid" 2>/dev/null || true
+  trickle_fold="$(aib_event_scan "$EVENTS_FILE")"
+  has "…recorded aborted, not left open forever" "$trickle_fold" '"class":"aborted"'
+  pkill -f "$TRICKLE_MARKER" >/dev/null 2>&1 || true
+else
+  skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
+fi
+
+# =============================================================================
+# 12. D8 (gate delta, Ikarus, MEDIUM): an attempt.ended commit failure AFTER
+#     the provider already ran must still close the wire with exactly one
+#     terminal end= — never a positive-length chunk followed by bare EOF.
+#     Reproduced exactly like Ikarus's repro: commit a real decided record,
+#     corrupt the stream with an unparsable terminated line, then run a
+#     provider that succeeds — the ended commit itself must now fail.
+# =============================================================================
+reset_run
+adapter_conf_write ok
+INCIDENT_EVENTS="$WORK/incident/main.events"
+INCIDENT_LOCK="$WORK/incident/main.events.lock"
+mkdir -p "$WORK/incident"
+# seed_decided() commits against $EVENTS_FILE, not this dedicated stream — this
+# fixture needs its OWN stream (with its OWN decided record) so the corruption
+# below cannot also poison $EVENTS_FILE for every section after this one.
+incident_kv="$(printf 'decision=allow\ncode=0\nreasons=\npid=%s\nprompt_len=1\nprompt_sha256=deadbeef' "$$")"
+incident_payload="$(aib_event_compose_decided_payload "$incident_kv")"
+aib_event_commit "$INCIDENT_EVENTS" "$INCIDENT_LOCK" attempt.decided "$ENVELOPE_KV" "$incident_payload" >/dev/null 2>&1
+incident_decided="$AIB_EVENT_COMMIT_EVENT_ID"
+printf 'corrupt terminated record\n' >> "$INCIDENT_EVENTS"
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$INCIDENT_EVENTS" "$INCIDENT_LOCK" "$ENVELOPE_KV" "$incident_decided" \
+  >"$WORK/resp-12" 2>"$WORK/enact-err-12"
+incident_rc=$?
+eq "an ended-commit failure after the provider ran is reported nonzero" \
+  "$([ "$incident_rc" -ne 0 ] && printf nonzero || printf zero)" "nonzero"
+has "…the response still closes the chunk section" "$(<"$WORK/resp-12")" "chunk_bytes=0"
+has "…and ends with a flat reason=event_store_unavailable / end=error, never a bare EOF" \
+  "$(<"$WORK/resp-12")" "reason=event_store_unavailable"
+eq "…exactly one end= line, and it is error" "$(tail -1 "$WORK/resp-12" 2>/dev/null)" "end=error"
+eq "…exactly one end= total" "$(count_matches_in_file '^end=' "$WORK/resp-12")" "1"
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
