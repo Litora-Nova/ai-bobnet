@@ -35,6 +35,20 @@
  * unset before a successful execvp too (belt and suspenders alongside CLOEXEC: a
  * provider that somehow inherited it across an exec that failed to honour CLOEXEC must
  * still not find it) — see status_close() below.
+ *
+ *   LL_STDERR_FD=<n>   provider-stderr relay channel (gate delta D2, Ikarus, HIGH).
+ *
+ * The contract's minimum ("read access to the credential directory only as far as the
+ * adapter needs") says nothing about the PROVIDER's own stderr, and it must reach the
+ * caller like stdout does — but this process's OWN stderr (the fprintf diagnostics
+ * above, every one of them) must stay on the journal, never the caller's stream
+ * (docs/CONFINEMENT.md, "Diagnostics go to the broker's journal, never the caller's
+ * stream"). Both requirements are satisfied by doing the redirect LAST: if LL_STDERR_FD
+ * names an fd, this process dup2()s it onto fd 2 immediately before execvp — after every
+ * diagnostic this process itself could ever emit, so this process's own stderr is never
+ * touched, and the provider inherits fd 2 already pointing wherever the caller wants
+ * (typically the same relay the caller gave it for fd 1, so provider stdout and stderr
+ * end up on the same wire chunk stream, exactly as stdout is already relayed).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -152,11 +166,21 @@ int main(int argc, char **argv){
   }
   close(rs);
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);
+  /* LL_STDERR_FD, last, deliberately after the line above: every diagnostic this
+   * process itself ever emits is already on real fd 2 (the journal) by this point.
+   * From here on fd 2 belongs to the provider, not to us. */
+  { const char *v = getenv("LL_STDERR_FD");
+    if (v && *v){
+      char *end = NULL; long n = strtol(v,&end,10);
+      if (end && !*end && n >= 0 && n <= 65535 && dup2((int)n,2) < 0)
+        fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
+    }
+  }
   /* This process's own configuration ends here — the child gets a ruleset, not a
    * memo about how it was built. LL_RO/LL_RW have done their job; LL_STATUS_FD is
-   * closed by CLOEXEC on a successful exec below regardless, but unsetting all three
+   * closed by CLOEXEC on a successful exec below regardless, but unsetting all four
    * is cheap and removes any dependence on that being the only backstop. */
-  unsetenv("LL_RO"); unsetenv("LL_RW"); unsetenv("LL_STATUS_FD");
+  unsetenv("LL_RO"); unsetenv("LL_RW"); unsetenv("LL_STATUS_FD"); unsetenv("LL_STDERR_FD");
   execvp(argv[1],&argv[1]);
   fprintf(stderr,"landlock-exec: exec %s: %s\n",argv[1],strerror(errno));
   status_fail("exec: execvp failed");
