@@ -185,10 +185,15 @@ expect_targeted_failure "terminal-heartbeat-reopens-registry" \
 # 7. Dropping the end-of-options -- before the prompt lets a leading-dash prompt be
 # parsed by codex as an option instead of prompt text (RM-0 hotfix #1). The regression
 # assertion pins the prompt operand immediately after a standalone -- in the argv.
+#
+# RE-ANCHORED (RM-3 slice 3): the exec line moved out of bin/launch-agent's
+# _pep_exec_provider into lib/aibobnet.sh's _aib_enact_exec_child_direct
+# (aib_enact_launch's direct-mode path) — same argv shape, ported not
+# reinvented, now at 6-space indent inside the nested function.
 NO_EOO="$(make_mutant end-of-options-removed)"
-replace_exact "$NO_EOO/bin/launch-agent" \
-  '    -- "$prompt" 2>&1' \
-  '    "$prompt" 2>&1 # mutation: end-of-options -- removed'
+replace_exact "$NO_EOO/lib/aibobnet.sh" \
+  '      -- "$prompt" 2>&1' \
+  '      "$prompt" 2>&1 # mutation: end-of-options -- removed'
 record_mutation "end-of-options-removed" "$?"
 expect_targeted_failure "end-of-options-removed" \
   "$NO_EOO/tests/managed_launch_spec.sh" \
@@ -228,10 +233,16 @@ expect_targeted_failure "restore-path-adapter" \
 # allow-list loop to admit ambient variables lets non-allow-listed inheritance cross
 # `env -i` into the provider. The child must see ONLY the allow-list + explicit exports;
 # a leaked LEAKME_SENTINEL / CODEX_RUN_BIN proves the allow-list stopped being complete.
+#
+# RE-ANCHORED (RM-3 slice 3): the allow-list loop moved out of bin/launch-agent
+# into lib/aibobnet.sh's aib_enact_launch (shared with bin/aib-broker-handler's
+# confined path — this is now genuinely shared code, not a duplicate), and
+# picked up a `:-` default along the way (empty AIB_VERDICT_ENV_ALLOW must not
+# be an unbound-variable error under a caller's `set -u`).
 ENV_DENYLIST="$(make_mutant env-denylist-scrub)"
-replace_exact "$ENV_DENYLIST/bin/launch-agent" \
-  'for _n in $AIB_VERDICT_ENV_ALLOW; do' \
-  'for _n in $AIB_VERDICT_ENV_ALLOW LEAKME_SENTINEL CODEX_RUN_BIN AIBOBNET_PROVIDER; do # mutation: ambient vars admitted (denylist mindset)'
+replace_exact "$ENV_DENYLIST/lib/aibobnet.sh" \
+  '  for _n in ${AIB_VERDICT_ENV_ALLOW:-}; do' \
+  '  for _n in ${AIB_VERDICT_ENV_ALLOW:-} LEAKME_SENTINEL CODEX_RUN_BIN AIBOBNET_PROVIDER; do # mutation: ambient vars admitted (denylist mindset)'
 record_mutation "env-denylist-scrub" "$?"
 expect_targeted_failure "env-denylist-scrub" \
   "$ENV_DENYLIST/tests/managed_launch_spec.sh" \

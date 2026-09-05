@@ -201,10 +201,18 @@ expect_targeted_failure "reader-corrupt-gate-removed" \
 # PEP signal honesty: the handler must commit the child's CONFIRMED status, never forge
 # aborted. Forcing aborted forges a terminal abort after a child that handled TERM and
 # exited 0. (attempt_audit_spec)
+#
+# RE-ANCHORED (RM-3 slice 3): _pep_signal_handler moved out of bin/launch-agent
+# into lib/aibobnet.sh as _aib_enact_signal_handler_direct (aib_enact_launch's
+# direct-mode path) — same guard, ported not reinvented, now at 6-space
+# indent. _pep_commit_ended (3 args: class, code, signal) became
+# _aib_enact_commit_ended (4 args: class, STAGE, code, signal) when stage was
+# added this slice — the forged commit below names it explicitly (provider:
+# this is still "the child ran", never a helper-side refusal).
 M4="$(make_mutant pep-forges-aborted-after-success)"
-replace_exact "$M4/bin/launch-agent" \
-  '    [ "$_provider_status_confirmed" -eq 0 ] || ( _pep_commit_status "$_provider_status" ) || true' \
-  '    ( _pep_commit_ended aborted "" "$signal" ) || true'
+replace_exact "$M4/lib/aibobnet.sh" \
+  '      [ "$_provider_status_confirmed" -eq 0 ] || ( _aib_enact_map_status "$_provider_status" ) || true' \
+  '      ( _aib_enact_commit_ended aborted provider "" "$signal" ) || true'
 record_mutation "pep-forges-aborted-after-success" "$?"
 expect_targeted_failure "pep-forges-aborted-after-success" \
   "$M4/tests/attempt_audit_spec.sh" \

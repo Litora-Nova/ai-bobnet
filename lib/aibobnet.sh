@@ -1427,6 +1427,333 @@ aib_event_compose_ended_payload() {
     "$(_aib_kv_json_or_null "$kv" stage)"
 }
 
+# =============================================================================
+# RM-3 slice 3 — aib_enact_launch: §2 step 3 (enactment, incl. §2.1 confinement)
+# + step 4 (commit attempt.ended), extracted from bin/launch-agent's PEP and
+# shared with bin/aib-broker-handler. See docs/CONFINEMENT.md and
+# docs/SPEC-wire-format.md ("Response frame") for the contract this implements.
+# =============================================================================
+
+# aib_enact_launch <enact-record> <prompt> <events-path> <lock-path> <envelope-kv>
+#                   <decided-event-id> [mode]
+#
+# mode "confined" (default) — bin/aib-broker-handler's path. The provider is exec'd
+#   ONLY through $AIB_CONFINE_BIN (docs/CONFINEMENT.md); this function writes ONLY
+#   the chunk section and the terminal line of the response frame
+#   (docs/SPEC-wire-format.md, "Response frame") to its OWN stdout — never the
+#   prologue, that is the caller's job, written before this is even called.
+# mode "direct" — bin/launch-agent's single-trust-domain path (§7): execs the
+#   adapter directly, NEVER touches $AIB_CONFINE_BIN, and returns the provider's
+#   raw merged stdout+stderr on ITS OWN stdout for the caller to capture — no wire
+#   framing, because launch-agent's stdout has never been a broker connection and
+#   docs/CONTRACT-codex-run.md §4 already specifies "relay to stdout" byte-for-byte.
+#
+# <enact-record> (newline key=value): adapter (absolute path) · root (the
+# registry-derived Landlock/containment root) · cwd (already-authorized, RE-CHECKED
+# here, never trusted) · sandbox / effort / model / timeout (all EFFECTIVE, already
+# clamped). <prompt> is its own argument, never a record line — see the spec-fixture
+# correction in tests/broker_enact_spec.sh: prompt is multi-line free text and a
+# newline-keyed record cannot carry it.
+#
+# Ambient inputs, read rather than passed positionally (house style: both callers
+# already have them from their own aib_authorize_launch call before this runs):
+#   AIB_VERDICT_ENV_ALLOW      the PDP's env allow-list (today "HOME PATH").
+#   AIB_ENACT_CHILD_ENV_EXTRA  optional array the CALLER pre-populates with any
+#     further NAME=value strings for the child (bin/launch-agent's rich AIBOBNET_*
+#     export set; the broker's own, built from its request/snapshot). This
+#     function always appends AIBOBNET_ATTEMPT_ID=<decided-event-id> itself, last,
+#     so it always wins over anything the caller also put in the array.
+#   AIB_CONFINE_BIN            (confined mode only) unit-environment-only per
+#     docs/CONFINEMENT.md — never request- or registry-supplied. Empty/unset is
+#     "confinement unavailable", not "skip confinement": D-A is fail-closed.
+#
+# On return, publishes (house AIB_VERDICT_*-style globals):
+#   AIB_ENACT_EXIT_CLASS  ok | provider-failure | timeout | io-refused | aborted
+#   AIB_ENACT_STAGE       confine | cwd | exec | provider
+#   AIB_ENACT_EXIT_CODE   the provider/helper's numeric status (may be empty)
+#   AIB_ENACT_SIGNAL      the forwarded signal name (may be empty; exactly one of
+#                         AIB_ENACT_EXIT_CODE / AIB_ENACT_SIGNAL is ever non-empty)
+#   AIB_ENACT_ENDED_EVENT_ID  the committed attempt.ended event_id
+# and has committed exactly one attempt.ended record, causally bound to
+# <decided-event-id>, over <events-path>/<lock-path> with the given <envelope-kv>.
+aib_enact_launch() {
+  local enact_record="${1-}" prompt="${2-}" events_path="${3-}" lock_path="${4-}"
+  local envelope_kv="${5-}" decided_id="${6-}" mode="${7:-confined}"
+  local adapter root cwd_req sandbox effort model timeout_s resolved_root
+
+  case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
+  [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$decided_id" ] ||
+    aib_die 2 "aib_enact_launch requires events-path, lock-path and a decided-event-id"
+
+  adapter="$(_aib_record_field "$enact_record" adapter)" || aib_die 2 "enact record requires adapter"
+  root="$(_aib_record_field "$enact_record" root)" || aib_die 2 "enact record requires root"
+  cwd_req="$(_aib_record_field "$enact_record" cwd)" || cwd_req="$root"
+  sandbox="$(_aib_record_field "$enact_record" sandbox)" || aib_die 2 "enact record requires sandbox"
+  effort="$(_aib_record_field "$enact_record" effort)" || aib_die 2 "enact record requires effort"
+  model="$(_aib_record_field "$enact_record" model)" || aib_die 2 "enact record requires model"
+  timeout_s="$(_aib_record_field "$enact_record" timeout)" || aib_die 2 "enact record requires timeout"
+  case "$timeout_s" in ''|*[!0-9]*) aib_die 2 "enact record timeout must be digits (got '$timeout_s')";; esac
+  [ "$timeout_s" -gt 0 ] 2>/dev/null || aib_die 2 "enact record timeout must be > 0"
+
+  local _env_bin _sleep_bin _mktemp_bin _cat_bin _wc_bin
+  _env_bin="$(command -v env)" || aib_die 6 "required runtime dependency not found: env (coreutils)"
+  _sleep_bin="$(command -v sleep)" || aib_die 6 "required runtime dependency not found: sleep (coreutils)"
+  _mktemp_bin="$(command -v mktemp)" || aib_die 6 "required runtime dependency not found: mktemp (coreutils)"
+  _cat_bin="$(command -v cat)" || aib_die 6 "required runtime dependency not found: cat (coreutils)"
+  _wc_bin="$(command -v wc)" || aib_die 6 "required runtime dependency not found: wc (coreutils)"
+
+  AIB_ENACT_EXIT_CLASS=""
+  AIB_ENACT_STAGE=""
+  AIB_ENACT_EXIT_CODE=""
+  AIB_ENACT_SIGNAL=""
+  AIB_ENACT_ENDED_EVENT_ID=""
+
+  if [ "$mode" = confined ]; then
+    resolved_root="$(realpath -e -- "$root" 2>/dev/null)" ||
+      aib_die 2 "enact record root does not exist: $root"
+  fi
+
+  # --- child env: allow-list (ambient, from the PDP this caller already ran)
+  # plus whatever the caller pre-populated, plus ATTEMPT_ID (always, always last).
+  local _child_env=() _n
+  for _n in ${AIB_VERDICT_ENV_ALLOW:-}; do
+    [ -n "${!_n+x}" ] && _child_env+=("$_n=${!_n}")
+  done
+  if declare -p AIB_ENACT_CHILD_ENV_EXTRA >/dev/null 2>&1; then
+    local -n _extra_ref=AIB_ENACT_CHILD_ENV_EXTRA
+    [ "${#_extra_ref[@]}" -eq 0 ] || _child_env+=("${_extra_ref[@]}")
+  fi
+  _child_env+=("AIBOBNET_ATTEMPT_ID=$decided_id")
+
+  local _terminal_written=0
+
+  # _aib_enact_commit_ended <exit_class> <stage> [exit_code] [signal]
+  # Dynamic-scope helper (bash has no closures — this just reads this call's
+  # locals, exactly the idiom bin/launch-agent's own _pep_commit_ended already
+  # used before extraction). Guards double-write, same invariant as before.
+  _aib_enact_commit_ended() {
+    local exit_class="$1" stage="$2" exit_code="${3-}" signal="${4-}" ended_kv ended_payload
+    [ "$_terminal_written" -eq 0 ] ||
+      aib_die 2 "attempt '$decided_id' already entered a terminal path"
+    ended_kv="exit_class=$exit_class"$'\n'"stage=$stage"
+    [ -z "$exit_code" ] || ended_kv="${ended_kv}"$'\n'"exit_code=$exit_code"
+    [ -z "$signal" ] || ended_kv="${ended_kv}"$'\n'"signal=$signal"
+    ended_payload="$(aib_event_compose_ended_payload "$ended_kv")"
+    local _rc _had_errexit_ce=0
+    case $- in *e*) _had_errexit_ce=1;; esac
+    set +e
+    aib_event_commit "$events_path" "$lock_path" attempt.ended "$envelope_kv" "$ended_payload" "$decided_id"
+    _rc=$?
+    [ "$_had_errexit_ce" -eq 0 ] || set -e
+    [ "$_rc" -eq 0 ] || aib_die "$_rc" "attempt.ended commit failed"
+    _terminal_written=1
+    AIB_ENACT_EXIT_CLASS="$exit_class"
+    AIB_ENACT_STAGE="$stage"
+    AIB_ENACT_EXIT_CODE="$exit_code"
+    AIB_ENACT_SIGNAL="$signal"
+    AIB_ENACT_ENDED_EVENT_ID="$AIB_EVENT_COMMIT_EVENT_ID"
+  }
+
+  # _aib_enact_status_signal <128+n> -> signal name (same table as the PEP's).
+  _aib_enact_status_signal() {
+    case "$1" in
+      129) printf 'HUP';; 130) printf 'INT';; 137) printf 'KILL';; 143) printf 'TERM';;
+      *) printf 'SIGNAL-%s' "$(($1 - 128))";;
+    esac
+  }
+
+  # _aib_enact_map_status <rc> -> commits the terminal record for a REAPED
+  # provider status (the ordinary case: confinement + exec both succeeded, or
+  # mode=direct where there is no confinement to speak of). stage=provider always.
+  _aib_enact_map_status() {
+    local rc="$1"
+    case "$rc" in
+      0) _aib_enact_commit_ended ok provider ;;
+      124) _aib_enact_commit_ended timeout provider 124 ;;
+      126|127) _aib_enact_commit_ended io-refused provider "$rc" ;;
+      *)
+        if [ "$rc" -ge 128 ]; then
+          _aib_enact_commit_ended aborted provider "" "$(_aib_enact_status_signal "$rc")"
+        else
+          _aib_enact_commit_ended provider-failure provider "$rc"
+        fi
+        ;;
+    esac
+  }
+
+  if [ "$mode" = direct ]; then
+    aib_enact_launch__run_direct
+  else
+    aib_enact_launch__run_confined
+  fi
+  # Return status mirrors AIB_ENACT_EXIT_CLASS, not "did this function crash":
+  # 0 only for a clean provider success, non-zero for every refusal/failure/
+  # abort class — the caller already has the richer AIB_ENACT_* globals for
+  # anything more specific than "did it work".
+  [ "$AIB_ENACT_EXIT_CLASS" = ok ]
+}
+
+# --- direct mode: byte-identical reproduction of bin/launch-agent's PEP -------
+# manager/watchdog/reap, minus the decision to build the argv/env (still generic
+# from the enact-record + the ambient allow-list, done once in aib_enact_launch
+# above) and minus the caller's own heartbeats/messages (those stay in
+# bin/launch-agent, unchanged, driven by the AIB_ENACT_* globals this leaves).
+aib_enact_launch__run_direct() {
+  local _provider_output _provider_status_file _cwd_fail_marker
+  _provider_output="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-enact.XXXXXX")" ||
+    aib_die 2 "cannot create provider lifecycle buffer"
+  _provider_status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-enact-status.XXXXXX")" ||
+    aib_die 2 "cannot create provider status buffer"
+  _cwd_fail_marker="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-enact-cwdfail.XXXXXX")" ||
+    aib_die 2 "cannot create cwd-check marker"
+  : > "$_cwd_fail_marker"
+
+  local _provider_manager_pid _provider_status="" _provider_status_confirmed=0
+  local manager_pid_outer
+
+  _aib_enact_exec_child_direct() {
+    exec "$_env_bin" -i "${_child_env[@]}" \
+      "$adapter" exec \
+      -m "$model" -s "$sandbox" \
+      -c "model_reasoning_effort=\"$effort\"" \
+      -c 'approval_policy="never"' \
+      -- "$prompt" 2>&1
+  }
+
+  _aib_enact_manager_direct() {
+    set +e
+    local provider_pid="" timer_pid="" killer_pid="" provider_rc=1 confirmed_rc=1
+    local timed_out=0 wait_interrupted=0
+    local manager_pid="$BASHPID"
+
+    _aib_enact_forward() { local sig="$1"; wait_interrupted=1; [ -z "$provider_pid" ] || kill -s "$sig" "$provider_pid" 2>/dev/null || true; }
+    _aib_enact_on_timeout() {
+      timed_out=1; wait_interrupted=1
+      [ -z "$provider_pid" ] || kill -TERM "$provider_pid" 2>/dev/null || true
+      if [ -n "$provider_pid" ]; then
+        ( "$_sleep_bin" 10; kill -KILL "$provider_pid" 2>/dev/null || true ) &
+        killer_pid=$!
+      fi
+    }
+    trap '_aib_enact_forward HUP' HUP
+    trap '_aib_enact_forward INT' INT
+    trap '_aib_enact_forward TERM' TERM
+    trap '_aib_enact_on_timeout' USR1
+
+    if ! cd "$cwd_req" 2>/dev/null; then
+      printf 'cwd_moved\n' > "$_cwd_fail_marker" 2>/dev/null
+      exit 127
+    fi
+    _aib_enact_exec_child_direct &
+    provider_pid=$!
+    ( "$_sleep_bin" "$timeout_s"; kill -USR1 "$manager_pid" 2>/dev/null || true ) &
+    timer_pid=$!
+
+    wait "$provider_pid"
+    provider_rc=$?
+    if [ "$wait_interrupted" -eq 1 ]; then
+      while kill -0 "$provider_pid" 2>/dev/null; do
+        wait "$provider_pid"
+        confirmed_rc=$?
+        [ "$confirmed_rc" -eq 127 ] || provider_rc="$confirmed_rc"
+        kill -0 "$provider_pid" 2>/dev/null && "$_sleep_bin" 0.01
+      done
+    fi
+
+    kill "$timer_pid" 2>/dev/null || true
+    wait "$timer_pid" 2>/dev/null || true
+    if [ -n "$killer_pid" ]; then kill "$killer_pid" 2>/dev/null || true; wait "$killer_pid" 2>/dev/null || true; fi
+    [ "$timed_out" -eq 0 ] || provider_rc=124
+    printf '%s\n' "$provider_rc" > "$_provider_status_file" || exit 125
+    exit "$provider_rc"
+  }
+
+  _aib_enact_reap_direct() {
+    local wait_status _had_errexit_rd=0
+    case $- in *e*) _had_errexit_rd=1;; esac
+    set +e
+    wait "$_provider_manager_pid"
+    wait_status=$?
+    _provider_status="$wait_status"
+    _provider_status_confirmed=0
+    if [ -r "$_provider_status_file" ]; then
+      IFS= read -r _provider_status < "$_provider_status_file"
+      case "$_provider_status" in ''|*[!0-9]*) _provider_status="$wait_status";; *) _provider_status_confirmed=1;; esac
+    fi
+    [ "$_had_errexit_rd" -eq 0 ] || set -e
+    _provider_manager_pid=""
+  }
+
+  _aib_enact_cleanup_direct() {
+    [ -z "$_provider_output" ] || rm -f -- "$_provider_output" 2>/dev/null || true
+    [ -z "$_provider_status_file" ] || rm -f -- "$_provider_status_file" 2>/dev/null || true
+    [ -z "$_cwd_fail_marker" ] || rm -f -- "$_cwd_fail_marker" 2>/dev/null || true
+  }
+
+  # --- wrapper-level safety net: a signal or an early `exit`/aib_die reaching
+  # THIS process (bin/launch-agent itself — this all runs at script scope, no
+  # subshell) while the manager is still running must not strand the attempt
+  # `presumed-dead` or orphan the manager. Ported from the original
+  # _pep_signal_handler/_pep_exit_handler (mutation-pinned: M4 in
+  # rm2_adversarial_spec.sh re-anchors here) — same guard against forging a
+  # terminal record the manager's OWN confirmed status didn't earn.
+  _aib_enact_signal_handler_direct() {
+    trap - EXIT INT TERM HUP
+    local signal="$1" original_status="$2"
+    if [ "$_terminal_written" -eq 0 ] && [ -n "$_provider_manager_pid" ]; then
+      kill -s "$signal" "$_provider_manager_pid" 2>/dev/null || true
+      _aib_enact_reap_direct
+      [ "$_provider_status_confirmed" -eq 0 ] || ( _aib_enact_map_status "$_provider_status" ) || true
+    fi
+    [ -z "$_provider_output" ] || cat "$_provider_output" >&2 2>/dev/null || true
+    _aib_enact_cleanup_direct
+    exit "$original_status"
+  }
+  _aib_enact_exit_handler_direct() {
+    trap - EXIT INT TERM HUP
+    local original_status="$1"
+    if [ "$_terminal_written" -eq 0 ]; then
+      if [ -n "$_provider_manager_pid" ]; then
+        kill -TERM "$_provider_manager_pid" 2>/dev/null || true
+        _aib_enact_reap_direct
+      fi
+      if [ "$_provider_status_confirmed" -eq 1 ]; then
+        ( _aib_enact_map_status "$_provider_status" ) || true
+      fi
+    fi
+    [ -z "$_provider_output" ] || cat "$_provider_output" >&2 2>/dev/null || true
+    _aib_enact_cleanup_direct
+    exit "$original_status"
+  }
+  trap '_aib_enact_exit_handler_direct "$?"' EXIT
+  trap '_aib_enact_signal_handler_direct HUP "$?"' HUP
+  trap '_aib_enact_signal_handler_direct INT "$?"' INT
+  trap '_aib_enact_signal_handler_direct TERM "$?"' TERM
+
+  local _had_errexit=0
+  case $- in *e*) _had_errexit=1;; esac
+  set +e
+  _aib_enact_manager_direct >"$_provider_output" 2>&1 &
+  _provider_manager_pid=$!
+  _aib_enact_reap_direct
+  local rc="$_provider_status"
+  [ "$_had_errexit" -eq 0 ] || set -e
+  trap - EXIT INT TERM HUP
+
+  if [ "$_provider_status_confirmed" -ne 1 ]; then
+    _aib_enact_cleanup_direct
+    aib_die 2 "provider exited without a confirmed reaped status"
+  fi
+
+  if [ -s "$_cwd_fail_marker" ]; then
+    _aib_enact_commit_ended io-refused cwd 126
+  else
+    _aib_enact_map_status "$rc"
+  fi
+  "$_cat_bin" "$_provider_output"
+  _aib_enact_cleanup_direct
+}
+
 # --- top-level JSON field extractor (the shared reader primitive) -------------
 # The runtime has no general JSON parser beyond the registry awk. This is a small,
 # depth-tracking tokeniser that returns TOP-LEVEL (depth-1) string field values only —
