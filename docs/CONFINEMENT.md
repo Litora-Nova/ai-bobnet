@@ -1,7 +1,13 @@
 # ai-bobnet — Confining the provider child (contract §2.1)
 
-**Status:** decided 2026-08-19, measured on a live VM. Nothing here is built into the launch path
-yet — that is slice 4. This document exists so the decision is not re-litigated when it is.
+**Status:** decided 2026-08-19, measured on a live VM. Slice 3 wires this into the broker's enactment
+path (`bin/aib-broker-handler`) against the contract this document specifies. The helper is exec'd
+through, never invoked ad hoc, and its CLI contract gains one addition for slice 3: the exec-status
+channel below. This document is the contract the slice-3 build must satisfy; it is not itself the
+build. On the dev host the ruleset install fails closed (Landlock ABI unavailable — see "Exercising
+this on a Landlock-less host"), so slice 3 is gated against a stub honouring the same contract, and
+the real helper's failure path is compiled and exercised where a C compiler is present. The VM
+exercise, where "confined" becomes true rather than contractual, has a precondition — see below.
 
 ## What §2.1 requires
 
@@ -31,6 +37,93 @@ Two findings from that measurement are part of the requirement, not footnotes:
   directories belong to root and the broker reaches them through its group.
 
 **The paths come from the registry, never from the request** — see `SPEC-wire-format.md`.
+
+## The helper contract, extended for slice 3
+
+The provider child is exec'd **only** through the helper, at an absolute, broker-owned path:
+`AIB_CONFINE_BIN`, default `/opt/aib/engine/libexec/landlock-exec`, settable only from the unit
+environment — never from the request, never from the registry. There is no code path that runs the
+provider unconfined; if the helper cannot be run, the provider does not start.
+
+### Pre-flight, before every launch
+
+Before spawning the provider, the enactment runs a pre-flight call through the same helper:
+
+```
+LL_RO=/ LL_RW=<tmp-dir> $AIB_CONFINE_BIN /bin/true
+```
+
+A non-zero exit from the pre-flight means confinement is not available on this host right now.
+Enactment responds `attempt.ended(io-refused, code=126, stage=confine)` on the durable stream and
+`reason=confinement_unavailable` on the wire — and the provider **never starts**. The pre-flight is
+cheap (`/bin/true`) and existence is not the question it answers; installability of the ruleset is.
+It answers that question fresh on every launch rather than once at broker start, because a host can
+lose Landlock (a kernel downgrade, a container runtime change) between launches without the broker
+restarting.
+
+### Exec-status channel (`LL_STATUS_FD`)
+
+`execvp` never returns on success, so no exit code from the helper process is available to
+distinguish "confinement was never attempted" from "the confined provider itself exited 3, 127, or
+any other number" — the child, once exec'd, owns the full 256-value exit-code space, and no number in
+it is reserved. The helper contract therefore gains a second channel, independent of the exit code:
+
+- The caller opens an fd, marks it `CLOEXEC`, and passes its number in `LL_STATUS_FD=<n>`.
+- If the helper fails **before** `execvp` — ruleset create, add-rule, `no_new_privs`, or
+  `restrict_self` — it writes **one line** naming the reason to that fd, then exits non-zero (the
+  existing exit-3 convention is unchanged; `LL_STATUS_FD` is additive, not a replacement for it).
+- If `execvp` succeeds, the fd is `CLOEXEC` and therefore **closes silently, with nothing written to
+  it** — the kernel closes it across the exec, so the now-running provider never sees it and never
+  inherits it.
+- The caller reads the fd **after the child ends**: non-empty means the helper never reached `exec`
+  (`stage=confine`, `io-refused`, exit code 126, regardless of the child's own wait status); empty
+  means `execvp` succeeded and the wait status belongs to the provider, classified by the existing
+  exit-class mapping (`provider-failure` / `io-refused` / `timeout` / `aborted`, never `confine`).
+
+This is the only reliable discriminator. A provider that happens to exit 3 (the helper's own
+"Landlock unavailable" code) or 127 (the helper's own "exec failed" code) is not thereby mistaken for
+a confinement failure — the status fd is empty in both cases, because the provider is what ran.
+
+### Diagnostics go to the broker's journal, never the caller's stream
+
+The helper's own stderr diagnostics (`landlock-exec: …` lines) are the broker's operational log, not
+part of the response the caller reads. They reach the unit's `StandardError=journal`
+(`deploy/systemd/aib-broker@.service`) like every other broker-side diagnostic. They are never merged
+into the provider's output stream and never appear in the wire response — a confinement failure is
+reported to the caller as the structured `reason=confinement_unavailable` above, not as leaked
+stderr text from a helper the caller has no reason to know exists.
+
+### `LL_RO=/` — a stated divergence, not an oversight
+
+§2.1's credential clause reads "read access to the credential directory only as far as the adapter
+needs." Slice 3 does not build that narrowing: `LL_RO=/` for this slice, composed alongside
+`LL_RW = <home>:/tmp:/var/tmp:/dev` from the registry snapshot alone (the request contributes
+nothing to either list). This is looser than the minimum stated above, and it is recorded here as a
+deliberate, dated divergence rather than left implicit: guessing the adapter's true read set without
+a VM to observe it against breaks at the first real run, and a wrong guess that under-grants is a
+launch-stopper while a wrong guess that over-grants is silently unsafe. Narrowing `LL_RO` to the
+resolved adapter and its credential directory is a slice-4/VM item, tracked there, not here.
+
+### The VM exercise's precondition — the metadata gap
+
+Landlock does not mediate inode metadata up to ABI 6 (see the finding above): a fully confined child
+can still `chmod` or rename a TCB directory it owns, which is a permanent DAC change reachable from
+inside the cage. The measured fix is ownership, not Landlock: TCB directories owned `root:aib-broker
+0770` rather than `aib-broker:aib-broker 0700` — a `prox-init` change (`environments/bobnet.sh`), not
+a change in this repository. Until that ownership change lands, the word "confined" is not true on
+the VM even once slice 3's code is deployed there — the contract above is necessary but not
+sufficient. This is listed here as a **gating precondition of the VM exercise**, owned by Remote
+Bob/Austin, needing Austin's explicit GO to push, inside the window that closes 2026-10-02.
+
+### Exercising this on a Landlock-less host
+
+The development host this slice is built and gated on has no Landlock ABI (`ll_create` returns
+`ENOSYS`/`EOPNOTSUPP` — confirmed by compiling and running `src/landlock-exec.c` directly: exit 3,
+"unavailable"). Slice 3's tests therefore exercise the contract two ways: a stub helper with the real
+CLI shape (`LL_RO`/`LL_RW`/`LL_STATUS_FD`, logs what it was asked to confine, execs its argument) for
+every enactment path, and the real `src/landlock-exec.c` compiled with `cc` (skipped, not faked, where
+no compiler is present) to exercise its actual failure path — exit 3, non-empty status fd — which is
+the one path this host can genuinely exhibit without Landlock.
 
 ## Fallback — mount namespace, no compiler needed
 
