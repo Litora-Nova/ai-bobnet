@@ -296,6 +296,24 @@ Wire-level errors (malformed request, registry unavailable, registry misconfigur
 slice-1/2 shape unchanged — a flat set of `reason=`/`detail=` lines and `end=error`, with no prologue
 and no `decided_event_id`, because no verdict was ever reached.
 
+### Detecting a disconnected client while the provider is silent
+
+The broker side of this is a `poll(2)`-based liveness probe (`_aib_enact_conn_alive`,
+`lib/aibobnet.sh`), run once per idle relay tick, that classifies the connection "gone" iff
+`POLLHUP`, `POLLERR`, or `POLLNVAL` is set — never `POLLOUT`, which a writable socket reports
+regardless of whether anyone is still reading it. This closes the general case (the client process
+exits, or closes the socket outright) within one idle tick, without ever writing a probe byte onto
+the wire — chunk bytes are opaque and counted, never invented for a liveness check.
+
+**Accepted latency case, stated explicitly rather than left implicit:** a client that shuts down
+only its own READ half (`shutdown(fd, SHUT_RD)`) while leaving the socket itself open is not visible
+to this probe — the kernel does not surface that specific half-close to the writer via `poll(2)`.
+Such a client is indistinguishable from one that is merely slow to read until the broker's next real
+write discovers the failure on its own (`EPIPE`/`ECONNRESET`). A client abandoning a response in the
+ordinary way — closing the connection, or shutting down its own WRITE half of what was already a
+read-only reply channel — is caught by the probe; only the narrower "still open, deliberately not
+reading" case falls back to next-write detection.
+
 ### The client-side reading rule
 
 A connection that closes **without** an `end=` line — at any point, prologue, mid-chunk, or between

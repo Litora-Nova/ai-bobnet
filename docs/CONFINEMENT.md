@@ -68,7 +68,11 @@ distinguish "confinement was never attempted" from "the confined provider itself
 any other number" — the child, once exec'd, owns the full 256-value exit-code space, and no number in
 it is reserved. The helper contract therefore gains a second channel, independent of the exit code:
 
-- The caller opens an fd, marks it `CLOEXEC`, and passes its number in `LL_STATUS_FD=<n>`.
+- The caller opens an fd and passes its number in `LL_STATUS_FD=<n>`. The helper — not the caller —
+  marks it `CLOEXEC` (`fcntl(F_SETFD, FD_CLOEXEC)`, `src/landlock-exec.c`'s `status_init()`), before
+  any Landlock work and well before its own `execvp`: that is what makes a later successful `execvp`
+  close it automatically, while it stays open, in the helper's own process, for every failure path
+  that returns before that point.
 - If the helper fails **before** `execvp` — ruleset create, add-rule, `no_new_privs`, or
   `restrict_self` — it writes **one line** naming the reason to that fd, then exits non-zero (the
   existing exit-3 convention is unchanged; `LL_STATUS_FD` is additive, not a replacement for it).
@@ -109,11 +113,13 @@ resolved adapter and its credential directory is a slice-4/VM item, tracked ther
 Landlock does not mediate inode metadata up to ABI 6 (see the finding above): a fully confined child
 can still `chmod` or rename a TCB directory it owns, which is a permanent DAC change reachable from
 inside the cage. The measured fix is ownership, not Landlock: TCB directories owned `root:aib-broker
-0770` rather than `aib-broker:aib-broker 0700` — a `prox-init` change (`environments/bobnet.sh`), not
-a change in this repository. Until that ownership change lands, the word "confined" is not true on
-the VM even once slice 3's code is deployed there — the contract above is necessary but not
-sufficient. This is listed here as a **gating precondition of the VM exercise**, owned by Remote
-Bob/Austin, needing Austin's explicit GO to push, inside the window that closes 2026-10-02.
+0770` rather than `aib-broker:aib-broker 0700` — a change to host provisioning, not a change in this
+repository. Until that ownership change lands, the word "confined" is not true on the VM even once
+slice 3's code is deployed there — the contract above is necessary but not sufficient. This is listed
+here as a **gating precondition of the VM exercise**: the host provisioning must own the trusted
+directories as root with the broker group (mode 0770/2770) before confinement is exercised on a real
+host, gated on operator sign-off before that provisioning change ships. No exercise result should be
+read as "confined" until it is confirmed done.
 
 ### Exercising this on a Landlock-less host
 
@@ -146,6 +152,23 @@ there.
 mount approach is a **blocklist**: only what is explicitly bind-mounted read-only is protected, and
 every forgotten path stays open. For a trusted base that grows, a blocklist is the weaker design.
 Per-path *read* restrictions are trivial in Landlock and contortions with mounts.
+
+## Runtime dependencies of the broker's confined path
+
+`dd`, `timeout`, `mkfifo`, `realpath`, `setsid`, `env`, `sleep`, `mktemp`, `cat`, `wc` — all
+coreutils/util-linux, all hard requirements resolved via `command -v` with a fail-closed
+`aib_die 6 "required runtime dependency not found: ..."` on absence, the same style the rest of this
+codebase already uses. `cc` is install-time only (it compiles this helper; nothing at runtime needs
+a compiler).
+
+**`python3` is the one optional runtime dependency**, and it runs in the unconfined broker/manager
+process, never inside the sandboxed child or the Landlock helper. It sharpens disconnect detection
+(the `poll(2)`-based liveness probe — see SPEC-wire-format.md, "Detecting a disconnected client
+while the provider is silent") from "next real write" latency down to one idle tick. When it is
+absent, `_aib_enact_conn_alive` returns "alive" unconditionally and enactment degrades gracefully to
+next-write-only detection — never a crash, never a hang, and the probe never writes a byte to the
+wire either way. An operator auditing this path's runtime dependencies should install `python3` if
+they want the sharper detection; its absence is a documented degradation, not a defect.
 
 ## Why the helper is built at install time and not shipped as a binary
 
