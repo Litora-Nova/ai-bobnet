@@ -306,6 +306,15 @@ case "${STUB_MODE:-ok}" in
     done
     exit 0
     ;;
+  early-close)
+    # Marvin (gate delta, should-fix, edge): closes ITS OWN stdout (so the
+    # relay sees true EOF almost immediately) but keeps running afterward —
+    # the terminal record must reflect the EVENTUAL exit the manager's
+    # `wait` blocks for, not whatever was true at EOF time.
+    exec 1>&-
+    sleep 1
+    exit 0
+    ;;
 esac
 STUB
 chmod +x "$ADAPTER"
@@ -966,6 +975,40 @@ has "…and ends with a flat reason=event_store_unavailable / end=error, never a
   "$(<"$WORK/resp-12")" "reason=event_store_unavailable"
 eq "…exactly one end= line, and it is error" "$(tail -1 "$WORK/resp-12" 2>/dev/null)" "end=error"
 eq "…exactly one end= total" "$(count_matches_in_file '^end=' "$WORK/resp-12")" "1"
+
+# =============================================================================
+# 13. Marvin (gate delta, should-fix, edge): AIB_EVENT_ROOT is SET and its
+#     project subdirectory already EXISTS, but is not writable — the other
+#     branch of the handler's `mkdir -p ... || [ ! -w "$_event_dir" ]` guard;
+#     only "directory absent, mkdir succeeds" had a fixture before this.
+# =============================================================================
+RO_EVENT_ROOT="$WORK/ro-event-root"
+mkdir -p "$RO_EVENT_ROOT/acme"
+chmod 0500 "$RO_EVENT_ROOT/acme"
+reset_run
+resp_ro="$(frame2 "$FIXTURE_WS" "" "hallo" "op=launch" "agent_uid=acme-core" \
+  | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_CONFINE_BIN="$LANDLOCK_STUB" AIB_EVENT_ROOT="$RO_EVENT_ROOT" \
+    "$SRC_ROOT/bin/aib-broker-handler" 2>"$WORK/handler-err-13")"
+chmod 0700 "$RO_EVENT_ROOT/acme"
+if [ -e "$SENTINEL" ]; then no "an existing-but-unwritable AIB_EVENT_ROOT subdir never enacts"
+else ok "an existing-but-unwritable AIB_EVENT_ROOT subdir never enacts"; fi
+has "…and answers error, not a silent success" "$resp_ro" "reason=event_store_unavailable"
+has "…ending end=error" "$resp_ro" "end=error"
+
+# =============================================================================
+# 14. Marvin (gate delta, should-fix, edge): a provider that closes its
+#     stdout early but keeps running afterward — the relay's "true EOF" is
+#     structurally independent of the provider's actual process lifetime;
+#     the terminal record must reflect the EVENTUAL exit, not the moment
+#     stdout closed.
+# =============================================================================
+reset_run
+adapter_conf_write early-close
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-14" 2>"$WORK/enact-err-14"
+eq "a provider closing stdout early still runs to its real exit before the record is committed" \
+  "${AIB_ENACT_EXIT_CLASS:-}" "ok"
+has "…and its actual (late) exit code reaches the wire" "$(<"$WORK/resp-14")" "exit_class=ok"
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
