@@ -41,6 +41,17 @@
 # "cwd — the field that stops carrying authority").
 set -uo pipefail
 
+# D1 (gate delta, Ikarus, HIGH): must be in effect BEFORE the prologue write, not just
+# inside aib_enact_launch's own confined-mode path (which is called strictly after the
+# prologue and did not exist yet). A client that disconnects right after sending its
+# request can be gone before this process ever writes a byte back — with SIGPIPE at its
+# default disposition, the write that discovers that kills this process outright,
+# leaving a persisted attempt.decided with no attempt.ended. Ignoring SIGPIPE turns that
+# same write into an ordinary EPIPE return this file already checks for (see the
+# prologue write below); never restored, because this is a short-lived per-connection
+# process that only ever wants EPIPE-as-return-code for its whole life.
+trap '' PIPE
+
 AIB_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
 . "$AIB_ROOT/lib/aibobnet.sh"
@@ -213,11 +224,19 @@ if [ "$_verdict_allow" -eq 1 ]; then
     "$AIB_PROVIDER" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_EFFORT" \
     "$AIB_VERDICT_EFFECTIVE_SANDBOX" "$AIB_VERDICT_ADAPTER_PATH")"
 fi
+# D7 fix (gate delta, Ikarus, MEDIUM): this file is declared `set -uo pipefail` —
+# deliberately no `-e` — and MUST stay that way for its whole life: `aib_enact_launch`
+# below returns non-zero for every non-"ok" provider outcome by design (its own
+# return mirrors AIB_ENACT_EXIT_CLASS), and this handler needs to run its blocked
+# heartbeat and still exit 0 for that case ("end=ok" means the broker did its job,
+# not that the provider succeeded). A `set +e ... set -e` bracket here used to leave
+# `-e` ENABLED for the rest of this process (it was never on before), so a later
+# provider failure silently killed the handler via errexit before the heartbeat/exit-0
+# path ever ran, instead of the process failing case ended below. Capture the
+# commit's rc without ever touching `-e`.
 _decided_payload="$(aib_event_compose_decided_payload "$_decided_kv")"
-set +e
-aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided "$_broker_envelope" "$_decided_payload"
-_decided_commit_rc=$?
-set -e
+aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided "$_broker_envelope" "$_decided_payload" \
+  && _decided_commit_rc=0 || _decided_commit_rc=$?
 if [ "$_decided_commit_rc" -ne 0 ]; then
   aib_wire_write_response error "reason=event_store_unavailable"
   exit 2
@@ -242,16 +261,26 @@ fi
 # already happened, above. This is NOT aib_wire_write_response (that appends
 # `end=` unconditionally, which would put a terminal line in front of the
 # chunks) — a client reading to the first `end=` must not stop here.
-printf 'decision=%s\n' "$AIB_VERDICT_DECISION"
-printf 'code=%s\n' "$AIB_VERDICT_CODE"
-printf 'effective_sandbox=%s\n' "$AIB_VERDICT_EFFECTIVE_SANDBOX"
-printf 'effective_clearance=%s\n' "$AIB_VERDICT_EFFECTIVE_CLEARANCE"
-printf 'effective_effort=%s\n' "$AIB_VERDICT_EFFECTIVE_EFFORT"
-printf 'effective_timeout=%s\n' "$AIB_VERDICT_EFFECTIVE_TIMEOUT"
-printf 'cwd=%s\n' "$AIB_CWD_RESOLVED"
-printf 'reasons=%s\n' "$AIB_VERDICT_REASONS"
-printf 'decided_event_id=%s\n' "$_decided_event_id"
-printf 'enacted=yes\n'
+#
+# D1 (gate delta, Ikarus, HIGH): built as ONE string and written in ONE
+# `printf`, so there is exactly one write to check — a client gone before any
+# of it is read makes this fail (EPIPE, `trap '' PIPE` above turns the kill
+# into a plain nonzero return) instead of dying mid-prologue with a decided
+# record and no ended. On that failure, no enactment ever started (no child,
+# no manager, nothing to reap) — the same abort outcome
+# aib_enact_launch/aib-broker-handler already commit elsewhere for a
+# self-initiated abort with no more specific information, so it is committed
+# the same way here, directly (aib_enact_launch was never reached).
+_prologue="$(printf 'decision=%s\ncode=%s\neffective_sandbox=%s\neffective_clearance=%s\neffective_effort=%s\neffective_timeout=%s\ncwd=%s\nreasons=%s\ndecided_event_id=%s\nenacted=yes' \
+  "$AIB_VERDICT_DECISION" "$AIB_VERDICT_CODE" "$AIB_VERDICT_EFFECTIVE_SANDBOX" \
+  "$AIB_VERDICT_EFFECTIVE_CLEARANCE" "$AIB_VERDICT_EFFECTIVE_EFFORT" "$AIB_VERDICT_EFFECTIVE_TIMEOUT" \
+  "$AIB_CWD_RESOLVED" "$AIB_VERDICT_REASONS" "$_decided_event_id")"
+if ! printf '%s\n' "$_prologue"; then
+  aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.ended "$_broker_envelope" \
+    "$(aib_event_compose_ended_payload $'exit_class=aborted\nstage=provider\nsignal=TERM')" \
+    "$_decided_event_id" >/dev/null 2>&1 || true
+  exit 0
+fi
 
 _broker_label="${AIB_REQ_LABEL:-codex-run}"
 _broker_hb() {
@@ -297,6 +326,16 @@ _enact_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=%s\neffort=%s\nmod
 
 aib_enact_launch "$_enact_record" "${AIB_REQ_PROMPT:-}" "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" \
   "$_broker_envelope" "$_decided_event_id"
+
+# D8 (gate delta, Ikarus, MEDIUM): a broker-side incident (the ended commit
+# itself failed, after the provider already ran) is NOT the provider-outcome
+# case below — aib_enact_launch already closed the wire with end=error
+# itself; this process reports the incident the same way every other
+# incident in this file does (exit 2), never the provider-outcome exit 0.
+if [ -n "${AIB_ENACT_INCIDENT:-}" ]; then
+  _broker_hb blocked "codex-run event_store_unavailable (post-enactment) — $_broker_label"
+  exit 2
+fi
 
 if [ "$AIB_ENACT_EXIT_CLASS" = ok ]; then
   _broker_hb done "codex-run OK — $_broker_label"
