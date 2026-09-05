@@ -1283,10 +1283,16 @@ aib_inbox_path() {
 #   There is NO exit field on attempt.decided (omitted, not null, §B7).
 #
 # PAYLOAD — attempt.ended (allow-path terminal only):
-#   exit: {class, code, signal}. class ∈ ok|provider-failure|timeout|io-refused|aborted
-#     — a genuinely observed terminal value only. `presumed-dead` is NEVER a payload
-#     value (§B7): it is exclusively a reader-side fold classification of an open
-#     decided(allow) whose recorded PID has vanished. The composer rejects it fail-closed.
+#   exit: {class, code, signal, stage}. class ∈ ok|provider-failure|timeout|io-refused|
+#     aborted — a genuinely observed terminal value only. `presumed-dead` is NEVER a
+#     payload value (§B7): it is exclusively a reader-side fold classification of an
+#     open decided(allow) whose recorded PID has vanished. The composer rejects it
+#     fail-closed. `stage` (RM-3 slice 3, schema version 2, CONTRACT-execution-binding
+#     §8.1, D-K) ∈ confine|cwd|exec|provider|null — which phase of enactment the
+#     terminal status belongs to, so a helper-side refusal is never misread as the
+#     provider's own outcome. Always supplied by every real writer; `null` only on a
+#     record composed under schema version 1 (pre-slice-3), which a reader folds the
+#     same as "unknown", never as a refused record.
 #
 # QUARANTINE (§B6, fail-closed):
 #   uncommitted tail — ONLY the last record AND only unterminated (no trailing LF): the
@@ -1303,7 +1309,12 @@ aib_inbox_path() {
 #   NOT detectable without an external cursor: whole-suffix / file replacement (a
 #     persistent high-water anchor sits in the same trust domain — it is the RM-3 close).
 
-AIB_EVENT_SCHEMA_VERSION=1
+# RM-3 slice 3 bumps 1 -> 2: attempt.ended payloads gain exit.stage (see above). This is
+# a deliberate, additive payload change (CONTRACT-execution-binding.md §8.1) — readers
+# (aib_event_scan / bin/attempts) treat the envelope's schema_version as opaque and
+# never branch on it, so a stream mixing version-1 and version-2 records folds
+# unchanged either way (tests/broker_enact_spec.sh §3 pins exactly this).
+AIB_EVENT_SCHEMA_VERSION=2
 AIB_EVENT_STREAM_NAME="main"
 AIB_EVENT_MAX_LABEL_BYTES=256
 AIB_EVENT_MAX_RECORD_BYTES=65536
@@ -1385,7 +1396,7 @@ aib_event_compose_decided_payload() {
 }
 
 aib_event_compose_ended_payload() {
-  local kv="${1-}" exit_class
+  local kv="${1-}" exit_class stage
   _aib_utf8_is_valid "$kv" || aib_die 2 "ended payload input is not valid UTF-8"
   exit_class="$(_aib_record_field "$kv" exit_class)" || exit_class=""
   case "$exit_class" in
@@ -1393,10 +1404,27 @@ aib_event_compose_ended_payload() {
     presumed-dead) aib_die 2 "'presumed-dead' is a reader-side fold classification, never an event payload value (§B7)";;
     *) aib_die 2 "invalid exit_class '$exit_class' (ok|provider-failure|timeout|io-refused|aborted)";;
   esac
-  printf '{"exit":{"class":%s,"code":%s,"signal":%s}}' \
+  # RM-3 slice 3 (CONTRACT-execution-binding.md §8.1, D-K): exit.stage distinguishes a
+  # helper-side refusal from the provider's own outcome — "we never ran it" from "it
+  # ran and failed". OPTIONAL at this composer: every real (schema-version-2) caller
+  # supplies it on every commit, but the composer itself does not enforce that,
+  # because this same function is how tests/broker_enact_spec.sh builds a
+  # schema-version-1-shaped payload (no stage key) to prove the fold still reads an
+  # old stream unchanged. When given, it is validated against the same enum
+  # CONTRACT-execution-binding.md §8.1 fixes; when absent it composes as `null`,
+  # indistinguishable to a reader from "unknown" per that section's reader-tolerance
+  # rule.
+  if stage="$(_aib_record_field "$kv" stage)"; then
+    case "$stage" in
+      confine|cwd|exec|provider) ;;
+      *) aib_die 2 "invalid stage '$stage' (confine|cwd|exec|provider)";;
+    esac
+  fi
+  printf '{"exit":{"class":%s,"code":%s,"signal":%s,"stage":%s}}' \
     "$(aib_json "$exit_class")" \
     "$(_aib_kv_num_or_null "$kv" exit_code)" \
-    "$(_aib_kv_json_or_null "$kv" signal)"
+    "$(_aib_kv_json_or_null "$kv" signal)" \
+    "$(_aib_kv_json_or_null "$kv" stage)"
 }
 
 # --- top-level JSON field extractor (the shared reader primitive) -------------
