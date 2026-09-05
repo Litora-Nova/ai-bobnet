@@ -4,30 +4,41 @@
 # systemd spawns one of these per accepted connection; the connection is stdin AND stdout,
 # which the unit has to say EXPLICITLY (see deploy/systemd/aib-broker@.service).
 #
-# Slice 2 scope: `authorize` moves behind this seam. The handler resolves the snapshot
-# from the BROKER'S OWN registry (§2: "the snapshot comes from the broker's own
-# registry, never from the caller"), contains `cwd` against the registry-derived root
-# (SPEC-wire-format), and asks the PDP for a verdict. Every path still answers with a
-# terminal status line before exiting — a refusal the caller cannot read is
-# indistinguishable from a dead broker.
+# Slice 2 moved `authorize` behind this seam: the handler resolves the snapshot from
+# the BROKER'S OWN registry (§2: "the snapshot comes from the broker's own registry,
+# never from the caller"), contains `cwd` against the registry-derived root
+# (SPEC-wire-format), and asks the PDP for a verdict.
 #
-# What still does NOT move in slice 2:
-#   - Enactment. No provider process starts here; every allow answers `enacted=no` so
-#     a verdict is never mistaken for a launch (§2.1 confinement is slice 3).
+# Slice 3 (this revision) adds §2 steps 2-4 for real: `commit(attempt.decided)` on
+# EVERY verdict (deny too — CONTRACT-codex-run.md §4 item 1: "the deny path writes
+# exactly one attempt.decided record and fails closed"), enactment under §2.1
+# confinement on allow (`aib_enact_launch`, lib/aibobnet.sh — the same function
+# bin/launch-agent's in-process path uses, in "confined" mode here), and
+# `commit(attempt.ended)`. The durable stream lives at `$AIB_EVENT_ROOT/<project_uid>`
+# (ADR-0005), never under the project's `standup_dir` — the confined child's `LL_RW`
+# may safely include `home` (and therefore `standup_dir`) only because the stream
+# and the high-water anchor live OUTSIDE it. `AIB_EVENT_ROOT` is unit-environment-only,
+# exactly like `AIB_CONFINE_BIN` (docs/CONFINEMENT.md) — never request- or
+# registry-supplied — and this handler fails closed if it is unset or unwritable:
+# an attempt this handler cannot durably record is an incident, not a launch.
+#
+# What still does NOT move here:
 #   - The wrapper's extra refusal of --sandbox danger-full-access. The PDP's own
 #     clamp-to-capability is the contracted behaviour (§3) and stays a clamp, not a
 #     refusal (SPEC-wire-format, "Assurances that must move with authorize").
+#   - Wire-level errors (malformed request, registry unavailable, unknown agent,
+#     cwd not found/outside root): SPEC-wire-format.md is explicit that these keep
+#     the slice-1/2 shape unchanged — no prologue, no decided_event_id, because no
+#     verdict was ever reached. Only a REAL PDP verdict (allow or deny) commits.
 #
-# OBLIGATION FOR SLICE 3 (gate delta D2, Ikarus, stated now so it cannot be forgotten):
-# aib_contain_cwd closes the window where a symlink is planted at a cwd BEFORE this
-# handler authorises it (resolution now requires existence, realpath -e, which fully
-# resolves symlinks). It does NOT close the window where a symlink is swapped in
-# AFTER authorisation and BEFORE the provider actually starts — this handler and the
-# PDP both run well before enactment exists. Whoever performs step 4 (`cd`) of
-# SPEC-wire-format's five-step containment order MUST re-check `pwd -P` against the
-# registry-derived root before step 5 (`exec`), inside the same enactment that
-# installs Landlock. A re-check anywhere earlier than immediately-before-exec still
-# leaves a window; a re-check skipped entirely reopens D2 one step later.
+# D2 (gate delta, Ikarus — CLOSED this slice, not just stated): aib_contain_cwd closes
+# the window where a symlink is planted at a cwd BEFORE this handler authorises it
+# (resolution requires existence, realpath -e, which fully resolves symlinks). It does
+# NOT close the window where a symlink is swapped in AFTER authorisation and BEFORE the
+# provider actually starts — this handler and the PDP both run well before enactment.
+# `aib_enact_launch` re-checks `pwd -P` against the registry-derived root immediately
+# before exec, inside the same enactment that installs Landlock (SPEC-wire-format.md,
+# "cwd — the field that stops carrying authority").
 set -uo pipefail
 
 AIB_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
@@ -141,25 +152,158 @@ fi
 _request="$(aib_build_pdp_request_record "${AIB_REQ_AGENT_UID:-}" "${AIB_REQ_SANDBOX:-read-only}" \
   "$AIB_CWD_RESOLVED" "${AIB_REQ_TIMEOUT:-}" "${AIB_REQ_LABEL:-}")"
 
-if aib_authorize_launch "$_request" "$_snapshot"; then
-  # enacted=no on every allow: no provider process has started here. A verdict is not
-  # a launch — enactment under §2.1 confinement is slice 3. cwd is echoed only in its
-  # RESOLVED form; label and prompt (caller free text) are never echoed back at all.
-  aib_wire_write_response ok \
-    "decision=$AIB_VERDICT_DECISION" \
-    "code=$AIB_VERDICT_CODE" \
-    "effective_sandbox=$AIB_VERDICT_EFFECTIVE_SANDBOX" \
-    "effective_clearance=$AIB_VERDICT_EFFECTIVE_CLEARANCE" \
-    "effective_effort=$AIB_VERDICT_EFFECTIVE_EFFORT" \
-    "effective_timeout=$AIB_VERDICT_EFFECTIVE_TIMEOUT" \
-    "cwd=$AIB_CWD_RESOLVED" \
-    "reasons=$AIB_VERDICT_REASONS" \
-    "enacted=no"
-  exit 0
-else
+_verdict_allow=1
+aib_authorize_launch "$_request" "$_snapshot" || _verdict_allow=0
+
+# --- re-resolve OUTSIDE a subshell -------------------------------------------
+# _aib_broker_resolve_snapshot above ran inside `$( )` (so its exit status could
+# be classified rather than ending this process) — every global
+# aib_resolve_managed_agent sets (AIB_HOME, AIB_STANDUP_DIR, AIB_PROJECT_UID,
+# AIB_TEAM_UID, AIB_PROVIDER/_SOURCE, AIB_MODEL/_SOURCE, AIB_EFFORT/_SOURCE,
+# AIB_ADAPTER_PATH/_SOURCE, AIB_REGISTRY_SCHEMA_VERSION, …) therefore died with
+# that subshell; only what it explicitly printed (home, the snapshot record)
+# survived. We already know this call succeeds (identically — same registry
+# file, same agent_uid, same deterministic resolver) because the first one
+# already did; this second, ordinary call is what makes those globals exist in
+# THIS process for the commit envelope, the enact-record, and the child's
+# AIBOBNET_* exports below.
+aib_resolve_managed_agent "${AIB_REQ_AGENT_UID:-}"
+
+# --- §2 step 2: commit(attempt.decided) on EVERY verdict, allow or deny ------
+# ADR-0005: the broker's OWN stream, outside every project home. AIB_EVENT_ROOT
+# is unit-environment-only (never request/registry-supplied), exactly like
+# AIB_CONFINE_BIN — an attempt this handler cannot durably record is an
+# incident, not a launch, so this fails closed before ever touching the PDP's
+# answer.
+: "${AIB_EVENT_ROOT:=}"
+if [ -z "$AIB_EVENT_ROOT" ]; then
+  aib_wire_write_response error "reason=event_store_unavailable"
+  exit 2
+fi
+_event_dir="$AIB_EVENT_ROOT/$AIB_PROJECT_UID"
+if ! mkdir -p -- "$_event_dir" 2>/dev/null || [ ! -w "$_event_dir" ]; then
+  aib_wire_write_response error "reason=event_store_unavailable"
+  exit 2
+fi
+AIB_EVENT_FILE="$_event_dir/main.events"
+AIB_EVENT_LOCK="$_event_dir/main.events.lock"
+
+# D-E: actor_type=service (the existing enum — no new value), actor_id names
+# the broker's own identity, a constant (§3.1: the broker fills actor_id
+# itself, not a request field).
+_broker_envelope="$(printf 'project_uid=%s\nactor_type=service\nactor_id=aib-broker\nagent_uid=%s\nteam_uid=%s\nsession_id=%s' \
+  "$AIB_PROJECT_UID" "${AIB_REQ_AGENT_UID:-}" "$AIB_TEAM_UID" "$AIB_MUX_SESSION")"
+
+LC_ALL=C
+_prompt_len=${#AIB_REQ_PROMPT}
+_label_len=${#AIB_REQ_LABEL}
+_audit_label="${AIB_REQ_LABEL//$'\n'/ }"
+_audit_label="${_audit_label//$'\r'/ }"
+_sha256_bin="$(command -v sha256sum)" || aib_die 6 "required runtime dependency not found: sha256sum (coreutils)"
+_prompt_sha_output="$(printf '%s' "$AIB_REQ_PROMPT" | "$_sha256_bin")" || aib_die 2 "cannot compute prompt sha256"
+_prompt_sha256="${_prompt_sha_output%% *}"
+
+_decided_kv="$(printf 'decision=%s\ncode=%s\nreasons=%s\nprovider_resolved=%s\nprovider_source=%s\nmodel_resolved=%s\nmodel_source=%s\neffort_resolved=%s\neffort_source=%s\nsandbox_requested=%s\nadapter_raw=%s\nadapter_source=%s\npid=%s\nprompt_len=%s\nprompt_sha256=%s\nlabel=%s\nlabel_len=%s' \
+  "$AIB_VERDICT_DECISION" "$AIB_VERDICT_CODE" "$AIB_VERDICT_REASONS" \
+  "$AIB_PROVIDER" "$AIB_PROVIDER_SOURCE" "$AIB_MODEL" "$AIB_MODEL_SOURCE" \
+  "$AIB_EFFORT" "$AIB_EFFORT_SOURCE" "${AIB_REQ_SANDBOX:-read-only}" "$AIB_ADAPTER_PATH" \
+  "$AIB_ADAPTER_SOURCE" "$$" "$_prompt_len" "$_prompt_sha256" "$_audit_label" "$_label_len")"
+if [ "$_verdict_allow" -eq 1 ]; then
+  _decided_kv="${_decided_kv}"$'\n'"$(printf 'provider_effective=%s\nmodel_effective=%s\neffort_effective=%s\nsandbox_effective=%s\nadapter_effective=%s' \
+    "$AIB_PROVIDER" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_EFFORT" \
+    "$AIB_VERDICT_EFFECTIVE_SANDBOX" "$AIB_VERDICT_ADAPTER_PATH")"
+fi
+_decided_payload="$(aib_event_compose_decided_payload "$_decided_kv")"
+set +e
+aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided "$_broker_envelope" "$_decided_payload"
+_decided_commit_rc=$?
+set -e
+if [ "$_decided_commit_rc" -ne 0 ]; then
+  aib_wire_write_response error "reason=event_store_unavailable"
+  exit 2
+fi
+_decided_event_id="$AIB_EVENT_COMMIT_EVENT_ID"
+
+if [ "$_verdict_allow" -ne 1 ]; then
+  # codex-run.md §4 item 1 / SPEC-wire-format "Deny": decided-only, no
+  # enactment, no chunk section — closes the RM-1 hole where a deny left no
+  # trace at all.
   aib_wire_write_response denied \
     "decision=$AIB_VERDICT_DECISION" \
     "code=$AIB_VERDICT_CODE" \
-    "reasons=$AIB_VERDICT_REASONS"
+    "reasons=$AIB_VERDICT_REASONS" \
+    "decided_event_id=$_decided_event_id"
   exit 3
 fi
+
+# --- §2 steps 3-4: enactment (§2.1 confinement) + commit(attempt.ended) -----
+# Prologue FIRST (SPEC-wire-format.md, "Response frame"): everything in it is
+# already known from the verdict, decided_event_id included — commit(decided)
+# already happened, above. This is NOT aib_wire_write_response (that appends
+# `end=` unconditionally, which would put a terminal line in front of the
+# chunks) — a client reading to the first `end=` must not stop here.
+printf 'decision=%s\n' "$AIB_VERDICT_DECISION"
+printf 'code=%s\n' "$AIB_VERDICT_CODE"
+printf 'effective_sandbox=%s\n' "$AIB_VERDICT_EFFECTIVE_SANDBOX"
+printf 'effective_clearance=%s\n' "$AIB_VERDICT_EFFECTIVE_CLEARANCE"
+printf 'effective_effort=%s\n' "$AIB_VERDICT_EFFECTIVE_EFFORT"
+printf 'effective_timeout=%s\n' "$AIB_VERDICT_EFFECTIVE_TIMEOUT"
+printf 'cwd=%s\n' "$AIB_CWD_RESOLVED"
+printf 'reasons=%s\n' "$AIB_VERDICT_REASONS"
+printf 'decided_event_id=%s\n' "$_decided_event_id"
+printf 'enacted=yes\n'
+
+_broker_label="${AIB_REQ_LABEL:-codex-run}"
+_broker_hb() {
+  # D-G: a broker-owned umask must not lock the agent account out of its own
+  # heartbeat file — files THIS process creates under the shared standup_dir
+  # stay group-appendable.
+  ( umask 0002; aib_log_resolved "$AIB_STANDUP_DIR" "${AIB_REQ_AGENT_UID:-}" "$1" "$2" )
+}
+_broker_hb busy "codex-run: $AIB_MODEL/$AIB_VERDICT_EFFECTIVE_SANDBOX effort=$AIB_VERDICT_EFFECTIVE_EFFORT — $_broker_label"
+
+# D-F: env -i, HOME/PATH from THIS process's own context (the allow-list loop
+# inside aib_enact_launch reads AIB_VERDICT_ENV_ALLOW, already set by the
+# aib_authorize_launch call above), the PEP's AIBOBNET_* exports — same shape,
+# built from the broker's own resolved snapshot rather than launch-agent's.
+# AIBOBNET_ATTEMPT_ID is added by aib_enact_launch itself, always, last.
+AIB_ENACT_CHILD_ENV_EXTRA=(
+  "AIBOBNET_AGENT_UID=${AIB_REQ_AGENT_UID:-}"
+  "AIBOBNET_PROJECT_UID=$AIB_PROJECT_UID"
+  "AIBOBNET_AGENT_KEY=$AIB_AGENT_KEY"
+  "AIBOBNET_PROFILE=$AIB_PROFILE"
+  "AIBOBNET_CLEARANCE=$AIB_CLEARANCE"
+  "AIBOBNET_TEAM_UID=$AIB_TEAM_UID"
+  "AIBOBNET_HOME=$AIB_HOME"
+  "AIBOBNET_STANDUP_DIR=$AIB_STANDUP_DIR"
+  "AIBOBNET_INBOX_PATH=$AIB_INBOX_PATH"
+  "AIBOBNET_MUX_SESSION=$AIB_MUX_SESSION"
+  "AIBOBNET_PROVIDER=$AIB_PROVIDER"
+  "AIBOBNET_PROVIDER_SOURCE=$AIB_PROVIDER_SOURCE"
+  "AIBOBNET_MODEL=$AIB_MODEL"
+  "AIBOBNET_MODEL_SOURCE=$AIB_MODEL_SOURCE"
+  "AIBOBNET_EFFORT=$AIB_EFFORT"
+  "AIBOBNET_EFFORT_SOURCE=$AIB_EFFORT_SOURCE"
+  "AIBOBNET_REGISTRY_SCHEMA_VERSION=$AIB_REGISTRY_SCHEMA_VERSION"
+  "STANDUP_DIR=$AIB_STANDUP_DIR"
+)
+
+# adapter argv identical to the PEP's (D-F): -m/-s/effort/prompt come from the
+# VERDICT's effective values, never the request. root is AIB_HOME — the
+# registry-derived Landlock boundary aib_enact_launch re-checks cwd against.
+_enact_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=%s\neffort=%s\nmodel=%s\ntimeout=%s' \
+  "$AIB_VERDICT_ADAPTER_PATH" "$AIB_HOME" "$AIB_CWD_RESOLVED" "$AIB_VERDICT_EFFECTIVE_SANDBOX" \
+  "$AIB_VERDICT_EFFECTIVE_EFFORT" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_TIMEOUT")"
+
+aib_enact_launch "$_enact_record" "${AIB_REQ_PROMPT:-}" "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" \
+  "$_broker_envelope" "$_decided_event_id"
+
+if [ "$AIB_ENACT_EXIT_CLASS" = ok ]; then
+  _broker_hb done "codex-run OK — $_broker_label"
+else
+  _broker_hb blocked "codex-run ${AIB_ENACT_EXIT_CLASS:-unknown} (${AIB_ENACT_STAGE:-unknown}) — $_broker_label"
+fi
+# end=ok already on the wire (aib_enact_launch's own terminal-line write): "the
+# broker did its job", regardless of the provider's own exit class
+# (SPEC-wire-format.md, "Terminal lines").
+exit 0
