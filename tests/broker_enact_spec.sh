@@ -10,8 +10,21 @@
 #
 #   THE CALL CONTRACT THIS SPEC PINS (the builder must provide it to this shape):
 #
-#     aib_enact_launch <enact-record> <events-path> <lock-path> <envelope-kv> \
-#                       <decided-event-id>
+#     aib_enact_launch <enact-record> <prompt> <events-path> <lock-path> \
+#                       <envelope-kv> <decided-event-id> [mode]
+#
+#   SPEC-FIXTURE CORRECTION (this file, this commit): the enact-record originally
+#   carried `prompt=<text>` as a record LINE. Prompts are multi-line free text, and a
+#   newline-keyed record cannot carry them without corrupting on the first embedded
+#   newline — the same reason the wire itself length-prefixes prompt rather than
+#   putting it on a record line (SPEC-wire-format.md, field classification table).
+#   The ABI is corrected here, before any implementation exists: prompt is its own
+#   positional argument, never a `prompt=` line in <enact-record>. `[mode]` is an
+#   OPTIONAL 7th argument this file never passes (so every call below exercises the
+#   default) — it exists so bin/launch-agent's in-process, unconfined enactment can
+#   share this same function without an unset AIB_CONFINE_BIN reading as "confinement
+#   unavailable" (see docs/CONFINEMENT.md and the builder's report for the exact
+#   values and default).
 #
 #   writes ONLY the chunk section and the terminal line of the response frame
 #   (docs/SPEC-wire-format.md, "Response frame") to its stdout — the prologue
@@ -25,8 +38,9 @@
 #   <enact-record> (newline key=value, same idiom as the PDP's request/snapshot
 #   records): adapter (absolute path) · root (the registry-derived Landlock root,
 #   i.e. AIB_HOME) · cwd (the ALREADY-AUTHORIZED resolved cwd — re-checked here, not
-#   trusted) · sandbox / effort / model / timeout (all EFFECTIVE, already clamped) ·
-#   prompt.
+#   trusted) · sandbox / effort / model / timeout (all EFFECTIVE, already clamped).
+#   prompt is NOT in the record (see the spec-fixture correction above) — it is the
+#   dedicated 2nd positional argument, exactly once, never re-derived from the record.
 #
 #   Confinement configuration is deliberately NOT in the record: AIB_CONFINE_BIN is
 #   unit-environment-only (CONFINEMENT.md), never request- or registry-supplied, so
@@ -209,10 +223,13 @@ agent_uid=acme-core
 team_uid=acme-engine
 session_id=acme-broker"
 
-base_enact_record() { # base_enact_record <cwd> [prompt-mode-as-prompt-text]
-  printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5\nprompt=%s' \
-    "$ADAPTER" "$FIXTURE_HOME" "$1" "${2:-hello}"
+base_enact_record() { # base_enact_record <cwd>
+  printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5' \
+    "$ADAPTER" "$FIXTURE_HOME" "$1"
 }
+# base_prompt [text] — the corresponding default prompt, now a call argument, never
+# a record line (see the spec-fixture correction at the top of this file).
+base_prompt() { printf '%s' "${1:-hello}"; }
 
 reset_run() {
   rm -f "$SENTINEL" "$ARGV_OUT"
@@ -321,7 +338,7 @@ fi
 # --- 4a. no exec without the helper -----------------------------------------
 reset_run
 unset AIB_CONFINE_BIN 2>/dev/null || true
-enact_out="$(AIB_CONFINE_BIN="" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" \
+enact_out="$(AIB_CONFINE_BIN="" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-1" 2>"$WORK/enact-err-4a")"
 enact_rc=$?
 if [ -e "$SENTINEL" ]; then no "an unset AIB_CONFINE_BIN never runs the provider"
@@ -332,7 +349,7 @@ eq "…and the enactment fails closed (nonzero)" "$([ "$enact_rc" -ne 0 ] && pri
 reset_run
 landlock_conf_write preflight-fail
 adapter_conf_write ok
-enact_out="$(AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" \
+enact_out="$(AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-2" 2>"$WORK/enact-err-4b")"
 if [ -e "$SENTINEL" ]; then no "a failed pre-flight never runs the provider (D-A)"
 else ok "a failed pre-flight never runs the provider (D-A)"; fi
@@ -348,11 +365,11 @@ reset_run
 landlock_conf_write ok
 adapter_conf_write ok
 mkdir -p "$FIXTURE_WS/sub-a" "$FIXTURE_WS/sub-b"
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS/sub-a")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS/sub-a")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-3a" >/dev/null 2>"$WORK/enact-err-4c1"
 ll_rw_a="$(grep '^LL_RW=' "$LL_LOG" | tail -1)"
 reset_run
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS/sub-b")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS/sub-b")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-3b" >/dev/null 2>"$WORK/enact-err-4c2"
 ll_rw_b="$(grep '^LL_RW=' "$LL_LOG" | tail -1)"
 # Guard against the comparison below passing vacuously because the helper was never
@@ -385,9 +402,9 @@ ln -s "$SWAP_OUTSIDE" "$SWAP_ROOT/sub"   # swapped to point OUTSIDE root, same p
 reset_run
 landlock_conf_write ok
 adapter_conf_write ok
-swap_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5\nprompt=hello' \
+swap_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5' \
   "$ADAPTER" "$SWAP_ROOT" "$authorized_cwd")"
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$swap_record" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$swap_record" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-4e" >"$WORK/resp-4e" 2>"$WORK/enact-err-4e"
 if [ -e "$SENTINEL" ]; then no "a cwd swapped to point outside root after authorize never runs the adapter (D2/D-C)"
 else ok "a cwd swapped to point outside root after authorize never runs the adapter (D2/D-C)"; fi
@@ -402,7 +419,7 @@ has "…the terminal line on the wire names stage=cwd" "$(<"$WORK/resp-4e")" "st
 reset_run
 landlock_conf_write ok
 adapter_conf_write ok
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS" "make it so")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "make it so")" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-5" >"$WORK/resp-5" 2>"$WORK/enact-err-5"
 eq "a clean allow runs the provider exactly once" "$(file_line_count "$SENTINEL")" "1"
 has "…the resolved cwd is where the child actually starts (pwd -P, logged by the helper)" \
@@ -416,6 +433,24 @@ eq "…exactly one end= total, never a second one" "$end_count" "1"
 last_line="$(tail -1 "$WORK/resp-5" 2>/dev/null)"
 has "…end= is the LAST line of the frame" "$last_line" "end="
 
+# --- 5b. a multi-line prompt reaches the adapter byte-exact ------------------
+# The whole reason for the spec-fixture correction at the top of this file: a
+# newline-keyed enact-record cannot carry free text containing its own key
+# separator. Proving the fix means proving a prompt WITH embedded newlines
+# survives as the single argv token the adapter receives, unfolded and
+# untruncated at the first newline — not just that a one-line "hello" works.
+reset_run
+landlock_conf_write ok
+adapter_conf_write ok
+MULTILINE_PROMPT=$'first line\nsecond line\nthird line, no trailing newline'
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$MULTILINE_PROMPT" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-5b" >"$WORK/resp-5b" 2>"$WORK/enact-err-5b"
+argv_captured="$(<"$ARGV_OUT")"
+has "a multi-line prompt's first line reaches the adapter" "$argv_captured" "first line"
+has "…its second line, still inside the SAME argv token (not a record split)" "$argv_captured" "second line"
+has "…and its last line, with no silent truncation at the last newline" \
+  "$argv_captured" "third line, no trailing newline"
+
 # =============================================================================
 # 6. Exit-class mapping carries stage=provider, so a provider's OWN exit 3/127
 #    is never misread as a confinement refusal (advisor finding on D-A/D-C).
@@ -423,7 +458,7 @@ has "…end= is the LAST line of the frame" "$last_line" "end="
 reset_run
 landlock_conf_write ok
 adapter_conf_write err 3
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-6a" >"$WORK/resp-6a" 2>"$WORK/enact-err-6a"
 eq "a provider exiting 3 is provider-failure, never confine (advisor: exit code is not reservable)" \
   "${AIB_ENACT_EXIT_CLASS:-}" "provider-failure"
@@ -431,7 +466,7 @@ eq "…and its stage is provider" "${AIB_ENACT_STAGE:-}" "provider"
 
 reset_run
 adapter_conf_write err 127
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-6b" >"$WORK/resp-6b" 2>"$WORK/enact-err-6b"
 eq "a provider exiting 127 is io-refused, but stage=provider (not confine)" \
   "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
@@ -439,9 +474,9 @@ eq "…its stage is provider, distinguishing it from a helper-side io-refused" "
 
 reset_run
 adapter_conf_write sleep 0 5
-timeout_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=1\nprompt=hello' \
+timeout_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=1' \
   "$ADAPTER" "$FIXTURE_HOME" "$FIXTURE_WS")"
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$timeout_record" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$timeout_record" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-6c" >"$WORK/resp-6c" 2>"$WORK/enact-err-6c"
 eq "a provider outliving the effective timeout is classified timeout" "${AIB_ENACT_EXIT_CLASS:-}" "timeout"
 has "…exit_code=124 on the wire" "$(<"$WORK/resp-6c")" "exit_code=124"
@@ -453,7 +488,7 @@ has "…exit_code=124 on the wire" "$(<"$WORK/resp-6c")" "exit_code=124"
 # =============================================================================
 reset_run
 adapter_conf_write chunk-nul
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-7a" >"$WORK/resp-7a" 2>"$WORK/enact-err-7a"
 body_bytes="$(file_byte_count "$WORK/resp-7a")"
 if [ "$body_bytes" -gt 0 ] && grep -qaF 'before' "$WORK/resp-7a" && grep -qaF 'after' "$WORK/resp-7a"; then
@@ -464,7 +499,7 @@ fi
 
 reset_run
 adapter_conf_write chunk-endok
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" \
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-7b" >"$WORK/resp-7b" 2>"$WORK/enact-err-7b"
 end_lines="$(count_matches_in_file '^end=' "$WORK/resp-7b")"
 eq "a chunk containing the literal line 'end=ok' does not create a second end= (reader counts, never scans)" \
@@ -596,7 +631,7 @@ if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
   FIFO="$WORK/resp-fifo"
   rm -f "$FIFO"; mkfifo "$FIFO"
   (
-    AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS" "$DISC_MARKER")" \
+    AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "$DISC_MARKER")" \
       "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "test-decided-11" \
       >"$FIFO" 2>"$WORK/enact-err-11"
   ) &
