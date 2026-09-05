@@ -17,6 +17,24 @@
  * Built at install time, not shipped as a binary: an architecture- and libc-specific blob
  * asks for trust in a build nobody can reproduce, in a repository whose purpose is the
  * opposite. See docs/CONFINEMENT.md.
+ *
+ *   LL_STATUS_FD=<n>   exec-status channel (slice 3, docs/CONFINEMENT.md).
+ *
+ * execvp() never returns on success, so no exit code from THIS process is ever available
+ * to the caller to distinguish "confinement was never attempted" from "the confined
+ * provider itself exited 3, 127 or any other number" once exec has handed off — the
+ * child owns the whole exit-code space after that point. LL_STATUS_FD is the caller's
+ * side channel for that distinction: if it names an open fd, this process marks it
+ * CLOEXEC FIRST (fcntl, before any Landlock work), then writes ONE line naming the
+ * reason to it on every failure path that returns before a successful execvp — ruleset
+ * create/add-rule/no_new_privs/restrict_self, and execvp itself failing. On a
+ * successful execvp the fd is still open at that instant, but CLOEXEC means the kernel
+ * closes it as part of that very exec, before the replacement image's first
+ * instruction runs — the caller reads it only AFTER the child ends, and empty then
+ * means exec succeeded (the wait status is the provider's own). The fd is deliberately
+ * unset before a successful execvp too (belt and suspenders alongside CLOEXEC: a
+ * provider that somehow inherited it across an exec that failed to honour CLOEXEC must
+ * still not find it) — see status_close() below.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -59,10 +77,51 @@ static int add_list(int rs, const char *env, __u64 rights){
   free(d); return 0;
 }
 
+/* status_fd: -1 if LL_STATUS_FD was absent/unparsable — every status_fail() call below
+ * then becomes a silent no-op, so a caller that does not use the channel sees exactly
+ * the pre-slice-3 behaviour (stderr only). */
+static int status_fd = -1;
+
+static void status_init(void){
+  const char *v = getenv("LL_STATUS_FD");
+  if (!v || !*v) return;
+  char *end = NULL;
+  long n = strtol(v, &end, 10);
+  if (!end || *end || n < 0 || n > 65535) return; /* malformed: treat as absent, fail-closed on stderr only */
+  status_fd = (int)n;
+  /* CLOEXEC set HERE, by the helper, not assumed from the caller (docs/CONFINEMENT.md,
+   * D-A2): this is what makes a later successful execvp() close the fd automatically,
+   * while it stays open in THIS process for every failure path below. */
+  if (fcntl(status_fd, F_SETFD, FD_CLOEXEC) < 0) status_fd = -1;
+}
+
+/* One line, no trailing content beyond the newline this always appends — the caller
+ * reads the whole fd after the child ends and only cares whether it is empty. */
+static void status_fail(const char *reason){
+  if (status_fd < 0) return;
+  size_t len = strlen(reason);
+  ssize_t off = 0;
+  while ((size_t)off < len) {
+    ssize_t w = write(status_fd, reason + off, len - off);
+    if (w <= 0) return; /* best-effort: stderr already has the same reason */
+    off += w;
+  }
+  (void)write(status_fd, "\n", 1);
+}
+
 int main(int argc, char **argv){
-  if (argc < 2){ fprintf(stderr,"usage: landlock-exec CMD [ARGS...]\n"); return 2; }
+  status_init();
+  if (argc < 2){
+    fprintf(stderr,"usage: landlock-exec CMD [ARGS...]\n");
+    status_fail("confine: usage: landlock-exec CMD [ARGS...]");
+    return 2;
+  }
   int abi = ll_create(NULL,0,1 /*VERSION*/);
-  if (abi < 1){ fprintf(stderr,"landlock-exec: unavailable (%s)\n",strerror(errno)); return 3; }
+  if (abi < 1){
+    fprintf(stderr,"landlock-exec: unavailable (%s)\n",strerror(errno));
+    status_fail("confine: landlock unavailable");
+    return 3;
+  }
 
   __u64 all = (1ULL<<13)-1;              /* ABI1: EXECUTE..MAKE_SYM */
   if (abi >= 2) all |= (1ULL<<13);       /* REFER    */
@@ -72,13 +131,34 @@ int main(int argc, char **argv){
 
   struct rs_attr a = { .handled_access_fs = all, .handled_access_net = 0, .scoped = 0 };
   int rs = ll_create(&a,sizeof(a),0);
-  if (rs < 0){ fprintf(stderr,"landlock-exec: create: %s\n",strerror(errno)); return 3; }
-  if (add_list(rs,"LL_RO",ro) || add_list(rs,"LL_RW",all)) return 3;
-  if (prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)){ perror("no_new_privs"); return 3; }
-  if (ll_self(rs,0)){ fprintf(stderr,"landlock-exec: restrict_self: %s\n",strerror(errno)); return 3; }
+  if (rs < 0){
+    fprintf(stderr,"landlock-exec: create: %s\n",strerror(errno));
+    status_fail("confine: ruleset create failed");
+    return 3;
+  }
+  if (add_list(rs,"LL_RO",ro) || add_list(rs,"LL_RW",all)){
+    status_fail("confine: add-rule failed (see journal for the path)");
+    return 3;
+  }
+  if (prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)){
+    perror("no_new_privs");
+    status_fail("confine: no_new_privs failed");
+    return 3;
+  }
+  if (ll_self(rs,0)){
+    fprintf(stderr,"landlock-exec: restrict_self: %s\n",strerror(errno));
+    status_fail("confine: restrict_self failed");
+    return 3;
+  }
   close(rs);
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);
+  /* This process's own configuration ends here — the child gets a ruleset, not a
+   * memo about how it was built. LL_RO/LL_RW have done their job; LL_STATUS_FD is
+   * closed by CLOEXEC on a successful exec below regardless, but unsetting all three
+   * is cheap and removes any dependence on that being the only backstop. */
+  unsetenv("LL_RO"); unsetenv("LL_RW"); unsetenv("LL_STATUS_FD");
   execvp(argv[1],&argv[1]);
   fprintf(stderr,"landlock-exec: exec %s: %s\n",argv[1],strerror(errno));
+  status_fail("exec: execvp failed");
   return 127;
 }

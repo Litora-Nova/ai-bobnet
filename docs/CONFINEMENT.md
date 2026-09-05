@@ -158,3 +158,20 @@ A compiler is consequently needed **at install time only**. On a development hos
 meaningful exposure: the agent account already has a shell, node and python, so arbitrary code
 execution is long since available and a compiler adds little. On a production host the compiler is
 removed after the install, through the mediated package wrapper.
+
+### The install step, concretely
+
+```
+cc -O2 -Wall -o /opt/aib/engine/libexec/landlock-exec src/landlock-exec.c
+chown root:aib-broker /opt/aib/engine/libexec/landlock-exec
+chmod 0750 /opt/aib/engine/libexec/landlock-exec
+```
+
+Owned `root:aib-broker 0750` (never `aib-broker:aib-broker`, the same reasoning as the TCB
+directories' metadata-gap fix above): the broker account can exec it but not overwrite it, so a
+confined child that somehow reached the broker account still cannot replace the helper it was
+launched through. `deploy/systemd/aib-broker@.service` points `AIB_CONFINE_BIN` at this exact path
+via `Environment=`, unconditionally — there is no code path in `bin/aib-broker-handler` or
+`aib_enact_launch` that falls back to a different location or skips the helper when it is missing;
+a missing or non-executable helper is D-A's pre-flight failure (`io-refused`, `stage=confine`), not
+a silent bypass.
