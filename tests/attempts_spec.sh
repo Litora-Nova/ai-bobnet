@@ -102,7 +102,11 @@ adapter_effective=/bin/true'
 
 commit_ended() {
   local decided_id="$1" exit_class="$2" exit_code="${3-}" signal="${4-}"
-  local kv="exit_class=$exit_class" payload
+  # stage=provider: gate delta Ikarus D5 made the composer require stage on
+  # every record; this fixture exercises the generic ended-commit/fold path,
+  # not confinement staging, so "the provider genuinely ran" is the correct
+  # constant here.
+  local kv="exit_class=$exit_class"$'\n'"stage=provider" payload
   [ -z "$exit_code" ] || kv="${kv}"$'\n'"exit_code=$exit_code"
   [ -z "$signal" ] || kv="${kv}"$'\n'"signal=$signal"
   payload="$(aib_event_compose_ended_payload "$kv")"
