@@ -107,11 +107,11 @@ assert_nonzero 'decided composer rejects a label above 256 bytes' "$?"
 # -----------------------------------------------------------------------------
 # 4. ended payload composer — closed exit enum, presumed-dead forbidden
 # -----------------------------------------------------------------------------
-ended_pay="$(aib_event_compose_ended_payload $'exit_class=provider-failure\nexit_code=7')"
+ended_pay="$(aib_event_compose_ended_payload $'exit_class=provider-failure\nstage=provider\nexit_code=7')"
 assert_contains 'ended carries exit class' "$ended_pay" '"class":"provider-failure"'
 assert_contains 'ended carries exit code' "$ended_pay" '"code":7'
 assert_contains 'ended signal null when absent' "$ended_pay" '"signal":null'
-ended_ok="$(aib_event_compose_ended_payload $'exit_class=ok')"
+ended_ok="$(aib_event_compose_ended_payload $'exit_class=ok\nstage=provider')"
 assert_contains 'ended ok code null when absent' "$ended_ok" '"code":null'
 ( aib_event_compose_ended_payload $'exit_class=presumed-dead' ) >/dev/null 2>&1
 assert_nonzero 'ended rejects presumed-dead fail-closed' "$?"
@@ -224,7 +224,7 @@ aib_event_stream_paths "$S4"
 EV4="$AIB_EVENT_FILE"; LK4="$AIB_EVENT_LOCK"
 aib_event_commit "$EV4" "$LK4" attempt.decided "$env_dec" "$pay_dec"   # seq 1
 decided_id="$AIB_EVENT_COMMIT_EVENT_ID"
-end_pay="$(aib_event_compose_ended_payload $'exit_class=ok')"
+end_pay="$(aib_event_compose_ended_payload $'exit_class=ok\nstage=provider')"
 aib_event_commit "$EV4" "$LK4" attempt.ended "$env_dec" "$end_pay" "$decided_id"   # seq 2
 assert_streq 'ended commit gets its own seq 2' "$AIB_EVENT_COMMIT_SEQ" '2'
 end_json="$(frame_json "$(sed -n '2p' "$EV4")")"

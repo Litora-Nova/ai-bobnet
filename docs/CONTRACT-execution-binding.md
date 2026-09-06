@@ -367,6 +367,44 @@ An open `attempt.decided(allow)` with no `attempt.ended` whose recorded PID has 
 reader as **`presumed-dead`**. That is a reader-side classification only: there is no recovery writer, and
 `presumed-dead` is rejected fail-closed as a payload value — it can be derived, never stored.
 
+**RM-3 slice 3 addition — `exit.stage`.** The confined-enactment path (`docs/CONFINEMENT.md`) can fail
+before the provider ever runs — the pre-flight, the post-`cd` `pwd -P` re-check
+(`docs/SPEC-wire-format.md`, "Order is part of the requirement") — and a bare `exit.class` of
+`io-refused` cannot distinguish "we refused to run the child" from "the child ran and refused to do
+its job". The `attempt.ended` payload therefore gains `exit.stage`, always present, one of
+`confine | cwd | exec | provider`: `confine` — the pre-flight or the helper's own before-`exec`
+failure (§2.1, `LL_STATUS_FD` non-empty); `cwd` — the post-`cd` re-check found the resolved path had
+moved; `exec` — the helper installed confinement but `execvp` itself failed (helper exit 127); `provider`
+— confinement and exec both succeeded and the recorded exit class is the provider's own. This is a
+**deliberate payload change**: `AIB_EVENT_SCHEMA_VERSION` (`lib/aibobnet.sh`) bumps from `1` to `2`.
+Readers (the `attempts` fold, any stream scanner) accept both versions — an existing stream containing
+version-1 records with no `exit.stage` folds unchanged, reading an absent `stage` as unknown rather
+than refusing the record; nothing under version 1 is invalidated by the bump.
+
+**Gate delta 2 addition — `exit.stage = transport`.** A client can disconnect at the response-frame
+PROLOGUE boundary, strictly before `aib_enact_launch` is ever called — no confinement, no `cd`, no
+`execvp`, nothing enactment-shaped has happened yet. `stage=provider` there would misreport a provider
+outcome that never occurred, and none of `confine | cwd | exec` fit either (all three name a specific
+enactment step this path never reached). `transport` names it directly: the attempt ended because the
+connection itself failed before enactment started. Schema version 2 is still unreleased at the time
+this value is added, so the enum extends to `confine | cwd | exec | provider | transport` in place,
+without a version bump — the same reason D-K's original four values needed one (an already-released
+schema cannot silently redefine what a field means), and the reason this one doesn't. An abort that
+happens DURING a provider run (client gone while the provider is running or silent) is unaffected and
+stays `stage=provider`, same as before.
+
+**Schema-2 addition — `exit.group_empty`.** Every newly composed `attempt.ended` includes this JSON
+boolean. It is `true` on ordinary paths, including direct-mode completion and refusal before a
+provider starts. If the confined manager still observes a non-empty group after the final KILL
+and bounded wait, it is `false`: the leader's reaped status is established, but disappearance of
+the entire group is not confirmed. The existing exit class, code, signal, and stage retain their
+meaning; `group_empty` is an additional cleanup observation, not a replacement exit classification.
+The manager logs the exhaustion and completes the record instead of waiting indefinitely.
+Schema 2 is unreleased, so its version remains 2. Historical schema-1 records lacking the field
+remain readable; an absent historical value is unknown and must not be interpreted as `true`.
+The composer defaults omitted input to `true` for ordinary writers and rejects explicitly supplied
+values other than `true` or `false`.
+
 ### 8.2 Framed stream (decision B: framed non-`.jsonl`)
 
 Stream `(project_uid, "main")`, file `<standup_dir>/events/main.events`, sidecar lock `main.events.lock`.

@@ -284,11 +284,25 @@ JSON
 # Assert the POSITIVE outcome, not the absence of a word. An earlier draft checked that
 # "not_implemented" was gone and passed for the wrong reason: the parser rejected the new fields, so
 # the handler never ran at all. A refusal upstream must not look like success downstream.
-resp="$(frame2 "" "" "hallo" "op=launch" "agent_uid=acme-dev" | AIBOBNET_REGISTRY="$FIXTURE_REG" "$SRC_ROOT/bin/aib-broker-handler" 2>/dev/null)"
+#
+# SPEC-FIXTURE UPDATE (RM-3 slice 3 — a deliberate boundary move, not a slice-2
+# regression): this call now reaches a REAL PDP verdict, and since this slice
+# commits attempt.decided for every verdict, AIB_EVENT_ROOT (ADR-0005) must be
+# a real, writable location for that commit to succeed — added here exactly as
+# slice 2 added AIBOBNET_REGISTRY to this same fixture. "Never mistakes a
+# verdict for a launch" was slice 2's OWN stated boundary (this file's header:
+# "the handler stops refusing unconditionally", not yet "the handler
+# launches") — slice 3 is the slice that deliberately moves it, so the
+# assertion now pins the NEW boundary: a real launch starts, `enacted=yes`.
+# The fixture's provider adapter (`/opt/acme/adapters/acme`, never meant to
+# exist) and the absent AIB_CONFINE_BIN mean enactment never gets past
+# aib_enact_launch's pre-flight — still `end=ok` ("the broker did its job",
+# SPEC-wire-format.md), still a clean verdict, never `not_implemented`.
+resp="$(frame2 "" "" "hallo" "op=launch" "agent_uid=acme-dev" | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_EVENT_ROOT="$WORK/event-root" "$SRC_ROOT/bin/aib-broker-handler" 2>/dev/null)"
 has "the handler returns a decision"                  "$resp" "decision="
 has "…and terminates with a verdict, not an error"    "$resp" "end=ok"
 hasnt "…and no longer refuses unconditionally"        "$resp" "not_implemented"
-has "…and never mistakes a verdict for a launch"      "$resp" "enacted=no"
+has "…and now really launches (RM-3 slice 3 moves this boundary)" "$resp" "enacted=yes"
 
 # ADDED (not in the original RED spec): a deny is `end=denied`, never `end=ok` — the
 # earlier assertion only pins the allow path, and a handler that always said `end=ok`
@@ -296,8 +310,10 @@ has "…and never mistakes a verdict for a launch"      "$resp" "enacted=no"
 # a well-formed but invalid JSON string ("bogus") — the resolver only requires the
 # field to be present, so this reaches the PDP, which denies it (config, 2), exactly
 # as tests/authorize_launch_spec.sh pins for a direct call ("invalid cap_tier").
+# AIB_EVENT_ROOT added for the same reason as immediately above — every
+# verdict, allow or deny, commits attempt.decided since slice 3.
 resp="$(frame2 "" "" "hallo" "op=launch" "agent_uid=acme-bad-baddev" \
-        | AIBOBNET_REGISTRY="$FIXTURE_REG" "$SRC_ROOT/bin/aib-broker-handler" 2>/dev/null)"
+        | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_EVENT_ROOT="$WORK/event-root" "$SRC_ROOT/bin/aib-broker-handler" 2>/dev/null)"
 has "a PDP deny answers end=denied, not end=ok"        "$resp" "end=denied"
 has "…and the decision says deny"                      "$resp" "decision=deny"
 

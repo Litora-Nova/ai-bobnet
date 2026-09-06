@@ -312,6 +312,12 @@ eq "unsupported provider is refused" "$RUN_RC" 64
 has "unsupported provider error names the registry provider" "$RUN_OUT" "unsupported registry provider 'claude-code'"
 not_called "unsupported provider refusal happens before provider start"
 eq "unsupported provider refusal writes no heartbeat" "$(wc -l < "$HBLOG" 2>/dev/null || printf 0)" 0
+# D5 (gate delta, Ikarus, MEDIUM): this refusal never reaches aib_enact_launch —
+# it must carry stage=exec, never the stage:null this exact fixture used to
+# commit before this delta (the composer now fails closed on a missing stage,
+# so a regression here would abort the whole launch, not silently null it).
+has "…and its ended record carries stage=exec, never stage:null (D5)" \
+  "$(tail -1 "$STATE/acme/standup/events/main.events" 2>/dev/null)" '"stage":"exec"'
 
 # An unrecognised registry effort is denied by the PDP (64), before any provider.
 BAD_EFFORT="$WORK/bad-effort.json"; write_v4 "$BAD_EFFORT" codex turbo

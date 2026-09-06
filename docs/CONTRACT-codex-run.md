@@ -125,6 +125,16 @@ Then, on allow:
      `decided(allow)`, not `aborted`;
    - success: `attempt.ended(ok)`, heartbeat `done`, relay Codex output to stdout.
 
+RM-3 slice 3 adds `exit.stage` to every `attempt.ended` payload (schema version 2,
+`CONTRACT-execution-binding.md` §8.1). For this wrapper's own single-trust-domain path it is almost
+always `provider` — there is no confinement helper here to fail before the adapter runs, unlike
+`bin/aib-broker-handler`'s confined path, which is where `confine` actually occurs. It is `exec` for
+the two IO-hygiene refusals this wrapper itself makes before ever calling `aib_enact_launch` (an
+unsupported registry provider, or a resolved adapter that is not executable), and `cwd` in the
+same rare TOCTOU case the confined path's post-`cd` re-check also guards against (a `cwd` swapped
+out from under the launch between validation and `cd`) — this wrapper carries that same re-check,
+unchanged from before this slice, only newly stage-tagged now.
+
 The heartbeat proves that the wrapper observed a start and terminal result but stays mutable operational
 visibility. The durable proof of what the launcher decided and observed is the RM-2 `attempt.decided`/
 `attempt.ended` stream — for attempts that go through the seam; a bypassing process still leaves nothing,

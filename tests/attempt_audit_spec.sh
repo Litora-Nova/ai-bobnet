@@ -320,19 +320,31 @@ eq "adapter proves it handled TERM and exited successfully" "$(cat "$CHILD_RESUL
 # that exact action is exercised in an isolated real launcher copy: EXIT re-enters,
 # attempts a second ended, and the broker refuses it. The persisted stream still has
 # one ended, but the refusal proves the process-level double-terminal path went live.
-signal_first_action="$(awk '/^_pep_signal_handler\(\) \{/{getline; print; exit}' "$LA")"
-eq "signal handler disarms EXIT/INT/TERM/HUP before any other action" "$signal_first_action" "  trap - EXIT INT TERM HUP"
+#
+# RE-ANCHORED (RM-3 slice 3): _pep_signal_handler/_pep_exit_handler moved out of
+# bin/launch-agent into lib/aibobnet.sh (aib_enact_launch's direct-mode path,
+# shared with bin/aib-broker-handler's confined path) as
+# _aib_enact_signal_handler_direct/_aib_enact_exit_handler_direct — same first
+# action, same guard, ported rather than reinvented. They are nested inside
+# aib_enact_launch__run_direct, hence the extra two-space indent on both the
+# function line and its body. The mutant now copies bin/launch-agent
+# UNCHANGED (the target function is no longer there) and mutates
+# lib/aibobnet.sh instead.
+LIBFILE="$SRC_ROOT/lib/aibobnet.sh"
+signal_first_action="$(awk '/^  _aib_enact_signal_handler_direct\(\) \{/{getline; print; exit}' "$LIBFILE")"
+eq "signal handler disarms EXIT/INT/TERM/HUP before any other action" "$signal_first_action" "    trap - EXIT INT TERM HUP"
 MUTANT_ROOT="$WORK/no-trap-disarm"
 MUTANT="$MUTANT_ROOT/bin/launch-agent"
+MUTANT_LIB="$MUTANT_ROOT/lib/aibobnet.sh"
 mkdir -p "$MUTANT_ROOT/bin" "$MUTANT_ROOT/lib"
-cp "$SRC_ROOT/lib/aibobnet.sh" "$MUTANT_ROOT/lib/aibobnet.sh"
+cp "$LA" "$MUTANT" && chmod +x "$MUTANT"
 if awk '
-  /^_pep_signal_handler\(\) \{/ { in_handler=1; print; next }
-  /^_pep_exit_handler\(\) \{/ { in_handler=0; print; next }
-  in_handler && $0 == "  trap - EXIT INT TERM HUP" { print "  : # mutation: trap disarm removed"; changed++; in_handler=0; next }
+  /^  _aib_enact_signal_handler_direct\(\) \{/ { in_handler=1; print; next }
+  /^  _aib_enact_exit_handler_direct\(\) \{/ { in_handler=0; print; next }
+  in_handler && $0 == "    trap - EXIT INT TERM HUP" { print "    : # mutation: trap disarm removed"; changed++; in_handler=0; next }
   { print }
   END { if (changed != 1) exit 42 }
-' "$LA" > "$MUTANT" && chmod +x "$MUTANT"; then
+' "$LIBFILE" > "$MUTANT_LIB"; then
   ok "trap-disarm mutation applied exactly once"
 else
   no "trap-disarm mutation applied exactly once"
