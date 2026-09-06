@@ -239,6 +239,8 @@ case "${STUB_LL_MODE:-ok}" in
     fi
     # CLOEXEC on success: close the status fd, write nothing, THEN exec.
     if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
+    # The real helper's saved journal duplicate is also CLOEXEC.
+    exec 3>&-
     exec "$@"
     ;;
   preflight-fail)
@@ -381,6 +383,17 @@ case "${STUB_MODE:-ok}" in
     exec 1>&-
     sleep 1
     exit 0
+    ;;
+  list-fds)
+    # exec removes bash's own script descriptor. Filter the transient directory
+    # fd opened by listdir: it is already closed when fstat checks each entry.
+    exec python3 -c 'import os
+fds = []
+for entry in os.listdir("/proc/self/fd"):
+    try: os.fstat(int(entry))
+    except OSError: continue
+    fds.append(int(entry))
+print("PROVIDER_FDS=" + " ".join(map(str, sorted(fds))))'
     ;;
 esac
 STUB
@@ -1494,6 +1507,24 @@ esac
 eq "exhausted escalation still writes exactly one terminal end" "$(count_real_terminal_end_lines "$WORK/resp-exhausted")" 1
 eq "…and end=ok remains the final line" "$(tail -1 "$WORK/resp-exhausted")" 'end=ok'
 has "exhausted escalation is also journaled" "$(<"$WORK/err-exhausted")" 'proceeding'
+
+# Seed both read-only and writable inherited descriptors deliberately. Closing
+# the provider's copy must not disturb the broker caller's own descriptors.
+reset_run
+landlock_conf_write ok
+adapter_conf_write list-fds
+: > "$WORK/adapter-fd-input"
+(
+  exec 57>/dev/null 58<"$WORK/adapter-fd-input"
+  AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+    "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" \
+    >"$WORK/resp-fds" 2>"$WORK/err-fds"
+  if : >&57 && : <&58; then printf 'retained\n' > "$WORK/parent-fds"; fi
+)
+eq "the provider fd probe completes" "$?" 0
+eq "the exec'd adapter inherits only standard descriptors" \
+  "$(grep '^PROVIDER_FDS=' "$WORK/resp-fds")" 'PROVIDER_FDS=0 1 2'
+eq "closing child descriptors preserves the caller's copies" "$(cat "$WORK/parent-fds" 2>/dev/null)" retained
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
