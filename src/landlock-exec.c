@@ -184,8 +184,28 @@ int main(int argc, char **argv){
     if (v && *v){
       char *end = NULL; long n = strtol(v,&end,10);
       if (end && !*end && n >= 0 && n <= 65535){
+        /* S2 (gate delta 3, Ikarus MEDIUM): dup()/fcntl() failing here used to
+         * fall through silently — journal_fd stayed 2 while the redirect below
+         * still went ahead, so a LATER execvp failure's diagnostic would reach
+         * the relay fd after all (the exact leak this whole mechanism exists to
+         * prevent); or, if dup() succeeded but fcntl() didn't, the un-CLOEXEC'd
+         * saved fd would leak into a successfully exec'd provider. Both are
+         * fail-closed now: either failure aborts before the redirect, before
+         * exec, with LL_STATUS_FD carrying the reason — exactly like every
+         * other pre-exec failure path above. */
         int saved = dup(2);
-        if (saved >= 0 && fcntl(saved, F_SETFD, FD_CLOEXEC) == 0) journal_fd = saved;
+        if (saved < 0){
+          fprintf(stderr,"landlock-exec: dup 2 (journal fd): %s\n",strerror(errno));
+          status_fail("confine: dup(2) failed");
+          return 3;
+        }
+        if (fcntl(saved, F_SETFD, FD_CLOEXEC) < 0){
+          fprintf(stderr,"landlock-exec: fcntl FD_CLOEXEC (journal fd): %s\n",strerror(errno));
+          close(saved);
+          status_fail("confine: fcntl FD_CLOEXEC (journal fd) failed");
+          return 3;
+        }
+        journal_fd = saved;
         if (dup2((int)n,2) < 0)
           fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
       }
