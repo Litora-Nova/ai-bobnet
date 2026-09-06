@@ -276,8 +276,12 @@ _prologue="$(printf 'decision=%s\ncode=%s\neffective_sandbox=%s\neffective_clear
   "$AIB_VERDICT_EFFECTIVE_CLEARANCE" "$AIB_VERDICT_EFFECTIVE_EFFORT" "$AIB_VERDICT_EFFECTIVE_TIMEOUT" \
   "$AIB_CWD_RESOLVED" "$AIB_VERDICT_REASONS" "$_decided_event_id")"
 if ! printf '%s\n' "$_prologue"; then
+  # R3 (gate delta 2, Ikarus MEDIUM): no provider was ever invoked here — the
+  # client is gone before enactment starts at all. stage=provider would claim
+  # a provider outcome that never happened; stage=transport says what actually
+  # ended the attempt (docs/CONTRACT-execution-binding.md §8.1).
   aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.ended "$_broker_envelope" \
-    "$(aib_event_compose_ended_payload $'exit_class=aborted\nstage=provider\nsignal=TERM')" \
+    "$(aib_event_compose_ended_payload $'exit_class=aborted\nstage=transport\nsignal=TERM')" \
     "$_decided_event_id" >/dev/null 2>&1 || true
   exit 0
 fi

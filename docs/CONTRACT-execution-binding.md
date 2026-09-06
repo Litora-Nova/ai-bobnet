@@ -381,6 +381,18 @@ Readers (the `attempts` fold, any stream scanner) accept both versions — an ex
 version-1 records with no `exit.stage` folds unchanged, reading an absent `stage` as unknown rather
 than refusing the record; nothing under version 1 is invalidated by the bump.
 
+**Gate delta 2 addition — `exit.stage = transport`.** A client can disconnect at the response-frame
+PROLOGUE boundary, strictly before `aib_enact_launch` is ever called — no confinement, no `cd`, no
+`execvp`, nothing enactment-shaped has happened yet. `stage=provider` there would misreport a provider
+outcome that never occurred, and none of `confine | cwd | exec` fit either (all three name a specific
+enactment step this path never reached). `transport` names it directly: the attempt ended because the
+connection itself failed before enactment started. Schema version 2 is still unreleased at the time
+this value is added, so the enum extends to `confine | cwd | exec | provider | transport` in place,
+without a version bump — the same reason D-K's original four values needed one (an already-released
+schema cannot silently redefine what a field means), and the reason this one doesn't. An abort that
+happens DURING a provider run (client gone while the provider is running or silent) is unaffected and
+stays `stage=provider`, same as before.
+
 ### 8.2 Framed stream (decision B: framed non-`.jsonl`)
 
 Stream `(project_uid, "main")`, file `<standup_dir>/events/main.events`, sidecar lock `main.events.lock`.
