@@ -393,6 +393,18 @@ schema cannot silently redefine what a field means), and the reason this one doe
 happens DURING a provider run (client gone while the provider is running or silent) is unaffected and
 stays `stage=provider`, same as before.
 
+**Schema-2 addition — `exit.group_empty`.** Every newly composed `attempt.ended` includes this JSON
+boolean. It is `true` on ordinary paths, including direct-mode completion and refusal before a
+provider starts. If the confined manager still observes a non-empty group after the final KILL
+and bounded wait, it is `false`: the leader's reaped status is established, but disappearance of
+the entire group is not confirmed. The existing exit class, code, signal, and stage retain their
+meaning; `group_empty` is an additional cleanup observation, not a replacement exit classification.
+The manager logs the exhaustion and completes the record instead of waiting indefinitely.
+Schema 2 is unreleased, so its version remains 2. Historical schema-1 records lacking the field
+remain readable; an absent historical value is unknown and must not be interpreted as `true`.
+The composer defaults omitted input to `true` for ordinary writers and rejects explicitly supplied
+values other than `true` or `false`.
+
 ### 8.2 Framed stream (decision B: framed non-`.jsonl`)
 
 Stream `(project_uid, "main")`, file `<standup_dir>/events/main.events`, sidecar lock `main.events.lock`.

@@ -466,7 +466,7 @@ if [ -n "$CC_BIN" ]; then
       2>"$WORK/fd-cc-err"; then
     for fd_failure in dup fcntl; do
       FD_SENTINEL="$WORK/fd-$fd_failure-exec"
-      TEST_FD_FAILURE="$fd_failure" LL_STATUS_FD=9 LL_STDERR_FD=1 \
+      LC_ALL=C TEST_FD_FAILURE="$fd_failure" LL_STATUS_FD=9 LL_STDERR_FD=1 \
         "$FD_HELPER" /bin/sh -c 'printf executed > "$1"' sh "$FD_SENTINEL" \
         8>"$WORK/fd-$fd_failure-trace" 9>"$WORK/fd-$fd_failure-status" \
         >"$WORK/fd-$fd_failure-wire" 2>"$WORK/fd-$fd_failure-journal"

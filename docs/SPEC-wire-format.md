@@ -262,7 +262,7 @@ status) or `signal=` (the forwarded signal name) follows, matching the shape
 of enactment the terminal status belongs to — see the "stage" field note in
 `docs/CONTRACT-execution-binding.md` §8.1.
 
-When `stage` is anything other than `provider`, a `reason=` line follows it: the fixed machine
+For ordinary cleanup, when `stage` is anything other than `provider`, a `reason=` line follows it: the fixed machine
 reason for that stage, so a client can act on it without knowing the stage enum by heart.
 
 ```
@@ -271,6 +271,20 @@ stage=cwd      -> reason=cwd_moved
 stage=exec     -> reason=exec_failed
 stage=provider -> (no reason= line — exit_class/exit_code/signal already say what happened)
 ```
+
+If the manager exhausts its final process-group KILL and bounded wait without confirming an empty
+group, two lines follow `stage`, replacing any ordinary stage reason:
+
+```
+group_empty=false
+reason=escalation_exhausted
+```
+
+The committed `attempt.ended` carries the matching JSON boolean `exit.group_empty: false`.
+Every ordinary ended record carries `exit.group_empty: true`, but ordinary wire terminals omit
+both the `group_empty` line and this exhaustion reason. The exit class/code/signal still describe
+the reaped leader. `end=ok` still means the broker completed its report; with `group_empty=false`
+it does **not** promise that every group member has disappeared.
 
 `ended_event_id` is the `attempt.ended` event's own id, committed causally bound to
 `decided_event_id` from the prologue. Then, always last:

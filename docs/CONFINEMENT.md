@@ -73,7 +73,7 @@ it is reserved. The helper contract therefore gains a second channel, independen
   any Landlock work and well before its own `execvp`: that is what makes a later successful `execvp`
   close it automatically, while it stays open, in the helper's own process, for every failure path
   that returns before that point.
-- If the helper fails **before** `execvp` — ruleset create, add-rule, `no_new_privs`, or
+- If the helper fails **before** `execvp` — journal-fd preparation, ruleset create, add-rule, `no_new_privs`, or
   `restrict_self` — it writes **one line** naming the reason to that fd, then exits non-zero (the
   existing exit-3 convention is unchanged; `LL_STATUS_FD` is additive, not a replacement for it).
 - If `execvp` succeeds, the fd is `CLOEXEC` and therefore **closes silently, with nothing written to
@@ -87,6 +87,14 @@ it is reserved. The helper contract therefore gains a second channel, independen
 This is the only reliable discriminator. A provider that happens to exit 3 (the helper's own
 "Landlock unavailable" code) or 127 (the helper's own "exec failed" code) is not thereby mistaken for
 a confinement failure — the status fd is empty in both cases, because the provider is what ran.
+
+When `LL_STDERR_FD` is supplied, the helper saves the original journal fd with `dup(2)` and
+`FD_CLOEXEC` **before** Landlock setup. Either operation failing writes a `confine:` reason to
+`LL_STATUS_FD` and exits 3 before redirect or exec; failed `fcntl` also closes the duplicate.
+The provider-stderr redirect still occurs **after** confinement. This ordering makes descriptor
+failures independently testable on a host without Landlock: the real-helper fixture exhausts its
+fd table under `RLIMIT_NOFILE` after the dynamic loader runs, and separately injects a failed
+`fcntl` into the compiled helper. It does not substitute Landlock results or helper output.
 
 ### Diagnostics go to the broker's journal, never the caller's stream
 
@@ -155,8 +163,8 @@ Per-path *read* restrictions are trivial in Landlock and contortions with mounts
 
 ## Runtime dependencies of the broker's confined path
 
-`dd`, `timeout`, `mkfifo`, `realpath`, `setsid`, `env`, `sleep`, `mktemp`, `cat`, `wc` — all
-coreutils/util-linux, all hard requirements resolved via `command -v` with a fail-closed
+`dd`, `timeout`, `mkfifo`, `realpath`, `env`, `sleep`, `mktemp`, `cat`, `wc` — all
+coreutils, all hard requirements resolved via `command -v` with a fail-closed
 `aib_die 6 "required runtime dependency not found: ..."` on absence, the same style the rest of this
 codebase already uses. `cc` is install-time only (it compiles this helper; nothing at runtime needs
 a compiler).
@@ -169,6 +177,22 @@ absent, `_aib_enact_conn_alive` returns "alive" unconditionally and enactment de
 next-write-only detection — never a crash, never a hang, and the probe never writes a byte to the
 wire either way. An operator auditing this path's runtime dependencies should install `python3` if
 they want the sharper detection; its absence is a documented degradation, not a defect.
+
+### Exhausted process-group cleanup
+
+The bash manager enables job control only while spawning the provider, making `$!` its process-group
+leader; no external `setsid` is required. After reaping the leader and completing any scheduled
+TERM/KILL escalation, the manager waits up to two seconds for the group to disappear. If needed it
+sends another group KILL and waits up to three more seconds. A group that remains non-empty does
+not block the connection forever: the manager logs the exhausted cleanup and proceeds with the
+reaped leader's status, recording **`exit.group_empty: false`** in `attempt.ended`. The wire adds
+`group_empty=false` and `reason=escalation_exhausted`. Consumers must not interpret that outcome as
+confirmation that every group member has disappeared. Ordinary paths, including refusals before a
+provider starts, record `group_empty: true`; the ordinary wire shape is unchanged.
+
+The internal `_aib_enact_wait_group_empty` library function can be replaced after sourcing in a
+test subshell to exercise exhaustion without creating an unkillable process. The broker exposes
+no request field, environment variable, or command-line flag for replacing this probe.
 
 ## Why the helper is built at install time and not shipped as a binary
 

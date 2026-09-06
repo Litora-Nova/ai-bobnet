@@ -1309,7 +1309,8 @@ aib_inbox_path() {
 #   NOT detectable without an external cursor: whole-suffix / file replacement (a
 #     persistent high-water anchor sits in the same trust domain — it is the RM-3 close).
 
-# RM-3 slice 3 bumps 1 -> 2: attempt.ended payloads gain exit.stage (see above). This is
+# RM-3 slice 3 bumps 1 -> 2: attempt.ended payloads gain exit.stage and exit.group_empty.
+# group_empty is always boolean; false records exhausted group cleanup. This is
 # a deliberate, additive payload change (CONTRACT-execution-binding.md §8.1) — readers
 # (aib_event_scan / bin/attempts) treat the envelope's schema_version as opaque and
 # never branch on it, so a stream mixing version-1 and version-2 records folds
@@ -1396,7 +1397,7 @@ aib_event_compose_decided_payload() {
 }
 
 aib_event_compose_ended_payload() {
-  local kv="${1-}" exit_class stage
+  local kv="${1-}" exit_class stage group_empty
   _aib_utf8_is_valid "$kv" || aib_die 2 "ended payload input is not valid UTF-8"
   exit_class="$(_aib_record_field "$kv" exit_class)" || exit_class=""
   case "$exit_class" in
@@ -1425,11 +1426,18 @@ aib_event_compose_ended_payload() {
     confine|cwd|exec|provider|transport) ;;
     *) aib_die 2 "invalid stage '$stage' (confine|cwd|exec|provider|transport)";;
   esac
-  printf '{"exit":{"class":%s,"code":%s,"signal":%s,"stage":%s}}' \
+  # Ordinary writers, including paths that never started a provider, default to
+  # true. Only the confined manager can report exhausted group cleanup.
+  group_empty="$(_aib_record_field "$kv" group_empty)" || group_empty=true
+  case "$group_empty" in
+    true|false) ;;
+    *) aib_die 2 "invalid group_empty '$group_empty' (true|false)";;
+  esac
+  printf '{"exit":{"class":%s,"code":%s,"signal":%s,"stage":%s,"group_empty":%s}}' \
     "$(aib_json "$exit_class")" \
     "$(_aib_kv_num_or_null "$kv" exit_code)" \
     "$(_aib_kv_json_or_null "$kv" signal)" \
-    "$(_aib_kv_json_or_null "$kv" stage)"
+    "$(_aib_kv_json_or_null "$kv" stage)" "$group_empty"
 }
 
 # =============================================================================
@@ -1479,10 +1487,10 @@ aib_event_compose_ended_payload() {
 #   AIB_ENACT_SIGNAL      the forwarded signal name (may be empty; exactly one of
 #                         AIB_ENACT_EXIT_CODE / AIB_ENACT_SIGNAL is ever non-empty)
 #   AIB_ENACT_ENDED_EVENT_ID  the committed attempt.ended event_id
-#   AIB_ENACT_REASON      set only when AIB_ENACT_STAGE != provider: the fixed
-#     machine reason for that stage (confine -> confinement_unavailable,
-#     cwd -> cwd_moved, exec -> exec_failed); empty when stage == provider,
-#     because the provider's own exit class/code/signal already say enough
+#   AIB_ENACT_GROUP_EMPTY    false only when confined group cleanup was exhausted
+#   AIB_ENACT_REASON      fixed refusal reason (confine -> confinement_unavailable,
+#     cwd -> cwd_moved, exec -> exec_failed), or escalation_exhausted when group
+#     cleanup could not be confirmed; otherwise empty
 #     (docs/SPEC-wire-format.md, "Terminal lines").
 # and has committed exactly one attempt.ended record, causally bound to
 # <decided-event-id>, over <events-path>/<lock-path> with the given <envelope-kv>.
@@ -1518,6 +1526,7 @@ aib_enact_launch() {
   AIB_ENACT_SIGNAL=""
   AIB_ENACT_ENDED_EVENT_ID=""
   AIB_ENACT_REASON=""
+  AIB_ENACT_GROUP_EMPTY=true
   # D8 (gate delta, Ikarus, MEDIUM): set instead of dying, confined mode only —
   # see _aib_enact_commit_ended below.
   AIB_ENACT_INCIDENT=""
@@ -1549,7 +1558,7 @@ aib_enact_launch() {
     local exit_class="$1" stage="$2" exit_code="${3-}" signal="${4-}" ended_kv ended_payload
     [ "$_terminal_written" -eq 0 ] ||
       aib_die 2 "attempt '$decided_id' already entered a terminal path"
-    ended_kv="exit_class=$exit_class"$'\n'"stage=$stage"
+    ended_kv="exit_class=$exit_class"$'\n'"stage=$stage"$'\n'"group_empty=$AIB_ENACT_GROUP_EMPTY"
     [ -z "$exit_code" ] || ended_kv="${ended_kv}"$'\n'"exit_code=$exit_code"
     [ -z "$signal" ] || ended_kv="${ended_kv}"$'\n'"signal=$signal"
     ended_payload="$(aib_event_compose_ended_payload "$ended_kv")"
@@ -1602,6 +1611,9 @@ aib_enact_launch() {
       exec) AIB_ENACT_REASON=exec_failed;;
       provider) AIB_ENACT_REASON="";;
     esac
+    if [ "$AIB_ENACT_GROUP_EMPTY" = false ]; then
+      AIB_ENACT_REASON=escalation_exhausted
+    fi
   }
 
   # _aib_enact_status_signal <128+n> -> signal name (same table as the PEP's).
@@ -1804,6 +1816,18 @@ aib_enact_launch__run_direct() {
   _aib_enact_cleanup_direct
 }
 
+# Internal process-group probe. Kept at library scope so fixtures can replace
+# it after sourcing the library, inside their own subshell. There is no request,
+# environment-variable, or command-line override in the broker.
+_aib_enact_wait_group_empty() {
+  local _pgid="$1" _deadline_s="$2" _wge_start="$SECONDS"
+  while kill -0 -- "-$_pgid" 2>/dev/null; do
+    [ $((SECONDS - _wge_start)) -lt "$_deadline_s" ] || return 1
+    "$_sleep_bin" 0.05
+  done
+  return 0
+}
+
 # --- confined mode: §2.1 confinement, response-frame chunks + terminal lines --
 aib_enact_launch__run_confined() {
   local _dd_bin _timeout_bin _mkfifo_bin _realpath_bin _python_bin
@@ -1907,12 +1931,12 @@ aib_enact_launch__run_confined() {
   _aib_enact_manager_confined() {
     set +e
     local provider_pid="" timer_pid="" killer_pid="" provider_rc=1 confirmed_rc=1
-    local timed_out=0 aborted_disc=0 wait_interrupted=0
+    local timed_out=0 aborted_disc=0 wait_interrupted=0 group_empty=true
     local manager_pid="$BASHPID"
 
     _aib_enact_forward() { local sig="$1"; wait_interrupted=1; [ -z "$provider_pid" ] || kill -s "$sig" -- "-$provider_pid" 2>/dev/null || true; }
     _aib_enact_escalate() {
-      # D3: TERM the whole process group (setsid made provider_pid its leader),
+      # TERM the whole process group (bash job control made provider_pid its leader),
       # never just the one pid — a provider that forked before the signal
       # arrived would otherwise survive as a live orphan once the manager
       # reaps only its direct child. Deliberately no single-pid fallback: that
@@ -1942,24 +1966,6 @@ aib_enact_launch__run_confined() {
         ) >&- 2>&- &
         killer_pid=$!
       fi
-    }
-    # _aib_enact_wait_group_empty <pgid> <deadline_s> — S1b (gate delta 3, Ikarus
-    # HIGH): a signal being SENT (TERM, or KILL from the killer job) is not the
-    # same as the group being GONE. Every terminal path below used to proceed
-    # straight from "the leader is reaped" / "the killer job finished" to writing
-    # the provider status and letting attempt.ended commit — under load, a
-    # grandchild can still be mid-death (or, rarer, a fresh escalation race) at
-    # that exact moment, so the "no orphan" read a poller does the instant the
-    # ended record becomes visible can still find one. Polls the GROUP (never a
-    # single pid) until `kill -0` reports ESRCH (nothing left) or the deadline
-    # passes; returns nonzero only in the latter case.
-    _aib_enact_wait_group_empty() {
-      local _pgid="$1" _deadline_s="$2" _wge_start="$SECONDS"
-      while kill -0 -- "-$_pgid" 2>/dev/null; do
-        [ $((SECONDS - _wge_start)) -lt "$_deadline_s" ] || return 1
-        "$_sleep_bin" 0.05
-      done
-      return 0
     }
     _aib_enact_on_timeout() { timed_out=1; wait_interrupted=1; _aib_enact_escalate; }
     _aib_enact_on_disconnect() { aborted_disc=1; wait_interrupted=1; _aib_enact_escalate; }
@@ -2045,11 +2051,12 @@ aib_enact_launch__run_confined() {
     # stuck in an uninterruptible state is the realistic cause, since KILL was
     # already sent twice — this deliberately does not block the connection
     # forever (that would trade one incident for a worse one, a hung response);
-    # it logs to the journal and proceeds. Nothing about the record itself
-    # changes: the log line is the honest record of what was chosen here.
+    # it logs and reports group_empty=false alongside the reaped leader's
+    # status. The parent carries that observation into the event and wire.
     if ! _aib_enact_wait_group_empty "$provider_pid" 2; then
       kill -KILL -- "-$provider_pid" 2>/dev/null || true
       if ! _aib_enact_wait_group_empty "$provider_pid" 3; then
+        group_empty=false
         printf 'ai-bobnet: process group %s still had live members after a second KILL escalation; proceeding\n' \
           "$provider_pid" >&2
       fi
@@ -2057,7 +2064,7 @@ aib_enact_launch__run_confined() {
     if [ "$aborted_disc" -eq 1 ]; then provider_rc=143
     elif [ "$timed_out" -eq 1 ]; then provider_rc=124
     fi
-    printf '%s\n' "$provider_rc" > "$_provider_status_file" || exit 125
+    printf '%s %s\n' "$provider_rc" "$group_empty" > "$_provider_status_file" || exit 125
     exit "$provider_rc"
   }
 
@@ -2202,10 +2209,13 @@ sys.exit(0)
   local wait_status
   wait "$_provider_manager_pid"
   wait_status=$?
-  local _provider_status="$wait_status" _provider_status_confirmed=0
+  local _provider_status="$wait_status" _provider_status_confirmed=0 _provider_group_empty
   if [ -r "$_provider_status_file" ]; then
-    IFS= read -r _provider_status < "$_provider_status_file"
+    IFS=' ' read -r _provider_status _provider_group_empty < "$_provider_status_file"
     case "$_provider_status" in ''|*[!0-9]*) _provider_status="$wait_status";; *) _provider_status_confirmed=1;; esac
+    if [ "$_provider_status_confirmed" -eq 1 ]; then
+      AIB_ENACT_GROUP_EMPTY="$_provider_group_empty"
+    fi
   fi
   [ "$_had_errexit" -eq 0 ] || set -e
   trap - EXIT INT TERM HUP
@@ -2265,8 +2275,7 @@ sys.exit(0)
 # frame (docs/SPEC-wire-format.md, "Response frame", §3): exit_class, exactly
 # one of exit_code=/signal= (neither, for class "ok" — matching the composer's
 # own convention of nulling both when the caller never supplies them), stage,
-# reason (only when stage != provider — confinement_unavailable/cwd_moved/
-# exec_failed, so a caller need not know the stage enum by heart), ended_event_id,
+# reason (a refusal stage or exhausted group cleanup), ended_event_id,
 # and `end=ok` LAST — always "ok" here, because "end=ok on the
 # response means the broker did its job, regardless of the provider's own exit
 # class" (SPEC-wire-format.md, "Terminal lines"): a provider that failed, timed
@@ -2283,6 +2292,9 @@ aib_enact_launch__write_terminal() {
     printf 'exit_code=%s\n' "$AIB_ENACT_EXIT_CODE"
   fi
   printf 'stage=%s\n' "$AIB_ENACT_STAGE"
+  if [ "$AIB_ENACT_GROUP_EMPTY" = false ]; then
+    printf 'group_empty=false\n'
+  fi
   if [ -n "$AIB_ENACT_REASON" ]; then
     printf 'reason=%s\n' "$AIB_ENACT_REASON"
   fi

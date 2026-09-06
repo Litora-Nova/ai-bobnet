@@ -136,6 +136,34 @@ int main(int argc, char **argv){
     status_fail("confine: usage: landlock-exec CMD [ARGS...]");
     return 2;
   }
+  /* Reserve the journal channel before Landlock work. Descriptor failures
+   * remain distinguishable even when this host cannot install a ruleset.
+   * Only preparation moves: provider stderr is redirected after confinement. */
+  int journal_fd = 2, relay_fd = -1;
+  { const char *v = getenv("LL_STDERR_FD");
+    if (v && *v){
+      char *end = NULL; long n = strtol(v,&end,10);
+      if (end && !*end && n >= 0 && n <= 65535){
+        /* Never redirect without a saved, CLOEXEC journal descriptor: an exec
+         * failure would leak diagnostics to the relay, or a successful exec
+         * would inherit the journal. Both preparation failures refuse exec. */
+        int saved = dup(2);
+        if (saved < 0){
+          fprintf(stderr,"landlock-exec: dup 2 (journal fd): %s\n",strerror(errno));
+          status_fail("confine: dup(2) failed");
+          return 3;
+        }
+        if (fcntl(saved, F_SETFD, FD_CLOEXEC) < 0){
+          fprintf(stderr,"landlock-exec: fcntl FD_CLOEXEC (journal fd): %s\n",strerror(errno));
+          close(saved);
+          status_fail("confine: fcntl FD_CLOEXEC (journal fd) failed");
+          return 3;
+        }
+        journal_fd = saved;
+        relay_fd = (int)n;
+      }
+    }
+  }
   int abi = ll_create(NULL,0,1 /*VERSION*/);
   if (abi < 1){
     fprintf(stderr,"landlock-exec: unavailable (%s)\n",strerror(errno));
@@ -172,45 +200,8 @@ int main(int argc, char **argv){
   }
   close(rs);
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);
-  /* journal_fd: where THIS process's own diagnostics go from here on. Starts as
-   * plain fd 2. If LL_STDERR_FD is about to steal fd 2 for the provider, a saved,
-   * CLOEXEC'd duplicate of the CURRENT fd 2 takes over that job instead — so the
-   * one diagnostic still possible after the redirect (execvp itself failing,
-   * below) reaches the journal instead of the caller's wire (gate delta 2, Riker
-   * HIGH / Ikarus MEDIUM: fixing the exact regression this comment used to argue
-   * around — "doing the redirect last" is not enough on its own). */
-  int journal_fd = 2;
-  { const char *v = getenv("LL_STDERR_FD");
-    if (v && *v){
-      char *end = NULL; long n = strtol(v,&end,10);
-      if (end && !*end && n >= 0 && n <= 65535){
-        /* S2 (gate delta 3, Ikarus MEDIUM): dup()/fcntl() failing here used to
-         * fall through silently — journal_fd stayed 2 while the redirect below
-         * still went ahead, so a LATER execvp failure's diagnostic would reach
-         * the relay fd after all (the exact leak this whole mechanism exists to
-         * prevent); or, if dup() succeeded but fcntl() didn't, the un-CLOEXEC'd
-         * saved fd would leak into a successfully exec'd provider. Both are
-         * fail-closed now: either failure aborts before the redirect, before
-         * exec, with LL_STATUS_FD carrying the reason — exactly like every
-         * other pre-exec failure path above. */
-        int saved = dup(2);
-        if (saved < 0){
-          fprintf(stderr,"landlock-exec: dup 2 (journal fd): %s\n",strerror(errno));
-          status_fail("confine: dup(2) failed");
-          return 3;
-        }
-        if (fcntl(saved, F_SETFD, FD_CLOEXEC) < 0){
-          fprintf(stderr,"landlock-exec: fcntl FD_CLOEXEC (journal fd): %s\n",strerror(errno));
-          close(saved);
-          status_fail("confine: fcntl FD_CLOEXEC (journal fd) failed");
-          return 3;
-        }
-        journal_fd = saved;
-        if (dup2((int)n,2) < 0)
-          fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
-      }
-    }
-  }
+  if (relay_fd >= 0 && dup2(relay_fd,2) < 0)
+    fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
   /* This process's own configuration ends here — the child gets a ruleset, not a
    * memo about how it was built. LL_RO/LL_RW have done their job; LL_STATUS_FD is
    * closed by CLOEXEC on a successful exec below regardless, but unsetting all four
