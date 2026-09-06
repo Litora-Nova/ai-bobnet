@@ -1288,7 +1288,7 @@ aib_inbox_path() {
 #     payload value (§B7): it is exclusively a reader-side fold classification of an
 #     open decided(allow) whose recorded PID has vanished. The composer rejects it
 #     fail-closed. `stage` (RM-3 slice 3, schema version 2, CONTRACT-execution-binding
-#     §8.1, D-K) ∈ confine|cwd|exec|provider|null — which phase of enactment the
+#     §8.1, D-K) ∈ confine|cwd|exec|provider|transport|null — which phase of enactment the
 #     terminal status belongs to, so a helper-side refusal is never misread as the
 #     provider's own outcome. Always supplied by every real writer; `null` only on a
 #     record composed under schema version 1 (pre-slice-3), which a reader folds the
@@ -1806,20 +1806,30 @@ aib_enact_launch__run_direct() {
 
 # --- confined mode: §2.1 confinement, response-frame chunks + terminal lines --
 aib_enact_launch__run_confined() {
-  local _dd_bin _timeout_bin _mkfifo_bin _realpath_bin _python_bin _setsid_bin
+  local _dd_bin _timeout_bin _mkfifo_bin _realpath_bin _python_bin
   _dd_bin="$(command -v dd)" || aib_die 6 "required runtime dependency not found: dd (coreutils)"
   _timeout_bin="$(command -v timeout)" || aib_die 6 "required runtime dependency not found: timeout (coreutils)"
   _mkfifo_bin="$(command -v mkfifo)" || aib_die 6 "required runtime dependency not found: mkfifo (coreutils)"
   _realpath_bin="$(command -v realpath)" || aib_die 6 "required runtime dependency not found: realpath (coreutils)"
-  # D3 (gate delta, Ikarus, HIGH): a plain `kill -TERM $provider_pid` only reaches the
-  # direct child of the manager — a provider that itself forks (or that the adapter
-  # spawns beneath it) can survive that signal as a live orphan once the manager
-  # reaps its own direct child. setsid (util-linux) makes the confined exec chain the
-  # leader of its OWN new session/process group, so `kill -TERM -- "-$pid"` reaches
-  # the whole tree in one signal. Required, not optional — no fallback to a bare
-  # single-pid kill: a fallback would silently reintroduce the exact orphan class
-  # this fix exists to close.
-  _setsid_bin="$(command -v setsid)" || aib_die 6 "required runtime dependency not found: setsid (util-linux)"
+  # D3 (gate delta, Ikarus, HIGH), S1a (gate delta 3, Marvin root-cause / Ikarus HIGH):
+  # a plain `kill -TERM $provider_pid` only reaches the direct child of the manager —
+  # a provider that itself forks (or that the adapter spawns beneath it) can survive
+  # that signal as a live orphan once the manager reaps its own direct child, so the
+  # exec chain needs to lead its OWN new process group. Used to be util-linux `setsid`
+  # for this — but `setsid` is CONDITIONAL: if the calling process happens to already
+  # be a process-group leader (observed under load — the "already a leader" state is
+  # a live race, not a fixed property of how this code backgrounds jobs), it forks a
+  # NEW child to hold the new group instead of using the caller's own pid, so
+  # `provider_pid` (captured as `$!` of the ORIGINAL, non-forked process) silently
+  # stops being the group leader. Every subsequent `kill -- "-$provider_pid"` then
+  # targets an empty (or wrong) group while the real exec chain, now led by setsid's
+  # own fork, survives untouched — reparented to PID 1 once its actual parent exits.
+  # Fixed by not depending on external, conditional behaviour at all: `set -m` in the
+  # manager (below, right before backgrounding the child) makes BASH itself assign
+  # the new job its own process group, deterministically, with pgid == "$!" — no
+  # forking, no leader-detection heuristic, no race. setsid is dropped from the child
+  # exec chain entirely: a second, redundant group-creation attempt there would only
+  # reintroduce the same "am I already a leader" question one level down.
   _python_bin="$(command -v python3 2>/dev/null || true)"
 
   # --- D-A / D-A2: pre-flight, before ANYTHING else runs -----------------------
@@ -1873,15 +1883,18 @@ aib_enact_launch__run_confined() {
   }
 
   _aib_enact_exec_child_confined() {
-    # setsid (D3): makes this process the leader of a new session/process group, so
-    # the manager can TERM/KILL the whole tree by process group later, not just this
-    # one pid. LL_STDERR_FD=1 (D2, gate delta, Ikarus, HIGH): the confinement helper
-    # keeps its OWN stderr wherever fd2 already points (the journal — unchanged) but
-    # dup2's the fd NAMED here onto its fd 2 immediately before its execvp, so the
-    # PROVIDER's stderr (after that handoff) lands on fd 1 — the same relay fifo
-    # every chunk already goes through — never merged with the helper's own
-    # diagnostics, because the dup2 happens strictly after them.
-    exec "$_setsid_bin" "$_env_bin" -i "${_child_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
+    # S1a: no setsid here — the manager's own `set -m` (below) already put THIS
+    # process in a fresh process group, with pgid == its own pid, at the moment it
+    # was backgrounded, before this function body even started running. A second
+    # group-creation attempt here would just reopen the same "am I already a group
+    # leader" question setsid used to answer wrong under load. LL_STDERR_FD=1 (D2,
+    # gate delta, Ikarus, HIGH): the confinement helper keeps its OWN stderr
+    # wherever fd2 already points (the journal — unchanged) but dup2's the fd
+    # NAMED here onto its fd 2 immediately before its execvp, so the PROVIDER's
+    # stderr (after that handoff) lands on fd 1 — the same relay fifo every chunk
+    # already goes through — never merged with the helper's own diagnostics,
+    # because the dup2 happens strictly after them.
+    exec "$_env_bin" -i "${_child_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
       "LL_STATUS_FD=9" "LL_STDERR_FD=1" \
       "$AIB_CONFINE_BIN" "$adapter" exec \
       -m "$model" -s "$sandbox" \
@@ -1930,6 +1943,24 @@ aib_enact_launch__run_confined() {
         killer_pid=$!
       fi
     }
+    # _aib_enact_wait_group_empty <pgid> <deadline_s> — S1b (gate delta 3, Ikarus
+    # HIGH): a signal being SENT (TERM, or KILL from the killer job) is not the
+    # same as the group being GONE. Every terminal path below used to proceed
+    # straight from "the leader is reaped" / "the killer job finished" to writing
+    # the provider status and letting attempt.ended commit — under load, a
+    # grandchild can still be mid-death (or, rarer, a fresh escalation race) at
+    # that exact moment, so the "no orphan" read a poller does the instant the
+    # ended record becomes visible can still find one. Polls the GROUP (never a
+    # single pid) until `kill -0` reports ESRCH (nothing left) or the deadline
+    # passes; returns nonzero only in the latter case.
+    _aib_enact_wait_group_empty() {
+      local _pgid="$1" _deadline_s="$2" _wge_start="$SECONDS"
+      while kill -0 -- "-$_pgid" 2>/dev/null; do
+        [ $((SECONDS - _wge_start)) -lt "$_deadline_s" ] || return 1
+        "$_sleep_bin" 0.05
+      done
+      return 0
+    }
     _aib_enact_on_timeout() { timed_out=1; wait_interrupted=1; _aib_enact_escalate; }
     _aib_enact_on_disconnect() { aborted_disc=1; wait_interrupted=1; _aib_enact_escalate; }
     trap '_aib_enact_forward HUP' HUP
@@ -1954,8 +1985,17 @@ aib_enact_launch__run_confined() {
       exit 126
     fi
 
+    # S1a (gate delta 3, Marvin root-cause / Ikarus HIGH): `set -m` (job control)
+    # right before backgrounding, not before — enabling it earlier would also put
+    # the timer/killer helper jobs below under monitor-mode job control, which
+    # this function does not need and does not want to reason about. With job
+    # control on, bash itself creates a NEW process group for this one background
+    # job and assigns its pgid == its own pid, deterministically, at fork time —
+    # no external command, no "am I already a leader" ambiguity, no race.
+    set -m
     _aib_enact_exec_child_confined 9>"$_status_file" &
     provider_pid=$!
+    set +m
     # >&- : same reasoning as the killer job above — this timer outlives a
     # fast provider by design and must not be an extra open writer on the
     # relay fifo once the provider itself is done with it.
@@ -1992,6 +2032,26 @@ aib_enact_launch__run_confined() {
       else
         kill "$killer_pid" 2>/dev/null || true
         wait "$killer_pid" 2>/dev/null || true
+      fi
+    fi
+    # S1b (gate delta 3, Ikarus HIGH): EVERY terminal path — normal exit,
+    # timeout, disconnect abort — reaches here, and none of the waits above
+    # actually confirm the GROUP is empty (only that the leader was reaped, and
+    # that the killer job, if one ran, finished). One more bounded check, with
+    # one more real escalation attempt if it's still not empty: proceeding to
+    # commit while a member of the group is still alive is exactly the window
+    # a reader polling the stream can catch as a false "no orphan" (Marvin's and
+    # Ikarus' load repros). If it is STILL not empty after that — a process
+    # stuck in an uninterruptible state is the realistic cause, since KILL was
+    # already sent twice — this deliberately does not block the connection
+    # forever (that would trade one incident for a worse one, a hung response);
+    # it logs to the journal and proceeds. Nothing about the record itself
+    # changes: the log line is the honest record of what was chosen here.
+    if ! _aib_enact_wait_group_empty "$provider_pid" 2; then
+      kill -KILL -- "-$provider_pid" 2>/dev/null || true
+      if ! _aib_enact_wait_group_empty "$provider_pid" 3; then
+        printf 'ai-bobnet: process group %s still had live members after a second KILL escalation; proceeding\n' \
+          "$provider_pid" >&2
       fi
     fi
     if [ "$aborted_disc" -eq 1 ]; then provider_rc=143
