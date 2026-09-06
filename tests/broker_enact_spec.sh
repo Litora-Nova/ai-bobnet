@@ -1485,7 +1485,12 @@ eq "both bounded group waits are exercised" "$(cat "$WORK/group-waits" 2>/dev/nu
 exhausted_record="$(aib_event_scan "$EVENTS_FILE" | grep '"event_type":"attempt.ended"' | tail -1)"
 has "exhausted escalation is durable as a boolean" "$exhausted_record" '"group_empty":false'
 has "…and belongs to the tested attempt" "$exhausted_record" "\"attempt_id\":\"$exhausted_decided\""
-has "exhausted escalation is visible on the wire" "$(<"$WORK/resp-exhausted")" $'group_empty=false\nreason=escalation_exhausted'
+has "exhausted escalation is visible on the wire" "$(<"$WORK/resp-exhausted")" 'group_empty=false'
+has "exhausted escalation has a wire reason" "$(<"$WORK/resp-exhausted")" 'reason=escalation_exhausted'
+case $'\n'"$(<"$WORK/resp-exhausted")"$'\n' in
+  *$'\ngroup_empty=false\nreason=escalation_exhausted\n'*) ok "the group-empty line is immediately followed by its reason";;
+  *) no "the group-empty line is immediately followed by its reason";;
+esac
 eq "exhausted escalation still writes exactly one terminal end" "$(count_real_terminal_end_lines "$WORK/resp-exhausted")" 1
 eq "…and end=ok remains the final line" "$(tail -1 "$WORK/resp-exhausted")" 'end=ok'
 has "exhausted escalation is also journaled" "$(<"$WORK/err-exhausted")" 'proceeding'
