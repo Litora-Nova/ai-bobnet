@@ -43,12 +43,18 @@
  * caller like stdout does — but this process's OWN stderr (the fprintf diagnostics
  * above, every one of them) must stay on the journal, never the caller's stream
  * (docs/CONFINEMENT.md, "Diagnostics go to the broker's journal, never the caller's
- * stream"). Both requirements are satisfied by doing the redirect LAST: if LL_STDERR_FD
- * names an fd, this process dup2()s it onto fd 2 immediately before execvp — after every
- * diagnostic this process itself could ever emit, so this process's own stderr is never
- * touched, and the provider inherits fd 2 already pointing wherever the caller wants
- * (typically the same relay the caller gave it for fd 1, so provider stdout and stderr
- * end up on the same wire chunk stream, exactly as stdout is already relayed).
+ * stream"). This process dup2()s LL_STDERR_FD onto fd 2 before execvp, after every
+ * diagnostic printed ABOVE this point — but execvp can still fail AFTER the redirect
+ * (gate delta 2, Riker HIGH / Ikarus MEDIUM: the ONE diagnostic this process can still
+ * emit past that point is execvp's own failure, and "doing the redirect last" put fd 2
+ * already aliasing the caller's relay by then, so that one diagnostic — including the
+ * adapter's absolute path — leaked onto the wire instead of the journal). Fixed by
+ * saving the ORIGINAL fd 2 with dup() (CLOEXEC'd, so a successful exec still closes it
+ * same as everything else) before the redirect: the post-execvp diagnostic always goes
+ * to that saved journal fd, never to fd 2, so it reaches the journal whether execvp
+ * succeeds or fails. LL_STATUS_FD (unaffected by any of this) is still the caller's
+ * PRIMARY signal that exec failed; the saved-fd diagnostic is belt-and-suspenders for
+ * the journal, matching every earlier failure path's fprintf.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -166,14 +172,23 @@ int main(int argc, char **argv){
   }
   close(rs);
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);
-  /* LL_STDERR_FD, last, deliberately after the line above: every diagnostic this
-   * process itself ever emits is already on real fd 2 (the journal) by this point.
-   * From here on fd 2 belongs to the provider, not to us. */
+  /* journal_fd: where THIS process's own diagnostics go from here on. Starts as
+   * plain fd 2. If LL_STDERR_FD is about to steal fd 2 for the provider, a saved,
+   * CLOEXEC'd duplicate of the CURRENT fd 2 takes over that job instead — so the
+   * one diagnostic still possible after the redirect (execvp itself failing,
+   * below) reaches the journal instead of the caller's wire (gate delta 2, Riker
+   * HIGH / Ikarus MEDIUM: fixing the exact regression this comment used to argue
+   * around — "doing the redirect last" is not enough on its own). */
+  int journal_fd = 2;
   { const char *v = getenv("LL_STDERR_FD");
     if (v && *v){
       char *end = NULL; long n = strtol(v,&end,10);
-      if (end && !*end && n >= 0 && n <= 65535 && dup2((int)n,2) < 0)
-        fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
+      if (end && !*end && n >= 0 && n <= 65535){
+        int saved = dup(2);
+        if (saved >= 0 && fcntl(saved, F_SETFD, FD_CLOEXEC) == 0) journal_fd = saved;
+        if (dup2((int)n,2) < 0)
+          fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
+      }
     }
   }
   /* This process's own configuration ends here — the child gets a ruleset, not a
@@ -182,7 +197,12 @@ int main(int argc, char **argv){
    * is cheap and removes any dependence on that being the only backstop. */
   unsetenv("LL_RO"); unsetenv("LL_RW"); unsetenv("LL_STATUS_FD"); unsetenv("LL_STDERR_FD");
   execvp(argv[1],&argv[1]);
-  fprintf(stderr,"landlock-exec: exec %s: %s\n",argv[1],strerror(errno));
+  /* execvp failed: fd 2 may already be the PROVIDER's relay (LL_STDERR_FD above) —
+   * this diagnostic goes to journal_fd (the saved original stderr when that
+   * happened, plain fd 2 otherwise), never to fd 2 itself, so it can never land on
+   * the caller's wire. LL_STATUS_FD (status_fail below) is still the caller's
+   * primary signal; this is the journal's copy of the same failure. */
+  dprintf(journal_fd,"landlock-exec: exec %s: %s\n",argv[1],strerror(errno));
   status_fail("exec: execvp failed");
   return 127;
 }
