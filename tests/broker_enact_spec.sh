@@ -456,6 +456,38 @@ else
   skip "no cc"
 fi
 
+# Real journal-fd failures must run before Landlock, even on this host. The
+# fixture links the actual helper main: descriptor exhaustion uses RLIMIT_NOFILE;
+# only the fcntl error is injected. Neither test substitutes a helper result.
+if [ -n "$CC_BIN" ]; then
+  FD_HELPER="$WORK/fd-landlock-exec"
+  if "$CC_BIN" -Wall -Wextra -Werror -o "$FD_HELPER" "$SRC_ROOT/src/landlock-exec.c" \
+      "$SRC_ROOT/tests/fixtures/landlock_fd_fault.c" -Wl,--wrap=fcntl,--wrap=close \
+      2>"$WORK/fd-cc-err"; then
+    for fd_failure in dup fcntl; do
+      FD_SENTINEL="$WORK/fd-$fd_failure-exec"
+      TEST_FD_FAILURE="$fd_failure" LL_STATUS_FD=9 LL_STDERR_FD=1 \
+        "$FD_HELPER" /bin/sh -c 'printf executed > "$1"' sh "$FD_SENTINEL" \
+        8>"$WORK/fd-$fd_failure-trace" 9>"$WORK/fd-$fd_failure-status" \
+        >"$WORK/fd-$fd_failure-wire" 2>"$WORK/fd-$fd_failure-journal"
+      eq "real helper refuses journal $fd_failure failure with exit 3" "$?" 3
+      has "…status identifies the actual $fd_failure rejection before Landlock" \
+        "$(<"$WORK/fd-$fd_failure-status")" "confine: $fd_failure"
+      eq "…$fd_failure refusal writes nothing to the relay" "$(file_byte_count "$WORK/fd-$fd_failure-wire")" 0
+      if [ -e "$FD_SENTINEL" ]; then no "…$fd_failure refusal never execs the adapter"
+      else ok "…$fd_failure refusal never execs the adapter"; fi
+    done
+    has "real descriptor exhaustion is EMFILE, not a Landlock failure" \
+      "$(<"$WORK/fd-dup-journal")" "Too many open files"
+    has "fcntl rejection closes the saved journal descriptor" \
+      "$(<"$WORK/fd-fcntl-trace")" "saved fd closed"
+  else
+    no "real journal-fd fixture compiles ($(cat "$WORK/fd-cc-err"))"
+  fi
+else
+  no "real journal-fd rejection coverage requires cc"
+fi
+
 # =============================================================================
 # 2. aib_event_compose_ended_payload gains exit.stage (D-K) — no aib_enact_launch
 #    needed, this is the composer alone.
@@ -469,6 +501,14 @@ stage_payload_provider="$(aib_event_compose_ended_payload "exit_class=provider-f
 exit_code=3
 stage=provider")"
 has "…for every exit class, not only confinement refusals" "$stage_payload_provider" '"stage":"provider"'
+has "ordinary ended payloads include the boolean group_empty=true" "$stage_payload_provider" '"group_empty":true'
+has "pre-exec refusals also include group_empty=true" "$stage_payload" '"group_empty":true'
+has "the composer preserves a reported non-empty group" \
+  "$(aib_event_compose_ended_payload $'exit_class=ok\nstage=provider\ngroup_empty=false')" '"group_empty":false'
+for invalid_group_empty in '' yes null 'false,"injected":true'; do
+  ( aib_event_compose_ended_payload $'exit_class=ok\nstage=provider\ngroup_empty='"$invalid_group_empty" ) >/dev/null 2>&1
+  eq "the composer rejects invalid group_empty '$invalid_group_empty'" "$?" 2
+done
 
 # D5 (gate delta, Ikarus, MEDIUM): stage is REQUIRED, not merely accepted — a
 # missing/empty stage on a new record is a writer bug (direct-mode's two
@@ -1419,6 +1459,36 @@ TMPDIR="$MARKER_TMPDIR" AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(bas
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-16" 2>"$WORK/enact-err-16"
 _marker_after="$(find "$MARKER_TMPDIR" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
 eq "a confined run leaves no escalation-marker temp file behind (LOW)" "$_marker_after" "$_marker_before"
+
+# All ordinary schema-2 writers above (including transport/preflight failures)
+# must report the boolean, not omit it or serialize it as a string.
+ordinary_ended="$(aib_event_scan "$EVENTS_FILE" | grep '"event_type":"attempt.ended"')"
+eq "all ordinary ended records carry group_empty=true" \
+  "$(printf '%s\n' "$ordinary_ended" | grep -vc '"group_empty":true')" 0
+hasnt "ordinary wire terminals omit group_empty" "$(<"$WORK/resp-16")" 'group_empty='
+
+# The kernel's uninterruptible-process case is not reproducible safely here.
+# Override only the internal group wait in a subshell; the actual provider,
+# manager, status transfer, event commit, and wire writer still execute.
+reset_run
+landlock_conf_write ok
+adapter_conf_write ok
+exhausted_decided="$(seed_decided)"
+(
+  _aib_enact_wait_group_empty() { printf '%s\n' "$2" >> "$WORK/group-waits"; return 1; }
+  AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+    "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$exhausted_decided" \
+    >"$WORK/resp-exhausted" 2>"$WORK/err-exhausted"
+)
+eq "exhausted escalation completes the broker response" "$?" 0
+eq "both bounded group waits are exercised" "$(cat "$WORK/group-waits" 2>/dev/null)" $'2\n3'
+exhausted_record="$(aib_event_scan "$EVENTS_FILE" | grep '"event_type":"attempt.ended"' | tail -1)"
+has "exhausted escalation is durable as a boolean" "$exhausted_record" '"group_empty":false'
+has "…and belongs to the tested attempt" "$exhausted_record" "\"attempt_id\":\"$exhausted_decided\""
+has "exhausted escalation is visible on the wire" "$(<"$WORK/resp-exhausted")" $'group_empty=false\nreason=escalation_exhausted'
+eq "exhausted escalation still writes exactly one terminal end" "$(count_real_terminal_end_lines "$WORK/resp-exhausted")" 1
+eq "…and end=ok remains the final line" "$(tail -1 "$WORK/resp-exhausted")" 'end=ok'
+has "exhausted escalation is also journaled" "$(<"$WORK/err-exhausted")" 'proceeding'
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
