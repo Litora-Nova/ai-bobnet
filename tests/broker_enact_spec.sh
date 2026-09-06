@@ -505,6 +505,11 @@ else ok "a failed pre-flight never runs the provider (D-A)"; fi
 eq "…and AIB_ENACT_EXIT_CLASS is io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
 eq "…and AIB_ENACT_STAGE is confine, not provider (D-K)" "${AIB_ENACT_STAGE:-}" "confine"
 has "…the pre-flight call itself targets /bin/true, not the real adapter" "$(<"$LL_LOG")" "argv=/bin/true"
+# Gate delta (should-fix, now fixed): a client checking only stage= has to know
+# the enum by heart to react. reason= spells it out on the wire itself, ahead
+# of ended_event_id= (Ikarus' preflight repro expects exactly this string).
+has "…and the wire names reason=confinement_unavailable, not just stage=confine" \
+  "$(<"$WORK/resp-4b")" "reason=confinement_unavailable"
 
 # =============================================================================
 # --- 4c. LL_RW is composed from the registry snapshot only; a request cwd
@@ -571,6 +576,8 @@ else ok "a cwd swapped to point outside root after authorize never runs the adap
 eq "…classified stage=cwd, not confine or provider" "${AIB_ENACT_STAGE:-}" "cwd"
 eq "…and exit_class is io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
 has "…the terminal line on the wire names stage=cwd" "$(<"$WORK/resp-4e")" "stage=cwd"
+has "…and reason=cwd_moved, so a client need not know the stage enum by heart" \
+  "$(<"$WORK/resp-4e")" "reason=cwd_moved"
 
 # =============================================================================
 # 5. Successful enactment: helper receives the right shape, adapter runs once,

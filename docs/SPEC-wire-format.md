@@ -260,8 +260,20 @@ end=ok
 status) or `signal=` (the forwarded signal name) follows, matching the shape
 `aib_event_compose_ended_payload` already requires for the durable record. `stage` names which phase
 of enactment the terminal status belongs to — see the "stage" field note in
-`docs/CONTRACT-execution-binding.md` §8.1. `ended_event_id` is the `attempt.ended` event's own id,
-committed causally bound to `decided_event_id` from the prologue. Then, always last:
+`docs/CONTRACT-execution-binding.md` §8.1.
+
+When `stage` is anything other than `provider`, a `reason=` line follows it: the fixed machine
+reason for that stage, so a client can act on it without knowing the stage enum by heart.
+
+```
+stage=confine  -> reason=confinement_unavailable
+stage=cwd      -> reason=cwd_moved
+stage=exec     -> reason=exec_failed
+stage=provider -> (no reason= line — exit_class/exit_code/signal already say what happened)
+```
+
+`ended_event_id` is the `attempt.ended` event's own id, committed causally bound to
+`decided_event_id` from the prologue. Then, always last:
 
 ```
 end=ok | end=denied | end=error

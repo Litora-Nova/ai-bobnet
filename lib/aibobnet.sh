@@ -1472,6 +1472,11 @@ aib_event_compose_ended_payload() {
 #   AIB_ENACT_SIGNAL      the forwarded signal name (may be empty; exactly one of
 #                         AIB_ENACT_EXIT_CODE / AIB_ENACT_SIGNAL is ever non-empty)
 #   AIB_ENACT_ENDED_EVENT_ID  the committed attempt.ended event_id
+#   AIB_ENACT_REASON      set only when AIB_ENACT_STAGE != provider: the fixed
+#     machine reason for that stage (confine -> confinement_unavailable,
+#     cwd -> cwd_moved, exec -> exec_failed); empty when stage == provider,
+#     because the provider's own exit class/code/signal already say enough
+#     (docs/SPEC-wire-format.md, "Terminal lines").
 # and has committed exactly one attempt.ended record, causally bound to
 # <decided-event-id>, over <events-path>/<lock-path> with the given <envelope-kv>.
 aib_enact_launch() {
@@ -1505,6 +1510,7 @@ aib_enact_launch() {
   AIB_ENACT_EXIT_CODE=""
   AIB_ENACT_SIGNAL=""
   AIB_ENACT_ENDED_EVENT_ID=""
+  AIB_ENACT_REASON=""
   # D8 (gate delta, Ikarus, MEDIUM): set instead of dying, confined mode only —
   # see _aib_enact_commit_ended below.
   AIB_ENACT_INCIDENT=""
@@ -1579,6 +1585,16 @@ aib_enact_launch() {
     AIB_ENACT_EXIT_CODE="$exit_code"
     AIB_ENACT_SIGNAL="$signal"
     AIB_ENACT_ENDED_EVENT_ID="${_committed_id#OK:}"
+    # Ikarus' preflight repro expects reason=confinement_unavailable on the
+    # wire, not just stage=confine — a caller that only checks stage has to
+    # know the enum by heart. provider needs none: exit_class/exit_code/signal
+    # already say what happened (docs/SPEC-wire-format.md, "Terminal lines").
+    case "$stage" in
+      confine) AIB_ENACT_REASON=confinement_unavailable;;
+      cwd) AIB_ENACT_REASON=cwd_moved;;
+      exec) AIB_ENACT_REASON=exec_failed;;
+      provider) AIB_ENACT_REASON="";;
+    esac
   }
 
   # _aib_enact_status_signal <128+n> -> signal name (same table as the PEP's).
@@ -2141,7 +2157,9 @@ sys.exit(0)
 # frame (docs/SPEC-wire-format.md, "Response frame", §3): exit_class, exactly
 # one of exit_code=/signal= (neither, for class "ok" — matching the composer's
 # own convention of nulling both when the caller never supplies them), stage,
-# ended_event_id, and `end=ok` LAST — always "ok" here, because "end=ok on the
+# reason (only when stage != provider — confinement_unavailable/cwd_moved/
+# exec_failed, so a caller need not know the stage enum by heart), ended_event_id,
+# and `end=ok` LAST — always "ok" here, because "end=ok on the
 # response means the broker did its job, regardless of the provider's own exit
 # class" (SPEC-wire-format.md, "Terminal lines"): a provider that failed, timed
 # out, was aborted, or was refused before it ever ran still got a correctly
@@ -2157,6 +2175,9 @@ aib_enact_launch__write_terminal() {
     printf 'exit_code=%s\n' "$AIB_ENACT_EXIT_CODE"
   fi
   printf 'stage=%s\n' "$AIB_ENACT_STAGE"
+  if [ -n "$AIB_ENACT_REASON" ]; then
+    printf 'reason=%s\n' "$AIB_ENACT_REASON"
+  fi
   printf 'ended_event_id=%s\n' "$AIB_ENACT_ENDED_EVENT_ID"
   printf 'end=ok\n'
 }
