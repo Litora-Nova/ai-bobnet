@@ -925,7 +925,13 @@ if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
   if [ -s "$SENTINEL" ]; then ok "…the provider actually started before the disconnect (deterministic sync)"
   else no "…the provider actually started before the disconnect (deterministic sync) (never wrote its sentinel)"; fi
   exec 8<&-         # the client disconnects: reader closed, no end= ever read
-  disc_deadline=$((SECONDS+10))
+  # S1 load-proof (gate delta 3): bumped from 10s to 25s — under 2-way parallel
+  # load plus CPU noise, the TERM-then-confirm-group-empty sequence (S1b) can
+  # genuinely take longer than 10s of wall-clock time to become VISIBLE purely
+  # from host-level scheduling contention, not from any defect (the very next
+  # assertion below, and a live `ps` check, both confirm no orphan survives
+  # either way) — this bound only needs to be generous, not tight.
+  disc_deadline=$((SECONDS+25))
   disc_ended_seen=0
   while [ "$SECONDS" -lt "$disc_deadline" ]; do
     if aib_event_scan "$EVENTS_FILE" >/dev/null 2>&1 && \
@@ -1044,7 +1050,8 @@ if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
   IFS= read -r _blank <&9 || true
   IFS= read -r _first_chunk_line <&9 || true
   exec 9<&-   # disconnect mid-stream, provider still producing output
-  trickle_deadline=$((SECONDS+10))
+  # S1 load-proof (gate delta 3): same reasoning as the disconnect fixture above.
+  trickle_deadline=$((SECONDS+25))
   trickle_ended_seen=0
   while [ "$SECONDS" -lt "$trickle_deadline" ]; do
     if aib_event_scan "$EVENTS_FILE" >/dev/null 2>&1 && \
@@ -1280,6 +1287,63 @@ else
   skip "no mkfifo on this host"
   skip "no mkfifo on this host"
   skip "no mkfifo on this host"
+fi
+
+# =============================================================================
+# 15c. S1a (gate delta 3, Marvin root-cause / Ikarus HIGH): the confined exec
+#     chain must lead its OWN process group with pgid == its own pid — not via
+#     util-linux setsid's conditional fork-when-already-a-leader behaviour
+#     (the actual root cause of the R2 orphans under load: when it forked, the
+#     manager's captured provider_pid stopped being the group leader, so every
+#     `kill -- "-$provider_pid"` hit an empty/wrong group while the real tree
+#     survived, reparented to PID 1). Checks BOTH the leader itself and its
+#     forked grandchild share one real process group.
+# =============================================================================
+if command -v pgrep >/dev/null 2>&1 && command -v ps >/dev/null 2>&1; then
+  reset_run
+  PGID_MARKER="$WORK/pgid-marker-$$"
+  adapter_conf_write silent-hang
+  pgid_decided="$(seed_decided)"
+  AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "$PGID_MARKER")" \
+    "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$pgid_decided" \
+    >"$WORK/resp-pgid" 2>"$WORK/enact-err-pgid" &
+  pgid_bg_pid=$!
+  pgid_deadline=$((SECONDS+10))
+  while [ ! -s "$SENTINEL" ] && [ "$SECONDS" -lt "$pgid_deadline" ]; do sleep 0.05; done
+  # A brief settle so the grandchild fork has actually happened by the time we
+  # enumerate pids — the sentinel only proves the PARENT started.
+  sleep 0.3
+  _pgid_pids="$(pgrep -f "$PGID_MARKER" 2>/dev/null)"
+  _pgid_count="$(printf '%s\n' "$_pgid_pids" | grep -c .)"
+  if [ "$_pgid_count" -ge 2 ]; then
+    ok "…both the leader and its forked grandchild are found (sanity)"
+  else
+    no "…both the leader and its forked grandchild are found (sanity) (found $_pgid_count)"
+  fi
+  _pgid_ref="" _pgid_all_same=1 _pgid_leader_found=0
+  for _p in $_pgid_pids; do
+    _this_pgid="$(ps -o pgid= -p "$_p" 2>/dev/null | tr -d ' ')"
+    [ -n "$_this_pgid" ] || continue
+    if [ -z "$_pgid_ref" ]; then _pgid_ref="$_this_pgid"; fi
+    [ "$_this_pgid" = "$_pgid_ref" ] || _pgid_all_same=0
+    [ "$_p" != "$_this_pgid" ] || _pgid_leader_found=1
+  done
+  if [ "$_pgid_all_same" -eq 1 ]; then
+    ok "…the leader and its grandchild share ONE real process group (S1a)"
+  else
+    no "…the leader and its grandchild share ONE real process group (S1a) (pgids differed)"
+  fi
+  if [ "$_pgid_leader_found" -eq 1 ]; then
+    ok "…that group has a REAL leader among the confined chain (pgid == a member's own pid), not setsid's fork"
+  else
+    no "…that group has a REAL leader among the confined chain (pgid == a member's own pid), not setsid's fork"
+  fi
+  pkill -9 -f "$PGID_MARKER" >/dev/null 2>&1 || true
+  wait "$pgid_bg_pid" 2>/dev/null || true
+else
+  skip "no pgrep/ps on this host"
+  skip "no pgrep/ps on this host"
+  skip "no pgrep/ps on this host"
 fi
 
 # =============================================================================
