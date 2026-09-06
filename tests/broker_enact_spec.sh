@@ -214,12 +214,31 @@ _cfg="$(cd "$(dirname "$0")" && pwd)/landlock.conf"
 } >> "${STUB_LL_LOG:-/dev/null}"
 case "${STUB_LL_MODE:-ok}" in
   ok)
+    # R1 (gate delta 2, Riker HIGH / Ikarus MEDIUM): mirror the FIXED real-helper
+    # ordering, not the old buggy one. Save the ORIGINAL stderr as fd 3 BEFORE the
+    # LL_STDERR_FD redirect (src/landlock-exec.c now does the equivalent with a
+    # CLOEXEC'd dup()) — every diagnostic this stub emits AFTER the redirect (i.e.
+    # only the "exec target missing" one below) goes to fd 3, the journal, never
+    # to fd 2, which by then belongs to the provider's relay.
+    exec 3>&2
+    # D2 (gate delta): dup2 the named fd onto 2 — after every diagnostic the block
+    # above already emitted (flushed to STUB_LL_LOG by this point), but BEFORE we
+    # know whether the upcoming exec will even succeed.
+    if [ -n "${LL_STDERR_FD-}" ]; then eval "exec 2>&${LL_STDERR_FD}"; fi
+    # execvp's own failure path, reproduced without relying on bash's `exec`
+    # builtin's own stderr message (which bash would send to whatever fd 2
+    # already is — i.e. exactly the leak this fixture exists to catch — instead
+    # of letting us choose the journal deliberately, the way real execvp()'s
+    # errno-based failure lets src/landlock-exec.c choose).
+    if ! command -v "$1" >/dev/null 2>&1 && [ ! -x "$1" ]; then
+      if [ -n "${LL_STATUS_FD-}" ]; then
+        printf 'exec: %s: No such file or directory\n' "$1" >&"${LL_STATUS_FD}"
+      fi
+      printf 'landlock-exec: exec %s: No such file or directory\n' "$1" >&3
+      exit 127
+    fi
     # CLOEXEC on success: close the status fd, write nothing, THEN exec.
     if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
-    # D2 (gate delta): mirror the real helper's LL_STDERR_FD contract — dup2
-    # the named fd onto 2 LAST, after every diagnostic this stub itself could
-    # emit (the block above, already flushed to STUB_LL_LOG by this point).
-    if [ -n "${LL_STDERR_FD-}" ]; then eval "exec 2>&${LL_STDERR_FD}"; fi
     exec "$@"
     ;;
   preflight-fail)
@@ -637,6 +656,32 @@ eq "…and its stage is provider" "${AIB_ENACT_STAGE:-}" "provider"
 # stub itself already logged to STUB_LL_LOG.
 has "…and the provider's OWN stderr reaches the wire as a chunk (D2)" "$(<"$WORK/resp-6a")" "stub failure"
 hasnt "…while the helper's own diagnostics still never do" "$(<"$WORK/resp-6a")" "landlock-exec:"
+
+# --- 6a2. R1 (gate delta 2, Riker HIGH / Ikarus MEDIUM): execvp itself failing
+#     AFTER a successful confinement setup — the LL_STDERR_FD dup2 has already
+#     happened by then, so the helper's OWN "exec failed" diagnostic must go
+#     through LL_STATUS_FD/the journal, never leak onto the wire the way the
+#     provider's real stderr legitimately does above. This is the exact
+#     sub-case 84/84 green missed in the delta round: confinement succeeds,
+#     LL_STDERR_FD is set, and THEN the adapter path itself is missing.
+# =============================================================================
+reset_run
+landlock_conf_write ok
+adapter_conf_write ok
+MISSING_ADAPTER="$STUB_BIN/does-not-exist-xyz"
+missing_adapter_record="$(printf 'adapter=%s
+root=%s
+cwd=%s
+sandbox=workspace-write
+effort=high
+model=team/model-v2
+timeout=5'   "$MISSING_ADAPTER" "$FIXTURE_HOME" "$FIXTURE_WS")"
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$missing_adapter_record" "$(base_prompt)"   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6a2" 2>"$WORK/enact-err-6a2"
+eq "…classified stage=exec, the helper installed confinement but execvp itself failed"   "${AIB_ENACT_STAGE:-}" "exec"
+eq "…and exit_class is io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
+hasnt "…the exec-failure diagnostic (with the adapter's absolute path) never reaches the wire (R1)"   "$(<"$WORK/resp-6a2")" "$MISSING_ADAPTER"
+hasnt "…nor the literal 'landlock-exec:' prefix at all" "$(<"$WORK/resp-6a2")" "landlock-exec:"
+has "…while the SAME diagnostic DOES reach the broker's own journal stream"   "$(<"$WORK/enact-err-6a2")" "landlock-exec: exec $MISSING_ADAPTER"
 
 reset_run
 adapter_conf_write err 127
