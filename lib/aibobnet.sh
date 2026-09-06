@@ -1413,10 +1413,17 @@ aib_event_compose_ended_payload() {
   # stage key at all) can therefore no longer be produced through this composer —
   # tests/broker_enact_spec.sh's fold fixture builds that shape by hand instead, the
   # same way it already hand-builds the version-2 shape.
-  stage="$(_aib_record_field "$kv" stage)" || aib_die 2 "ended payload requires stage (confine|cwd|exec|provider)"
+  # R3 (gate delta 2, Ikarus MEDIUM): a disconnect at the PROLOGUE boundary —
+  # before enactment is ever reached — is not "the provider's own outcome"
+  # (stage=provider), nor any of aib_enact_launch's own three refusal stages
+  # (confine|cwd|exec). It gets its own value: the attempt ended because the
+  # TRANSPORT failed before enactment started. Schema version 2 is unreleased
+  # (no bump needed to extend its enum — docs/CONTRACT-execution-binding.md
+  # §8.1), so this composer accepts it starting now.
+  stage="$(_aib_record_field "$kv" stage)" || aib_die 2 "ended payload requires stage (confine|cwd|exec|provider|transport)"
   case "$stage" in
-    confine|cwd|exec|provider) ;;
-    *) aib_die 2 "invalid stage '$stage' (confine|cwd|exec|provider)";;
+    confine|cwd|exec|provider|transport) ;;
+    *) aib_die 2 "invalid stage '$stage' (confine|cwd|exec|provider|transport)";;
   esac
   printf '{"exit":{"class":%s,"code":%s,"signal":%s,"stage":%s}}' \
     "$(aib_json "$exit_class")" \
@@ -1825,6 +1832,19 @@ aib_enact_launch__run_confined() {
   fi
   if [ "$_preflight_rc" -ne 0 ]; then
     _aib_enact_commit_ended io-refused confine 126
+    # R4 (gate delta 2, Ikarus MEDIUM): _aib_enact_commit_ended's own D8 incident
+    # branch can fire right here too (event store gone/corrupt before the
+    # provider ever ran, not just after) — it sets AIB_ENACT_INCIDENT and returns
+    # without touching AIB_ENACT_EXIT_CLASS/STAGE/etc, so calling
+    # aib_enact_launch__write_terminal unconditionally printed empty fields and
+    # a false end=ok. Close the frame the same honest way every other incident
+    # in this function does: a flat reason=/end=error, never fabricated content.
+    if [ -n "$AIB_ENACT_INCIDENT" ]; then
+      printf 'chunk_bytes=0\n\n'
+      printf 'reason=event_store_unavailable\n'
+      printf 'end=error\n'
+      return 0
+    fi
     printf 'chunk_bytes=0\n\n'
     aib_enact_launch__write_terminal
     return 0
@@ -1892,7 +1912,14 @@ aib_enact_launch__run_confined() {
         # not until the provider actually finished).
         (
           "$_sleep_bin" 10
-          if kill -0 "$provider_pid" 2>/dev/null; then
+          # R2 (gate delta 2, Riker HIGH / Ikarus HIGH): this used to check
+          # only the LEADER pid (`kill -0 "$provider_pid"`) — but the leader
+          # is exactly the process that does NOT need to survive TERM to
+          # defeat this check; any ordinary (non-trapping) leader dies from
+          # the group TERM above like it always did, making this look like
+          # "nothing left to kill" even while a TERM-ignoring descendant is
+          # very much still alive in the same group. Ask about the GROUP.
+          if kill -0 -- "-$provider_pid" 2>/dev/null; then
             kill -KILL -- "-$provider_pid" 2>/dev/null || true
             printf 'KILL\n' > "$_escalated_marker" 2>/dev/null || true
           fi
@@ -1945,7 +1972,25 @@ aib_enact_launch__run_confined() {
 
     kill "$timer_pid" 2>/dev/null || true
     wait "$timer_pid" 2>/dev/null || true
-    if [ -n "$killer_pid" ]; then kill "$killer_pid" 2>/dev/null || true; wait "$killer_pid" 2>/dev/null || true; fi
+    if [ -n "$killer_pid" ]; then
+      # R2 (gate delta 2, Riker HIGH / Ikarus HIGH): provider_pid (the process
+      # GROUP LEADER) being confirmed reaped, just above, says nothing about
+      # whether the GROUP it led is actually empty — a grandchild that traps or
+      # ignores TERM (any daemonizing or adversarial child) survives the group
+      # TERM untouched and is left running, unreaped, forever, if the killer job
+      # is cancelled here on the leader's exit alone. `kill -0 -- "-$provider_pid"`
+      # asks the kernel the right question: is ANY process still in that group?
+      # If yes, let the killer's own 10s grace timer run its course for real and
+      # deliver KILL — cancelling it here would silently reopen the exact orphan
+      # class D3 exists to close, just via a TERM-ignoring descendant instead of
+      # D3's original un-grouped single-pid kill.
+      if kill -0 -- "-$provider_pid" 2>/dev/null; then
+        wait "$killer_pid" 2>/dev/null || true
+      else
+        kill "$killer_pid" 2>/dev/null || true
+        wait "$killer_pid" 2>/dev/null || true
+      fi
+    fi
     if [ "$aborted_disc" -eq 1 ]; then provider_rc=143
     elif [ "$timed_out" -eq 1 ]; then provider_rc=124
     fi
