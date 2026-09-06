@@ -239,6 +239,8 @@ case "${STUB_LL_MODE:-ok}" in
     fi
     # CLOEXEC on success: close the status fd, write nothing, THEN exec.
     if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
+    # The real helper's saved journal duplicate is also CLOEXEC.
+    exec 3>&-
     exec "$@"
     ;;
   preflight-fail)
@@ -382,6 +384,17 @@ case "${STUB_MODE:-ok}" in
     sleep 1
     exit 0
     ;;
+  list-fds)
+    # exec removes bash's own script descriptor. Filter the transient directory
+    # fd opened by listdir: it is already closed when fstat checks each entry.
+    exec python3 -c 'import os
+fds = []
+for entry in os.listdir("/proc/self/fd"):
+    try: os.fstat(int(entry))
+    except OSError: continue
+    fds.append(int(entry))
+print("PROVIDER_FDS=" + " ".join(map(str, sorted(fds))))'
+    ;;
 esac
 STUB
 chmod +x "$ADAPTER"
@@ -430,9 +443,8 @@ reset_run() {
 }
 
 # =============================================================================
-# 1. The compiled real helper's OWN failure path (D-A2), needs no broker code —
-#    the one part of docs/CONFINEMENT.md this Landlock-less host can genuinely
-#    exercise for real, not through a stub.
+# 1. Probe the compiled helper once on this host. Both supported confinement
+#    and an unavailable ruleset have real status-channel assertions (D-A2).
 # =============================================================================
 CC_BIN="$(command -v cc || command -v gcc || true)"
 if [ -n "$CC_BIN" ]; then
@@ -442,11 +454,18 @@ if [ -n "$CC_BIN" ]; then
     : > "$STATUS_OUT"
     LL_RO=/ LL_RW="$WORK" LL_STATUS_FD=9 "$REAL_HELPER" /bin/true 9>"$STATUS_OUT"
     real_rc=$?
-    eq "compiled helper exits 3 when Landlock is unavailable on this host" "$real_rc" "3"
-    if [ -s "$STATUS_OUT" ]; then
-      ok "…and LL_STATUS_FD carries a non-empty reason (D-A2)"
+    if [ "$real_rc" -eq 0 ]; then
+      printf '# Landlock host branch: available\n'
+      eq "compiled helper succeeds when confinement is available" "$real_rc" 0
+      eq "…and successful exec leaves the status channel empty (D-A2)" "$(file_byte_count "$STATUS_OUT")" 0
     else
-      no "…and LL_STATUS_FD carries a non-empty reason (D-A2) (status fd was empty — src/landlock-exec.c does not write it yet)"
+      printf '# Landlock host branch: unavailable\n'
+      eq "compiled helper exits 3 when confinement is unavailable" "$real_rc" 3
+      if [ -s "$STATUS_OUT" ]; then
+        ok "…and LL_STATUS_FD carries a non-empty reason (D-A2)"
+      else
+        no "…and LL_STATUS_FD carries a non-empty reason (D-A2) (status fd was empty)"
+      fi
     fi
   else
     no "src/landlock-exec.c compiles with $CC_BIN ($(cat "$WORK/cc-err" | tr '\n' ' '))"
@@ -1494,6 +1513,24 @@ esac
 eq "exhausted escalation still writes exactly one terminal end" "$(count_real_terminal_end_lines "$WORK/resp-exhausted")" 1
 eq "…and end=ok remains the final line" "$(tail -1 "$WORK/resp-exhausted")" 'end=ok'
 has "exhausted escalation is also journaled" "$(<"$WORK/err-exhausted")" 'proceeding'
+
+# Seed both read-only and writable inherited descriptors deliberately. Closing
+# the provider's copy must not disturb the broker caller's own descriptors.
+reset_run
+landlock_conf_write ok
+adapter_conf_write list-fds
+: > "$WORK/adapter-fd-input"
+(
+  exec 57>/dev/null 58<"$WORK/adapter-fd-input"
+  AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+    "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" \
+    >"$WORK/resp-fds" 2>"$WORK/err-fds"
+  if : >&57 && : <&58; then printf 'retained\n' > "$WORK/parent-fds"; fi
+)
+eq "the provider fd probe completes" "$?" 0
+eq "the exec'd adapter inherits only standard descriptors" \
+  "$(grep '^PROVIDER_FDS=' "$WORK/resp-fds")" 'PROVIDER_FDS=0 1 2'
+eq "closing child descriptors preserves the caller's copies" "$(cat "$WORK/parent-fds" 2>/dev/null)" retained
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

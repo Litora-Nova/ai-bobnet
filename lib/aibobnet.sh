@@ -1907,6 +1907,15 @@ aib_enact_launch__run_confined() {
   }
 
   _aib_enact_exec_child_confined() {
+    # Only stdio and the helper's status channel are part of this exec boundary.
+    # Enumerate this bash process before exec, closing inherited pipes/files in
+    # the child only. fd 9 remains until the helper closes it through CLOEXEC.
+    local _fd
+    for _fd in /proc/self/fd/[0-9]*; do
+      _fd="${_fd##*/}"
+      case "$_fd" in 0|1|2|9) continue;; esac
+      exec {_fd}>&-
+    done
     # S1a: no setsid here — the manager's own `set -m` (below) already put THIS
     # process in a fresh process group, with pgid == its own pid, at the moment it
     # was backgrounded, before this function body even started running. A second

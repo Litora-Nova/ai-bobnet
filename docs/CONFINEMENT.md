@@ -105,6 +105,17 @@ into the provider's output stream and never appear in the wire response — a co
 reported to the caller as the structured `reason=confinement_unavailable` above, not as leaked
 stderr text from a helper the caller has no reason to know exists.
 
+### Descriptor inheritance
+
+Before execing the confinement helper, the confined child enumerates its own
+`/proc/self/fd` and closes every inherited descriptor except 0, 1, 2, and 9. This requires
+Linux procfs to be mounted for the broker. Descriptor 9 is the private `LL_STATUS_FD`;
+the helper marks it `CLOEXEC`, as it does its saved journal duplicate. Consequently
+the exec'd provider receives only stdin, stdout, and stderr (0, 1, 2). The broker's
+copies remain open. The descriptor fixture injects read-only and writable inherited
+fds, then has the stub adapter enumerate `/proc/self/fd` after exec; it excludes the
+transient enumeration descriptor after confirming it is no longer open.
+
 ### `LL_RO=/` — a stated divergence, not an oversight
 
 §2.1's credential clause reads "read access to the credential directory only as far as the adapter
@@ -222,3 +233,29 @@ via `Environment=`, unconditionally — there is no code path in `bin/aib-broker
 `aib_enact_launch` that falls back to a different location or skips the helper when it is missing;
 a missing or non-executable helper is D-A's pre-flight failure (`io-refused`, `stage=confine`), not
 a silent bypass.
+
+### Registry and writable project paths
+
+The shipped `deploy/systemd/aib-broker@.service` sets
+`AIBOBNET_REGISTRY=/opt/aib/registry.json`. Install the registry at that path with
+broker read access; without this binding the handler reports `registry_unavailable`.
+
+**ReadWritePaths MUST include every registry project home and standup_dir.**
+`ProtectSystem=strict` makes other persistent paths read-only even when their normal
+ownership would permit writes. The default `/var/lib/aib /run/aib` paths cover broker
+state, not project workspaces or heartbeat logs. The filesystem allowlist installed
+by Landlock cannot make a read-only systemd mount writable.
+
+Copy `deploy/systemd/aib-broker@.service.d/site.conf.example` to the installed template's
+drop-in directory as `site.conf`, replacing `<site>` with the trusted deployment tree:
+
+```ini
+[Service]
+ReadWritePaths=/srv/<site>
+```
+
+Include further paths if any registry `home` or `standup_dir` is outside that tree.
+Keep the base unit's existing write paths (do not reset the directive with an empty
+assignment). The directories must also have ownership and permissions allowing the
+broker's required writes; `ReadWritePaths` does not grant filesystem permissions.
+The `.example` suffix prevents the sample from being applied before site configuration.

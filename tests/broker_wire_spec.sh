@@ -132,6 +132,15 @@ else
   ok "MaxConnectionsPerSource is NOT used as a directive"
 fi
 assert_ngrep "no daemon loop is shipped"       "$svc"  "Type=simple"
+assert_ok "the unit names the installed registry" \
+  grep -qxF 'Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json' "$SVC"
+assert_grep "the unit documents project home write access" "$svc" 'every registry project home and standup_dir'
+SITE_EXAMPLE="$SRC_ROOT/deploy/systemd/aib-broker@.service.d/site.conf.example"
+assert_ok "a site drop-in example is shipped" test -f "$SITE_EXAMPLE"
+assert_ok "the example grants the site tree write access" \
+  grep -qxF 'ReadWritePaths=/srv/<site>' "$SITE_EXAMPLE"
+assert_ok "the installation docs state the complete write-path rule" \
+  grep -qF 'ReadWritePaths MUST include every registry project home and standup_dir' "$SRC_ROOT/docs/CONFINEMENT.md"
 
 printf '\nbroker_wire_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
