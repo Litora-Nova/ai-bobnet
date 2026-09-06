@@ -297,6 +297,24 @@ case "${STUB_MODE:-ok}" in
     fi
     while :; do sleep 1; done
     ;;
+  silent-hang-term-trap)
+    # R2 (gate delta 2, Riker HIGH / Ikarus HIGH): silent-hang's grandchild
+    # dies from the ordinary TERM disposition, same as its parent, so it never
+    # stresses escalation CANCELLATION — only "did the group TERM reach
+    # everyone". This grandchild explicitly ignores TERM (a realistic
+    # daemonizing-or-adversarial child); the direct/leader process still does
+    # NOT trap TERM, so it dies immediately and normally from the group
+    # signal. Only the killer job's own KILL, delivered after its full grace
+    # period, can end the grandchild — proving cancellation is gated on the
+    # GROUP being empty, not on the leader's own exit.
+    if [ "${1:-}" != --grandchild ]; then
+      "$0" --grandchild "$@" &
+      while :; do sleep 1; done
+    else
+      trap '' TERM
+      while :; do sleep 1; done
+    fi
+    ;;
   chunk-nul)
     printf 'before'; printf '\0'; printf 'after'
     exit 0
@@ -938,6 +956,63 @@ else
 fi
 
 # =============================================================================
+# 11c. R2 (gate delta 2, Riker HIGH / Ikarus HIGH): a grandchild that ignores
+#     TERM must still be reached — by KILL, after the real 10s grace period —
+#     proving escalation-cancellation is gated on the process GROUP being
+#     empty, not on the leader's own exit. §11's grandchild dies from the
+#     ordinary TERM disposition and never stresses this; this one explicitly
+#     traps TERM away, so nothing but the killer's own group-KILL can end it.
+#     Genuinely takes ~10s (the real grace period, not shortened for the
+#     test) — that IS the assertion: cancelling early is exactly the bug.
+# =============================================================================
+if command -v pgrep >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
+  reset_run
+  TRAP_MARKER="$WORK/trap-term-marker-$$"
+  adapter_conf_write silent-hang-term-trap
+  FIFO3="$WORK/resp-fifo3"
+  rm -f "$FIFO3"; mkfifo "$FIFO3"
+  trap_decided="$(seed_decided)"
+  (
+    AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt "$TRAP_MARKER")"       "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$trap_decided"       >"$FIFO3" 2>"$WORK/enact-err-11c"
+  ) &
+  trap_bg_pid=$!
+  exec 7<"$FIFO3"
+  trap_start_deadline=$((SECONDS+10))
+  while [ ! -s "$SENTINEL" ] && [ "$SECONDS" -lt "$trap_start_deadline" ]; do sleep 0.05; done
+  if [ -s "$SENTINEL" ]; then ok "…the TERM-trapping provider actually started before the disconnect"
+  else no "…the TERM-trapping provider actually started before the disconnect (never wrote its sentinel)"; fi
+  exec 7<&-   # disconnect: triggers TERM to the whole group, then (after the
+              # grandchild survives it) KILL after the real 10s grace period
+  # Bounded poll generous enough to cover the full 10s grace plus margin —
+  # this is the one fixture in the file that is SUPPOSED to take that long.
+  trap_deadline=$((SECONDS+20))
+  trap_ended_seen=0
+  while [ "$SECONDS" -lt "$trap_deadline" ]; do
+    if aib_event_scan "$EVENTS_FILE" >/dev/null 2>&1 &&        printf '%s
+' "$AIB_EVENT_SCAN_ENDED_IDS" | grep -qxF "$trap_decided"; then
+      trap_ended_seen=1; break
+    fi
+    sleep 0.2
+  done
+  if [ "$trap_ended_seen" -eq 1 ]; then ok "…the ended record appears once the group is actually reaped"
+  else no "…the ended record appears once the group is actually reaped (timed out)"; fi
+  if pgrep -f "$TRAP_MARKER" >/dev/null 2>&1; then
+    no "…and the TERM-ignoring grandchild is eventually reached by KILL, tree-wide (R2)"
+  else
+    ok "…and the TERM-ignoring grandchild is eventually reached by KILL, tree-wide (R2)"
+  fi
+  wait "$trap_bg_pid" 2>/dev/null || true
+  has "…and the record names KILL, not TERM, as what actually ended it" \
+    "$(aib_event_scan "$EVENTS_FILE")" '"signal":"KILL"'
+  pkill -f "$TRAP_MARKER" >/dev/null 2>&1 || true
+else
+  skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
+  skip "no pgrep/mkfifo on this host"
+fi
+
+# =============================================================================
 # 11b. Marvin (gate delta, should-fix, Gap 5): disconnect WHILE the provider
 #     is actively streaming, not silent — the other half of D-I. This is the
 #     one that actually exercises `trap '' PIPE` and the relay loop's checked
@@ -1029,6 +1104,45 @@ eq "…exactly one end= line, and it is error" "$(tail -1 "$WORK/resp-12" 2>/dev
 eq "…exactly one end= total" "$(count_matches_in_file '^end=' "$WORK/resp-12")" "1"
 
 # =============================================================================
+# 12b. R4 (gate delta 2, Ikarus MEDIUM): an ended-commit failure during the
+#     confinement PRE-FLIGHT (before the provider was ever considered) is the
+#     SAME incident, not a special case — but the pre-flight's own early-return
+#     branch called aib_enact_launch__write_terminal unconditionally, so a
+#     failed commit there produced empty exit_class=/stage=/ended_event_id=
+#     fields and a false end=ok instead of end=error. Reproduced exactly like
+#     Ikarus's repro: a corrupt stream, PLUS an unusable AIB_CONFINE_BIN so the
+#     pre-flight itself refuses before the adapter is ever named.
+# =============================================================================
+reset_run
+INCIDENT_PF_EVENTS="$WORK/incident-pf/main.events"
+INCIDENT_PF_LOCK="$WORK/incident-pf/main.events.lock"
+mkdir -p "$WORK/incident-pf"
+incident_pf_kv="$(printf 'decision=allow
+code=0
+reasons=
+pid=%s
+prompt_len=1
+prompt_sha256=deadbeef' "$$")"
+incident_pf_payload="$(aib_event_compose_decided_payload "$incident_pf_kv")"
+aib_event_commit "$INCIDENT_PF_EVENTS" "$INCIDENT_PF_LOCK" attempt.decided "$ENVELOPE_KV" "$incident_pf_payload" >/dev/null 2>&1
+incident_pf_decided="$AIB_EVENT_COMMIT_EVENT_ID"
+printf 'corrupt terminated record
+' >> "$INCIDENT_PF_EVENTS"
+AIB_CONFINE_BIN=/nonexistent/aib-landlock-exec aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)"   "$INCIDENT_PF_EVENTS" "$INCIDENT_PF_LOCK" "$ENVELOPE_KV" "$incident_pf_decided"   >"$WORK/resp-12b" 2>"$WORK/enact-err-12b"
+incident_pf_rc=$?
+eq "an ended-commit failure during the pre-flight is reported nonzero"   "$([ "$incident_pf_rc" -ne 0 ] && printf nonzero || printf zero)" "nonzero"
+has "…the response still closes the chunk section" "$(<"$WORK/resp-12b")" "chunk_bytes=0"
+has "…and ends with a flat reason=event_store_unavailable / end=error, never a bare EOF"   "$(<"$WORK/resp-12b")" "reason=event_store_unavailable"
+eq "…exactly one end= line, and it is error" "$(tail -1 "$WORK/resp-12b" 2>/dev/null)" "end=error"
+eq "…exactly one end= total" "$(count_matches_in_file '^end=' "$WORK/resp-12b")" "1"
+if grep -qxF 'exit_class=' "$WORK/resp-12b"; then
+  no "…never an empty exit_class= field masquerading as a real (absent) verdict"
+else
+  ok "…never an empty exit_class= field masquerading as a real (absent) verdict"
+fi
+hasnt "…and never a false end=ok" "$(<"$WORK/resp-12b")" "end=ok"
+
+# =============================================================================
 # 13. Marvin (gate delta, should-fix, edge): AIB_EVENT_ROOT is SET and its
 #     project subdirectory already EXISTS, but is not writable — the other
 #     branch of the handler's `mkdir -p ... || [ ! -w "$_event_dir" ]` guard;
@@ -1061,6 +1175,128 @@ AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE
 eq "a provider closing stdout early still runs to its real exit before the record is committed" \
   "${AIB_ENACT_EXIT_CLASS:-}" "ok"
 has "…and its actual (late) exit code reaches the wire" "$(<"$WORK/resp-14")" "exit_class=ok"
+
+# =============================================================================
+# 15b. R5(b) (gate delta 2, Marvin unpinned must-fix, Ikarus MEDIUM original):
+#     the confined-mode post-cd re-check reuses aib_contain_cwd (D6), already
+#     confirmed correct by direct repro in the previous round — but with no
+#     pin, at THIS specific call site, for either boundary case the task
+#     asked for. Two things: root="/" (the exact shape a hand-rolled
+#     "$resolved_root"/* glob gets wrong, since "//*" matches nothing with a
+#     single leading slash) must still allow a real cwd underneath it; and
+#     "/srv/ws" vs "/srv/ws2" (a literal STRING-PREFIX match would wrongly
+#     treat ws2 as inside ws) must still be refused at a path-component
+#     boundary, at this call site specifically, not only at the PDP's own
+#     (already-covered) aib_contain_cwd call.
+# =============================================================================
+reset_run
+landlock_conf_write ok
+adapter_conf_write ok
+root_slash_record="$(printf 'adapter=%s\nroot=/\ncwd=/tmp\nsandbox=read-only\neffort=high\nmodel=team/model-v2\ntimeout=5' "$ADAPTER")"
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$root_slash_record" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-15b1" 2>"$WORK/enact-err-15b1"
+if [ -e "$SENTINEL" ]; then ok "root=/ with cwd=/tmp: the provider actually runs (R5b)"
+else no "root=/ with cwd=/tmp: the provider actually runs (R5b) (never called — refused as outside root=/)"; fi
+eq "…classified ok, not io-refused/cwd" "${AIB_ENACT_EXIT_CLASS:-}" "ok"
+eq "…stage=provider" "${AIB_ENACT_STAGE:-}" "provider"
+
+reset_run
+landlock_conf_write ok
+adapter_conf_write ok
+SRV_WS="$WORK/srv-ws"
+SRV_WS2="$WORK/srv-ws2"
+mkdir -p "$SRV_WS/sub" "$SRV_WS2"
+srv_boundary_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=read-only\neffort=high\nmodel=team/model-v2\ntimeout=5' \
+  "$ADAPTER" "$SRV_WS" "$SRV_WS2")"
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$srv_boundary_record" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-15b2" 2>"$WORK/enact-err-15b2"
+if [ -e "$SENTINEL" ]; then no "…/srv-ws2 is NOT inside root=/srv-ws — a string-prefix match would wrongly allow it (R5b)"
+else ok "…/srv-ws2 is NOT inside root=/srv-ws — a string-prefix match would wrongly allow it (R5b)"; fi
+eq "…refused at the cwd stage" "${AIB_ENACT_STAGE:-}" "cwd"
+eq "…exit_class io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
+
+# =============================================================================
+# 15. R3 (gate delta 2, Ikarus MEDIUM) + R5(a) (gate delta 2, Marvin unpinned
+#     must-fix, Ikarus HIGH original): a client that disconnects at the
+#     PROLOGUE boundary — before aib_enact_launch is ever called — drives the
+#     REAL bin/aib-broker-handler, not aib_enact_launch directly (this is the
+#     handler's own trap '' PIPE + single checked prologue printf, which live
+#     strictly before enactment starts). Two things must both hold: the
+#     handler must not die from a raw SIGPIPE (R5a: no automated coverage
+#     existed for this at all, though the fix itself was confirmed correct by
+#     direct repro), and the resulting terminal record must say what actually
+#     happened — stage=transport, not stage=provider (R3: no provider was
+#     ever invoked here).
+# =============================================================================
+if command -v mkfifo >/dev/null 2>&1; then
+  reset_run
+  PROLOGUE_FIFO="$WORK/prologue-disc-fifo"
+  rm -f "$PROLOGUE_FIFO"; mkfifo "$PROLOGUE_FIFO"
+  _pf_before_lines="$(wc -l < "$EVENTS_FILE" 2>/dev/null || printf 0)"
+  (
+    frame2 "$FIXTURE_WS" "nightly" "hallo" "op=launch" "agent_uid=acme-core" \
+      | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_CONFINE_BIN="$LANDLOCK_STUB" AIB_EVENT_ROOT="$EVENT_ROOT" \
+        "$SRC_ROOT/bin/aib-broker-handler" >"$PROLOGUE_FIFO" 2>"$WORK/handler-err-pf"
+    printf '%s' "$?" > "$WORK/handler-rc-pf"
+  ) &
+  _pf_bg_pid=$!
+  # Open the reader, then close it immediately without reading a single byte —
+  # the same "connect, then vanish before any response byte is read" shape as
+  # Ikarus' and Marvin's own repros. Opening the fifo for read is what lets the
+  # backgrounded handler actually start running (its own stdout redirect blocks
+  # until a reader appears); closing it again right away, before the handler
+  # has done anything more than a registry lookup and a decided-commit, puts
+  # its eventual prologue write on a connection that is already gone.
+  exec 6<"$PROLOGUE_FIFO"
+  exec 6<&-
+  wait "$_pf_bg_pid" 2>/dev/null || true
+  _pf_rc="$(cat "$WORK/handler-rc-pf" 2>/dev/null || printf 255)"
+  case "$_pf_rc" in
+    ''|*[!0-9]*) _pf_rc=255;;
+  esac
+  if [ "$_pf_rc" -lt 128 ]; then
+    ok "…the handler is not killed outright by the disconnect (R5a, trap '' PIPE)"
+  else
+    no "…the handler is not killed outright by the disconnect (R5a, trap '' PIPE) (rc=$_pf_rc, signal death)"
+  fi
+  _pf_new="$(tail -n "+$((_pf_before_lines+1))" "$EVENTS_FILE" 2>/dev/null)"
+  _pf_decided_n="$(printf '%s\n' "$_pf_new" | grep -c '"event_type":"attempt.decided"')"
+  _pf_ended_n="$(printf '%s\n' "$_pf_new" | grep -c '"event_type":"attempt.ended"')"
+  eq "…exactly one new attempt.decided record" "$_pf_decided_n" "1"
+  eq "…exactly one new attempt.ended record, matched (not left open)" "$_pf_ended_n" "1"
+  has "…the ended record says stage=transport, not stage=provider (R3 — no provider ever ran)" \
+    "$_pf_new" '"stage":"transport"'
+  hasnt "…and never claims stage=provider for a connection that never reached enactment" \
+    "$_pf_new" '"stage":"provider"'
+  if [ -e "$SENTINEL" ]; then
+    no "…and the adapter/provider was never invoked at all"
+  else
+    ok "…and the adapter/provider was never invoked at all"
+  fi
+else
+  skip "no mkfifo on this host"
+  skip "no mkfifo on this host"
+  skip "no mkfifo on this host"
+  skip "no mkfifo on this host"
+  skip "no mkfifo on this host"
+  skip "no mkfifo on this host"
+fi
+
+# =============================================================================
+# 16. LOW (gate delta 2, Ikarus): a confined run's escalation-marker temp file
+#     (aibobnet-escalated.*) must not survive the run — not just on the
+#     escalated path (already covered structurally by the run itself), but on
+#     the ordinary, nothing-went-wrong path too, since it is created
+#     unconditionally up front and only ever WRITTEN to conditionally.
+# =============================================================================
+reset_run
+landlock_conf_write ok
+adapter_conf_write ok
+_marker_before="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-16" 2>"$WORK/enact-err-16"
+_marker_after="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
+eq "a confined run leaves no escalation-marker temp file behind (LOW)" "$_marker_after" "$_marker_before"
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
