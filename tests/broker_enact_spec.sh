@@ -443,9 +443,8 @@ reset_run() {
 }
 
 # =============================================================================
-# 1. The compiled real helper's OWN failure path (D-A2), needs no broker code —
-#    the one part of docs/CONFINEMENT.md this Landlock-less host can genuinely
-#    exercise for real, not through a stub.
+# 1. Probe the compiled helper once on this host. Both supported confinement
+#    and an unavailable ruleset have real status-channel assertions (D-A2).
 # =============================================================================
 CC_BIN="$(command -v cc || command -v gcc || true)"
 if [ -n "$CC_BIN" ]; then
@@ -455,11 +454,18 @@ if [ -n "$CC_BIN" ]; then
     : > "$STATUS_OUT"
     LL_RO=/ LL_RW="$WORK" LL_STATUS_FD=9 "$REAL_HELPER" /bin/true 9>"$STATUS_OUT"
     real_rc=$?
-    eq "compiled helper exits 3 when Landlock is unavailable on this host" "$real_rc" "3"
-    if [ -s "$STATUS_OUT" ]; then
-      ok "…and LL_STATUS_FD carries a non-empty reason (D-A2)"
+    if [ "$real_rc" -eq 0 ]; then
+      printf '# Landlock host branch: available\n'
+      eq "compiled helper succeeds when confinement is available" "$real_rc" 0
+      eq "…and successful exec leaves the status channel empty (D-A2)" "$(file_byte_count "$STATUS_OUT")" 0
     else
-      no "…and LL_STATUS_FD carries a non-empty reason (D-A2) (status fd was empty — src/landlock-exec.c does not write it yet)"
+      printf '# Landlock host branch: unavailable\n'
+      eq "compiled helper exits 3 when confinement is unavailable" "$real_rc" 3
+      if [ -s "$STATUS_OUT" ]; then
+        ok "…and LL_STATUS_FD carries a non-empty reason (D-A2)"
+      else
+        no "…and LL_STATUS_FD carries a non-empty reason (D-A2) (status fd was empty)"
+      fi
     fi
   else
     no "src/landlock-exec.c compiles with $CC_BIN ($(cat "$WORK/cc-err" | tr '\n' ' '))"

@@ -1,0 +1,6 @@
+[Service]
+# Replace <site> with the trusted site tree containing the registry projects'
+# home and standup_dir paths. Add further paths when they live in other trees.
+# Install as a .conf drop-in; this example is not loaded automatically.
+# Do not reset ReadWritePaths: the base unit's broker state paths remain needed.
+ReadWritePaths=/srv/<site>

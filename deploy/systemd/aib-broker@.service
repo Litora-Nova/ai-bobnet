@@ -16,6 +16,7 @@ Group=aib-broker
 # (reason=event_store_unavailable) rather than silently guessing a path.
 Environment=AIB_EVENT_ROOT=/var/lib/aib/events
 Environment=AIB_CONFINE_BIN=/opt/aib/engine/libexec/landlock-exec
+Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
 
 # EXPLICIT, and this is the trap: with Accept=yes systemd does NOT hand the connection to the
 # handler by itself. Measured on 2026-08-10 - without these two lines the handler received
@@ -32,4 +33,8 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
+# Site drop-ins: ReadWritePaths MUST include every registry project home and standup_dir.
+# ProtectSystem=strict makes other persistent paths read-only, including the
+# workspace and heartbeat directory unless a site grants them explicitly.
+# See aib-broker@.service.d/site.conf.example; keep the broker paths below.
 ReadWritePaths=/var/lib/aib /run/aib
