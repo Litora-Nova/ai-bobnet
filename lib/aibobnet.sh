@@ -1866,7 +1866,10 @@ aib_enact_launch__run_confined() {
   : > "$_cwd_fail_marker"
 
   _aib_enact_cleanup_confined() {
-    rm -f -- "$_internal_fifo" "$_status_file" "$_cwd_fail_marker" "$_provider_status_file" 2>/dev/null || true
+    # LOW (gate delta 2, Ikarus): the escalation marker was created above but
+    # never listed here — every confined run leaked one file into TMPDIR
+    # forever, win or lose, escalated or not.
+    rm -f -- "$_internal_fifo" "$_status_file" "$_cwd_fail_marker" "$_provider_status_file" "$_escalated_marker" 2>/dev/null || true
   }
 
   _aib_enact_exec_child_confined() {
