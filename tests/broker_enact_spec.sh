@@ -269,6 +269,36 @@ case "${STUB_LL_MODE:-ok}" in
     fi
     exit 3
     ;;
+  stderr-fd-save-fail)
+    # S2 (gate delta 3, Ikarus MEDIUM): mirrors the FIXED contract downstream —
+    # a real dup(2)/fcntl(FD_CLOEXEC) failure while saving the journal fd is not
+    # reproducible from bash (there is no way to make dup(2) fail on a healthy
+    # fd 2 from a shell script), so this stub instead proves the OBSERVABLE
+    # shape the fix now guarantees: on that failure, src/landlock-exec.c
+    # returns 3 with LL_STATUS_FD carrying a reason, WITHOUT ever reaching the
+    # LL_STDERR_FD redirect or execvp — never "redirect anyway and hope",
+    # which is what the pre-fix code did (journal_fd silently stayed 2,
+    # meaning the redirect proceeded regardless). This is the same
+    # structural-unreachability shape as Gap 6/FD_CLOEXEC before it: the real
+    # C code's own syscall failure can't be forced here, so the stub proves
+    # the resulting CONTRACT (status fd + exit 3, no exec, no redirect) that
+    # the fixed source now provides on that path. Two-call pattern like
+    # fail-second-call above: the dedicated pre-flight call (no LL_STDERR_FD
+    # set at all) must still pass, so the failure below is only reachable on
+    # the REAL launch call, where LL_STDERR_FD is actually set.
+    _n=0
+    [ -f "${STUB_LL_COUNTER:-/dev/null}" ] && read -r _n < "$STUB_LL_COUNTER"
+    _n=$((_n+1))
+    printf '%s' "$_n" > "${STUB_LL_COUNTER:-/dev/null}"
+    if [ "$_n" -eq 1 ]; then
+      if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
+      exec "$@"
+    fi
+    if [ -n "${LL_STATUS_FD-}" ]; then
+      printf 'stub: dup/fcntl (journal fd) failed\n' >&"${LL_STATUS_FD}"
+    fi
+    exit 3
+    ;;
 esac
 STUB
 chmod +x "$LANDLOCK_STUB"
@@ -732,6 +762,24 @@ else ok "a helper that fails independently AFTER a successful pre-flight never r
 eq "…and is classified io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
 eq "…stage=confine, never mistaken for the provider's own exit (the discriminator this slice adds)" \
   "${AIB_ENACT_STAGE:-}" "confine"
+has "…the pre-flight itself still targeted /bin/true, not the adapter, before this failure" \
+  "$(grep '^argv=' "$LL_LOG" | head -1)" "/bin/true"
+landlock_conf_write ok
+
+# --- 6e. S2 (gate delta 3, Ikarus MEDIUM): a helper that fails to save the
+#     journal fd (dup(2)/fcntl(FD_CLOEXEC)) must fail closed — status fd +
+#     exit 3, no exec, never "redirect anyway and hope" ---------------------
+reset_run
+LL_COUNTER2="$WORK/ll-call-count-2"
+rm -f "$LL_COUNTER2"
+landlock_conf_write stderr-fd-save-fail "$LL_COUNTER2"
+adapter_conf_write ok
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-6e" 2>"$WORK/enact-err-6e"
+if [ -e "$SENTINEL" ]; then no "a helper that fails to save the journal fd never runs the adapter (S2)"
+else ok "a helper that fails to save the journal fd never runs the adapter (S2)"; fi
+eq "…and is classified io-refused" "${AIB_ENACT_EXIT_CLASS:-}" "io-refused"
+eq "…stage=confine (the helper never reached exec)" "${AIB_ENACT_STAGE:-}" "confine"
 has "…the pre-flight itself still targeted /bin/true, not the adapter, before this failure" \
   "$(grep '^argv=' "$LL_LOG" | head -1)" "/bin/true"
 # Every section from here on relies on the landlock stub's config carrying
@@ -1356,10 +1404,20 @@ fi
 reset_run
 landlock_conf_write ok
 adapter_conf_write ok
-_marker_before="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
-AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+# S3 (gate delta 3, Ikarus LOW): the shared, global ${TMPDIR:-/tmp} races
+# against every OTHER concurrent confined run on the same host — a sibling
+# process can create or remove its own marker between this fixture's before/
+# after counts, which is exactly what a 4-way-parallel load run reproduced
+# (a "1290 -> 1290, added=0" pass turning into a "1290 -> 1290, want 1291"
+# fail purely from a neighbour's timing, no mutation involved). A dedicated,
+# per-fixture TMPDIR — exported for this one enactment call only — makes the
+# count observe ONLY the marker this run itself creates and removes.
+MARKER_TMPDIR="$WORK/marker-tmpdir"
+mkdir -p "$MARKER_TMPDIR"
+_marker_before="$(find "$MARKER_TMPDIR" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
+TMPDIR="$MARKER_TMPDIR" AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
   "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-16" 2>"$WORK/enact-err-16"
-_marker_after="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
+_marker_after="$(find "$MARKER_TMPDIR" -maxdepth 1 -type f -name 'aibobnet-escalated.*' 2>/dev/null | wc -l)"
 eq "a confined run leaves no escalation-marker temp file behind (LOW)" "$_marker_after" "$_marker_before"
 
 printf '\nbroker_enact_spec: %d passed, %d failed\n' "$pass" "$fail"
