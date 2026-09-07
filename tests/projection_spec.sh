@@ -585,7 +585,7 @@ fi
 # M — non-consumption clause + the prod rule is never a runtime gate
 #     (CONTRACT-visibility.md SS3, SS5)
 # =========================================================================
-ALLOWLIST='^(docs/CONTRACT-visibility\.md|docs/decisions/0007-visibility-projection\.md|docs/CONFINEMENT\.md|docs/CONTRACT-execution-binding\.md|deploy/systemd/aib-projection\.(service|timer)|bin/project|tests/projection_spec\.sh|tests/fixtures/projection_jget\.py|tests/fixtures/projection_bulk_stream\.py)$'
+ALLOWLIST='^(docs/CONTRACT-visibility\.md|docs/decisions/0007-visibility-projection\.md|docs/CONFINEMENT\.md|docs/CONTRACT-execution-binding\.md|deploy/systemd/aib-projection\.(service|timer)|bin/project|tests/projection_spec\.sh|tests/visibility_delta_spec\.sh|tests/visibility_mutation_spec\.sh|tests/fixtures/projection_jget\.py|tests/fixtures/projection_bulk_stream\.py)$'
 hits="$(cd "$SRC_ROOT" && grep -rlE 'AIB_PROJECTION_ROOT|_projection\.json' --exclude-dir=.git . 2>/dev/null | sed 's#^\./##' | grep -vE "$ALLOWLIST" || true)"
 eq "non-consumption: nothing outside bin/project + its own fixtures + docs references the projection" "$hits" ""
 
@@ -625,6 +625,30 @@ NODEEOF
     eq "timestamp epoch agrees with beats.mjs at $stamp" "$actual" "$upstream"
   done
 fi
+
+# Delta F1: exercise this repository's real writer, then both mixed-file orders.
+: > "$WORK/acme/standup/acme-core.log"
+aib_log_resolved "$WORK/acme/standup" acme-core busy "real writer message"
+writer_stamp=$(cut -d ' ' -f1 "$WORK/acme/standup/acme-core.log")
+TZ_OVERRIDE=UTC
+run_project acme
+eq "real writer projects busy" "$(jget "$OUT_ACME" agents.acme-core.state)" busy
+eq "real writer projects its UTC instant" "$(jget "$OUT_ACME" agents.acme-core.since)" "${writer_stamp%Z}+00:00"
+eq "real writer heartbeat is interpretable" "$(jget "$OUT_ACME" agents.acme-core.stale)" false
+eq "real writer message is unshifted" "$(jget "$OUT_ACME" agents.acme-core.message)" "real writer message"
+eq "heartbeat claims are never broker-attested" "$(jget "$OUT_ACME" agents.acme-core.attested)" false
+printf '%s | acme-other | done | wrong identity\n' "$writer_stamp" >> "$WORK/acme/standup/acme-core.log"
+run_project acme
+eq "mismatched writer uid does not replace the heartbeat" "$(jget "$OUT_ACME" agents.acme-core.state)" busy
+eq "mismatched writer uid is a counted anomaly" "$(jget "$OUT_ACME" anomalies.uid_mismatches)" 1
+printf '2026-09-07 10:01 | idle | engine shape\n' >> "$WORK/acme/standup/acme-core.log"
+run_project acme
+eq "mixed file accepts engine shape last" "$(jget "$OUT_ACME" agents.acme-core.state)" idle
+aib_log_resolved "$WORK/acme/standup" acme-core blocked "needs:human review"
+run_project acme
+eq "mixed file accepts native shape last" "$(jget "$OUT_ACME" agents.acme-core.state)" blocked
+eq "native needs attention remains agent-asserted" "$(jget "$OUT_ACME" 'attention[kind=human].attested')" false
+TZ_OVERRIDE=Europe/Berlin
 
 total=$((pass+fail))
 printf '\n%d checks (%d skipped): %d ok / %d fail\n' "$total" "$skipped" "$pass" "$fail"
