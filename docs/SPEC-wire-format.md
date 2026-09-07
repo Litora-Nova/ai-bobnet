@@ -323,8 +323,12 @@ slice-1/2 shape unchanged — a flat set of `reason=`/`detail=` lines and `end=e
 and no `decided_event_id`, because no verdict was ever reached.
 
 **`reason=over_capacity` (RM-3 slice 5) is one of these wire-level errors, not a sibling of the Deny
-shape above.** ADR-0006 adds a capacity ceiling, shared by every agent within one project, checked
-before the registry is ever read for a connection. Over capacity, the response is:
+shape above.** ADR-0006 adds one capacity ceiling for the whole broker — every project, every agent,
+one pool — checked before `agent_uid` is resolved and before the registry is ever read for a
+connection. It is deliberately not scoped per project: `project_uid` is derived from `agent_uid`, which
+§4 already treats as a caller-chosen, unverified assertion, so a per-project pool would let a caller
+target one project's budget the same way a per-agent cap would target one agent's (ADR-0006 part B).
+Over capacity, the response is:
 
 ```
 reason=over_capacity

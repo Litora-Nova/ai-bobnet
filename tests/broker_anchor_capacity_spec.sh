@@ -38,17 +38,23 @@
 #   it pins the file's existence, its argument handling, and its side effects.
 #
 #     AIB_BROKER_CAPACITY (unit env, default 12 if unset) and AIB_BROKER_MAX_CONNECTIONS
-#     (unit env, ADR-0006's own flagged resolution — ask the maintainer to confirm this
-#     variable before treating §16 below as settled) gate `bin/aib-broker-handler`
-#     BEFORE any registry read: leases live at
-#     `<AIB_EVENT_ROOT>/<project_uid>/attempts/<agent_uid>.<n>` (`<n>` the smallest free
-#     index below the cap), `project_uid` derived SYNTACTICALLY from the
-#     already-wire-validated `agent_uid` prefix (never a registry lookup — this is the
-#     invariant that makes an over-capacity answer cheap; F15), counted and created under
-#     `<AIB_EVENT_ROOT>/<project_uid>/attempts/attempts.lock`. Over capacity:
+#     (unit env, ADR-0006's own resolution of an underspecified mechanism, ACCEPTED on
+#     maintainer review 2026-09-07 — a mirrored value with a stated, unenforced drift
+#     risk against the socket's real MaxConnections) gate `bin/aib-broker-handler` BEFORE
+#     any registry read: leases live at `<AIB_EVENT_ROOT>/attempts/<agent_uid>.<n>`
+#     (`<n>` the smallest free index below the cap), counted and created under
+#     `<AIB_EVENT_ROOT>/attempts/attempts.lock`. **ONE POOL FOR THE WHOLE BROKER — every
+#     project, every agent — corrected 2026-09-07 (maintainer review) from an earlier
+#     per-project draft.** The pool is deliberately NOT scoped by `project_uid` (even
+#     syntactically, even after it would cost nothing extra): `project_uid` is derived
+#     from `agent_uid`, and `agent_uid` is a caller-chosen, unverified assertion
+#     (CONTRACT-mediation.md §4) — a per-project pool inherits that weakness exactly the
+#     way F9 rejected it for a per-agent pool, one level up (assert a victim project's
+#     agent_uid, exhaust that project's pool). Because the pool is broker-global, the
+#     admission check needs nothing beyond `op=launch` parsed off the wire — it does not
+#     need `agent_uid` resolved or validated against a project first. Over capacity:
 #     `end=error reason=over_capacity`, handler exit 2, no registry read, no PDP call, no
-#     stream lock, no `attempt.decided` record. This is a per-PROJECT ceiling shared by
-#     every agent in that project (ADR-0006 part B), not per-agent and not per-broker.
+#     stream lock, no `attempt.decided` record (ADR-0006 part B).
 #
 #   NOTE ON F11/F17's "admission deny record" pins: H6 (v2, this design) does not write
 #   ANY decided record on an over-capacity answer — admission runs strictly before
@@ -494,7 +500,10 @@ frame() { # frame <cwd> <label> <prompt> <record-line>...
   printf '%s%s%s' "$c" "$l" "$p"
 }
 
-ATTEMPTS_DIR="$EVENT_ROOT/acme/attempts"
+# Broker-global: a SIBLING of the per-project stream directories, never nested inside
+# one — this is the fixture-level expression of ADR-0006 part B's correction (one pool
+# for the whole broker, not one per project).
+ATTEMPTS_DIR="$EVENT_ROOT/attempts"
 
 reset_capacity() {
   rm -rf "$ATTEMPTS_DIR" "$EVENTS_FILE" "$EVENTS_LOCK" "$ANCHOR_FILE"
@@ -647,11 +656,14 @@ if [ -e "$SENTINEL" ]; then no "AIB_BROKER_CAPACITY > AIB_BROKER_MAX_CONNECTIONS
 else ok "AIB_BROKER_CAPACITY > AIB_BROKER_MAX_CONNECTIONS: also refused at start"; fi
 
 # =============================================================================
-# 17. path-safety invariant this design depends on (consult F15): the project scope for
-#     the lease directory comes from the agent_uid's OWN validated <project_uid>-<key>
-#     shape, never from a value that could traverse out of <AIB_EVENT_ROOT>/<project>/
-#     attempts/. Pinned directly against the existing validator so a later refactor that
-#     accepts a project scope from elsewhere breaks this test, not silently.
+# 17. path-safety invariant this design depends on (consult F15), NARROWER than before
+#     the broker-global correction: the pool is no longer scoped by project_uid at all
+#     (nothing is derived from agent_uid to pick a directory any more — ADR-0006 part B),
+#     so the only remaining traversal surface is the lease FILENAME itself, if a future
+#     implementation labels leases with agent_uid inside the one shared
+#     <AIB_EVENT_ROOT>/attempts/ directory. Pinned directly against the existing
+#     validator so a crafted agent_uid can never become a path component that escapes
+#     attempts/.
 # =============================================================================
 ( aib_validate_agent_uid "acme-../../etc" ) >/dev/null 2>&1
 eq "a traversal-shaped agent_uid is already rejected by the existing validator (invariant this design relies on)" "$?" 4

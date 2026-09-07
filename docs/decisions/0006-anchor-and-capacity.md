@@ -1,4 +1,4 @@
-# ADR-006: `high_water` Anchor Location and Absence Semantics; Global-Per-Project Capacity by Leases
+# ADR-006: `high_water` Anchor Location and Absence Semantics; Broker-Global Capacity by Leases
 
 ## Status
 
@@ -158,7 +158,7 @@ unchanged, see part C below). But the audit consequence — a decided record who
 closed by that same commit call — is a real outcome of a fail-closed anchor at that specific commit,
 stated here rather than left to be discovered.
 
-### B. Global-per-project capacity, replacing the per-agent cap
+### B. Broker-global capacity, replacing the per-agent cap
 
 **The per-agent cap is dropped, not merely re-tuned.** The consult's F9 finding: under
 `docs/CONTRACT-mediation.md` §4, an agent asserting another agent's `agent_uid` does not just receive
@@ -177,43 +177,59 @@ F10 additionally found the per-agent cap **not implementable as specified**: reu
 — that resolver `aib_die`s when a field is absent at agent, team, and project levels, so every agent
 that had not declared the new field would turn every launch attempt into a broker incident fleet-wide.
 
-**What replaces it: a capacity ceiling shared by every agent within one project**, checked by a lease
-count, before the registry is ever read for that connection:
+**What replaces it: one capacity ceiling for the whole broker**, checked by a lease count, before the
+registry is ever read for that connection — **corrected 2026-09-07, maintainer review**: an earlier
+revision of this ADR scoped the pool per project. That was wrong for exactly the reason F9 rejected the
+per-agent cap: `project_uid` is not a fact the broker verifies at this point, it is derived from
+`agent_uid`, which §4 already states is a caller-chosen, unverified assertion. A per-project pool
+inherits that weakness undiminished — a caller wanting to deny a specific victim project simply asserts
+one of that project's `agent_uid`s and exhausts its pool, the identical targeted-denial-of-service shape
+F9 named, one level up. A pool that is global across the whole broker removes the "aimed at a project"
+property the same way the per-project draft removed the "aimed at an agent" property: every caller,
+honest or not, draws from the same shared budget it would consume anyway.
 
-- **Scope: per project, shared across all its agents — not global across the whole broker, and not
-  per-agent.** Leases for one project's attempts live at
-  `<AIB_EVENT_ROOT>/<project_uid>/attempts/` — the same per-project events directory
-  `bin/aib-broker-handler` already computes as `_event_dir` (ADR-0005) — so the count and the ceiling
-  are project-scoped. "Global" in this slice's design note means *global across agents*, replacing a
-  cap that (as F14 observed) would otherwise read as fleet-wide while actually being per
-  `(project_uid, agent_uid)`; it does not mean one number shared across every project on the broker.
-  `AIB_BROKER_CAPACITY` names one ceiling applied identically to each project's own lease directory.
-- **Known: `project_uid` is available before any registry read.** The wire reader already validates
-  `agent_uid` through `aib_validate_agent_uid` before publishing it (lowercase/digit/hyphen, no
-  leading/trailing/doubled hyphen, `<project_uid>-<agent_key>` shape) — rejecting a malformed token
-  before anything downstream sees it (consult F15). The capacity check derives `project_uid` from that
-  already-validated prefix, syntactically, the same way `_aib_split_agent_with` later derives it
-  authoritatively from the registry — it does not open the registry to learn where to look. This is the
-  invariant that makes "no registry read" possible for an over-capacity answer, and the RED spec pins
-  it explicitly so a later refactor that moves admission ahead of validation, or accepts a project scope
-  from another source, cannot silently open a path into broker-owned state.
-- **Mechanism: a `flock`-held lease file per live attempt**, `<project_uid>/attempts/<agent_uid>.<n>`,
-  `<n>` the smallest free index below the cap (not a monotonic counter — an ever-growing counter would
-  make the directory and the stale scan grow unbounded over the broker's lifetime). Every step —
-  opening the lease file, taking its exclusive `flock`, counting how many of the directory's lease
-  files cannot be locked with `flock -n` (a file whose lock *can* be taken is stale — no live holder —
-  and is removed as part of the same pass), and creating the new lease file if under capacity — happens
-  while a small `<project_uid>/attempts/attempts.lock` is held. This closes the unlink/recreate race
-  where one connection removes a stale name while another is mid-open on the old inode and both end up
-  believing they hold a slot (consult F7a). There is no TOCTOU between the count and the decided commit
-  either way: the lease is already created and flocked, under `attempts.lock`, before that lock is
-  released — nothing another connection does afterward can invalidate an admission already granted
-  (F8).
-- **Lock order is total and one-directional: `attempts.lock` → the stream's own lock, never the
+- **Scope: the whole broker, every project, every agent — one pool.** Leases live at
+  `<AIB_EVENT_ROOT>/attempts/` (broker-owned, created `0700` by the broker), a **sibling** of the
+  per-project stream directories `bin/aib-broker-handler` already computes as `_event_dir`
+  (ADR-0005), never nested inside one. `AIB_BROKER_CAPACITY` names the one ceiling the whole broker
+  answers against, regardless of which project or agent a connection names.
+- **Checked before `project_uid` is even relevant.** Because the pool is not project-scoped, the
+  admission check needs nothing beyond `op=launch` having been read off the wire — it does not need
+  `agent_uid` resolved, validated against a project, or looked up in the registry at all. This is a
+  stronger form of the "no registry read" property than a per-project pool could offer (which still had
+  to resolve *which* project's directory to check, even syntactically): here there is nothing
+  project-shaped to resolve in the first place. `agent_uid` may still be used to *label* an individual
+  lease file for operator visibility (`attempts/<agent_uid>.<n>`) once the wire has parsed it, but no
+  admission decision — over or under capacity — depends on that label, and the RED spec pins the
+  "no registry read" property directly rather than through the now-removed project-derivation step.
+- **Mechanism: a `flock`-held lease file per live attempt**, `attempts/<agent_uid>.<n>` (or an
+  equivalent anonymous name if the builder finds labelling impractical at this call site — the pool's
+  correctness never depends on the label, only on one file per live attempt), `<n>` the smallest free
+  index below the cap (not a monotonic counter — an ever-growing counter would make the directory and
+  the stale scan grow unbounded over the broker's lifetime). Every step — opening the lease file, taking
+  its exclusive `flock`, counting how many of the directory's lease files cannot be locked with
+  `flock -n` (a file whose lock *can* be taken is stale — no live holder — and is removed as part of the
+  same pass), and creating the new lease file if under capacity — happens while a small
+  `attempts/attempts.lock` is held. This closes the unlink/recreate race where one connection removes a
+  stale name while another is mid-open on the old inode and both end up believing they hold a slot
+  (consult F7a). There is no TOCTOU between the count and the decided commit either way: the lease is
+  already created and flocked, under `attempts.lock`, before that lock is released — nothing another
+  connection does afterward can invalidate an admission already granted (F8).
+- **If `agent_uid` labels the lease filename, it is still validated first.** The wire reader already
+  validates `agent_uid` through `aib_validate_agent_uid` before publishing it
+  (lowercase/digit/hyphen, no leading/trailing/doubled hyphen — consult F15) before this admission check
+  ever runs, so a lease filename built from it cannot escape `attempts/` via a crafted value. This is no
+  longer load-bearing for *scope* (there is no project directory to select any more), only for keeping
+  the label itself a safe filename component — recorded here so a future change that builds the label
+  from a different, unvalidated source does not reopen a path outside broker-owned state.
+- **Lock order is total and one-directional: `attempts.lock` → any stream's own lock, never the
   reverse.** This is a standing invariant for any future change to this path, not just this slice's
-  code — the symmetric-looking move of folding admission into the stream commit (the way H4 folds
-  anchor maintenance into `aib_event_commit`) would invert this order and deadlock. Recorded here so
-  that refactor has something concrete to run into before it ships.
+  code — the symmetric-looking move of folding admission into a stream commit (the way H4 folds anchor
+  maintenance into `aib_event_commit`) would invert this order and deadlock. Recorded here so that
+  refactor has something concrete to run into before it ships. Because the pool is broker-wide rather
+  than per-stream, this single lock now serializes admission across every project's connections — an
+  accepted cost of a shared ceiling, and the reason the count/create pass under it must stay cheap
+  (`flock -n` probes, no registry, no PDP).
 - **The lease file descriptor must not reach the provider child.** Verified against this host's bash:
   `exec {fd}>>file`'s descriptor is **not** close-on-exec by default — a leaked fd 10 survived into an
   exec'd child in the consult's own reproduction. The confined enactment path is saved only by the
@@ -238,13 +254,16 @@ count, before the registry is ever read for that connection:
   `MaxConnections` (`deploy/systemd/aib-broker.socket`, currently 16) is refused at handler start with a
   journal line, never silently clamped — because the whole point of this ceiling is to answer honestly
   *below* the point where the socket itself would silently close the connection, and a capacity at or
-  above that point can never be reached. **Ambiguity flagged for the maintainer:** the handler process
+  above that point can never be reached. **Accepted, maintainer review 2026-09-07:** the handler process
   has no direct way to read the socket unit's `MaxConnections`; this ADR and the RED spec model that
   self-check against a second, mirrored unit-environment variable, `AIB_BROKER_MAX_CONNECTIONS`
-  (deploy sets it to the same value as the socket's `MaxConnections`, 16), rather than inventing a
-  mechanism that reads the socket unit file at runtime. This is Homer's resolution, not a decision
-  H1–H8 named explicitly — the maintainer should confirm it or specify a different mechanism before the
-  builder implements it.
+  (deploy sets it to the same value as the socket's `MaxConnections`, 16). This was Homer's own
+  resolution of a mechanism H1–H8 did not name explicitly, and it is now accepted rather than merely
+  flagged — with one standing risk the deploy comment must carry: nothing enforces agreement between
+  the two files, so `AIB_BROKER_MAX_CONNECTIONS` and the socket's real `MaxConnections` can drift apart
+  by hand-editing one and not the other. The self-check is only as good as an operator keeping both in
+  sync; it catches a capacity misconfigured against a stale or wrong belief about the ceiling, not a
+  drifted mirror variable itself.
 
 ### C. Docs
 
@@ -300,9 +319,21 @@ suitable `sync`, even though only the commit path needs it — the established p
 Rejected (F9, F10). Not implementable against the existing binding resolver without inventing a
 tolerant variant nobody asked for, and — independent of that — it converts an uncontested assertion
 weakness (§4) into an active denial-of-service and audit-amplification primitive against a specific,
-named victim agent, at the smallest possible cost to the attacker. A global-per-project pool removes
-the "aimed at a victim" property entirely: consuming a slot burns from the same shared pool the
-attacker's own launches draw from.
+named victim agent, at the smallest possible cost to the attacker. A broker-global pool removes the
+"aimed at a victim" property entirely: consuming a slot burns from the same shared pool the attacker's
+own launches draw from.
+
+### Per-project capacity pool
+
+Considered, built, and then rejected on maintainer review of an earlier revision of this ADR. It looked
+safer than a per-agent pool — many agents sharing one project's budget, rather than each agent owning
+a private one — but it inherits the identical weakness one level up: `project_uid` is not verified at
+this point either, it is derived from `agent_uid`, and `agent_uid` is a caller-chosen, unverified
+assertion (§4). A caller wanting to deny a specific victim *project* simply asserts one of that
+project's `agent_uid`s and exhausts its pool — the same targeted denial-of-service shape F9 rejected for
+a per-agent pool, not a different one. It also could not reach as cheap an admission path: even deriving
+`project_uid` syntactically (never from the registry) still required parsing and validating `agent_uid`
+before an admission decision was possible, where a broker-global pool needs nothing beyond `op=launch`.
 
 ### Folding admission into `aib_event_commit`, symmetric with the anchor's H4 treatment
 
@@ -341,8 +372,9 @@ ordering instead.
   §4's underlying assertion weakness (an agent naming another agent's `agent_uid` receives that agent's
   clearance) is unchanged by this slice, only the specific DoS/amplification primitive the v1 per-agent
   cap would have added on top of it is what this ADR removes. The `AIB_BROKER_MAX_CONNECTIONS`
-  self-check variable this ADR proposes (part B) is Homer's resolution of an underspecified mechanism,
-  flagged for the maintainer's confirmation before the builder implements it.
+  self-check variable this ADR proposes (part B) is accepted (maintainer review 2026-09-07); it carries
+  a standing drift risk — nothing enforces agreement between it and the socket unit's own
+  `MaxConnections` — which `deploy/systemd/aib-broker@.service`'s comment must state.
 - **Still specified, not built** (this slice remains docs + RED spec only): `aib_event_commit`'s 7th
   argument, `bin/anchor`, the lease mechanism in `bin/aib-broker-handler`, and every library change the
   RED spec's failing assertions name.
