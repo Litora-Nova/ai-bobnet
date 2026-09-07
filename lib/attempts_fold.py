@@ -62,6 +62,7 @@ def scan(path):
                 if not terminated:
                     if line:
                         out['torn'] = True
+                        out['truncate_at'] = offset
                     break
                 match = _FRAME.fullmatch(line)
                 if not match:
@@ -86,7 +87,6 @@ def scan(path):
                     raise ValueError(f'event_id/seq mismatch (seq {seq_s}, event_id {ident})')
                 records.append((seq_b, data))
                 offset += len(line) + 1
-                out['truncate_at'] = offset
     except ValueError as error:
         out.update(status='corrupt', reason=str(error))
         return out, records
