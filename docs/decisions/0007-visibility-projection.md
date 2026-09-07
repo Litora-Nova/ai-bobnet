@@ -125,7 +125,7 @@ ADR.
 
 The shell API `aib_attempts_fold` invokes one Python 3 process for the complete stream. The CRC
 uses bit-order translation around zlib's C implementation, differentially checked against coreutils
-`cksum`; per-record shell forks would miss the 10,000-record budget. A block-buffered `mapfile` handoff avoids quadratic Bash string replacement when returning large folds. `bin/attempts` formats the same
+`cksum`; per-record shell forks would miss the 10,000-record budget. A private regular scratch file enables buffered `mapfile` reads: the measured pipe handoff read large lines bytewise, while the original Bash string replacement was quadratic. Both costs are excluded from the final implementation. `bin/attempts` formats the same
 ordered fold as before, while `bin/project` applies the frozen visibility schema's corruption policy.
 No writer or admission path calls this reader.
 

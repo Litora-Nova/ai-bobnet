@@ -2626,16 +2626,18 @@ aib_event_scan() {
 # whether to report the scan or refuse. JSON includes each attempt's display state
 # and the durable open/ended facts separately (PID liveness is only a hint).
 aib_attempts_fold() {
-  local header fd reader rc=0
+  local header buffer rc=0
   local -a lines=()
   command -v python3 >/dev/null 2>&1 || { printf 'ai-bobnet: attempt fold requires python3\n' >&2; return 6; }
-  # mapfile reads the pipe in blocks. Pattern-substituting a multi-megabyte
-  # captured JSON string once per ID makes this handoff quadratic in Bash.
-  exec {fd}< <(python3 "${REPO_ROOT}/lib/attempts_fold.py" "$1")
-  reader=$!
-  mapfile -t lines <&"$fd" || rc=$?
-  exec {fd}<&-
-  wait "$reader" || rc=$?
+  # A regular scratch file lets mapfile buffer large JSON lines. On a pipe,
+  # Bash reads these lines bytewise; that alone exceeds the projection budget.
+  buffer=$(mktemp "${TMPDIR:-/tmp}/aib-fold.XXXXXX") || return 2
+  if python3 "${REPO_ROOT}/lib/attempts_fold.py" "$1" > "$buffer"; then
+    mapfile -t lines < "$buffer" || rc=$?
+  else
+    rc=$?
+  fi
+  rm -f -- "$buffer" || rc=2
   [ "$rc" -eq 0 ] || return "$rc"
   [ "${#lines[@]}" -ge 2 ] || { printf 'ai-bobnet: incomplete fold response\n' >&2; return 2; }
   header="${lines[0]}"
