@@ -639,6 +639,13 @@ eq "real writer projects its UTC instant" "$(jget "$OUT_ACME" agents.acme-core.s
 eq "real writer heartbeat is interpretable" "$(jget "$OUT_ACME" agents.acme-core.stale)" false
 eq "real writer message is unshifted" "$(jget "$OUT_ACME" agents.acme-core.message)" "real writer message"
 eq "heartbeat claims are never broker-attested" "$(jget "$OUT_ACME" agents.acme-core.attested)" false
+# The native UTC instant must also survive conversion under the fleet zone.
+writer_berlin_stamp=$(TZ=Europe/Berlin date -d "$writer_stamp" '+%Y-%m-%dT%H:%M:%S%:z')
+TZ_OVERRIDE=Europe/Berlin
+run_project acme
+eq "real writer preserves its UTC instant under the fleet timezone" \
+  "$(jget "$OUT_ACME" agents.acme-core.since)" "$writer_berlin_stamp"
+TZ_OVERRIDE=UTC
 printf '%s | acme-other | done | wrong identity\n' "$writer_stamp" >> "$WORK/acme/standup/acme-core.log"
 run_project acme
 eq "mismatched writer uid does not replace the heartbeat" "$(jget "$OUT_ACME" agents.acme-core.state)" busy
