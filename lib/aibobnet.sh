@@ -1576,7 +1576,7 @@ aib_enact_launch() {
     # mistaken for a real id) — aib_event_commit's own diagnostics still go to
     # real stderr either way, subshell or not.
     _committed_id="$(
-      aib_event_commit "$events_path" "$lock_path" attempt.ended "$envelope_kv" "$ended_payload" "$decided_id"
+      aib_event_commit "$events_path" "$lock_path" attempt.ended "$envelope_kv" "$ended_payload" "$decided_id" "${AIB_ENACT_ANCHOR_MODE:-}"
       printf 'OK:%s' "$AIB_EVENT_COMMIT_EVENT_ID"
     )"
     _rc=$?
@@ -1911,6 +1911,9 @@ aib_enact_launch__run_confined() {
     # Enumerate this bash process before exec, closing inherited pipes/files in
     # the child only. fd 9 remains until the helper closes it through CLOEXEC.
     local _fd
+    if [ -n "${AIB_BROKER_LEASE_FD:-}" ]; then
+      exec {AIB_BROKER_LEASE_FD}>&-
+    fi
     for _fd in /proc/self/fd/[0-9]*; do
       _fd="${_fd##*/}"
       case "$_fd" in 0|1|2|9) continue;; esac
@@ -1938,6 +1941,10 @@ aib_enact_launch__run_confined() {
 
   local _provider_manager_pid manager_pid_ref
   _aib_enact_manager_confined() {
+    if [ -n "${AIB_BROKER_LEASE_FD:-}" ]; then
+      exec {AIB_BROKER_LEASE_FD}>&-
+      AIB_BROKER_LEASE_FD=""
+    fi
     set +e
     local provider_pid="" timer_pid="" killer_pid="" provider_rc=1 confirmed_rc=1
     local timed_out=0 aborted_disc=0 wait_interrupted=0 group_empty=true
@@ -2101,9 +2108,14 @@ aib_enact_launch__run_confined() {
   # close (or a shutdown of the peer's WRITE half, which is the shape an
   # abandoned response actually takes in practice) is detected within one
   # idle tick, as tested below.
+  _aib_enact_exec_without_lease() (
+    if [ -n "${AIB_BROKER_LEASE_FD:-}" ]; then exec {AIB_BROKER_LEASE_FD}>&-; fi
+    exec "$@"
+  )
+
   _aib_enact_conn_alive() {
     [ -n "$_python_bin" ] || return 0
-    "$_python_bin" -c '
+    _aib_enact_exec_without_lease "$_python_bin" -c '
 import select, sys
 try:
     p = select.poll()
@@ -2189,7 +2201,7 @@ sys.exit(0)
     # `timeout` with the writer long gone). Redirecting the ALREADY-OPEN fd
     # onto dd's stdin is a plain fd inheritance, not a fresh open, and sees
     # EOF exactly when the writer closes, as it must.
-    "$_timeout_bin" 0.3 "$_dd_bin" of="$_chunk_tmp" bs=65536 count=1 status=none 2>/dev/null <&"$_relay_fd"
+    _aib_enact_exec_without_lease "$_timeout_bin" 0.3 "$_dd_bin" of="$_chunk_tmp" bs=65536 count=1 status=none 2>/dev/null <&"$_relay_fd"
     local _dd_rc=$? _n
     _n="$("$_wc_bin" -c < "$_chunk_tmp")"
     if [ "$_dd_rc" -eq 124 ]; then
@@ -2206,7 +2218,7 @@ sys.exit(0)
     if [ "$_n" -eq 0 ]; then
       break # true EOF: the provider's output side closed.
     fi
-    if ! { printf 'chunk_bytes=%s\n\n' "$_n" && "$_cat_bin" "$_chunk_tmp"; } 2>/dev/null; then
+    if ! { printf 'chunk_bytes=%s\n\n' "$_n" && _aib_enact_exec_without_lease "$_cat_bin" "$_chunk_tmp"; } 2>/dev/null; then
       _disconnected=1
       kill -USR2 "$_provider_manager_pid" 2>/dev/null || true
       break
@@ -2627,8 +2639,48 @@ _aib_event_compose_record() {
     "$schema_version" "$payload_json"
 }
 
+# Anchor helpers share the writer's stream lock; status is deliberately read-only.
+_aib_anchor_sync_capability() {
+  command -v sync >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: sync (GNU coreutils with file arguments)"
+  local probe
+  probe=$(mktemp "${TMPDIR:-/tmp}/aib-sync.XXXXXX") || aib_die 6 "cannot create sync capability probe"
+  if sync -d -- "$probe.missing" 2>/dev/null || ! sync -d -- "$probe" 2>/dev/null || ! sync -- "$probe" 2>/dev/null; then
+    rm -f -- "$probe"
+    aib_die 6 "required runtime dependency: sync must support -d and file arguments"
+  fi
+  rm -f -- "$probe"
+}
+
+_aib_anchor_read() {
+  local path="$1" m="$2" raw LC_ALL=C
+  AIB_ANCHOR_VALUE=absent AIB_ANCHOR_STATE=absent
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  AIB_ANCHOR_VALUE=corrupt AIB_ANCHOR_STATE=corrupt
+  [ -f "$path" ] && [ -r "$path" ] || return 0
+  # read -d NUL preserves trailing newlines and detects embedded NULs.
+  if IFS= read -r -d '' raw < "$path"; then return 0; fi
+  raw="${raw%$'\n'}"
+  [[ "$raw" =~ ^(0|[1-9][0-9]*)$ ]] || return 0
+  AIB_ANCHOR_VALUE="$raw"
+  # Decimal string comparison avoids arithmetic overflow on damaged anchors.
+  if [ "${#raw}" -gt "${#m}" ] || { [ "${#raw}" -eq "${#m}" ] && [[ "$raw" > "$m" ]]; }; then
+    AIB_ANCHOR_STATE=ahead
+  elif [ "$raw" = "$m" ]; then AIB_ANCHOR_STATE=ok
+  else AIB_ANCHOR_STATE=lag; fi
+}
+
+_aib_anchor_write() {
+  local path="$1" seq="$2" tmp
+  tmp=$(mktemp "${path}.XXXXXX") || aib_die 2 "cannot create anchor temp: $path"
+  if ! printf '%s\n' "$seq" > "$tmp" || ! sync -- "$tmp" || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    aib_die 2 "cannot durably replace anchor: $path"
+  fi
+  sync -- "$(dirname -- "$path")" || aib_die 2 "cannot sync anchor directory: $path"
+}
+
 # --- aib_event_commit — the serialising append broker ------------------------
-# aib_event_commit <events_path> <lock_path> <event_type> <envelope_kv> <payload_json> [decided_event_id]
+# aib_event_commit <events_path> <lock_path> <event_type> <envelope_kv> <payload_json> [decided_event_id] [anchor_mode]
 #
 # `payload_json` is trusted composer output from aib_event_compose_decided_payload or
 # aib_event_compose_ended_payload. The broker enforces object/one-line shape, identity,
@@ -2644,7 +2696,7 @@ _aib_event_compose_record() {
 # launches (§3/§5 DoS bound); a timeout fails loudly with a stable exit code (75).
 aib_event_commit() {
   local events_path="${1:-}" lock_path="${2:-}" event_type="${3:-}"
-  local envelope_kv="${4-}" payload_json="${5-}" decided_id="${6-}"
+  local envelope_kv="${4-}" payload_json="${5-}" decided_id="${6-}" anchor_mode="${7-}"
   local _fd timeout k LC_ALL=C
   local project_uid actor_type actor_id agent_uid team_uid session_id run_id task_id gate_id grant_id effect_id occurred_at
 
@@ -2654,6 +2706,7 @@ aib_event_commit() {
   [ -z "${AIB_EVENT_ACTIVE_LOCK:-}" ] || aib_die 2 "nested event commits are not supported"
   command -v flock >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: flock (util-linux)"
   command -v cksum >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: cksum"
+  if [ "$anchor_mode" = anchor ]; then _aib_anchor_sync_capability; fi
 
   case "$event_type" in
     attempt.decided|attempt.ended) ;;
@@ -2721,6 +2774,23 @@ aib_event_commit() {
       aib_die 2 "cannot truncate the uncommitted tail of: $events_path"
   fi
 
+  if [ "$anchor_mode" = anchor ]; then
+    _aib_anchor_read "${events_path}.high_water" "$AIB_EVENT_SCAN_HIGHEST_SEQ"
+    case "$AIB_ANCHOR_STATE" in
+      ahead) aib_die 2 "anchor ahead: possible truncation ($AIB_ANCHOR_VALUE > $AIB_EVENT_SCAN_HIGHEST_SEQ): $events_path";;
+      corrupt) aib_die 2 "corrupt or empty anchor: ${events_path}.high_water";;
+      absent|lag)
+        printf 'ai-bobnet: anchor %s: %s -> %s: %s\n' "$AIB_ANCHOR_STATE" "$AIB_ANCHOR_VALUE" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$events_path" >&2
+        # A complete scanned append can still be only in page cache after a
+        # process crash. Make that prefix durable before publishing its anchor.
+        if [ -e "$events_path" ]; then
+          sync -d -- "$events_path" || aib_die 2 "cannot sync event stream before anchor catch-up: $events_path"
+        fi
+        _aib_anchor_write "${events_path}.high_water" "$AIB_EVENT_SCAN_HIGHEST_SEQ"
+        ;;
+    esac
+  fi
+
   local seq="$AIB_EVENT_SCAN_NEXT_SEQ"
   local event_id="${project_uid}-${AIB_EVENT_STREAM_NAME}-${seq}"
   local attempt_id correlation_id causation_id
@@ -2755,6 +2825,10 @@ aib_event_commit() {
   set -- $(printf '%s' "$record" | cksum); crc="$1"; len="$2"
   if ! printf '%s %s %s %s\n' "$seq" "$crc" "$len" "$record" >> "$events_path"; then
     aib_die 2 "cannot append event record: $events_path"
+  fi
+  if [ "$anchor_mode" = anchor ]; then
+    sync -d -- "$events_path" || aib_die 2 "cannot sync event stream: $events_path"
+    _aib_anchor_write "${events_path}.high_water" "$seq"
   fi
   exec {_fd}>&- || aib_die 2 "cannot close event lock: $lock_path"
   AIB_EVENT_COMMIT_SEQ="$seq"

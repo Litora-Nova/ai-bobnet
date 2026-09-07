@@ -18,6 +18,27 @@ Environment=AIB_EVENT_ROOT=/var/lib/aib/events
 Environment=AIB_CONFINE_BIN=/opt/aib/engine/libexec/landlock-exec
 Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
 
+# RM-3 slice 5 (ADR-0006): ONE capacity ceiling for the WHOLE BROKER — every project,
+# every agent, one shared pool, checked by flock leases in AIB_EVENT_ROOT/attempts/
+# before agent_uid is resolved and before the registry is ever read for a connection.
+# Deliberately NOT scoped per project or per agent: project_uid comes from agent_uid,
+# which the caller chooses and the broker does not verify at this point (§4) — a
+# per-project or per-agent pool would let a caller target one project's or one agent's
+# budget specifically, the same denial-of-service shape ADR-0006 rejects for the cap
+# this replaces. Default if omitted is 12; MUST stay below deploy/systemd/
+# aib-broker.socket's MaxConnections (16 below) — a ceiling at or above that point can
+# never be reached, because the socket itself would already have silently closed the
+# connection first. The handler refuses to start (a journal line, not a launch failure)
+# if AIB_BROKER_CAPACITY >= AIB_BROKER_MAX_CONNECTIONS.
+Environment=AIB_BROKER_CAPACITY=12
+# Mirrors aib-broker.socket's MaxConnections so this unit can self-check the rule above
+# without reading the socket unit at runtime. DRIFT RISK, accepted (ADR-0006, maintainer
+# review 2026-09-07): nothing enforces agreement between this value and the socket's own
+# MaxConnections= line — they are two separate files, hand-edited independently, and a
+# change to one that is not mirrored to the other silently weakens or defeats this
+# self-check. Keep them in sync BY HAND; there is no automated guard against drift.
+Environment=AIB_BROKER_MAX_CONNECTIONS=16
+
 # EXPLICIT, and this is the trap: with Accept=yes systemd does NOT hand the connection to the
 # handler by itself. Measured on 2026-08-10 - without these two lines the handler received
 # nothing on stdin and wrote its answer to the journal. Six connections, six empty replies,

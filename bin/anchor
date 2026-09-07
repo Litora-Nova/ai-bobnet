@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Inspect or explicitly repair one stream's high-water anchor (ADR-0006).
+set -uo pipefail
+ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$ROOT/lib/aibobnet.sh"
+usage='usage: anchor <events_path> {status|reanchor --accept-truncation}'
+[ "$#" -ge 2 ] || aib_die 64 "$usage"
+stream="$1" action="$2"
+case "$action:$#:${3:-}" in
+  status:2:) ;;
+  reanchor:3:--accept-truncation)
+    _aib_anchor_sync_capability
+    command -v flock >/dev/null 2>&1 || aib_die 6 'required runtime dependency not found: flock'
+    exec {lock_fd}>>"${stream}.lock" || aib_die 2 "cannot open stream lock: $stream.lock"
+    flock -x -w "${AIBOBNET_EVENT_LOCK_TIMEOUT:-10}" "$lock_fd" || aib_die 75 "cannot acquire stream lock: $stream.lock"
+    ;;
+  *) aib_die 64 "$usage (repair requires explicit acceptance of truncation)";;
+esac
+_aib_event_scan_core "$stream" 1 0
+_aib_anchor_read "${stream}.high_water" "$AIB_EVENT_SCAN_HIGHEST_SEQ"
+if [ "$action" = status ]; then
+  printf 'anchor=%s\nmax_seq=%s\nrelationship=%s\nstream=%s\ntorn_tail=%s\n' \
+    "$AIB_ANCHOR_VALUE" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$AIB_ANCHOR_STATE" "$AIB_EVENT_SCAN_STATUS" "$AIB_EVENT_SCAN_TORN_TAIL"
+  [ "$AIB_EVENT_SCAN_STATUS" != corrupt ] || exit 2
+else
+  [ "$AIB_EVENT_SCAN_STATUS" != corrupt ] || aib_die 2 "cannot reanchor corrupt stream: $AIB_EVENT_SCAN_CORRUPT_REASON"
+  if [ -e "$stream" ]; then
+    sync -d -- "$stream" || aib_die 2 "cannot sync stream before reanchor: $stream"
+  fi
+  _aib_anchor_write "${stream}.high_water" "$AIB_EVENT_SCAN_HIGHEST_SEQ"
+  printf 'ai-bobnet: reanchor operator=%s old=%s new=%s stream=%s\n' \
+    "${USER:-unknown}" "$AIB_ANCHOR_VALUE" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$stream" >&2
+fi

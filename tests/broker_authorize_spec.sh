@@ -227,6 +227,8 @@ if printf 'op=launch\nagent_uid=acme-dev\ncap_sandbox=danger-full-access\nprompt
 # actual override this codebase honours (not AIB_REGISTRY_FILE, which nothing reads).
 # Schema 4, project home under $WORK (so aib_contain_cwd has a real derived root to
 # resolve against), one provider carrying all four capabilities including cap_timeout.
+# Admission now precedes registry/cwd checks and needs its own writable store.
+export AIB_EVENT_ROOT="$WORK/event-root"
 FIXTURE_HOME="$WORK/home-acme"
 mkdir -p "$FIXTURE_HOME"
 # A REAL sibling directory sharing FIXTURE_HOME's string prefix (D2/gate delta:

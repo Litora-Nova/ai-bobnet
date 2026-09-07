@@ -180,6 +180,44 @@ coreutils, all hard requirements resolved via `command -v` with a fail-closed
 codebase already uses. `cc` is install-time only (it compiles this helper; nothing at runtime needs
 a compiler).
 
+### Runtime dependencies of the commit path this confinement sits behind (ADR-0006)
+
+Every confined launch is preceded by a `commit(attempt.decided)` (`docs/CONTRACT-mediation.md` §2 step
+2) and followed by a `commit(attempt.ended)` (step 4) — neither is optional, and both now carry the
+`high_water` anchor's own dependencies on the broker's always-anchored path (§8.8,
+`docs/CONTRACT-execution-binding.md`). These are distinct from the confined *child's* own dependency
+list above — they run in the unconfined broker/manager process, before and after the confined child
+exists, never inside it:
+
+- **`flock`** (util-linux) — already a hard dependency of `aib_event_commit` for the stream's own
+  sidecar lock; the anchor's repair tool, `bin/anchor reanchor`, takes the same lock and shares the
+  dependency.
+- **`truncate`** (coreutils) — already a hard dependency of the torn-tail path; unrelated to the
+  anchor itself, listed here only because it lives in the same commit-path dependency set the anchor
+  now joins.
+- **`sync` with file arguments** (GNU coreutils ≥ 8.24) — new in this slice. Checked with `command -v`
+  plus a capability probe **at `aib_event_commit`'s own entry**, alongside `flock`/`cksum`, and
+  **never at library load** — a load-time check would turn a commit-path dependency into a load-path
+  one and brick every read-only consumer that merely sources `lib/aibobnet.sh` (the fold,
+  `bin/attempts`, the dashboard, the specs) on a host whose `sync` predates file-argument support.
+  Absence fails closed with `aib_die 6`. The probe **never falls back to argument-less `sync`**: bare
+  `sync` returns 0 and flushes the whole system, which would make a broken capability check read as
+  "satisfied" while the anchor's durability claim (ADR-0006, part A) is silently false. `sync -d
+  <events_path>` (fdatasync) covers the stream append; a full `sync` on the anchor's temp file covers
+  the anchor's own fresh-inode write, before its rename.
+
+Anchor maintenance additionally uses `mktemp`, `mv`, `rm`, and `dirname` (coreutils);
+`mkdir` creates stream/admission directories and `cksum` validates the framed stream. The sync
+probe uses a temporary file under `TMPDIR` (default `/tmp`), checks rejection of a missing file,
+then checks both data-only and full file sync. These checks run only for anchored commits.
+Admission also requires `flock` and `rm` before any registry read; storage or lock failures are
+reported on the wire as `event_store_unavailable`. The repair tool uses the same coreutils and
+stream-lock dependencies, with no provider or C helper involved.
+
+A broker unit missing any of these fails every anchored commit closed with exit 6 — the same posture
+`docs/CONTRACT-execution-binding.md` §8.4 already documents for the launcher's other runtime
+dependencies, extended to anchored writes in this slice.
+
 **`python3` is the one optional runtime dependency**, and it runs in the unconfined broker/manager
 process, never inside the sandboxed child or the Landlock helper. It sharpens disconnect detection
 (the `poll(2)`-based liveness probe — see SPEC-wire-format.md, "Detecting a disconnected client
