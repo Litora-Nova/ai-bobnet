@@ -52,6 +52,25 @@ for FAULT in stream temp rename dir; do
   ( PATH="$WORK/bin:$PATH" commit ) >"$WORK/out" 2>"$WORK/err"; check test "$?" -ne 0
   if [ "$FAULT" != dir ]; then check test "$(cat "$EVENTS.high_water")" = 1; fi
 done
+# Successful ordering excludes capability probes and requires full temp fsync.
+printf '%s\n' "$original" > "$EVENTS"
+printf '1\n' > "$EVENTS.high_water"
+: > "$TRACE"
+FAULT=none PATH="$WORK/bin:$PATH" commit >"$WORK/out" 2>"$WORK/err"
+check test "$?" = 0
+sequence=$(grep -v 'aib-sync\.' "$TRACE")
+case "$sequence" in
+  "sync -d -- $EVENTS"$'\n'"sync -- $EVENTS.high_water."*$'\n'"mv -f -- $EVENTS.high_water."*" $EVENTS.high_water"$'\n'"sync -- $WORK") check true;;
+  *) check false;;
+esac
+# A NUL cannot be silently stripped by the anchor reader.
+printf '2\0' > "$EVENTS.high_water"
+( commit ) >"$WORK/out" 2>"$WORK/err"; check test "$?" -ne 0
+# A corrupt stream cannot be blessed by the human repair tool either.
+printf 'broken\n' > "$EVENTS"
+"$SRC_ROOT/bin/anchor" "$EVENTS" reanchor --accept-truncation >"$WORK/out" 2>"$WORK/err"
+check test "$?" -ne 0
+check test "$(cat "$EVENTS")" = broken
 # Admission configuration is rejected before attempting to read a frame.
 for cap in 0 -1 bad 01 999999999999999999999999; do
   out=$(AIB_BROKER_CAPACITY="$cap" "$SRC_ROOT/bin/aib-broker-handler" </dev/null 2>"$WORK/err"); rc=$?

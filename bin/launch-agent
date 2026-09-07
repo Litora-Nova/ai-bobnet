@@ -182,10 +182,12 @@ if [ "$AIB_VERDICT_DECISION" = allow ]; then
     "$AIB_PROVIDER" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_EFFORT" \
     "$AIB_VERDICT_EFFECTIVE_SANDBOX" "$AIB_VERDICT_ADAPTER_PATH")"
 fi
+AIB_ENACT_ANCHOR_MODE=""
+[ "${AIBOBNET_EVENT_ANCHOR:-}" != 1 ] || AIB_ENACT_ANCHOR_MODE=anchor
 _decided_payload="$(aib_event_compose_decided_payload "$_decided_kv")"
 set +e
 aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided \
-  "$_event_envelope" "$_decided_payload"
+  "$_event_envelope" "$_decided_payload" "" "$AIB_ENACT_ANCHOR_MODE"
 _event_commit_rc=$?
 set -e
 [ "$_event_commit_rc" -eq 0 ] ||
@@ -208,7 +210,7 @@ _pep_commit_ended() {
   ended_payload="$(aib_event_compose_ended_payload "$ended_kv")"
   set +e
   aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.ended \
-    "$_event_envelope" "$ended_payload" "$_decided_event_id"
+    "$_event_envelope" "$ended_payload" "$_decided_event_id" "$AIB_ENACT_ANCHOR_MODE"
   _event_commit_rc=$?
   set -e
   [ "$_event_commit_rc" -eq 0 ] ||

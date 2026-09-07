@@ -236,7 +236,9 @@ honest or not, draws from the same shared budget it would consume anyway.
   pre-exec fd-hygiene loop already present in `_aib_enact_exec_child_confined`
   (`lib/aibobnet.sh`), which enumerates `/proc/self/fd` in the child before `exec` and closes every
   descriptor except 0/1/2/9 — the lease fd, whatever number it lands on, is closed by that existing
-  loop with no change to it required. Any enactment path that lacks that loop would hand the provider a
+  loop. The child also explicitly closes the named lease fd; the confined manager closes
+  its inherited copy before spawning any long-lived children, so it cannot keep a dead
+  connection admitted. Any enactment path that lacks that loop would hand the provider a
   writable descriptor into broker-owned state, the exact capability crossing slices 3–4 exist to close,
   and a leaked fd would also pin the lease for the lifetime of any descendant that inherited it — this
   is stated as a hard requirement on any future enactment path, not merely a nicety of the existing one.
@@ -375,9 +377,24 @@ ordering instead.
   self-check variable this ADR proposes (part B) is accepted (maintainer review 2026-09-07); it carries
   a standing drift risk — nothing enforces agreement between it and the socket unit's own
   `MaxConnections` — which `deploy/systemd/aib-broker@.service`'s comment must state.
-- **Still specified, not built** (this slice remains docs + RED spec only): `aib_event_commit`'s 7th
-  argument, `bin/anchor`, the lease mechanism in `bin/aib-broker-handler`, and every library change the
-  RED spec's failing assertions name.
+- **Implemented:** the optional commit argument, repair tool, wrapper opt-in, and global leases.
+- **Input and failure details:** anchor files hold canonical nonnegative decimal digits with at most
+  one trailing LF; comparisons use decimal strings, avoiding signed arithmetic overflow. Capacity
+  settings accept canonical positive decimals from 1 through 999999999, rejecting empty, zero,
+  signed, padded, or larger values as `broker_misconfigured` before reading a frame. Admission
+  storage/lock failures produce `event_store_unavailable`; the admission lock wait is bounded at
+  10 seconds. Because admission precedes registry resolution, a missing event root now takes
+  precedence over registry/cwd errors. Released lease names are reclaimed on the next admission
+  pass under the admission lock, rather than unlinked by an exit trap.
+- **Capability probe:** anchored commit entry creates a disposable file under `TMPDIR` (default
+  `/tmp`), verifies that a nonexistent file argument fails, and that both `sync -d` and full `sync`
+  succeed on the real probe. This also rejects implementations that silently ignore file arguments.
+  Plain commits do not require sync. Every actual stream, temp-anchor, and directory sync is checked.
+- **Repair output:** `status` reports `anchor`, `max_seq`, `relationship`, `stream`, and `torn_tail`
+  (0/1); the two reads are an unlocked observation. It returns 2 for a corrupt stream. Repair refuses
+  a corrupt committed stream even with acceptance, but permits a torn tail without changing it.
+  The repair lock is `<events_path>.lock`; custom-lock callers must use that same convention for
+  this operator tool. Diagnostics go to stderr (the service journal), never the event stream.
 
 This ADR extends ADR-0004 and ADR-0005; it reverses neither. `docs/CONTRACT-mediation.md` §5/§5.1's
 ordering and failure-case table are implemented here exactly as specified, not renegotiated.

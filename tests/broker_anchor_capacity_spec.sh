@@ -670,5 +670,32 @@ eq "a traversal-shaped agent_uid is already rejected by the existing validator (
 ( aib_validate_agent_uid "acme-core" ) >/dev/null 2>&1
 eq "…while an ordinary agent_uid still validates" "$?" 0
 
+# Integration: wrapper opt-in reaches both decided and ended commits.
+reset_capacity
+AIBOBNET_REGISTRY="$FIXTURE_REG" AIBOBNET_EVENT_ANCHOR=0 "$SRC_ROOT/bin/launch-agent" \
+  --as acme-core --cwd "$FIXTURE_WS" --prompt hi >"$WORK/wrapper-out" 2>"$WORK/wrapper-err"
+if [ -e "$ANCHOR_FILE" ]; then no "wrapper default does not create an anchor"; else ok "wrapper default does not create an anchor"; fi
+AIBOBNET_REGISTRY="$FIXTURE_REG" AIBOBNET_EVENT_ANCHOR=1 "$SRC_ROOT/bin/launch-agent" \
+  --as acme-core --cwd "$FIXTURE_WS" --prompt hi >"$WORK/wrapper-out" 2>"$WORK/wrapper-err"
+eq "wrapper opt-in anchors through the terminal commit" "$(cat "$ANCHOR_FILE" 2>/dev/null)" "$(current_max_seq)"
+# An ahead anchor must reach the wire, never merely terminate the handler.
+printf '999\n' > "$ANCHOR_FILE"
+resp_ahead="$(frame "$FIXTURE_WS" "cap-test" hi op=launch agent_uid=acme-core \
+  | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_CONFINE_BIN="$LANDLOCK_STUB" AIB_EVENT_ROOT="$EVENT_ROOT" \
+    "$SRC_ROOT/bin/aib-broker-handler" 2>"$WORK/handler-ahead-err")"; ahead_rc=$?
+eq "broker anchor refusal exits 2" "$ahead_rc" 2
+has "broker anchor refusal names event_store_unavailable" "$resp_ahead" 'reason=event_store_unavailable'
+has "broker anchor refusal has a terminal error" "$resp_ahead" 'end=error'
+has "broker anchor refusal journals truncation" "$(cat "$WORK/handler-ahead-err")" truncation
+# Different project/agent labels must consume the same pool before registry lookup.
+reset_capacity
+holder_global="$(hold_lease other-worker 0)"
+resp_global="$(frame "$FIXTURE_WS" "cap-test" hi op=launch agent_uid=acme-core \
+  | AIBOBNET_REGISTRY=/nonexistent AIB_EVENT_ROOT="$EVENT_ROOT" AIB_BROKER_CAPACITY=1 \
+    "$SRC_ROOT/bin/aib-broker-handler" 2>"$WORK/handler-global-err")"; global_rc=$?
+eq "cross-project saturation exits 2" "$global_rc" 2
+has "cross-project saturation precedes registry resolution" "$resp_global" 'reason=over_capacity'
+release_lease "$holder_global"
+
 printf '\nbroker_anchor_capacity_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

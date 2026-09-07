@@ -206,9 +206,17 @@ exists, never inside it:
   <events_path>` (fdatasync) covers the stream append; a full `sync` on the anchor's temp file covers
   the anchor's own fresh-inode write, before its rename.
 
+Anchor maintenance additionally uses `mktemp`, `mv`, `rm`, and `dirname` (coreutils);
+`mkdir` creates stream/admission directories and `cksum` validates the framed stream. The sync
+probe uses a temporary file under `TMPDIR` (default `/tmp`), checks rejection of a missing file,
+then checks both data-only and full file sync. These checks run only for anchored commits.
+Admission also requires `flock` and `rm` before any registry read; storage or lock failures are
+reported on the wire as `event_store_unavailable`. The repair tool uses the same coreutils and
+stream-lock dependencies, with no provider or C helper involved.
+
 A broker unit missing any of these fails every anchored commit closed with exit 6 — the same posture
 `docs/CONTRACT-execution-binding.md` §8.4 already documents for the launcher's other runtime
-dependencies, extended to the two new ones this slice adds.
+dependencies, extended to anchored writes in this slice.
 
 **`python3` is the one optional runtime dependency**, and it runs in the unconfined broker/manager
 process, never inside the sandboxed child or the Landlock helper. It sharpens disconnect detection

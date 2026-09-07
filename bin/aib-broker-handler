@@ -56,6 +56,24 @@ AIB_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
 . "$AIB_ROOT/lib/aibobnet.sh"
 
+# Unit-only admission settings are checked before reading even a frame.
+_broker_misconfigured() {
+  printf 'ai-bobnet: AIB_BROKER_CAPACITY / AIB_BROKER_MAX_CONNECTIONS: %s\n' "$1" >&2
+  aib_wire_write_response error "reason=broker_misconfigured"
+  exit 2
+}
+_broker_positive_limit() {
+  # A bounded canonical decimal avoids bash arithmetic overflow and octal input.
+  [[ "$1" =~ ^[1-9][0-9]{0,8}$ ]]
+}
+_capacity="${AIB_BROKER_CAPACITY-12}"
+_broker_positive_limit "$_capacity" || _broker_misconfigured 'expected positive decimal (1..999999999)'
+if [ "${AIB_BROKER_MAX_CONNECTIONS+x}" ]; then
+  _broker_positive_limit "$AIB_BROKER_MAX_CONNECTIONS" || _broker_misconfigured 'invalid socket ceiling mirror'
+  [ "$_capacity" -lt "$AIB_BROKER_MAX_CONNECTIONS" ] || _broker_misconfigured 'capacity must be below socket ceiling mirror'
+fi
+AIB_ENACT_ANCHOR_MODE=anchor
+
 if ! aib_wire_read_request; then
   # The reason is our own text, never caller-controlled content echoed back.
   aib_wire_write_response error "reason=malformed_request" "detail=${AIB_WIRE_ERROR:-unspecified}"
@@ -69,6 +87,44 @@ case "${AIB_REQ_OP:-}" in
   # was the one denied answer still exiting 2, a leftover from slice 1.
   *) aib_wire_write_response denied "reason=unknown_operation"; exit 3 ;;
 esac
+
+# One broker-global pool, before any registry/PDP/stream access. Keep the
+# admission lock only for count/create; the lease remains open for this connection.
+_broker_store_error() {
+  printf 'ai-bobnet: admission store unavailable: %s\n' "$1" >&2
+  aib_wire_write_response error "reason=event_store_unavailable"
+  exit 2
+}
+[ -n "${AIB_EVENT_ROOT:-}" ] || _broker_store_error 'AIB_EVENT_ROOT is unset'
+command -v flock >/dev/null 2>&1 || _broker_store_error 'flock is missing'
+_attempts="$AIB_EVENT_ROOT/attempts"
+( umask 0077; mkdir -p -- "$_attempts" ) || _broker_store_error 'cannot create attempts directory'
+exec {_admission_fd}>>"$_attempts/attempts.lock" || _broker_store_error 'cannot open attempts lock'
+flock -x -w 10 "$_admission_fd" || _broker_store_error 'attempts lock timeout'
+_live=0
+for _lease in "$_attempts"/*; do
+  [ "$_lease" != "$_attempts/attempts.lock" ] || continue
+  [ -e "$_lease" ] || continue
+  exec {_probe_fd}>>"$_lease" || _broker_store_error 'cannot open lease'
+  flock -n -x "$_probe_fd"; _lease_rc=$?
+  case "$_lease_rc" in
+    0) rm -f -- "$_lease" || _broker_store_error 'cannot remove stale lease';;
+    1) _live=$((_live+1));;
+    *) _broker_store_error 'cannot probe lease lock';;
+  esac
+  exec {_probe_fd}>&-
+done
+if [ "$_live" -ge "$_capacity" ]; then
+  exec {_admission_fd}>&-
+  aib_wire_write_response error "reason=over_capacity"
+  exit 2
+fi
+_slot=0
+while [ -e "$_attempts/${AIB_REQ_AGENT_UID}.$_slot" ]; do _slot=$((_slot+1)); done
+[ "$_slot" -lt "$_capacity" ] || _broker_store_error 'no free lease index'
+exec {AIB_BROKER_LEASE_FD}>>"$_attempts/${AIB_REQ_AGENT_UID}.$_slot" || _broker_store_error 'cannot create lease'
+flock -n -x "$AIB_BROKER_LEASE_FD" || _broker_store_error 'cannot acquire new lease'
+exec {_admission_fd}>&-
 
 # --- resolve the snapshot from the BROKER'S OWN registry (§2), never the caller's ---
 # aib_resolve_managed_agent aib_die's on any registry/config problem. It is called
@@ -235,13 +291,17 @@ fi
 # path ever ran, instead of the process failing case ended below. Capture the
 # commit's rc without ever touching `-e`.
 _decided_payload="$(aib_event_compose_decided_payload "$_decided_kv")"
-aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided "$_broker_envelope" "$_decided_payload" \
-  && _decided_commit_rc=0 || _decided_commit_rc=$?
+# Capture the commit: aib_die exits its process on incidents. The handler must
+# still send the wire terminal, including an anchor refusal before enactment.
+_decided_result="$(
+  aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.decided "$_broker_envelope" "$_decided_payload" "" anchor &&
+    printf 'OK:%s' "$AIB_EVENT_COMMIT_EVENT_ID"
+)"; _decided_commit_rc=$?
 if [ "$_decided_commit_rc" -ne 0 ]; then
   aib_wire_write_response error "reason=event_store_unavailable"
   exit 2
 fi
-_decided_event_id="$AIB_EVENT_COMMIT_EVENT_ID"
+_decided_event_id="${_decided_result#OK:}"
 
 if [ "$_verdict_allow" -ne 1 ]; then
   # codex-run.md §4 item 1 / SPEC-wire-format "Deny": decided-only, no
@@ -282,7 +342,7 @@ if ! printf '%s\n' "$_prologue"; then
   # ended the attempt (docs/CONTRACT-execution-binding.md §8.1).
   aib_event_commit "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" attempt.ended "$_broker_envelope" \
     "$(aib_event_compose_ended_payload $'exit_class=aborted\nstage=transport\nsignal=TERM')" \
-    "$_decided_event_id" >/dev/null 2>&1 || true
+    "$_decided_event_id" anchor >/dev/null || true
   exit 0
 fi
 
