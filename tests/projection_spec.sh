@@ -328,6 +328,19 @@ eq "hostile message text still parses as valid JSON" \
 has "hostile message text is preserved in reason, escaped not interpreted" \
   "$(jget "$OUT_ACME" 'attention[kind=human].reason')" 'quit'
 
+# Message bytes after framing whitespace are data, including pipes and shell syntax.
+hostile='needs:human a|b  "quoted" $(touch SHOULD_NOT_EXIST) `false` \tail'
+hb acme acme-core "" "11:46" blocked "$hostile"
+run_project acme
+eq "message punctuation and shell-looking text round-trips exactly" "$(jget "$OUT_ACME" 'agents.acme-core.message')" "$hostile"
+eq "attention preserves the complete original message" "$(jget "$OUT_ACME" 'attention[kind=human].reason')" "$hostile"
+# An invalid source cannot replace a previously complete result.
+before_bad=$(cksum "$OUT_ACME")
+printf 'bad timestamp | blocked | needs:human undecidable time\n' >> "$WORK/acme/standup/acme-core.log"
+run_project acme
+eq "undatable attention refuses publication" "$RUN_RC" 2
+eq "undatable attention preserves the previous bytes" "$(cksum "$OUT_ACME")" "$before_bad"
+
 # =========================================================================
 # G — broker-derived attention + the six stream-status variants
 #     (CONTRACT-visibility.md SS8, SS18 "stream", ADR-0007)
@@ -466,6 +479,26 @@ run_project acme
 chmod 0750 "$PROJROOT" 2>/dev/null || true
 eq "a publish that cannot write reports failure" "$([ "$RUN_RC" -ne 0 ] && printf yes || printf no)" yes
 eq "the previous file is left byte-identical on a failed publish" "$(cksum "$OUT_ACME" 2>/dev/null)" "$baseline_sum"
+
+# A configured output root inside the project home must never receive writes.
+old_root="$PROJROOT"; PROJROOT="$WORK/acme/unsafe-output"
+run_project acme
+eq "output under project home is refused" "$RUN_RC" 2
+eq "an unsafe output directory is not created" "$([ -e "$PROJROOT" ] && printf yes || printf no)" no
+PROJROOT="$old_root"
+# Named pipes and symlinks in the agent-controlled log slot must not be read.
+log_path="$WORK/acme/standup/acme-core.log"
+mv "$log_path" "$WORK/log-saved"
+mkfifo "$log_path"
+before_bad=$(cksum "$OUT_ACME")
+run_project acme
+eq "FIFO heartbeat refuses promptly" "$RUN_RC" 2
+eq "FIFO heartbeat preserves the previous bytes" "$(cksum "$OUT_ACME")" "$before_bad"
+rm "$log_path"
+ln -s "$WORK/log-saved" "$log_path"
+run_project acme
+eq "symlink heartbeat refuses publication" "$RUN_RC" 2
+rm "$log_path"; mv "$WORK/log-saved" "$log_path"
 
 # =========================================================================
 # K — rebuild acceptance (CONTRACT-visibility.md SS17, docs/DOMAIN.md SS11(e))

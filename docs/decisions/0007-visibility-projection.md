@@ -121,6 +121,24 @@ real distinction agents will want, and the fallback (`other`) already protects a
 mistakes either way. A future pillar that finds this unworkable in practice can revisit it by its own
 ADR.
 
+### F. Shared reader implementation and failure policy
+
+The shell API `aib_attempts_fold` invokes one Python 3 process for the complete stream. The CRC
+uses bit-order translation around zlib's C implementation, differentially checked against coreutils
+`cksum`; per-record shell forks would miss the 10,000-record budget. `bin/attempts` formats the same
+ordered fold as before, while `bin/project` applies the frozen visibility schema's corruption policy.
+No writer or admission path calls this reader.
+
+The shipped pins needed two fixture corrections: a dateless line labelled "non-last" was actually
+last (and `beats.mjs` borrows its old mtime without marking it stale), and the fold-global assertion
+ran its fold inside a command substitution where assignments cannot reach the caller. The corrected
+pins test the actual parser rule and invoke the fold directly before inspecting its globals.
+
+The handler samples `.live` before allocating its new lease. Sample publication is best-effort:
+a write failure leaves the previous value and diagnostic, preserving every existing admission answer.
+The projection's schema-1 decisions for degraded streams, malformed anchors, multiple attempts,
+undatable attention and `--stdout` are stated in CONTRACT-visibility's implementation notes.
+
 ## Alternatives Considered
 
 ### Handler-triggered projection instead of a timer

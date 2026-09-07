@@ -301,3 +301,13 @@ Keep the base unit's existing write paths (do not reset the directive with an em
 assignment). The directories must also have ownership and permissions allowing the
 broker's required writes; `ReadWritePaths` does not grant filesystem permissions.
 The `.example` suffix prevents the sample from being applied before site configuration.
+
+## Read-only visibility commands
+
+`bin/project` and `bin/attempts` require Python 3.9+ (standard library only; `zoneinfo` uses the
+host timezone database), plus the existing Bash/awk registry reader. Projection strings, including
+messages, pass through `aib_json` in one batched shell encoder invocation. The projector uses
+coreutils `realpath`, `mktemp`, `mkdir`, `cat`, `chmod`, `mv`, and `rm` for path checking and atomic
+publication; it never invokes `flock` or opens an admission lease. Python remains optional for the
+broker's connection-liveness probe; neither admission nor event commits acquire a Python dependency.
+Output ownership (`aib-broker:aib-shared`) belongs to provisioning, not the reader.

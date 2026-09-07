@@ -4,6 +4,7 @@ set -uo pipefail
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 python3 - "$ROOT" <<'PY'
 import importlib.util,json,os,pathlib,subprocess,sys,tempfile
+sys.dont_write_bytecode=True
 root=pathlib.Path(sys.argv[1]); passed=failed=0
 spec=importlib.util.spec_from_file_location('fold',root/'lib/attempts_fold.py')
 try:
@@ -33,7 +34,7 @@ with tempfile.TemporaryDirectory() as tmp:
         old=subprocess.check_output(['bash','-c',cmd,'_',str(root),str(path)],text=True)
         new=f"{got['status']} {got['highest']} {got['next']} {int(got['torn'])}"
         check('shared fold matches existing scanner metadata',old==new)
-    bad=[record(payload={'decision':'bogus','pid':1}),record(payload={'decision':'allow','pid':0}),record(payload={'decision':'allow','pid':'bad'}),record(attempt_id=''),record(event_type='attempt.ended',payload={'exit':{'class':'ok'}})]
+    bad=[record(payload={'decision':'bogus','pid':1}),record(payload={'decision':'allow','pid':0}),record(payload={'decision':'allow','pid':'bad'}),record(attempt_id=''),record(attempt_id='bad\n1'),record(event_type='attempt.ended',payload={'exit':{'class':'ok'}})]
     for r in bad:
         path.write_bytes(frame(r,1)); got=fold.fold(path)
         check('invalid attempt cannot produce a partial fold',got['status']=='corrupt' and not got['attempts'])
@@ -47,6 +48,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check('denied terminal rejected',fold.fold(path)['status']=='corrupt')
     path.write_bytes(first+frame(record(2),2))
     check('duplicate decided rejected',fold.fold(path)['status']=='corrupt')
+    data=json.dumps(record(),separators=(',',':')).encode().replace(b'"decision":"allow"',b'"decision":"deny","decision":"allow"')
+    path.write_bytes(f'1 {crc(data)} {len(data)} '.encode()+data+b'\n')
+    check('duplicate JSON keys cannot select a conflicting truth',fold.fold(path)['status']=='corrupt')
 print(f'attempts_fold_spec: {passed} passed, {failed} failed')
 sys.exit(bool(failed))
 PY

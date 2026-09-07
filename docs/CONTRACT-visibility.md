@@ -1,9 +1,6 @@
 # ai-bobnet — Visibility Contract (V-1)
 
-> **Status: SPECIFICATION — `bin/project` does not exist yet.** This document is written before the
-> projector, deliberately, in the same spirit `docs/CONTRACT-mediation.md` was written before the
-> broker: the thing being built has something to be measured against. Every path, environment
-> variable, and JSON field named here is a requirement, not a description of running code.
+> **Status: implemented V-1, schema 1 frozen.** This contract remains the normative consumer interface.
 
 ## 0. Why this exists
 
@@ -229,7 +226,7 @@ admission decision** — allowed or refused, so the file reflects real traffic e
 refusals. The written value is the live-lease count exactly as the handler's own lock-held arithmetic
 produced it for that decision; this contract does not require a specific pre- or post-lease-creation
 instant, only that it come from the one count already computed under the lock, never a second,
-separately-timed pass.
+separately-timed pass. V-1 samples the pre-allocation count. A sample-write failure is journaled and leaves the previous sample intact; it never changes the admission answer.
 
 **The projector reads `.live` and its mtime and does nothing else in `attempts/`:**
 
@@ -281,7 +278,7 @@ projection:
   in which case its instant is the file's own mtime (never the wall-clock `HH:MM`, which cannot be
   dated).
 - An unparsable line is conservatively stale.
-- `agents[uid].stale` is set accordingly; `agents[uid].state` still reports the line's own claimed
+- `agents[uid].stale` is a timestamp-interpretability flag, as in `beats.mjs`, not an age threshold: even an old, dated line is not automatically stale. It is set accordingly; `agents[uid].state` still reports the line's own claimed
   status even when stale — staleness qualifies the claim, it does not erase it.
 
 `tests/projection_spec.sh` pins this with a **differential test against `beats.mjs`**, run through
@@ -306,6 +303,7 @@ aib_attempts_fold <events_path>
   sets:  AIB_ATTEMPTS_FOLD_STATUS        (mirrors AIB_EVENT_SCAN_STATUS: ok|degraded|corrupt)
          AIB_ATTEMPTS_FOLD_IDS           (newline list of attempt_ids, in stream order)
          per-attempt state exactly as bin/attempts today: decision/pid/state/exit_code
+  AIB_ATTEMPTS_FOLD_JSON holds the complete fold object, also printed on stdout
   never dies on a corrupt or absent stream — the caller decides
 ```
 
@@ -497,6 +495,31 @@ Every field, documented:
 | `anomalies.unparsable_lines` | integer | Count of heartbeat lines that matched neither the ISO nor the dateless `HH:MM` shape, across every agent's log this tick. |
 
 ---
+
+### Implementation decisions within schema 1
+
+- The shared fold uses a single Python 3 reader with C-backed POSIX CRC computation, rather than
+  forking parsers per record. Its JSON result exposes status, reason, scan counters, presence and
+  readability, and ordered attempts (including display state and durable open/ended facts separately).
+  Python 3.9+ is required by the two read-only commands. The writer's scanner and event schema are
+  unchanged. Duplicate JSON keys and malformed attempt payloads report corruption, never a partial fold.
+- A degraded scan (sequence loss) maps to projection `stream.status=corrupt` with a sequence-gap
+  reason, because schema 1 has no `degraded` member. `bin/attempts` retains its existing
+  `degraded`/`integrity:lost` output. An invalid/unreadable anchor instead fails that project's
+  publication: schema 1 has no corrupt-anchor relationship, so the previous file ages honestly.
+- The latest decided record in stream order selects `agents[uid].attempt`. Broker attention checks
+  **all** still-open attempts, including an older open attempt followed by a newer terminal one.
+- Heartbeat framing whitespace is trimmed; message bytes inside that framing (including pipe spacing)
+  are preserved. A malformed timestamp remains stale. If an attention item cannot be dated from its
+  source, publication fails instead of inventing a timestamp or emitting an invalid schema-1 `since`.
+  Registered FIFO/symlink/nonregular log entries likewise fail that project; they are never followed or
+  allowed to block the reader. Missing/unreadable logs retain the specified unknown state.
+- `--stdout` also publishes, then prints that invocation's exact output inode, without reopening any
+  prior projection. `--all --stdout` emits one JSON line per successful project. Any failed project
+  makes the final exit code 2 while the other projects continue.
+- Directory/file ownership is provisioned; this command creates missing output directories with mode
+  0750 and publishes mode 0640. Existing root permissions are not repaired by the reader. The configured
+  root is refused if it resolves inside the current project's home. The units remain deployment text.
 
 ## 19. Not in V-1
 

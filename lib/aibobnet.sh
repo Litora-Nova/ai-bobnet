@@ -2622,6 +2622,22 @@ aib_event_scan() {
   _aib_event_scan_core "$path" 1 1
 }
 
+# Shared read-only attempt fold. No corruption policy here: callers decide
+# whether to report the scan or refuse. JSON includes each attempt's display state
+# and the durable open/ended facts separately (PID liveness is only a hint).
+aib_attempts_fold() {
+  local result header ids
+  command -v python3 >/dev/null 2>&1 || { printf 'ai-bobnet: attempt fold requires python3\n' >&2; return 6; }
+  result="$(python3 "${REPO_ROOT}/lib/attempts_fold.py" "$1")" || return $?
+  header="${result%%$'\n'*}"; result="${result#*$'\n'}"
+  ids="${result%%$'\n'*}"
+  AIB_ATTEMPTS_FOLD_IDS="${ids//$'\t'/$'\n'}"
+  IFS=$'\t' read -r AIB_ATTEMPTS_FOLD_STATUS AIB_EVENT_SCAN_HIGHEST_SEQ AIB_EVENT_SCAN_NEXT_SEQ AIB_EVENT_SCAN_TORN_TAIL <<< "$header"
+  AIB_EVENT_SCAN_STATUS="$AIB_ATTEMPTS_FOLD_STATUS"
+  AIB_ATTEMPTS_FOLD_JSON="${result#*$'\n'}"
+  printf '%s\n' "$AIB_ATTEMPTS_FOLD_JSON"
+}
+
 # --- record composer (identity fields injected by the broker only) -----------
 _aib_json_or_null() { [ -n "$1" ] && aib_json "$1" || printf 'null'; }
 _aib_event_compose_record() {
