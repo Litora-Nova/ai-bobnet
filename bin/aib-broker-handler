@@ -103,7 +103,9 @@ exec {_admission_fd}>>"$_attempts/attempts.lock" || _broker_store_error 'cannot 
 flock -x -w 10 "$_admission_fd" || _broker_store_error 'attempts lock timeout'
 _live=0
 for _lease in "$_attempts"/*; do
-  [ "$_lease" != "$_attempts/attempts.lock" ] || continue
+  # This directory can also be the stream directory for a project named
+  # attempts. Only validated agent-label + decimal-index names are leases.
+  [[ "${_lease##*/}" =~ ^[a-z0-9]+(-[a-z0-9]+)+\.[0-9]+$ ]] || continue
   [ -e "$_lease" ] || continue
   exec {_probe_fd}>>"$_lease" || _broker_store_error 'cannot open lease'
   flock -n -x "$_probe_fd"; _lease_rc=$?

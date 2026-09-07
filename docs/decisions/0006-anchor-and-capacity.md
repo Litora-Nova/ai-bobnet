@@ -385,7 +385,9 @@ ordering instead.
   storage/lock failures produce `event_store_unavailable`; the admission lock wait is bounded at
   10 seconds. Because admission precedes registry resolution, a missing event root now takes
   precedence over registry/cwd errors. Released lease names are reclaimed on the next admission
-  pass under the admission lock, rather than unlinked by an exit trap.
+  pass under the admission lock, rather than unlinked by an exit trap. Only filenames matching
+  a valid agent label plus a decimal index are leases. Other entries are preserved, including
+  streams for a project whose UID is `attempts`.
 - **Capability probe:** anchored commit entry creates a disposable file under `TMPDIR` (default
   `/tmp`), verifies that a nonexistent file argument fails, and that both `sync -d` and full `sync`
   succeed on the real probe. This also rejects implementations that silently ignore file arguments.

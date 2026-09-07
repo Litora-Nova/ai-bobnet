@@ -79,5 +79,46 @@ for cap in 0 -1 bad 01 999999999999999999999999; do
 done
 out=$(AIB_BROKER_MAX_CONNECTIONS=bad "$SRC_ROOT/bin/aib-broker-handler" </dev/null 2>"$WORK/err")
 check grep -qx 'reason=broker_misconfigured' <<<"$out"
+# A project named attempts can share this directory with the pool. Its stream
+# and anchor are never lease files and must survive admission's stale sweep.
+export AIB_EVENT_ROOT="$WORK/store" AIBOBNET_REGISTRY=/nonexistent
+mkdir -p "$AIB_EVENT_ROOT/attempts"
+printf 'preserve\n' > "$AIB_EVENT_ROOT/attempts/main.events"
+request() { printf 'op=launch\nagent_uid=acme-core\nprompt_bytes=2\n\nhi'; }
+handler() { request | "$SRC_ROOT/bin/aib-broker-handler"; }
+handler >"$WORK/out" 2>"$WORK/err"
+check test "$(cat "$AIB_EVENT_ROOT/attempts/main.events" 2>/dev/null)" = preserve
+# Operational admission failures must answer on the wire, before the registry.
+REAL_FLOCK=$(command -v flock); REAL_RM=$(command -v rm)
+export REAL_FLOCK REAL_RM
+cat > "$WORK/bin/flock" <<'STUB'
+#!/usr/bin/env bash
+case "$MODE:$*" in
+  lock:'-x -w 10 '*) exit 1;;
+  probe:'-n -x '*) exit 70;;
+  create:'-n -x '*) exit 1;;
+esac
+exec "$REAL_FLOCK" "$@"
+STUB
+cat > "$WORK/bin/rm" <<'STUB'
+#!/usr/bin/env bash
+[ "$MODE" != remove ] || exit 1
+exec "$REAL_RM" "$@"
+STUB
+chmod +x "$WORK/bin/flock" "$WORK/bin/rm"
+for MODE in root lockopen leaseopen lock probe create remove; do
+  export MODE
+  rm -rf "$AIB_EVENT_ROOT"
+  mkdir -p "$AIB_EVENT_ROOT/attempts"
+  case "$MODE" in
+    root) rm -rf "$AIB_EVENT_ROOT"; : > "$AIB_EVENT_ROOT";;
+    lockopen) mkdir "$AIB_EVENT_ROOT/attempts/attempts.lock";;
+    leaseopen) mkdir "$AIB_EVENT_ROOT/attempts/acme-core.0";;
+    probe|remove) : > "$AIB_EVENT_ROOT/attempts/acme-core.0";;
+  esac
+  PATH="$WORK/bin:$PATH" handler >"$WORK/out" 2>"$WORK/err"; rc=$?
+  check test "$rc" = 2
+  check grep -qx reason=event_store_unavailable "$WORK/out"
+done
 printf '\nbroker_anchor_fault_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
