@@ -34,18 +34,26 @@ def legacy_record(data):
     # scalar accessors of the old CLI rather than inventing a lossy JSON repair.
     script = r''' . "$1"
 IFS= read -r -d "" json || :
-for key in event_type attempt_id agent_uid occurred_at; do
-  printf '%s\0' "$(aib_event_field "$json" "$key")"
-done
-for key in decision pid exit.class exit.code; do
+kind=$(aib_event_field "$json" event_type)
+printf '%s\0' "$kind" "$(aib_event_field "$json" attempt_id)"
+case "$kind" in
+  attempt.decided) keys='decision pid';;
+  attempt.ended) keys='exit.class exit.code';;
+  *) keys='';;
+esac
+for key in $keys; do
   printf '%s\0' "$(aib_event_payload_field "$json" "$key")"
 done
 '''
     raw = subprocess.check_output(['bash', '-c', script, '_', str(Path(__file__).with_name('aibobnet.sh'))], input=data)
     values = [v.decode('utf-8', errors='surrogateescape') for v in raw.split(b'\0')[:-1]]
-    kind, ident, agent, occurred, decision, pid, exit_class, code = values
-    return dict(event_type=kind, attempt_id=ident, agent_uid=agent, occurred_at=occurred,
-                payload=dict(decision=decision, pid=pid, exit={'class':exit_class, 'code':code}))
+    kind, ident = values[:2]
+    payload = {}
+    if kind == 'attempt.decided':
+        payload = dict(decision=values[2], pid=values[3])
+    elif kind == 'attempt.ended':
+        payload = {'exit':{'class':values[2], 'code':values[3]}}
+    return dict(event_type=kind, attempt_id=ident, payload=payload)
 
 
 def fold_records(records, legacy=False):

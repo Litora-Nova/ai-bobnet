@@ -27,7 +27,7 @@ def fixture():
         (events/'acme/main.events').touch()
         registry={'schema_version':4,'providers':{'codex':{'adapter':'/bin/true','cap_sandbox':'workspace-write','cap_tier':'t3','cap_effort':'high','cap_timeout':'900'}},'projects':{'acme':{'home':str(home),'standup_dir':str(standup),'mux_session':'acme','provider':'codex','model':'m','effort':'low'}},'agents':{'acme-core':{'project':'acme','profile':'engine-dev','clearance':'t2'}}}
         reg=w/'registry.json';reg.write_text(json.dumps(registry))
-        env=dict(os.environ,AIBOBNET_REGISTRY=str(reg),AIB_EVENT_ROOT=str(events),AIB_PROJECTION_ROOT=str(w/'output'),TZ='UTC')
+        env=dict(os.environ,AIBOBNET_REGISTRY=str(reg),AIB_EVENT_ROOT=str(events),AIB_PROJECTION_ROOT=str(w/'output'),TZ='UTC',LC_ALL='C')
         yield w,standup,events,registry,env
 
 def project(env):
