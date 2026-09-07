@@ -119,7 +119,7 @@ done
 # Advisory count, sampled before allocating this connection's lease. Failure
 # cannot change admission: preserve the previous sample and journal the error.
 _live_tmp=$(mktemp "$_attempts/.live.XXXXXX")
-if [ -n "$_live_tmp" ] && printf '%s\n' "$_live" > "$_live_tmp" && chmod 0640 "$_live_tmp" && mv -f -- "$_live_tmp" "$_attempts/.live"; then
+if [ -n "$_live_tmp" ] && printf '%s\n' "$_live" > "$_live_tmp" && chmod 0640 "$_live_tmp" && mv -fT -- "$_live_tmp" "$_attempts/.live"; then
   :
 else
   [ -z "$_live_tmp" ] || rm -f -- "$_live_tmp"

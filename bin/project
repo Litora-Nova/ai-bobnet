@@ -187,7 +187,7 @@ for agent in roster:
             last=dict(attempt['last'], ended_at=iso(event_epoch(ended_at)) if ended_at else None))
     result['agents'][agent] = entry
     if entry['state'] == 'blocked' and entry['message'].startswith('needs:'):
-        match = re.match(r'needs:([^ ]+) ', entry['message'])
+        match = re.match(r'needs:([^ ]+) [^ ]', entry['message'])
         kind = match[1] if match and match[1] in ('human','t4','approval','conflict','input','other') else 'other'
         attention(kind,agent,entry['message'],entry['since'],False)
     for attempt in by_agent.get(agent, []):
@@ -229,10 +229,10 @@ PY
   temp=$(mktemp "$projection_root/.$uid.json.XXXXXX") || aib_die 2 "cannot create output temp for $uid"
   cat "$scratch/result" > "$temp" && chmod 0640 "$temp" || aib_die 2 'cannot prepare output'
   exec {output_fd}<"$temp" || aib_die 2 'cannot retain output inode'
-  mv -f -- "$temp" "$projection_root/$uid.json" || aib_die 2 "cannot publish $uid"
-  temp=''
   if [ "$stdout" -eq 1 ]; then cat <&"$output_fd" || aib_die 2 'cannot print output'; fi
   exec {output_fd}<&-
+  mv -fT -- "$temp" "$projection_root/$uid.json" || aib_die 2 "cannot publish $uid"
+  temp=''
 )
 rc=0
 if [ "$1" = --all ]; then

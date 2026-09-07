@@ -314,6 +314,7 @@ needs_case "input"     "needs:input the staging DB password"                inpu
 needs_case "other-explicit" "needs:other something not on the list"        other    "something not on the list"
 needs_case "unrecognized-kind" "needs:banana do the thing"                 other    "needs:banana do the thing"
 needs_case "malformed-no-space" "needs:justtext no space at all"           other    "needs:justtext no space at all"
+needs_case "malformed-double-space" "needs:human  two separators" other "needs:human  two separators"
 
 hb acme acme-core "" "11:30" blocked "stuck, no ceremony used"
 run_project acme
@@ -480,6 +481,29 @@ chmod 0750 "$PROJROOT" 2>/dev/null || true
 eq "a publish that cannot write reports failure" "$([ "$RUN_RC" -ne 0 ] && printf yes || printf no)" yes
 eq "the previous file is left byte-identical on a failed publish" "$(cksum "$OUT_ACME" 2>/dev/null)" "$baseline_sum"
 
+# stdout is the candidate bytes; a failed stdout write must precede publication.
+stdout_to() {
+  AIBOBNET_REGISTRY="$REG" AIB_PROJECTION_ROOT="$PROJROOT" AIB_EVENT_ROOT="$EVENTROOT" \
+    AIB_PROJECTION_DEAD_MINUTES="$DEAD_MIN" AIB_BROKER_CAPACITY="$CAP" TZ="$TZ_OVERRIDE" \
+    "$PROJECT_BIN" acme --stdout > "$1" 2>"$WORK/stdout-err"
+}
+stdout_to "$WORK/stdout-bytes"
+eq "--stdout succeeds" "$?" 0
+cmp -s "$OUT_ACME" "$WORK/stdout-bytes"
+eq "--stdout is byte-identical to the published file" "$?" 0
+before_stdout=$(cksum "$OUT_ACME")
+commit_decided acme acme-core "$$"
+stdout_to /dev/full
+eq "failed stdout is reported" "$?" 2
+eq "failed stdout preserves the previous publication" "$(cksum "$OUT_ACME")" "$before_stdout"
+
+# rename must reject a directory destination, never move the temp into it.
+mv "$OUT_ACME" "$WORK/output-saved"
+mkdir "$OUT_ACME"
+run_project acme
+eq "a directory at the output filename refuses publication" "$RUN_RC" 2
+eq "the destination directory receives no temporary child" "$(find "$OUT_ACME" -mindepth 1 -maxdepth 1 | wc -l)" 0
+rm -rf "$OUT_ACME"; mv "$WORK/output-saved" "$OUT_ACME"
 # A configured output root inside the project home must never receive writes.
 old_root="$PROJROOT"; PROJROOT="$WORK/acme/unsafe-output"
 run_project acme

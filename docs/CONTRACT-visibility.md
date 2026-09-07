@@ -514,12 +514,14 @@ Every field, documented:
   source, publication fails instead of inventing a timestamp or emitting an invalid schema-1 `since`.
   Registered FIFO/symlink/nonregular log entries likewise fail that project; they are never followed or
   allowed to block the reader. Missing/unreadable logs retain the specified unknown state.
-- `--stdout` also publishes, then prints that invocation's exact output inode, without reopening any
-  prior projection. `--all --stdout` emits one JSON line per successful project. Any failed project
+- `--stdout` prints that invocation's exact candidate bytes before publishing, without reopening any
+  prior projection. A stdout error therefore leaves the previous file untouched; consumers must check
+  the exit status because a later rename failure can still follow stdout output. `--all --stdout` emits one JSON line per successful project. Any failed project
   makes the final exit code 2 while the other projects continue.
 - Directory/file ownership is provisioned; this command creates missing output directories with mode
   0750 and publishes mode 0640. Existing root permissions are not repaired by the reader. The configured
-  root is refused if it resolves inside the current project's home. The units remain deployment text.
+  root is refused if it resolves inside the current project's home. GNU `mv -T` makes a directory
+  at the destination an error, never a container for the temporary file. The units remain deployment text.
 
 ## 19. Not in V-1
 

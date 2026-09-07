@@ -32,5 +32,11 @@ PATH="$WORK/bin:$PATH" request >"$WORK/out"
 check grep -qx reason=registry_unavailable "$WORK/out"
 check test "$(cat "$AIB_EVENT_ROOT/attempts/.live" 2>/dev/null)" = 1
 check grep -q 'cannot publish admission live count' "$WORK/err"
+rm "$AIB_EVENT_ROOT/attempts/.live"
+mkdir "$AIB_EVENT_ROOT/attempts/.live"
+request >"$WORK/out"
+check grep -qx reason=registry_unavailable "$WORK/out"
+check grep -q 'cannot publish admission live count' "$WORK/err"
+check test -z "$(ls -A "$AIB_EVENT_ROOT/attempts/.live")"
 printf '\nbroker_live_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
