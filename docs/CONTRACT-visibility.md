@@ -261,6 +261,16 @@ in `standup_dir` with no matching registry entry is **never** projected as an ag
 can therefore never become a JSON object key: it never reaches key position in the first place,
 because the key set comes from the registry, not from a directory listing.
 
+**`agents[uid].state`, `.since`, `.message`, and `.stale` are derived from that agent's own most
+recent heartbeat line only** — this contract's own resolution of a gap the design note left implicit.
+A heartbeat log is an append-only history; the projection is a snapshot of *current* state, and every
+one of those fields is singular per agent. An agent that was `blocked` five minutes ago and is now
+`busy` is no longer waiting on anything, and must not still show as `blocked`. The same rule governs
+§7: a `needs:` attention item is derived only from an agent's **current** (last) line when that line's
+status is `blocked` — a resolved block that scrolled into history produces no attention item, exactly
+mirroring how "presumed-dead" and "disagreement" (§8) are themselves current-state computations, never
+a scan of full history.
+
 **Heartbeat parsing reproduces `claude-bobnet/dashboard/server/utils/beats.mjs` exactly** — this is
 the concrete fix for the two-parsers-of-one-file risk named in `docs/DOMAIN.md`'s framing of this
 projection:
