@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix='aib-visibility-mutants.') as tmp:
     for folder in ('bin','lib','tests'):
         shutil.copytree(root/folder,tree/folder,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
     baseline=subprocess.run(['bash',str(tree/'tests/visibility_delta_spec.sh')],capture_output=True,text=True,timeout=90)
-    check('clean delta acceptance is green',baseline.returncode==0 and '32 passed, 0 failed' in baseline.stdout)
+    check('clean delta acceptance is green',baseline.returncode==0 and '34 passed, 0 failed' in baseline.stdout)
     if baseline.returncode:print(baseline.stdout,baseline.stderr)
     for name,case,file,old,new,label in mutants:
         path=tree/file;original=path.read_text();count=original.count(old)

@@ -156,6 +156,14 @@ def records():
         rc,out,err=run([str(root/'bin/attempts'),'acme-core'],env)
         expected=b'stream_status:ok | integrity:ok | highest_seq:2 | next_seq:3 | uncommitted_tail:0\n'+b''.join(('attempt_id:acme-main-'+str(n)+' | state:presumed-dead | decision:allow | pid:99999999 | exit_code:null\n').encode() for n in (1,2))
         check('legacy attempts bad-byte fixture retains exact stdout/stderr and exit',rc==0 and out==expected and err==b'')
+        # A decode failure must remain a record anomaly even when JSON's token
+        # parser cannot consume the surrogate representation of the bad byte.
+        bad_token=record(1).replace(b'"payload":{',b'"note":\xff,"payload":{')
+        (e/'acme/main.events').write_bytes(frame(1,bad_token)+frame(2,record(2)))
+        rc,data,_=project(env)
+        check('undecodable token cannot corrupt the frame-level stream status',rc==0 and data['stream']['status']=='ok' and data['stream']['undecodable_records']==[1])
+        rc,out,err=run([str(root/'bin/attempts'),'acme-core'],env)
+        check('legacy scalar extraction survives undecodable non-string token',rc==0 and out==expected and err==b'')
         for raw,reason in [(b'broken\n',b'event stream is corrupt (unparsable framed record near offset 0) \xe2\x80\x94 refusing partial attempt fold'),(frame(1,record(1,0)),b"attempt 'acme-main-1' has non-positive pid '0'")]:
             (e/'acme/main.events').write_bytes(raw)
             rc,out,err=run([str(root/'bin/attempts'),'acme-core'],env)
