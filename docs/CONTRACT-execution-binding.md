@@ -489,5 +489,39 @@ deployment uids (`*_source`) by design. Redact before publishing launcher output
 public artifact. `requested` is a frozen `null` schema slot for provider/model/effort (no direct CLI request
 exists today), reserved additively — distinct from a `null` `effective` on a deny.
 
+### 8.8 RM-3 slice 5 — `high_water` anchor, in-process path (ADR-0006)
+
+§8.3 named whole-suffix/whole-file replacement as **not detectable without an external cursor** and
+deferred that cursor to RM-3, where a broker owns it in a different trust domain. ADR-0006 builds that
+cursor — `CONTRACT-mediation.md` §5/§5.1's `high_water` anchor — and gives `aib_event_commit` a 7th,
+optional positional argument, `anchor_mode`: the literal value `anchor` maintains the anchor for that
+commit call (location `<events_path>.high_water`, derived from the stream path handed to the function,
+never a fixed name); any other value, including absent, commits exactly as before this slice, no
+anchor file touched.
+
+**The broker's commit path (`bin/aib-broker-handler`) always passes `anchor`.** Its stream lives under
+`AIB_EVENT_ROOT` (§8.2's location clause, as amended by ADR-0005) — broker-owned state, outside every
+project `home`, never git-tracked — so nothing about that deployment's threat model changes by
+anchoring unconditionally.
+
+**This wrapper's in-process path does not anchor by default.** `bin/launch-agent`'s stream stays at
+`<standup_dir>/events` exactly as §8.2 already specifies; in a fleet where `standup_dir` is a
+git-tracked directory, an unconditionally-active anchor is not a self-check but an outage generator —
+an ordinary `git clean`, stash, branch switch, or restore shortens or replaces `main.events`, the
+anchor then reports the stream truncated, and every subsequent launch in that project fails closed
+permanently, with no repair path in this contract's ordering. Setting `AIBOBNET_EVENT_ANCHOR=1` in the
+wrapper's own process environment opts a specific deployment in — one that keeps its stream out of
+version control, or otherwise accepts the risk — by making `bin/launch-agent` pass `anchor` on its own
+`aib_event_commit` calls. Unset, the wrapper's behavior is byte-for-byte what §8 already specified
+before this slice.
+
+**Repair is a human act, never automatic.** `bin/anchor <events_path> {status|reanchor
+[--accept-truncation]}` is the only sanctioned way to recover an anchored stream whose anchor now
+disagrees with the stream — `status` reports the discrepancy without mutating either file;
+`reanchor` requires the operator to pass `--accept-truncation` explicitly, takes the stream's own
+lock, journals the operator's identity and both anchor values, and touches only the anchor file, never
+the stream. `aib_event_commit` never calls it and no other code path may — an automatic repair is, by
+definition, the same as having no anchor at all.
+
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts.

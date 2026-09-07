@@ -322,6 +322,23 @@ Wire-level errors (malformed request, registry unavailable, registry misconfigur
 slice-1/2 shape unchanged — a flat set of `reason=`/`detail=` lines and `end=error`, with no prologue
 and no `decided_event_id`, because no verdict was ever reached.
 
+**`reason=over_capacity` (RM-3 slice 5) is one of these wire-level errors, not a sibling of the Deny
+shape above.** ADR-0006 adds a capacity ceiling, shared by every agent within one project, checked
+before the registry is ever read for a connection. Over capacity, the response is:
+
+```
+reason=over_capacity
+end=error
+```
+
+No `decision=`, no `code=`, no `decided_event_id` — exactly like every other wire-level error above,
+because admission runs before authorization and no verdict was ever reached; `commit(attempt.decided)`
+never happens, so there is nothing for `decided_event_id` to name. This is deliberately **not** the
+same class as a PDP deny: it costs the broker one lease-directory lock and a `flock -n` scan, never a
+registry read, a PDP call, or the stream lock (ADR-0006, part B) — the same cheap-refusal property the
+`MaxConnections` socket-level drop already has one layer up, now answered honestly on the wire instead
+of a silent close.
+
 ### Detecting a disconnected client while the provider is silent
 
 The broker side of this is a `poll(2)`-based liveness probe (`_aib_enact_conn_alive`,
@@ -351,6 +368,12 @@ when the socket accepted and then closed it — spike 1.4's measured behaviour, 
 the wire from a crash. A client MUST treat "closed without `end=`" as a hard failure in both cases; it
 is not entitled to assume success from an empty or partial reply, and this document does not obligate
 the broker to make the two causes distinguishable at the wire in this slice.
+
+`reason=over_capacity` (above) is **not** a third cause here and stays out of this rule. It is one
+layer below `MaxConnections`: the connection was accepted by the socket and served by a handler
+instance, which answers with an ordinary, complete `end=error` frame. A client that reaches
+`over_capacity` therefore already knows exactly what happened; `MaxConnections` remains the only
+capacity-related path that produces no terminal line at all.
 
 ## What this specification deliberately does not decide
 
