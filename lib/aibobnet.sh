@@ -2108,9 +2108,14 @@ aib_enact_launch__run_confined() {
   # close (or a shutdown of the peer's WRITE half, which is the shape an
   # abandoned response actually takes in practice) is detected within one
   # idle tick, as tested below.
+  _aib_enact_exec_without_lease() (
+    if [ -n "${AIB_BROKER_LEASE_FD:-}" ]; then exec {AIB_BROKER_LEASE_FD}>&-; fi
+    exec "$@"
+  )
+
   _aib_enact_conn_alive() {
     [ -n "$_python_bin" ] || return 0
-    "$_python_bin" -c '
+    _aib_enact_exec_without_lease "$_python_bin" -c '
 import select, sys
 try:
     p = select.poll()
@@ -2196,7 +2201,7 @@ sys.exit(0)
     # `timeout` with the writer long gone). Redirecting the ALREADY-OPEN fd
     # onto dd's stdin is a plain fd inheritance, not a fresh open, and sees
     # EOF exactly when the writer closes, as it must.
-    "$_timeout_bin" 0.3 "$_dd_bin" of="$_chunk_tmp" bs=65536 count=1 status=none 2>/dev/null <&"$_relay_fd"
+    _aib_enact_exec_without_lease "$_timeout_bin" 0.3 "$_dd_bin" of="$_chunk_tmp" bs=65536 count=1 status=none 2>/dev/null <&"$_relay_fd"
     local _dd_rc=$? _n
     _n="$("$_wc_bin" -c < "$_chunk_tmp")"
     if [ "$_dd_rc" -eq 124 ]; then
@@ -2213,7 +2218,7 @@ sys.exit(0)
     if [ "$_n" -eq 0 ]; then
       break # true EOF: the provider's output side closed.
     fi
-    if ! { printf 'chunk_bytes=%s\n\n' "$_n" && "$_cat_bin" "$_chunk_tmp"; } 2>/dev/null; then
+    if ! { printf 'chunk_bytes=%s\n\n' "$_n" && _aib_enact_exec_without_lease "$_cat_bin" "$_chunk_tmp"; } 2>/dev/null; then
       _disconnected=1
       kill -USR2 "$_provider_manager_pid" 2>/dev/null || true
       break
@@ -2776,6 +2781,11 @@ aib_event_commit() {
       corrupt) aib_die 2 "corrupt or empty anchor: ${events_path}.high_water";;
       absent|lag)
         printf 'ai-bobnet: anchor %s: %s -> %s: %s\n' "$AIB_ANCHOR_STATE" "$AIB_ANCHOR_VALUE" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$events_path" >&2
+        # A complete scanned append can still be only in page cache after a
+        # process crash. Make that prefix durable before publishing its anchor.
+        if [ -e "$events_path" ]; then
+          sync -d -- "$events_path" || aib_die 2 "cannot sync event stream before anchor catch-up: $events_path"
+        fi
         _aib_anchor_write "${events_path}.high_water" "$AIB_EVENT_SCAN_HIGHEST_SEQ"
         ;;
     esac

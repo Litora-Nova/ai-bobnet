@@ -24,6 +24,9 @@ if [ "$action" = status ]; then
   [ "$AIB_EVENT_SCAN_STATUS" != corrupt ] || exit 2
 else
   [ "$AIB_EVENT_SCAN_STATUS" != corrupt ] || aib_die 2 "cannot reanchor corrupt stream: $AIB_EVENT_SCAN_CORRUPT_REASON"
+  if [ -e "$stream" ]; then
+    sync -d -- "$stream" || aib_die 2 "cannot sync stream before reanchor: $stream"
+  fi
   _aib_anchor_write "${stream}.high_water" "$AIB_EVENT_SCAN_HIGHEST_SEQ"
   printf 'ai-bobnet: reanchor operator=%s old=%s new=%s stream=%s\n' \
     "${USER:-unknown}" "$AIB_ANCHOR_VALUE" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$stream" >&2

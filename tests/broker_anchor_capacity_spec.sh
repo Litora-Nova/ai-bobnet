@@ -697,5 +697,50 @@ eq "cross-project saturation exits 2" "$global_rc" 2
 has "cross-project saturation precedes registry resolution" "$resp_global" 'reason=over_capacity'
 release_lease "$holder_global"
 
+# Hold a real handler in its provider, proving that it allocates and retains a
+# lease itself (synthetic pre-held lease fixtures alone cannot prove allocation).
+reset_capacity
+cat > "$ADAPTER" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *hold-lease*)
+    printf '%s\n' "\$BASHPID" > "$WORK/live-provider-pid"
+    while [ ! -e "$WORK/release-provider" ]; do sleep 0.05; done;;
+  *) printf 'released\n';;
+esac
+STUB
+frame "$FIXTURE_WS" cap-test hold-lease op=launch agent_uid=acme-core > "$WORK/live-frame"
+AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_EVENT_ROOT="$EVENT_ROOT" AIB_BROKER_CAPACITY=1 \
+  AIB_CONFINE_BIN="$LANDLOCK_STUB" "$SRC_ROOT/bin/aib-broker-handler" \
+  < "$WORK/live-frame" > "$WORK/live-out" 2> "$WORK/live-err" &
+live_handler=$!
+for ((i=0; i<200; i++)); do [ ! -s "$WORK/live-provider-pid" ] || break; sleep 0.05; done
+if [ -s "$WORK/live-provider-pid" ]; then
+  ok "the real handler reaches its held provider"
+  if [ -e "$ATTEMPTS_DIR/acme-core.0" ]; then ok "real admission allocates the smallest free index"
+  else no "real admission allocates the smallest free index"; fi
+  ( exec 8>>"$ATTEMPTS_DIR/acme-core.0"; flock -n 8 )
+  eq "the real handler retains its exclusive lease during enactment" "$?" 1
+  live_resp="$(frame "$FIXTURE_WS" cap-test hi op=launch agent_uid=acme-core \
+    | AIBOBNET_REGISTRY=/nonexistent AIB_EVENT_ROOT="$EVENT_ROOT" AIB_BROKER_CAPACITY=1 \
+      "$SRC_ROOT/bin/aib-broker-handler" 2>"$WORK/live-second-err")"
+  has "a live handler exhausts capacity before the next registry read" "$live_resp" reason=over_capacity
+  kill -KILL "$live_handler"
+  wait "$live_handler" 2>/dev/null || true
+  live_resp="$(frame "$FIXTURE_WS" cap-test hi op=launch agent_uid=acme-core \
+    | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_EVENT_ROOT="$EVENT_ROOT" AIB_BROKER_CAPACITY=1 \
+      AIB_CONFINE_BIN="$LANDLOCK_STUB" "$SRC_ROOT/bin/aib-broker-handler" 2>"$WORK/live-third-err")"
+  has "SIGKILL of the handler frees capacity despite its surviving manager/provider" "$live_resp" end=ok
+  has "the replacement handler really enacts" "$live_resp" enacted=yes
+  : > "$WORK/release-provider"
+  live_provider=$(cat "$WORK/live-provider-pid")
+  for ((i=0; i<100; i++)); do kill -0 "$live_provider" 2>/dev/null || break; sleep 0.05; done
+  kill -TERM -- "-$live_provider" 2>/dev/null || true
+else
+  no "the real handler reaches its held provider"
+  kill -TERM "$live_handler" 2>/dev/null || true
+  wait "$live_handler" 2>/dev/null || true
+fi
+
 printf '\nbroker_anchor_capacity_spec: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

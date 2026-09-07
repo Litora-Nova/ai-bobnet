@@ -96,6 +96,12 @@ it to this signature, not a different one, because the spec below asserts agains
    `-d`) on that temp file**, `rename(2)` over `<events_path>.high_water`
 6. `sync <dir>` — directory fsync, so the rename itself survives a crash
 
+When adopting an absent anchor or catching up a lag, the scanned stream prefix is also
+`sync -d`'d before writing the anchor at `m`. A process crash can leave a complete append in page
+cache before its stream fsync; publishing a durable anchor first would turn a subsequent host
+crash into an artificial ahead-anchor incident. Explicit `reanchor` performs the same prefix sync
+before replacing the anchor; it never rewrites or truncates stream bytes.
+
 Step 5 uses a full fsync, not `fdatasync`, because the anchor file is freshly created on first write
 (and on every reanchor): for a brand-new inode the conventional and safe shape is
 fsync(temp) → rename → fsync(dir), not `fdatasync`, which only guarantees the data of an *existing*
@@ -238,7 +244,9 @@ honest or not, draws from the same shared budget it would consume anyway.
   descriptor except 0/1/2/9 — the lease fd, whatever number it lands on, is closed by that existing
   loop. The child also explicitly closes the named lease fd; the confined manager closes
   its inherited copy before spawning any long-lived children, so it cannot keep a dead
-  connection admitted. Any enactment path that lacks that loop would hand the provider a
+  connection admitted. The relay's timeout/dd, output cat, and liveness probe also explicitly
+  close their inherited lease before exec: these commands can block on a provider or connection
+  independently of the handler's own lifetime. Any enactment path that lacks that loop would hand the provider a
   writable descriptor into broker-owned state, the exact capability crossing slices 3–4 exist to close,
   and a leaked fd would also pin the lease for the lifetime of any descendant that inherited it — this
   is stated as a hard requirement on any future enactment path, not merely a nicety of the existing one.

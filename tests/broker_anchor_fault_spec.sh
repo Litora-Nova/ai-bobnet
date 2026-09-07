@@ -52,6 +52,23 @@ for FAULT in stream temp rename dir; do
   ( PATH="$WORK/bin:$PATH" commit ) >"$WORK/out" 2>"$WORK/err"; check test "$?" -ne 0
   if [ "$FAULT" != dir ]; then check test "$(cat "$EVENTS.high_water")" = 1; fi
 done
+# Catch-up must make the scanned prefix durable before publishing its anchor.
+# A process crash may leave a complete append in cache before its stream fsync.
+for state in lag absent; do
+  printf '%s\n' "$original" > "$EVENTS"
+  if [ "$state" = lag ]; then printf '0\n' > "$EVENTS.high_water"; else rm -f "$EVENTS.high_water"; fi
+  ( FAULT=stream PATH="$WORK/bin:$PATH" commit ) >"$WORK/out" 2>"$WORK/err"; rc=$?
+  check test "$rc" -ne 0
+  check test "$(cat "$EVENTS")" = "$original"
+  if [ "$state" = lag ]; then check test "$(cat "$EVENTS.high_water")" = 0
+  else check test ! -e "$EVENTS.high_water"; fi
+done
+printf '%s\n' "$original" > "$EVENTS"
+printf '99\n' > "$EVENTS.high_water"
+FAULT=stream PATH="$WORK/bin:$PATH" "$SRC_ROOT/bin/anchor" "$EVENTS" reanchor --accept-truncation >"$WORK/out" 2>"$WORK/err"
+check test "$?" -ne 0
+check test "$(cat "$EVENTS.high_water")" = 99
+
 # Successful ordering excludes capability probes and requires full temp fsync.
 printf '%s\n' "$original" > "$EVENTS"
 printf '1\n' > "$EVENTS.high_water"
