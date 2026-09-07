@@ -64,11 +64,10 @@ with tempfile.TemporaryDirectory() as tmp:
     path.write_bytes(b'broken\n')
     got=shared(path)
     check('corruption reason is canonical',got['reason']=='unparsable framed record near offset 0')
-    # Poison the scanner response: the wrapper must consume the canonical scan,
-    # rather than opening the raw source independently in a second authority.
-    cmd='. "$1/lib/aibobnet.sh"; REPO_ROOT="$1"; aib_event_scan() { AIB_EVENT_SCAN_STATUS=corrupt; AIB_EVENT_SCAN_HIGHEST_SEQ=0; AIB_EVENT_SCAN_NEXT_SEQ=1; AIB_EVENT_SCAN_TORN_TAIL=0; AIB_EVENT_SCAN_CORRUPT_REASON="scanner canary"; }; aib_attempts_fold "$2"'
-    got=json.loads(subprocess.check_output(['bash','-c',cmd,'_',str(root),str(path)]))
-    check('Bash scanner is the only frame authority',got['reason']=='scanner canary')
+    # The reference scanner verifies the reader in tests, never on each tick.
+    cmd='. "$1/lib/aibobnet.sh"; REPO_ROOT="$1"; aib_event_scan() { return 97; }; aib_attempts_fold "$2"'
+    result=subprocess.run(['bash','-c',cmd,'_',str(root),str(path)],capture_output=True)
+    check('reader runtime never invokes the Bash reference scan',result.returncode==0 and json.loads(result.stdout)['reason']=='unparsable framed record near offset 0')
 for fake,expected in [("printf 'ok\\n'",2),("return 9",9)]:
     cmd='. "$1/lib/aibobnet.sh"; REPO_ROOT="$1"; python3() { '+fake+'; }; aib_attempts_fold /nonexistent'
     result=subprocess.run(['bash','-c',cmd,'_',str(root)],capture_output=True)
