@@ -1,0 +1,19 @@
+[Unit]
+Description=BobNet visibility projection timer
+Documentation=file:/opt/aib/engine/docs/CONTRACT-visibility.md
+
+[Timer]
+# docs/CONTRACT-visibility.md SS16: a timer, not a handler-triggered nudge -
+# most of what the projection reports (staleness, presumed-dead, "blocked
+# since") is time-derived, and a commit-triggered refresh would be freshest
+# during launches and stalest exactly when an operator most wants to look
+# (an idle or blocked fleet). AIB_PROJECTION_INTERVAL in
+# aib-projection.service documents the same cadence; keep both in sync by
+# hand if either changes - this file is the one systemd actually reads.
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=aib-projection.service
+
+[Install]
+WantedBy=timers.target

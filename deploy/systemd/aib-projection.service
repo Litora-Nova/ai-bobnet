@@ -1,0 +1,62 @@
+[Unit]
+Description=BobNet visibility projection - one pass over every registered project
+Documentation=file:/opt/aib/engine/docs/CONTRACT-visibility.md
+Documentation=file:/opt/aib/engine/docs/decisions/0007-visibility-projection.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/aib/engine/bin/project --all
+User=aib-broker
+Group=aib-broker
+
+# Unit-environment-only, per docs/CONTRACT-visibility.md and ADR-0007 - never
+# request- or registry-supplied, the same restriction AIB_EVENT_ROOT and
+# AIB_CONFINE_BIN already carry (docs/CONFINEMENT.md, ADR-0005). Default under
+# /var/lib/aib/ if omitted here, but this deployment states it explicitly.
+Environment=AIB_PROJECTION_ROOT=/var/lib/aib/projection
+# Read-only consumer of the broker's own state - never a second write path.
+Environment=AIB_EVENT_ROOT=/var/lib/aib/events
+Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
+
+# Presumed-dead threshold (docs/CONTRACT-visibility.md SS8), minutes.
+Environment=AIB_PROJECTION_DEAD_MINUTES=15
+
+# Mirrors aib-broker@.service's AIB_BROKER_CAPACITY so capacity.limit can be
+# reported without reading the broker's own process or a shared file
+# (docs/CONTRACT-visibility.md SS10). DRIFT RISK, accepted (ADR-0006's
+# AIB_BROKER_MAX_CONNECTIONS precedent, ADR-0007): nothing enforces agreement
+# between this value and aib-broker@.service's own AIB_BROKER_CAPACITY line -
+# two separate files, hand-edited independently. Keep them in sync BY HAND.
+Environment=AIB_BROKER_CAPACITY=12
+
+# Heartbeat lines carry local wall time with no UTC offset in the line itself
+# (scripts/log.sh). This unit MUST set the identical zone
+# claude-bobnet/dashboard reads via DEV_TEAM_TZ, or every heartbeat is
+# misread by the UTC offset (docs/CONTRACT-visibility.md SS9). Replace with
+# the fleet's actual DEV_TEAM_TZ value - this is not a safe default to leave
+# unedited.
+Environment=TZ=Europe/Berlin
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+# The projector parses hostile agent-written heartbeat text under the broker
+# account; it must never be able to reach the credential directory the
+# confined provider child's adapter reads from (docs/CONFINEMENT.md,
+# docs/CONTRACT-visibility.md SS14).
+InaccessiblePaths=/var/lib/aib/auth
+ReadOnlyPaths=/var/lib/aib/events
+ReadWritePaths=/var/lib/aib/projection
+
+# Site drop-ins: if the registry file or its project home/standup_dir paths
+# live outside /opt/aib and /var/lib/aib, add a ReadOnlyPaths= drop-in the
+# same way aib-broker@.service.d/site.conf.example does for ReadWritePaths -
+# this unit never writes into a project home or standup_dir.

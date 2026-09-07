@@ -2622,6 +2622,34 @@ aib_event_scan() {
   _aib_event_scan_core "$path" 1 1
 }
 
+# Shared read-only attempt fold. No corruption policy here: callers decide
+# whether to report the scan or refuse. JSON includes each attempt's display state
+# and the durable open/ended facts separately (PID liveness is only a hint).
+aib_attempts_fold() {
+  local header scratch rc=0
+  local -a lines=()
+  command -v python3 >/dev/null 2>&1 || { printf 'ai-bobnet: attempt fold requires python3\n' >&2; return 6; }
+  scratch=$(mktemp "${TMPDIR:-/tmp}/aib-fold.XXXXXX") || return 2
+  # The fast reader is verified against aib_event_scan in the permanent corpus.
+  # No whole-stream Bash scan runs on a projection tick. A regular file keeps
+  # the shell handoff buffered even for large folded output.
+  if python3 -I "${REPO_ROOT}/lib/attempts_fold.py" "$1" > "$scratch"; then
+    mapfile -t lines < "$scratch" || rc=$?
+  else rc=$?; fi
+  rm -f -- "$scratch" || rc=2
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ "${#lines[@]}" -ge 4 ] || { printf 'ai-bobnet: incomplete fold response\n' >&2; return 2; }
+  header="${lines[0]}"
+  AIB_ATTEMPTS_FOLD_IDS=""
+  if [ "${#lines[@]}" -gt 4 ]; then printf -v AIB_ATTEMPTS_FOLD_IDS '%s\n' "${lines[@]:4}"; fi
+  IFS=$'\t' read -r AIB_ATTEMPTS_FOLD_STATUS AIB_EVENT_SCAN_HIGHEST_SEQ AIB_EVENT_SCAN_NEXT_SEQ \
+    AIB_EVENT_SCAN_TORN_TAIL AIB_EVENT_SCAN_STATUS AIB_EVENT_SCAN_TRUNCATE_AT <<< "$header"
+  AIB_ATTEMPTS_FOLD_REASON="${lines[1]}"
+  AIB_EVENT_SCAN_CORRUPT_REASON="${lines[2]}"
+  AIB_ATTEMPTS_FOLD_JSON="${lines[3]}"
+  printf '%s\n' "$AIB_ATTEMPTS_FOLD_JSON"
+}
+
 # --- record composer (identity fields injected by the broker only) -----------
 _aib_json_or_null() { [ -n "$1" ] && aib_json "$1" || printf 'null'; }
 _aib_event_compose_record() {

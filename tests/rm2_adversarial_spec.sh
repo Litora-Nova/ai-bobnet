@@ -186,16 +186,17 @@ has "utf8-above-max-accepted stays boundary-scoped (surrogate still rejected)" "
 # Part 2 — cross-stack invariants (each references a named sister assertion)
 # ===========================================================================
 
-# Reader corrupt-gate: without it the fold folds a valid prefix out of a corrupt stream
-# instead of failing closed — a partial-audit leak. (attempts_spec)
+# Reader corrupt-gate: the shared fold now withholds corrupt-prefix attempts.
+# The CLI must still refuse the reported corruption, not print a success-shaped
+# stream header. The caller owns that policy. (attempts_spec)
 M3="$(make_mutant reader-corrupt-gate-removed)"
 replace_exact "$M3/bin/attempts" \
-  'if [ "$AIB_EVENT_SCAN_STATUS" = corrupt ]; then' \
+  'if [ "$AIB_ATTEMPTS_FOLD_STATUS" = corrupt ]; then' \
   'if false; then'
 record_mutation "reader-corrupt-gate-removed" "$?"
 expect_targeted_failure "reader-corrupt-gate-removed" \
   "$M3/tests/attempts_spec.sh" \
-  "corrupt refusal never leaks the valid prefix attempt" \
+  "corrupt stream is refused fail-closed" \
   "$WORK/reader-corrupt-gate-removed.out"
 
 # PEP signal honesty: the handler must commit the child's CONFIRMED status, never forge

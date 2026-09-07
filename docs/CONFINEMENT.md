@@ -18,7 +18,11 @@ before `exec`**, with two properties: the restriction is installed before the fo
 the restricted process cannot revoke it.
 
 **Minimum:** no write access to the event stream, the high-water anchor, the registry, the adapter
-map or the installed engine. Read access to the credential directory only as far as the adapter needs.
+map, the installed engine, or **the visibility projection root** (`AIB_PROJECTION_ROOT`,
+`docs/CONTRACT-visibility.md` §14, `docs/decisions/0007-visibility-projection.md`) — a broker-produced,
+broker-attested artifact, added to this minimum for the same reason the event stream and the anchor are
+here: a confined child's `LL_RW` over a project `home` must never also reach a broker-owned attestation
+sitting outside that `home`. Read access to the credential directory only as far as the adapter needs.
 
 ## Primary path — Landlock
 
@@ -218,7 +222,9 @@ A broker unit missing any of these fails every anchored commit closed with exit 
 `docs/CONTRACT-execution-binding.md` §8.4 already documents for the launcher's other runtime
 dependencies, extended to anchored writes in this slice.
 
-**`python3` is the one optional runtime dependency**, and it runs in the unconfined broker/manager
+**`python3` is the one optional runtime dependency in the enactment path**; the readers
+`bin/attempts` and `bin/project` require Python 3.9+ (see the reader runtime requirements below).
+In enactment it runs in the unconfined broker/manager
 process, never inside the sandboxed child or the Landlock helper. It sharpens disconnect detection
 (the `poll(2)`-based liveness probe — see SPEC-wire-format.md, "Detecting a disconnected client
 while the provider is silent") from "next real write" latency down to one idle tick. When it is
@@ -297,3 +303,14 @@ Keep the base unit's existing write paths (do not reset the directive with an em
 assignment). The directories must also have ownership and permissions allowing the
 broker's required writes; `ReadWritePaths` does not grant filesystem permissions.
 The `.example` suffix prevents the sample from being applied before site configuration.
+
+## Read-only visibility commands
+
+`bin/project` and `bin/attempts` require Python 3.9+ (standard library only; `zoneinfo` uses the
+host timezone database), plus the existing Bash/awk registry reader. Python runs in isolated mode
+(`-I`), ignoring ambient Python import paths and the current working directory. Projection strings, including
+messages, pass through `aib_json` in one batched shell encoder invocation. The projector uses
+GNU coreutils `realpath`, `mktemp`, `mkdir`, `cat`, `chmod`, `mv` (with `-T`), and `rm` for path checking and atomic
+publication; it never invokes `flock` or opens an admission lease. Python remains optional for the
+broker's connection-liveness probe; neither admission nor event commits acquire a Python dependency.
+Output ownership (`aib-broker:aib-shared`) belongs to provisioning, not the reader.

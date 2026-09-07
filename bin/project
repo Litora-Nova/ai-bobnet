@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# Disposable visibility snapshot. The broker never consumes this output.
+set -uo pipefail
+REPO_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$REPO_ROOT/lib/aibobnet.sh"
+usage='usage: project <project_uid>|--all [--stdout]'
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || aib_die 64 "$usage"
+[ "$#" -ne 2 ] || [ "$2" = --stdout ] || aib_die 64 "$usage"
+stdout=0; [ "${2:-}" != --stdout ] || stdout=1
+command -v python3 >/dev/null || aib_die 6 'project requires python3 (3.9+)'
+: "${AIB_EVENT_ROOT:?AIB_EVENT_ROOT must name the broker event root}"
+projection_root="${AIB_PROJECTION_ROOT:-/var/lib/aib/projection}"
+dead_minutes="${AIB_PROJECTION_DEAD_MINUTES:-15}"
+capacity="${AIB_BROKER_CAPACITY:-12}"
+[[ "$dead_minutes" =~ ^[1-9][0-9]{0,8}$ ]] || aib_die 64 'invalid AIB_PROJECTION_DEAD_MINUTES'
+[[ "$capacity" =~ ^[1-9][0-9]{0,8}$ ]] || aib_die 64 'invalid AIB_BROKER_CAPACITY'
+_aib_load_registry_snapshot
+_aib_check_registry_snapshot
+projects="$(_aib_snapshot_query projects keys)" || aib_die 2 'cannot list projects'
+agents="$(_aib_snapshot_query agents keys)" || aib_die 2 'cannot list agents'
+
+# One output root serves the fleet; it must be outside every registered home,
+# including homes belonging to projects other than the one requested here.
+physical_root=$(realpath -m -- "$projection_root") || aib_die 2 'cannot resolve output root'
+while IFS= read -r protected_uid; do
+  [ -n "$protected_uid" ] || continue
+  project_home="$(_aib_snapshot_query projects field "$protected_uid" home)" || continue
+  case "$project_home" in /*) ;; *) continue;; esac
+  protected_home=$(realpath -m -- "$project_home") || aib_die 2 'cannot resolve protected home'
+  case "$physical_root/" in "$protected_home/"*) aib_die 2 'output root must be outside every registered project home';; esac
+done <<< "$projects"
+
+_project_one() (
+  local uid="$1" standup home agent owner scratch='' temp='' output_fd
+  aib_validate_token "$uid" project_uid
+  standup="$(_aib_snapshot_query projects field "$uid" standup_dir)" || aib_die 2 "cannot resolve standup_dir for $uid"
+  home="$(_aib_snapshot_query projects field "$uid" home)" || aib_die 2 "cannot resolve home for $uid"
+  [ -d "$standup" ] && [ -r "$standup" ] && [ -x "$standup" ] || aib_die 2 "standup_dir unavailable for $uid"
+  [ -d "$home" ] || aib_die 2 "home unavailable for $uid"
+  trap 'rm -rf -- "$scratch"; [ -z "$temp" ] || rm -f -- "$temp"' EXIT
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/aib-project.XXXXXX") || aib_die 2 'cannot create reader scratch directory'
+  : > "$scratch/agents"
+  while IFS= read -r agent; do
+    [ -n "$agent" ] || continue
+    owner="$(_aib_snapshot_query agents field "$agent" project)" || continue
+    [ "$owner" = "$uid" ] || continue
+    aib_validate_agent_uid "$agent"
+    printf '%s\n' "$agent" >> "$scratch/agents" || aib_die 2 'cannot buffer agent roster'
+  done <<< "$agents"
+  aib_attempts_fold "$AIB_EVENT_ROOT/$uid/main.events" > "$scratch/fold" || aib_die 2 "fold failed for $uid"
+  python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" > "$scratch/result" <<'PY'
+import datetime as dt
+import errno
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+lib, uid, standup, eventroot, scratch, minutes, limit = sys.argv[1:]
+scratch = Path(scratch)
+zone = ZoneInfo(os.environ.get('TZ') or 'UTC')
+now = time.time()
+def iso(epoch):
+    return dt.datetime.fromtimestamp(epoch, zone).isoformat(timespec='seconds')
+def event_epoch(value):
+    if not isinstance(value, str):
+        raise ValueError('attempt timestamp is missing')
+    stamp = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if stamp.utcoffset() is None:
+        raise ValueError('attempt timestamp has no offset')
+    return stamp.timestamp()
+def read_regular(path):
+    # Heartbeat paths are agent-controlled: never follow symlinks or wait on FIFOs.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('reader input is not a regular file')
+        return f.read(), info.st_mtime
+
+def zoned_epoch(parts):
+    # Date.UTC normalization and beats.mjs's two offset passes, including DST gaps.
+    y, mo, day, hour, minute = map(int, parts)
+    if 0 <= y <= 99:
+        y += 1900
+    y += (mo - 1) // 12
+    mo = (mo - 1) % 12 + 1
+    wall = (dt.datetime(y, mo, 1, tzinfo=dt.timezone.utc) +
+            dt.timedelta(days=day-1, hours=hour, minutes=minute)).timestamp()
+    def offset(t):
+        return dt.datetime.fromtimestamp(t, zone).utcoffset().total_seconds()
+    epoch = wall - offset(wall)
+    return wall - offset(epoch)
+
+def parse_beat_line(line, mtime, is_last, agent):
+    fields = [f.strip() for f in line.split('|', 3)]
+    raw = fields[0]
+    epoch = None
+    # Native writer has an ISO UTC timestamp and an identity column. Engine
+    # message pipes remain data: field count alone cannot distinguish the shapes.
+    native = re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', raw)
+    mismatch = False
+    unparsable = False
+    if native:
+        if len(fields) < 4:
+            unparsable = True
+            state, message = '', ''
+        else:
+            mismatch = fields[1] != agent
+            state, message = fields[2], fields[3]
+            try:
+                epoch = event_epoch(raw)
+            except ValueError:
+                unparsable = True
+    else:
+        state = fields[1] if len(fields) > 1 else ''
+        message = line.split('|', 2)[2].strip() if len(fields) > 2 else ''
+        match = re.fullmatch(r'(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})', raw)
+        if match:
+            epoch = zoned_epoch(match.groups())
+        elif re.fullmatch(r'\d{2}:\d{2}', raw):
+            if is_last:
+                epoch = mtime
+        else:
+            unparsable = True
+    return dict(state=state if state in ('busy','idle','blocked','done') else 'unknown',
+                since=iso(epoch) if epoch is not None else None, epoch=epoch,
+                message=message, stale=epoch is None, attested=False,
+                mismatch=mismatch, unparsable=unparsable)
+
+def heartbeat(path):
+    try:
+        data, mtime = read_regular(path)
+    except (FileNotFoundError, PermissionError):
+        return dict(state='unknown', since=None, message='', stale=True, attested=False), None, 0, 0
+    lines = [line for line in data.decode('utf-8').split('\n') if line]
+    last = dict(state='unknown', since=None, message='', stale=True, attested=False)
+    epoch = None
+    unparsable = mismatches = 0
+    for index, line in enumerate(lines):
+        beat = parse_beat_line(line, mtime, index == len(lines)-1, path.stem)
+        if beat.pop('mismatch'):
+            mismatches += 1
+            continue
+        unparsable += beat.pop('unparsable')
+        epoch = beat.pop('epoch')
+        last = beat
+    return last, epoch, unparsable, mismatches
+
+def presumed_dead(now, decided, beat_epoch, minutes):
+    return now-decided > minutes*60 and (beat_epoch is None or beat_epoch <= decided)
+
+def integer_file(path):
+    try:
+        data, mtime = read_regular(path)
+    except (OSError, ValueError):
+        return None, None
+    if not re.fullmatch(rb'(0|[1-9][0-9]*)\n?', data):
+        return None, None
+    return int(data), mtime
+
+fold = json.loads((scratch/'fold').read_text())
+roster = (scratch/'agents').read_text().splitlines()
+status = fold['status']
+reason = fold['reason']
+if not fold['present']:
+    status = 'absent'
+elif not fold['readable']:
+    status = 'unreadable'
+elif status == 'degraded':
+    # Frozen projection schema has no degraded member: expose loss as unhealthy.
+    status, reason = 'corrupt', 'sequence gap (degraded stream)'
+anchor_path = Path(eventroot)/uid/'main.events.high_water'
+anchor, _ = integer_file(anchor_path)
+if anchor is None:
+    if os.path.lexists(anchor_path):
+        raise ValueError('anchor is unreadable or corrupt; retaining previous output')
+    relationship = 'absent'
+else:
+    relationship = 'ok' if anchor == fold['highest'] else 'ahead' if anchor > fold['highest'] else 'lag'
+live, live_mtime = integer_file(Path(eventroot)/'attempts'/'.live')
+sources = []
+if fold['present'] and fold['readable']:
+    sources.append('stream')
+if live is not None:
+    sources.append('capacity')
+result = dict(schema=1, generated_at=iso(now), project_uid=uid, attested_sources=sources,
+    stream=dict(status=status, last_seq=fold['highest'], anchor=dict(value=anchor, relationship=relationship), torn_tail=fold['torn'], undecodable_records=fold['undecodable_records']),
+    capacity=dict(limit=int(limit), live=live, as_of=iso(live_mtime) if live is not None else None),
+    attention=[], agents={}, anomalies=dict(unregistered_logs=0, unparsable_lines=0, uid_mismatches=0, undecodable_records=len(fold['undecodable_records'])))
+def attention(kind, agent, reason, since, attested=True):
+    if since is None:
+        raise ValueError('cannot date attention from an unparsable heartbeat')
+    result['attention'].append(dict(kind=kind, agent=agent, reason=reason, since=since, attested=attested))
+if status != 'ok':
+    attention('stream_unhealthy',None,'stream corrupt: '+reason if status == 'corrupt' else 'stream '+status,iso(now))
+if relationship == 'ahead':
+    attention('stream_unhealthy',None,'anchor ahead of stream (a > m)',iso(now))
+if fold['torn']:
+    attention('stream_unhealthy',None,'uncommitted tail present',iso(now))
+with os.scandir(standup) as entries:
+    result['anomalies']['unregistered_logs'] = sum(e.name.endswith('.log') and e.name[:-4] not in roster for e in entries)
+latest = {}
+by_agent = {}
+if status == 'ok':
+    for attempt in fold['attempts']:
+        agent = attempt['agent']
+        if agent in roster:
+            latest[agent] = attempt
+            by_agent.setdefault(agent, []).append(attempt)
+for agent in roster:
+    entry, beat_epoch, bad, mismatches = heartbeat(Path(standup)/(agent+'.log'))
+    result['anomalies']['unparsable_lines'] += bad
+    result['anomalies']['uid_mismatches'] += mismatches
+    entry['attempt'] = None
+    attempt = latest.get(agent)
+    if attempt:
+        ended_at = attempt['last']['ended_at']
+        entry['attempt'] = dict(id=attempt['id'], decided_at=iso(event_epoch(attempt['decided_at'])), decision=attempt['decision'], open=attempt['open'],
+            last=dict(attempt['last'], ended_at=iso(event_epoch(ended_at)) if ended_at else None))
+    result['agents'][agent] = entry
+    if entry['state'] == 'blocked' and entry['message'].startswith('needs:'):
+        match = re.match(r'needs:([^ ]+) [^ ]', entry['message'])
+        kind = match[1] if match and match[1] in ('human','t4','approval','conflict','input','other') else 'other'
+        attention(kind,agent,entry['message'],entry['since'],False)
+    for attempt in by_agent.get(agent, []):
+        if not attempt['open']:
+            continue
+        decided = event_epoch(attempt['decided_at'])
+        if presumed_dead(now, decided, beat_epoch, int(minutes)):
+            attention('presumed_dead',agent,f"attempt {attempt['id']} decided {iso(decided)}, no ended record and no heartbeat since",iso(decided))
+        if entry['state'] in ('done','idle'):
+            attention('disagreement',agent,f"heartbeat claims {entry['state']} while attempt {attempt['id']} is still open",entry['since'])
+# Use the canonical shell encoder for every string, including hostile messages.
+# Batched NUL-delimited input is data, never shell source or eval. Reject NULs
+# rather than silently shortening a heartbeat that Bash cannot represent.
+strings = {}
+def collect(value):
+    if isinstance(value,str):
+        if '\0' in value:
+            raise ValueError('NUL in text cannot cross the shell string encoder')
+        strings[value] = None
+    elif isinstance(value,dict):
+        for key,val in value.items(): collect(key); collect(val)
+    elif isinstance(value,list):
+        for val in value: collect(val)
+collect(result)
+script = '. "$1"; while IFS= read -r -d "" value; do aib_json "$value" || exit $?; printf "\\n"; done'
+encoded = subprocess.run(['bash','-c',script,'_',lib],input=''.join(s+'\0' for s in strings),text=True,stdout=subprocess.PIPE,check=True).stdout.splitlines()
+if len(encoded) != len(strings):
+    raise ValueError('incomplete encoded string batch')
+strings = dict(zip(strings,encoded))
+def encode(value):
+    if isinstance(value,str): return strings[value]
+    if isinstance(value,dict): return '{'+','.join(strings[k]+':'+encode(v) for k,v in value.items())+'}'
+    if isinstance(value,list): return '['+','.join(encode(v) for v in value)+']'
+    return json.dumps(value,allow_nan=False)
+print(encode(result))
+PY
+  [ "$?" -eq 0 ] || aib_die 2 "projection computation failed for $uid"
+  ( umask 0027; mkdir -p -- "$projection_root" ) || aib_die 2 'cannot create output directory'
+  temp=$(mktemp "$projection_root/.$uid.json.XXXXXX") || aib_die 2 "cannot create output temp for $uid"
+  cat "$scratch/result" > "$temp" && chmod 0640 "$temp" || aib_die 2 'cannot prepare output'
+  exec {output_fd}<"$temp" || aib_die 2 'cannot retain output inode'
+  if [ "$stdout" -eq 1 ]; then cat <&"$output_fd" || aib_die 2 'cannot print output'; fi
+  exec {output_fd}<&-
+  mv -fT -- "$temp" "$projection_root/$uid.json" || aib_die 2 "cannot publish $uid"
+  temp=''
+)
+rc=0
+if [ "$1" = --all ]; then
+  while IFS= read -r uid; do
+    [ -n "$uid" ] || continue
+    _project_one "$uid" || rc=2
+  done <<< "$projects"
+else
+  _project_one "$1" || rc=2
+fi
+exit "$rc"
