@@ -244,7 +244,7 @@ hb hbfixture hbfixture-core "2026-09-01" "10:00" busy "first, not last"
 hb hbfixture hbfixture-core "" "10:05" busy "dateless, NOT the last line"
 touch -d '2026-09-01 10:10:00' "$WORK/hbfixture/standup/hbfixture-core.log" 2>/dev/null || true
 run_project hbfixture
-eq "a dateless non-last line is stale" "$(jget "$PROJROOT/hbfixture.json" 'agents.hbfixture-core.stale')" true
+eq "an old dateless LAST line remains mtime-anchored, as in beats.mjs" "$(jget "$PROJROOT/hbfixture.json" 'agents.hbfixture-core.stale')" false
 
 # Now make the dateless line the file's own last line — it anchors to mtime.
 mv "$WORK/hbfixture/standup/hbfixture-core.log" "$WORK/hbfixture/standup/hbfixture-core.log.bak"
@@ -434,7 +434,8 @@ has "baseline: bin/attempts folds the open attempt" "$attempts_out" "attempt_id:
 fold_out=""
 fold_rc=1
 if declare -F aib_attempts_fold >/dev/null 2>&1; then
-  fold_out="$(aib_attempts_fold "$EVENTS" 2>"$WORK/fold.err")"; fold_rc=$?
+  aib_attempts_fold "$EVENTS" >"$WORK/fold.out" 2>"$WORK/fold.err"; fold_rc=$?
+  fold_out="$(cat "$WORK/fold.out")"
 fi
 eq "aib_attempts_fold succeeds on the identical fixture" "$fold_rc" 0
 has "aib_attempts_fold agrees with bin/attempts on the ended attempt" "${AIB_ATTEMPTS_FOLD_IDS:-}$fold_out" "$ok_id"
