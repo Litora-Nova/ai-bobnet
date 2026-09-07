@@ -39,6 +39,7 @@ cases={
  'NUL-only unterminated tail':first+b'\0',
  'NUL elided before checksum':frame(1,nul,length=len(nul)-1,checksum=crc(nul.replace(b'\0',b'')))+second,
  'zero-padded sequence':frame('01',record('01'))+second,
+ 'zero-padded highest':frame('01',record('01')),
 }
 # Coreutils is also the checksum oracle at suffix-length boundaries.
 if hasattr(reader,'cksum'):
@@ -53,17 +54,17 @@ with tempfile.TemporaryDirectory(prefix='aib-frame-parity.') as tmp:
     registry={'schema_version':4,'providers':{'codex':{'adapter':'/bin/true','cap_sandbox':'workspace-write','cap_tier':'t3','cap_effort':'high','cap_timeout':'900'}},'projects':{'acme':{'home':str(home),'standup_dir':str(standup),'mux_session':'acme','provider':'codex','model':'m','effort':'low'}},'agents':{'acme-core':{'project':'acme','profile':'engine-dev','clearance':'t2'}}}
     reg=work/'registry.json';reg.write_text(json.dumps(registry))
     env=dict(os.environ,AIBOBNET_REGISTRY=str(reg),LC_ALL='C')
-    command='. "$1/lib/aibobnet.sh"; aib_event_scan "$2" > "$3"; printf "%s\\n" "$AIB_EVENT_SCAN_STATUS" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$AIB_EVENT_SCAN_NEXT_SEQ" "$AIB_EVENT_SCAN_TORN_TAIL" "$AIB_EVENT_SCAN_CORRUPT_REASON"'
+    command='. "$1/lib/aibobnet.sh"; aib_event_scan "$2" > "$3"; printf "%s\\n" "$AIB_EVENT_SCAN_STATUS" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$AIB_EVENT_SCAN_NEXT_SEQ" "$AIB_EVENT_SCAN_TORN_TAIL" "$AIB_EVENT_SCAN_TRUNCATE_AT" "$AIB_EVENT_SCAN_CORRUPT_REASON"'
     has_scan=hasattr(reader,'scan');check('Python frame pass is independently callable',has_scan)
     for name,data in cases.items():
         events.write_bytes(data);emitted=work/'records'
         raw=subprocess.check_output(['bash','-c',command,'_',str(root),str(events),str(emitted)],env=env)
-        status,highest,nxt,torn,reason=raw.decode('utf-8',errors='surrogateescape').splitlines()
+        status,highest,nxt,torn,truncate,reason=raw.decode('utf-8',errors='surrogateescape').splitlines()
         if has_scan:
             got,records=reader.scan(events)
             check(name+': frame status',got['status']==status)
             check(name+': NEXT_SEQ',got['next']==int(nxt))
-            check(name+': highest/torn/reason',(got['highest'],got['torn'],got['reason'])==(int(highest),bool(int(torn)),reason))
+            check(name+': highest/torn/truncate/reason',(got['highest'],got['torn'],got['truncate_at'],got['reason'])==(int(highest),bool(int(torn)),int(truncate),reason))
             intact=b''.join(seq+b'\t'+body+b'\n' for seq,body in records)
             check(name+': exact intact-record set',intact==emitted.read_bytes())
             if name.startswith('invalid UTF-8'):
