@@ -97,33 +97,63 @@ def zoned_epoch(parts):
     epoch = wall - offset(wall)
     return wall - offset(epoch)
 
-def heartbeat(path):
-    try:
-        data, mtime = read_regular(path)
-    except (FileNotFoundError, PermissionError):
-        return dict(state='unknown', since=None, message='', stale=True, attested=False), None, 0
-    lines = [line for line in data.decode('utf-8').split('\n') if line]
-    last = dict(state='unknown', since=None, message='', stale=True, attested=False)
+def parse_beat_line(line, mtime, is_last, agent):
+    fields = [f.strip() for f in line.split('|', 3)]
+    raw = fields[0]
     epoch = None
-    unparsable = 0
-    for index, line in enumerate(lines):
-        fields = [f.strip() for f in line.split('|')]
-        raw = fields[0]
+    # Native writer has an ISO UTC timestamp and an identity column. Engine
+    # message pipes remain data: field count alone cannot distinguish the shapes.
+    native = re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', raw)
+    mismatch = False
+    unparsable = False
+    if native:
+        if len(fields) < 4:
+            unparsable = True
+            state, message = '', ''
+        else:
+            mismatch = fields[1] != agent
+            state, message = fields[2], fields[3]
+            try:
+                epoch = event_epoch(raw)
+            except ValueError:
+                unparsable = True
+    else:
         state = fields[1] if len(fields) > 1 else ''
         message = line.split('|', 2)[2].strip() if len(fields) > 2 else ''
-        epoch = None
         match = re.fullmatch(r'(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})', raw)
         if match:
             epoch = zoned_epoch(match.groups())
         elif re.fullmatch(r'\d{2}:\d{2}', raw):
-            if index == len(lines)-1:
+            if is_last:
                 epoch = mtime
         else:
-            unparsable += 1
-        last = dict(state=state if state in ('busy','idle','blocked','done') else 'unknown',
-                    since=iso(epoch) if epoch is not None else None,
-                    message=message, stale=epoch is None, attested=False)
-    return last, epoch, unparsable
+            unparsable = True
+    return dict(state=state if state in ('busy','idle','blocked','done') else 'unknown',
+                since=iso(epoch) if epoch is not None else None, epoch=epoch,
+                message=message, stale=epoch is None, attested=False,
+                mismatch=mismatch, unparsable=unparsable)
+
+def heartbeat(path):
+    try:
+        data, mtime = read_regular(path)
+    except (FileNotFoundError, PermissionError):
+        return dict(state='unknown', since=None, message='', stale=True, attested=False), None, 0, 0
+    lines = [line for line in data.decode('utf-8').split('\n') if line]
+    last = dict(state='unknown', since=None, message='', stale=True, attested=False)
+    epoch = None
+    unparsable = mismatches = 0
+    for index, line in enumerate(lines):
+        beat = parse_beat_line(line, mtime, index == len(lines)-1, path.stem)
+        if beat.pop('mismatch'):
+            mismatches += 1
+            continue
+        unparsable += beat.pop('unparsable')
+        epoch = beat.pop('epoch')
+        last = beat
+    return last, epoch, unparsable, mismatches
+
+def presumed_dead(now, decided, beat_epoch, minutes):
+    return now-decided > minutes*60 and (beat_epoch is None or beat_epoch <= decided)
 
 def integer_file(path):
     try:
@@ -160,9 +190,9 @@ if fold['present'] and fold['readable']:
 if live is not None:
     sources.append('capacity')
 result = dict(schema=1, generated_at=iso(now), project_uid=uid, attested_sources=sources,
-    stream=dict(status=status, last_seq=fold['highest'], anchor=dict(value=anchor, relationship=relationship), torn_tail=fold['torn']),
+    stream=dict(status=status, last_seq=fold['highest'], anchor=dict(value=anchor, relationship=relationship), torn_tail=fold['torn'], undecodable_records=fold['undecodable_records']),
     capacity=dict(limit=int(limit), live=live, as_of=iso(live_mtime) if live is not None else None),
-    attention=[], agents={}, anomalies=dict(unregistered_logs=0, unparsable_lines=0))
+    attention=[], agents={}, anomalies=dict(unregistered_logs=0, unparsable_lines=0, uid_mismatches=0, undecodable_records=len(fold['undecodable_records'])))
 def attention(kind, agent, reason, since, attested=True):
     if since is None:
         raise ValueError('cannot date attention from an unparsable heartbeat')
@@ -184,8 +214,9 @@ if status == 'ok':
             latest[agent] = attempt
             by_agent.setdefault(agent, []).append(attempt)
 for agent in roster:
-    entry, beat_epoch, bad = heartbeat(Path(standup)/(agent+'.log'))
+    entry, beat_epoch, bad, mismatches = heartbeat(Path(standup)/(agent+'.log'))
     result['anomalies']['unparsable_lines'] += bad
+    result['anomalies']['uid_mismatches'] += mismatches
     entry['attempt'] = None
     attempt = latest.get(agent)
     if attempt:
@@ -201,7 +232,7 @@ for agent in roster:
         if not attempt['open']:
             continue
         decided = event_epoch(attempt['decided_at'])
-        if now-decided > int(minutes)*60 and (beat_epoch is None or beat_epoch <= decided):
+        if presumed_dead(now, decided, beat_epoch, int(minutes)):
             attention('presumed_dead',agent,f"attempt {attempt['id']} decided {iso(decided)}, no ended record and no heartbeat since",iso(decided))
         if entry['state'] in ('done','idle'):
             attention('disagreement',agent,f"heartbeat claims {entry['state']} while attempt {attempt['id']} is still open",entry['since'])

@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as tmp:
         if label=='invalid UTF-8':
             check('undecodable sequence is recorded',got.get('undecodable_records')==[1])
             check('later valid attempt stays visible',any(a['id']=='acme-main-2' for a in got['attempts']))
-            check('legacy fold retains frame-intact bad-byte attempt',any(a['id']=='acme-main-1' for a in got['attempts']))
+            check('legacy fold retains frame-intact bad-byte attempt',any(a['id']=='acme-main-1' for a in got.get('legacy_attempts',[])))
     path.write_bytes(b'broken\n')
     got=shared(path)
     check('corruption reason is canonical',got['reason']=='unparsable framed record near offset 0')

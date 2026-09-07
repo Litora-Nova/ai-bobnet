@@ -140,7 +140,28 @@ def admission():
         check('lease allocation occurs under admission lock','flock:True' in seen and 'flock:False' not in seen)
         check('lock-observed handler retains admission response',b'reason=registry_unavailable' in out)
 
-cases={f.__name__:f for f in (locks,leases,temps,roster,history,provenance,capacity,boundary,projects,admission)}
+def records():
+    with fixture() as (w,s,e,r,env):
+        def frame(seq,raw):
+            crc=subprocess.check_output(['cksum'],input=raw).split()[0]
+            return str(seq).encode()+b' '+crc+b' '+str(len(raw)).encode()+b' '+raw+b'\n'
+        def record(seq,pid=99999999):
+            return json.dumps(dict(event_id='acme-main-'+str(seq),attempt_id='acme-main-'+str(seq),event_type='attempt.decided',agent_uid='acme-core',occurred_at='2026-09-07T00:00:00Z',payload={'decision':'allow','pid':pid}),separators=(',',':')).encode()
+        bad=record(1).replace(b'"payload":{',b'"note":"\xff","payload":{')
+        (e/'acme/main.events').write_bytes(frame(1,bad)+frame(2,record(2)))
+        rc,data,_=project(env)
+        check('undecodable payload does not blind healthy stream',rc==0 and data['stream']['status']=='ok' and data['stream']['last_seq']==2)
+        check('undecodable sequence is listed and counted',data.get('stream',{}).get('undecodable_records')==[1] and data.get('anomalies',{}).get('undecodable_records')==1)
+        check('valid attempt after undecodable record remains projected',data.get('agents',{}).get('acme-core',{}).get('attempt',{}).get('id')=='acme-main-2')
+        rc,out,err=run([str(root/'bin/attempts'),'acme-core'],env)
+        expected=b'stream_status:ok | integrity:ok | highest_seq:2 | next_seq:3 | uncommitted_tail:0\n'+b''.join(('attempt_id:acme-main-'+str(n)+' | state:presumed-dead | decision:allow | pid:99999999 | exit_code:null\n').encode() for n in (1,2))
+        check('legacy attempts bad-byte fixture retains exact stdout/stderr and exit',rc==0 and out==expected and err==b'')
+        for raw,reason in [(b'broken\n',b'event stream is corrupt (unparsable framed record near offset 0) \xe2\x80\x94 refusing partial attempt fold'),(frame(1,record(1,0)),b"attempt 'acme-main-1' has non-positive pid '0'")]:
+            (e/'acme/main.events').write_bytes(raw)
+            rc,out,err=run([str(root/'bin/attempts'),'acme-core'],env)
+            check('legacy corruption diagnostic is byte-identical: '+repr(reason),rc==2 and out==b'' and err==b'ai-bobnet: '+reason+b'\n')
+
+cases={f.__name__:f for f in (locks,leases,temps,roster,history,provenance,capacity,boundary,projects,admission,records)}
 for name,fn in cases.items():
     if selected in ('all',name):
         try:fn()

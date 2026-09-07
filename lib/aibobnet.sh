@@ -2626,25 +2626,28 @@ aib_event_scan() {
 # whether to report the scan or refuse. JSON includes each attempt's display state
 # and the durable open/ended facts separately (PID liveness is only a hint).
 aib_attempts_fold() {
-  local header buffer rc=0
+  local header scratch rc=0 present=1 readable=1
   local -a lines=()
   command -v python3 >/dev/null 2>&1 || { printf 'ai-bobnet: attempt fold requires python3\n' >&2; return 6; }
-  # A regular scratch file lets mapfile buffer large JSON lines. On a pipe,
-  # Bash reads these lines bytewise; that alone exceeds the projection budget.
-  buffer=$(mktemp "${TMPDIR:-/tmp}/aib-fold.XXXXXX") || return 2
-  if python3 -I "${REPO_ROOT}/lib/attempts_fold.py" "$1" > "$buffer"; then
-    mapfile -t lines < "$buffer" || rc=$?
-  else
-    rc=$?
-  fi
-  rm -f -- "$buffer" || rc=2
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/aib-fold.XXXXXX") || return 2
+  [ -e "$1" ] || present=0
+  [ -r "$1" ] || readable=0
+  # The writer's Bash scanner is the sole framing authority. Buffer its output
+  # and complete status before Python sees any records; never re-open raw input.
+  if aib_event_scan "$1" > "$scratch/records"; then
+    if python3 -I "${REPO_ROOT}/lib/attempts_fold.py" "$scratch/records" \
+        "$AIB_EVENT_SCAN_STATUS" "$AIB_EVENT_SCAN_HIGHEST_SEQ" "$AIB_EVENT_SCAN_NEXT_SEQ" \
+        "$AIB_EVENT_SCAN_TORN_TAIL" "$AIB_EVENT_SCAN_CORRUPT_REASON" "$present" "$readable" > "$scratch/result"; then
+      mapfile -t lines < "$scratch/result" || rc=$?
+    else rc=$?; fi
+  else rc=$?; fi
+  rm -rf -- "$scratch" || rc=2
   [ "$rc" -eq 0 ] || return "$rc"
   [ "${#lines[@]}" -ge 2 ] || { printf 'ai-bobnet: incomplete fold response\n' >&2; return 2; }
   header="${lines[0]}"
   AIB_ATTEMPTS_FOLD_IDS=""
   if [ "${#lines[@]}" -gt 2 ]; then printf -v AIB_ATTEMPTS_FOLD_IDS '%s\n' "${lines[@]:2}"; fi
-  IFS=$'\t' read -r AIB_ATTEMPTS_FOLD_STATUS AIB_EVENT_SCAN_HIGHEST_SEQ AIB_EVENT_SCAN_NEXT_SEQ AIB_EVENT_SCAN_TORN_TAIL <<< "$header"
-  AIB_EVENT_SCAN_STATUS="$AIB_ATTEMPTS_FOLD_STATUS"
+  IFS=$'\t' read -r AIB_ATTEMPTS_FOLD_STATUS AIB_ATTEMPTS_FOLD_REASON <<< "$header"
   AIB_ATTEMPTS_FOLD_JSON="${lines[1]}"
   printf '%s\n' "$AIB_ATTEMPTS_FOLD_JSON"
 }

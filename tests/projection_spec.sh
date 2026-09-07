@@ -41,6 +41,8 @@
 #   repository, not in this (public, white-label) one. This spec never hardcodes a host path to
 #   it: `AIB_BEATS_MJS_PATH` names it explicitly, or a relative sibling-checkout guess
 #   (`../claude-bobnet/dashboard/...`) is tried, and the differential is skip-marked — not
+#   Suite runners should export AIB_BEATS_MJS_PATH when a sibling is available, including
+#   worktree runs; this environment setting is inherited by every spec. It is never a registry field.
 #   faked — when neither resolves to a readable file, the same "skipped, not faked" discipline
 #   `docs/CONFINEMENT.md` already uses for a Landlock-less host's `cc` step.
 set -uo pipefail
@@ -66,7 +68,7 @@ no()   { fail=$((fail+1)); printf 'FAIL - %s\n' "$1"; }
 eq()   { [ "$2" = "$3" ] && ok "$1" || no "$1 (got '$2' want '$3')"; }
 has()  { case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3' in: $2)";; esac; }
 hasnt(){ case "$2" in *"$3"*) no "$1 (unexpected '$3' in: $2)";; *) ok "$1";; esac; }
-skip() { skipped=$((skipped+1)); printf 'skip - %s\n' "$1"; }
+skip() { skipped=$((skipped+1)); printf 'skipped: %s\n' "$1"; }
 
 jget() { # jget <jsonfile> <dotted-path>
   [ -n "$PY" ] || { printf '__NO_PYTHON__'; return 0; }
@@ -265,9 +267,9 @@ case "$gte_one" in 0|__MISSING__|__PARSE_ERROR__) no "an unparsable line is coun
 # Cross-repo differential against claude-bobnet/dashboard/server/utils/beats.mjs.
 BEATS_MJS="${AIB_BEATS_MJS_PATH:-$SRC_ROOT/../claude-bobnet/dashboard/server/utils/beats.mjs}"
 if [ -z "$NODE" ]; then
-  skip "beats.mjs differential (node not present)"
+  skip "AIB_BEATS_MJS_PATH beats.mjs differential (node not present)"
 elif [ ! -r "$BEATS_MJS" ]; then
-  skip "beats.mjs differential (sibling checkout not found; set AIB_BEATS_MJS_PATH)"
+  skip "AIB_BEATS_MJS_PATH beats.mjs differential (sibling checkout not found; set AIB_BEATS_MJS_PATH)"
 else
   BEATS_JSON_PATH="$("$PY" -c "import json,sys; print(json.dumps(sys.argv[1]))" "$BEATS_MJS")"
   cat > "$WORK/beats_diff.mjs" <<NODEEOF
@@ -282,7 +284,7 @@ NODEEOF
   diff_log="$WORK/hbfixture/standup/hbfixture-core.log"
   node_stale="$("$NODE" "$WORK/beats_diff.mjs" "$diff_log" 2>/dev/null)"
   if [ -z "$node_stale" ]; then
-    skip "beats.mjs differential (node run failed to produce output)"
+    skip "AIB_BEATS_MJS_PATH beats.mjs differential (node run failed to produce output)"
   else
     # agents[uid].stale reflects only the file's own LAST line (CONTRACT-visibility.md
     # SS11), so the differential compares against beats.mjs's own verdict for that

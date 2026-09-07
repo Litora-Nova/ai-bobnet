@@ -200,8 +200,11 @@ emitted, and `agents[uid]` still projects from the still-readable heartbeat logs
 
 ## 9. Timezone coupling
 
-`scripts/log.sh` writes local wall time in `DEV_TEAM_TZ` (default `Europe/Berlin`) with **no UTC
-offset in the line itself** (`YYYY-MM-DD HH:MM | status | msg`). A systemd unit runs with `TZ` unset
+`ai-bobnet`'s `aib_log_resolved` (called by `scripts/log.sh`, the launcher and broker handler) writes
+`YYYY-MM-DDTHH:MM:SSZ | agent_uid | status | msg`, a four-field UTC instant with seconds.
+The separate `claude-bobnet` engine writer emits local wall time in `DEV_TEAM_TZ` (default
+`Europe/Berlin`): `YYYY-MM-DD HH:MM | status | msg`, with three fields and no offset. Both shapes
+can occur in the same log; the projector accepts both without changing either writer. A systemd unit runs with `TZ` unset
 (UTC) unless told otherwise. The projector's unit **MUST** set `Environment=TZ=<the same value
 operators set for DEV_TEAM_TZ>` — the identical coupling `claude-bobnet/dashboard/server/utils/beats.mjs`
 already has via its own `DEV_TEAM_TZ` read. Getting this wrong reads every heartbeat as one-to-two
@@ -259,7 +262,7 @@ can therefore never become a JSON object key: it never reaches key position in t
 because the key set comes from the registry, not from a directory listing.
 
 **`agents[uid].state`, `.since`, `.message`, and `.stale` are derived from that agent's own most
-recent heartbeat line only** — this contract's own resolution of a gap the design note left implicit.
+recent heartbeat line only (ignoring native lines with mismatched identities)** — this contract's own resolution of a gap the design note left implicit.
 A heartbeat log is an append-only history; the projection is a snapshot of *current* state, and every
 one of those fields is singular per agent. An agent that was `blocked` five minutes ago and is now
 `busy` is no longer waiting on anything, and must not still show as `blocked`. The same rule governs
@@ -268,11 +271,16 @@ status is `blocked` — a resolved block that scrolled into history produces no 
 mirroring how "presumed-dead" and "disagreement" (§8) are themselves current-state computations, never
 a scan of full history.
 
-**Heartbeat parsing reproduces `claude-bobnet/dashboard/server/utils/beats.mjs` exactly** — this is
+**Three-field heartbeat timestamp parsing reproduces `claude-bobnet/dashboard/server/utils/beats.mjs`** — this is
 the concrete fix for the two-parsers-of-one-file risk named in `docs/DOMAIN.md`'s framing of this
 projection:
 
-- An ISO line (`YYYY-MM-DD HH:MM | status | msg`) resolves to an offset-bearing epoch via the zone in
+- A native four-field line (`YYYY-MM-DDTHH:MM:SSZ | agent_uid | status | msg`) uses its UTC instant.
+  Its identity MUST equal the file's registry UID. A mismatch increments `anomalies.uid_mismatches`
+  and does not replace the prior heartbeat. Shape detection uses the timestamp and identity column;
+  pipes in a three-field engine message remain message text. Native timestamps are also rendered
+  with an explicit offset in the configured projection zone.
+- An engine line (`YYYY-MM-DD HH:MM | status | msg`) resolves to an offset-bearing epoch via the zone in
   §9, matching `zonedEpoch()`'s double-pass DST handling.
 - A dateless legacy line (`HH:MM | status | msg`) is **stale** unless it is the file's own last line,
   in which case its instant is the file's own mtime (never the wall-clock `HH:MM`, which cannot be
@@ -301,11 +309,24 @@ This contract requires the fold logic to live in one library function, `aib_atte
 ```text
 aib_attempts_fold <events_path>
   sets:  AIB_ATTEMPTS_FOLD_STATUS        (mirrors AIB_EVENT_SCAN_STATUS: ok|degraded|corrupt)
+         AIB_ATTEMPTS_FOLD_REASON        (legacy CLI diagnostic on refusal)
          AIB_ATTEMPTS_FOLD_IDS           (newline list of attempt_ids, in stream order)
          per-attempt state exactly as bin/attempts today: decision/pid/state/exit_code
   AIB_ATTEMPTS_FOLD_JSON holds the complete fold object, also printed on stdout
   never dies on a corrupt or absent stream — the caller decides
 ```
+
+The existing Bash `aib_event_scan` is the sole frame/checksum/sequence authority. Its complete scan
+status and buffered intact records are passed to Python; Python never reopens or reframes the source.
+`AIB_EVENT_SCAN_*` retain that scanner's metadata. Payload-semantic refusal is reported separately
+through `AIB_ATTEMPTS_FOLD_STATUS` and the precise legacy diagnostic.
+
+A frame-intact record containing invalid UTF-8 does not make the stream corrupt. Its sequence is
+listed in `stream.undecodable_records`, and `anomalies.undecodable_records` counts these records.
+Projection skips that record and continues with later decodable records. An ended record referring
+to a skipped decided record cannot create an attempt. The legacy `bin/attempts` text view retains
+byte-transparent scalar extraction for the malformed record, preserving its historical output;
+the projection never exposes undecodable strings as trusted structured state.
 
 `bin/attempts` is refactored to call this function and **MUST produce byte-identical output** to the
 pre-refactor version on every existing fixture (`tests/attempts_spec.sh` already pins that output
@@ -359,8 +380,7 @@ event stream, not inventing a new one:
   file pre-planted at any *fixed* name is irrelevant by construction, because no fixed name is ever
   opened for writing.
 - **`<standup_dir>/_projection.json`** is a **read-only symlink into the projection root**, maintained
-  by provisioning (`prox-init`, Remote Bob's revier per `[[prox-init-revier-split]]`-style ownership,
-  not this repository) — exactly the pattern `<standup_dir>/events` already is for the stream. **The
+  by host provisioning — exactly the pattern `<standup_dir>/events` already is for the stream. **The
   projector never creates, targets, or writes through this symlink.** It writes only inside
   `AIB_PROJECTION_ROOT`.
 - **`aib-projection.service`** (text specified here; the builder wires the code): `User=aib-broker`,
@@ -434,7 +454,7 @@ that always rebuilds identically cannot silently drift into being the truth.
     "status": "ok",
     "last_seq": 42,
     "anchor": { "value": 42, "relationship": "ok" },
-    "torn_tail": false
+    "torn_tail": false, "undecodable_records": []
   },
   "capacity": { "limit": 12, "live": 3, "as_of": "2026-09-07T14:32:09+02:00" },
   "attention": [
@@ -452,7 +472,7 @@ that always rebuilds identically cannot silently drift into being the truth.
       }
     }
   },
-  "anomalies": { "unregistered_logs": 0, "unparsable_lines": 0 }
+  "anomalies": { "unregistered_logs": 0, "unparsable_lines": 0, "uid_mismatches": 0, "undecodable_records": 0 }
 }
 ```
 
@@ -492,7 +512,10 @@ Every field, documented:
 | `agents[uid].attempt.last.stage` | stage or `null` | `docs/CONTRACT-execution-binding.md` §8.1's `exit.stage`, `null` when absent (schema-1 stream records) or `open`. |
 | `agents[uid].attempt.last.ended_at` | ISO 8601 or `null` | The `ended` record's own timestamp, `null` while `open`. |
 | `anomalies.unregistered_logs` | integer | Count of `<name>.log` files in `standup_dir` with no matching registry agent (§11). |
-| `anomalies.unparsable_lines` | integer | Count of heartbeat lines that matched neither the ISO nor the dateless `HH:MM` shape, across every agent's log this tick. |
+| `anomalies.unparsable_lines` | integer | Count of heartbeat lines whose native UTC or engine timestamp cannot be parsed. |
+| `anomalies.uid_mismatches` | integer | Native heartbeat lines whose UID differs from the registry/file UID; never replace state. |
+| `anomalies.undecodable_records` | integer | Number of frame-intact stream records with invalid UTF-8. |
+| `stream.undecodable_records` | integer array | Sequence numbers of those records, in scan order. |
 
 ---
 

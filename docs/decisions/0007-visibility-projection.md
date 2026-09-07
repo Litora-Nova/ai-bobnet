@@ -123,11 +123,18 @@ ADR.
 
 ### F. Shared reader implementation and failure policy
 
-The shell API `aib_attempts_fold` invokes one Python 3 process for the complete stream. The CRC
-uses bit-order translation around zlib's C implementation, differentially checked against coreutils
-`cksum`; per-record shell forks would miss the 10,000-record budget. A private regular scratch file enables buffered `mapfile` reads: the measured pipe handoff read large lines bytewise, while the original Bash string replacement was quadratic. Both costs are excluded from the final implementation. `bin/attempts` formats the same
-ordered fold as before, while `bin/project` applies the frozen visibility schema's corruption policy.
-No writer or admission path calls this reader.
+The shell API `aib_attempts_fold` first calls the existing Bash `aib_event_scan`, which is also
+the writer's frame-health authority. It buffers the intact records and completed scan status before
+passing them to one isolated Python process for payload semantics. There is no second frame/CRC
+implementation. Invalid UTF-8 in a CRC-consistent record is a per-record projection anomaly; later
+valid records remain visible. The legacy text view retains byte-transparent scalar parsing and
+specific diagnostics, including the scanner's exact corruption reason. A private regular scratch
+file keeps the shell handoff buffered. No writer or admission path calls this reader.
+
+Heartbeat parsing accepts both real writers: native `aib_log_resolved` emits four fields with a UTC
+instant and UID; the engine writer emits three fields with local wall time. Native UID mismatches
+are counted and ignored for current state. Only the engine timestamp shape follows `beats.mjs`;
+actual native-writer fixtures now complement that differential. Neither writer is changed.
 
 The shipped pins needed two fixture corrections: a dateless line labelled "non-last" was actually
 last (and `beats.mjs` borrows its old mtime without marking it stale), and the fold-global assertion
