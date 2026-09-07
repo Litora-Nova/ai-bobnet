@@ -123,13 +123,26 @@ ADR.
 
 ### F. Shared reader implementation and failure policy
 
-The shell API `aib_attempts_fold` first calls the existing Bash `aib_event_scan`, which is also
-the writer's frame-health authority. It buffers the intact records and completed scan status before
-passing them to one isolated Python process for payload semantics. There is no second frame/CRC
-implementation. Invalid UTF-8 in a CRC-consistent record is a per-record projection anomaly; later
-valid records remain visible. The legacy text view retains byte-transparent scalar parsing and
-specific diagnostics, including the scanner's exact corruption reason. A private regular scratch
-file keeps the shell handoff buffered. No writer or admission path calls this reader.
+The shell API `aib_attempts_fold` uses an isolated Python frame pass, a **verified reimplementation**
+whose reference is the existing Bash `aib_event_scan`. Running the Bash scan first was measured at
+roughly 100 seconds per 10,000-record projection and cannot satisfy the unchanged 2-second budget or
+10-second cadence. Verification replaces runtime double-scanning: the permanent frame corpus compares
+status, NEXT_SEQ and every emitted intact record, including malformed bytes, framing failures, gaps,
+tails and oversized records. The same cases compare the full legacy CLI output and diagnostics in
+both byte-oriented and UTF-8 locales. The corpus uses real coreutils checksums; the fast pass uses
+bit-order translation around zlib's C CRC implementation.
+
+Frame health remains separate from JSON/UTF-8 decoding. An invalid UTF-8 record is a counted anomaly,
+not a frame-wide failure; later valid records stay visible. Exceptional field syntax and undecodable
+legacy text use the existing byte-oriented Bash/awk accessors, without scanning the whole stream in
+Bash. A private regular scratch file keeps the shell handoff buffered. No writer or admission path
+calls this Python reader, and no new Python dependency enters the writer.
+
+**Follow-up ADR: writer cursor / incremental scanning.** The same pre-existing Bash whole-stream
+scan also runs before every writer commit. Its cost therefore grows with stream history independently
+of this projection. A future cursor/incremental-scan ADR must cover writer health checks as well as
+reader resynchronization, including corruption, truncation and trusted cursor validation. This build
+does not change the writer scanner, add a cursor or weaken frame validation.
 
 Heartbeat parsing accepts both real writers: native `aib_log_resolved` emits four fields with a UTC
 instant and UID; the engine writer emits three fields with local wall time. Native UID mismatches

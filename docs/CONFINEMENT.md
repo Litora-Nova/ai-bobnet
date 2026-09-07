@@ -223,7 +223,7 @@ A broker unit missing any of these fails every anchored commit closed with exit 
 dependencies, extended to anchored writes in this slice.
 
 **`python3` is the one optional runtime dependency in the enactment path**; the readers
-`bin/attempts` and `bin/project` require Python 3.9+ (see the reader runtime requirements above).
+`bin/attempts` and `bin/project` require Python 3.9+ (see the reader runtime requirements below).
 In enactment it runs in the unconfined broker/manager
 process, never inside the sandboxed child or the Landlock helper. It sharpens disconnect detection
 (the `poll(2)`-based liveness probe — see SPEC-wire-format.md, "Detecting a disconnected client

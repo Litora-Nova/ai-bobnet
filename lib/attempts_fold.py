@@ -1,8 +1,8 @@
-"""Attempt semantics over records already accepted by aib_event_scan.
+"""Verified reader frame parser and shared attempt semantics.
 
-There is no frame, checksum or sequence validator here. Undecodable UTF-8
-records are anomalies for projection; the legacy text view retains the byte-
-transparent scanner/awk behavior for scalar fields in those records.
+The Bash scanner remains the reference. The permanent parity corpus checks its
+classification, next sequence and exact intact records against this fast pass.
+Undecodable payloads are record anomalies, never frame failures by themselves.
 """
 import json
 import os
@@ -10,6 +10,91 @@ import re
 import subprocess
 from pathlib import Path
 import sys
+import zlib
+
+
+_REVERSE = bytes(int(f'{b:08b}'[::-1], 2) for b in range(256))
+_FRAME = re.compile(rb'([0-9]+) ([0-9]+) ([0-9]+) (.*)\Z')
+
+
+def cksum(data):
+    # POSIX polynomial/length suffix, with C-backed CRC and reversed bit order.
+    n = len(data)
+    suffix = n.to_bytes((n.bit_length() + 7) // 8, 'little')
+    crc = zlib.crc32((data + suffix).translate(_REVERSE), 0xffffffff)
+    return int(f'{crc:032b}'[::-1], 2)
+
+
+def frame_event_id(data):
+    try:
+        # JSON syntax/UTF-8 are not frame health. The common valid-object path
+        # is fast; exceptional syntax uses the existing byte-oriented accessor.
+        if b'\\u' in data:
+            raise ValueError('reference accessor preserves unicode escapes')
+        obj = json.loads(data.decode('utf-8', errors='surrogateescape'), object_pairs_hook=unique_pairs)
+        ident = obj.get('event_id', '')
+        return ident if isinstance(ident, str) else ''
+    except (ValueError, AttributeError):
+        command = '. "$1"; IFS= read -r -d "" json || :; aib_event_field "$json" event_id'
+        return subprocess.check_output(['bash','-c',command,'_',str(Path(__file__).with_name('aibobnet.sh'))],
+            input=data, env=dict(os.environ, LC_ALL='C')).rstrip(b'\n').decode('utf-8', errors='surrogateescape')
+
+
+def scan(path):
+    out = dict(status='ok', reason='', highest=0, highest_text='0', next=1,
+               torn=False, truncate_at=0, present=True, readable=True)
+    records = []
+    if not os.path.exists(path):
+        out['present'] = False
+        return out, records
+    try:
+        stream = open(path, 'rb')
+    except OSError:
+        out.update(status='corrupt', readable=False, reason='events stream is not readable')
+        return out, records
+    previous = offset = 0
+    try:
+        with stream:
+            for raw in stream:
+                terminated = raw.endswith(b'\n')
+                # Bash read -r silently discards NUL before all frame checks.
+                line = (raw[:-1] if terminated else raw).replace(b'\0', b'')
+                if not terminated:
+                    if line:
+                        out['torn'] = True
+                    break
+                match = _FRAME.fullmatch(line)
+                if not match:
+                    raise ValueError(f'unparsable framed record near offset {offset}')
+                seq_b, crc_b, length_b, data = match.groups()
+                seq_s = seq_b.decode('ascii')
+                seq = int(seq_s)
+                if not data.startswith(b'{'):
+                    raise ValueError(f'record body is not a JSON object (seq {seq_s})')
+                if len(data) != int(length_b):
+                    raise ValueError(f'len mismatch (seq {seq_s})')
+                if str(cksum(data)).encode() != crc_b:
+                    raise ValueError(f'crc/len mismatch (seq {seq_s})')
+                if previous and seq <= previous:
+                    raise ValueError(f"non-monotonic seq {seq_s} after {out['highest_text']}")
+                if seq != previous + 1:
+                    out['status'] = 'degraded'
+                previous = out['highest'] = seq
+                out['highest_text'] = seq_s
+                ident = frame_event_id(data)
+                if ident.rsplit('-', 1)[-1] != seq_s:
+                    raise ValueError(f'event_id/seq mismatch (seq {seq_s}, event_id {ident})')
+                records.append((seq_b, data))
+                offset += len(line) + 1
+                out['truncate_at'] = offset
+    except ValueError as error:
+        out.update(status='corrupt', reason=str(error))
+        return out, records
+    except OSError:
+        out.update(status='corrupt', readable=False, reason='events stream is not readable')
+        return out, records
+    out['next'] = out['highest'] + 1
+    return out, records
 
 
 def scalar(value):
@@ -119,26 +204,24 @@ def fold_records(records, legacy=False):
     return list(attempts.values())
 
 
-def fold(path, status, highest, next_seq, torn, reason, present, readable):
-    out = dict(status=status, reason=reason, highest=int(highest), next=int(next_seq),
-               torn=bool(int(torn)), present=bool(int(present)), readable=bool(int(readable)),
+def fold(path):
+    frame, intact = scan(path)
+    out = dict(frame, scan_status=frame['status'], scan_reason=frame['reason'],
                attempts=[], legacy_attempts=[], undecodable_records=[], diagnostic='')
-    if status == 'corrupt':
-        out['diagnostic'] = f'event stream is corrupt ({reason}) — refusing partial attempt fold'
+    if frame['status'] == 'corrupt':
+        out['diagnostic'] = f"event stream is corrupt ({frame['reason']}) — refusing partial attempt fold"
         return out
     records = []
     try:
-        with open(path, 'rb') as stream:
-            for line in stream:
-                seq, data = line.rstrip(b'\n').split(b'\t', 1)
-                try:
-                    text = data.decode('utf-8')
-                    undecodable = False
-                except UnicodeDecodeError:
-                    undecodable = True
-                    out['undecodable_records'].append(int(seq))
-                record = legacy_record(data) if undecodable else json.loads(text, object_pairs_hook=unique_pairs)
-                records.append((int(seq), record, undecodable))
+        for seq, data in intact:
+            try:
+                text = data.decode('utf-8')
+                undecodable = False
+            except UnicodeDecodeError:
+                undecodable = True
+                out['undecodable_records'].append(int(seq))
+            record = legacy_record(data) if undecodable else json.loads(text, object_pairs_hook=unique_pairs)
+            records.append((int(seq), record, undecodable))
         # Compute the legacy view first for its established semantic diagnostics.
         out['legacy_attempts'] = fold_records(records, legacy=True)
         out['attempts'] = fold_records(records)
@@ -152,12 +235,14 @@ def main():
         result = json.load(sys.stdin)
         sys.stdout.reconfigure(errors='surrogateescape')
         integrity = 'lost' if result['status'] == 'degraded' else 'ok'
-        print(f"stream_status:{result['status']} | integrity:{integrity} | highest_seq:{result['highest']} | next_seq:{result['next']} | uncommitted_tail:{int(result['torn'])}")
+        print(f"stream_status:{result['status']} | integrity:{integrity} | highest_seq:{result['highest_text']} | next_seq:{result['next']} | uncommitted_tail:{int(result['torn'])}")
         for a in result['legacy_attempts']:
             print(f"attempt_id:{a['id']} | state:{a['state']} | decision:{a['decision']} | pid:{a['pid']} | exit_code:{a['exit_code']}")
     else:
         result = fold(*sys.argv[1:])
-        print(result['status'], result['diagnostic'], sep='\t')
+        print(result['status'], result['highest_text'], result['next'], int(result['torn']), result['scan_status'], result['truncate_at'], sep='\t')
+        print(result['diagnostic'])
+        print(result['scan_reason'])
         print(json.dumps(result, ensure_ascii=True, separators=(',', ':')))
         for attempt in result['attempts']:
             print(attempt['id'])

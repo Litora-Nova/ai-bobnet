@@ -308,7 +308,7 @@ This contract requires the fold logic to live in one library function, `aib_atte
 
 ```text
 aib_attempts_fold <events_path>
-  sets:  AIB_ATTEMPTS_FOLD_STATUS        (mirrors AIB_EVENT_SCAN_STATUS: ok|degraded|corrupt)
+  sets:  AIB_ATTEMPTS_FOLD_STATUS        (frame or payload health: ok|degraded|corrupt)
          AIB_ATTEMPTS_FOLD_REASON        (legacy CLI diagnostic on refusal)
          AIB_ATTEMPTS_FOLD_IDS           (newline list of attempt_ids, in stream order)
          per-attempt state exactly as bin/attempts today: decision/pid/state/exit_code
@@ -316,10 +316,20 @@ aib_attempts_fold <events_path>
   never dies on a corrupt or absent stream — the caller decides
 ```
 
-The existing Bash `aib_event_scan` is the sole frame/checksum/sequence authority. Its complete scan
-status and buffered intact records are passed to Python; Python never reopens or reframes the source.
-`AIB_EVENT_SCAN_*` retain that scanner's metadata. Payload-semantic refusal is reported separately
-through `AIB_ATTEMPTS_FOLD_STATUS` and the precise legacy diagnostic.
+The existing Bash `aib_event_scan` is the reference frame/checksum/sequence authority. The reader's
+Python frame pass is a **verified reimplementation**, not a new definition of stream health. A
+permanent differential corpus in `tests/frame_parity_spec.sh` compares frame status, next sequence
+and exact intact records for valid input, CRC corruption, sequence gaps, torn tails, embedded NUL,
+invalid UTF-8, length mismatch, oversized records and non-JSON bodies. It also compares the complete
+`bin/attempts` stdout, stderr and exit status with the frozen pre-refactor CLI on every corpus case.
+The Python runtime does not first scan the stream in Bash: the 10,000-record / 2-second budget stands.
+`AIB_EVENT_SCAN_*` expose frame metadata; payload-semantic refusal is reported separately through
+`AIB_ATTEMPTS_FOLD_STATUS` and the precise legacy diagnostic.
+
+Reference semantics include Bash's NUL elision before frame checks and acceptance of correctly framed
+records above the writer's 65,536-byte creation limit. Readers must not invent a size rejection that
+the reference scanner lacks. Intact prefix records can be observed by the parity test on a corrupt
+stream, but neither caller publishes a partial attempt fold from them.
 
 A frame-intact record containing invalid UTF-8 does not make the stream corrupt. Its sequence is
 listed in `stream.undecodable_records`, and `anomalies.undecodable_records` counts these records.
