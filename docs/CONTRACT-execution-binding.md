@@ -523,5 +523,19 @@ lock, journals the operator's identity and both anchor values, and touches only 
 the stream. `aib_event_commit` never calls it and no other code path may — an automatic repair is, by
 definition, the same as having no anchor at all.
 
+### 8.9 RM-3/V-1 addition — the attested `.live` admission count
+
+`docs/CONTRACT-visibility.md` §10 (`docs/decisions/0007-visibility-projection.md`) adds one further
+write to the broker handler's existing admission block (`docs/decisions/0006-anchor-and-capacity.md`
+part B): on every admission decision — allowed or refused — the handler writes the live-lease count it
+already computed under `attempts.lock` to `$AIB_EVENT_ROOT/attempts/.live`, atomically (`mktemp` in the
+same directory, then `rename(2)`). This is additive to the existing admission arithmetic; it changes no
+wire answer and no exit code. The value exists so the visibility projector (`bin/project`) can report
+`capacity.live` from an attested number instead of probing lease files itself, which the admission path
+would otherwise treat as unwanted `flock` contention (a probing reader can cause the handler's own
+`flock -n` check to fail and answer `over_capacity` to a launch that should have been admitted). See
+`docs/CONTRACT-visibility.md` §10 for the projector-side reading contract; this subsection only states
+what the handler now writes.
+
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts.

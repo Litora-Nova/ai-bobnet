@@ -18,7 +18,11 @@ before `exec`**, with two properties: the restriction is installed before the fo
 the restricted process cannot revoke it.
 
 **Minimum:** no write access to the event stream, the high-water anchor, the registry, the adapter
-map or the installed engine. Read access to the credential directory only as far as the adapter needs.
+map, the installed engine, or **the visibility projection root** (`AIB_PROJECTION_ROOT`,
+`docs/CONTRACT-visibility.md` §14, `docs/decisions/0007-visibility-projection.md`) — a broker-produced,
+broker-attested artifact, added to this minimum for the same reason the event stream and the anchor are
+here: a confined child's `LL_RW` over a project `home` must never also reach a broker-owned attestation
+sitting outside that `home`. Read access to the credential directory only as far as the adapter needs.
 
 ## Primary path — Landlock
 
