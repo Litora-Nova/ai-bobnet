@@ -51,6 +51,10 @@ with tempfile.TemporaryDirectory() as tmp:
     data=json.dumps(record(),separators=(',',':')).encode().replace(b'"decision":"allow"',b'"decision":"deny","decision":"allow"')
     path.write_bytes(f'1 {crc(data)} {len(data)} '.encode()+data+b'\n')
     check('duplicate JSON keys cannot select a conflicting truth',fold.fold(path)['status']=='corrupt')
+for fake,expected in [("printf 'ok\\n'",2),("return 9",9)]:
+    cmd='. "$1/lib/aibobnet.sh"; REPO_ROOT="$1"; python3() { '+fake+'; }; aib_attempts_fold /nonexistent'
+    result=subprocess.run(['bash','-c',cmd,'_',str(root)],capture_output=True)
+    check('shell fold rejects failed or incomplete helper output',result.returncode==expected and not result.stdout)
 print(f'attempts_fold_spec: {passed} passed, {failed} failed')
 sys.exit(bool(failed))
 PY

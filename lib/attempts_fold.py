@@ -140,8 +140,9 @@ def main():
     else:
         result = fold(sys.argv[1])
         print(result['status'], result['highest'], result['next'], int(result['torn']), sep='\t')
-        print('\t'.join(a['id'] for a in result['attempts']))
         print(json.dumps(result, ensure_ascii=False, separators=(',', ':')))
+        for attempt in result['attempts']:
+            print(attempt['id'])
 
 
 if __name__ == '__main__':

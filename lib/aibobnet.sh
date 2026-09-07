@@ -2626,15 +2626,24 @@ aib_event_scan() {
 # whether to report the scan or refuse. JSON includes each attempt's display state
 # and the durable open/ended facts separately (PID liveness is only a hint).
 aib_attempts_fold() {
-  local result header ids
+  local header fd reader rc=0
+  local -a lines=()
   command -v python3 >/dev/null 2>&1 || { printf 'ai-bobnet: attempt fold requires python3\n' >&2; return 6; }
-  result="$(python3 "${REPO_ROOT}/lib/attempts_fold.py" "$1")" || return $?
-  header="${result%%$'\n'*}"; result="${result#*$'\n'}"
-  ids="${result%%$'\n'*}"
-  AIB_ATTEMPTS_FOLD_IDS="${ids//$'\t'/$'\n'}"
+  # mapfile reads the pipe in blocks. Pattern-substituting a multi-megabyte
+  # captured JSON string once per ID makes this handoff quadratic in Bash.
+  exec {fd}< <(python3 "${REPO_ROOT}/lib/attempts_fold.py" "$1")
+  reader=$!
+  mapfile -t lines <&"$fd" || rc=$?
+  exec {fd}<&-
+  wait "$reader" || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ "${#lines[@]}" -ge 2 ] || { printf 'ai-bobnet: incomplete fold response\n' >&2; return 2; }
+  header="${lines[0]}"
+  AIB_ATTEMPTS_FOLD_IDS=""
+  if [ "${#lines[@]}" -gt 2 ]; then printf -v AIB_ATTEMPTS_FOLD_IDS '%s\n' "${lines[@]:2}"; fi
   IFS=$'\t' read -r AIB_ATTEMPTS_FOLD_STATUS AIB_EVENT_SCAN_HIGHEST_SEQ AIB_EVENT_SCAN_NEXT_SEQ AIB_EVENT_SCAN_TORN_TAIL <<< "$header"
   AIB_EVENT_SCAN_STATUS="$AIB_ATTEMPTS_FOLD_STATUS"
-  AIB_ATTEMPTS_FOLD_JSON="${result#*$'\n'}"
+  AIB_ATTEMPTS_FOLD_JSON="${lines[1]}"
   printf '%s\n' "$AIB_ATTEMPTS_FOLD_JSON"
 }
 

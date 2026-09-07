@@ -562,6 +562,21 @@ else
   skip "TZ coupling (date -d/-v not available to compute 'one minute ago')"
 fi
 
+# Dated inputs around both DST transitions must match the upstream double pass.
+if [ -n "$NODE" ] && [ -r "$BEATS_MJS" ]; then
+  cat > "$WORK/beats_epoch.mjs" <<'NODEEOF'
+const { parseBeatLine } = await import(process.argv[2]);
+console.log(parseBeatLine(process.argv[3],0,{tz:'Europe/Berlin',isLast:true}).epoch);
+NODEEOF
+  for stamp in '2026-03-29 02:30' '2026-10-25 02:30' '2026-09-07 00:00'; do
+    printf '%s | busy | timestamp differential\n' "$stamp" > "$WORK/acme/standup/acme-core.log"
+    run_project acme
+    upstream=$("$NODE" "$WORK/beats_epoch.mjs" "$BEATS_MJS" "$stamp | busy | timestamp differential")
+    actual=$("$PY" -c 'import datetime,json,sys; s=json.load(open(sys.argv[1]))["agents"]["acme-core"]["since"]; print(int(datetime.datetime.fromisoformat(s).timestamp()*1000))' "$OUT_ACME")
+    eq "timestamp epoch agrees with beats.mjs at $stamp" "$actual" "$upstream"
+  done
+fi
+
 total=$((pass+fail))
 printf '\n%d checks (%d skipped): %d ok / %d fail\n' "$total" "$skipped" "$pass" "$fail"
 [ "$fail" -eq 0 ]
