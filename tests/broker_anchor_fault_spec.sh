@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Anchor durability failures and admission configuration must fail closed.
+set -uo pipefail
+SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+. "$SRC_ROOT/lib/aibobnet.sh"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+pass=0 fail=0
+check() { if "$@"; then pass=$((pass+1)); else fail=$((fail+1)); printf 'FAIL - %s\n' "$*"; fi; }
+EVENTS="$WORK/events"
+ENV_KV=$'project_uid=acme\nactor_type=service\nactor_id=broker'
+PAYLOAD=$(aib_event_compose_decided_payload $'decision=allow\ncode=0')
+commit() { aib_event_commit "$EVENTS" "$EVENTS.lock" attempt.decided "$ENV_KV" "$PAYLOAD" '' anchor; }
+# Seed without depending on the implementation's anchor support.
+aib_event_commit "$EVENTS" "$EVENTS.lock" attempt.decided "$ENV_KV" "$PAYLOAD"
+printf '1\n' > "$EVENTS.high_water"
+original=$(cat "$EVENTS")
+for bad in '' -1 01 '1 2' $'1\n\n' $'1\nx'; do
+  printf '%s' "$bad" > "$EVENTS.high_water"
+  ( commit ) >"$WORK/out" 2>"$WORK/err"; rc=$?
+  check test "$rc" -ne 0
+  check test "$(cat "$EVENTS")" = "$original"
+  printf '%s\n' "$original" > "$EVENTS"
+done
+# No signed integer wraparound can turn a huge ahead anchor into lag.
+printf '9999999999999999999999999999' > "$EVENTS.high_water"
+( commit ) >"$WORK/out" 2>"$WORK/err"; check test "$?" -ne 0
+check test "$(cat "$EVENTS")" = "$original"
+mkdir "$WORK/bin"
+REAL_SYNC=$(command -v sync); REAL_MV=$(command -v mv)
+export REAL_SYNC REAL_MV EVENTS
+cat > "$WORK/bin/sync" <<'STUB'
+#!/usr/bin/env bash
+printf 'sync %s\n' "$*" >> "$TRACE"
+case "$FAULT:$*" in
+  stream:"-d -- $EVENTS"|temp:*"$EVENTS.high_water."*|dir:"-- ${EVENTS%/*}") exit 1;;
+esac
+exec "$REAL_SYNC" "$@"
+STUB
+cat > "$WORK/bin/mv" <<'STUB'
+#!/usr/bin/env bash
+printf 'mv %s\n' "$*" >> "$TRACE"
+[ "$FAULT" != rename ] || exit 1
+exec "$REAL_MV" "$@"
+STUB
+chmod +x "$WORK/bin/"*
+export TRACE="$WORK/trace"
+for FAULT in stream temp rename dir; do
+  export FAULT
+  printf '%s\n' "$original" > "$EVENTS"
+  printf '1\n' > "$EVENTS.high_water"
+  ( PATH="$WORK/bin:$PATH" commit ) >"$WORK/out" 2>"$WORK/err"; check test "$?" -ne 0
+  if [ "$FAULT" != dir ]; then check test "$(cat "$EVENTS.high_water")" = 1; fi
+done
+# Admission configuration is rejected before attempting to read a frame.
+for cap in 0 -1 bad 01 999999999999999999999999; do
+  out=$(AIB_BROKER_CAPACITY="$cap" "$SRC_ROOT/bin/aib-broker-handler" </dev/null 2>"$WORK/err"); rc=$?
+  check test "$rc" = 2
+  check grep -qx 'reason=broker_misconfigured' <<<"$out"
+done
+out=$(AIB_BROKER_MAX_CONNECTIONS=bad "$SRC_ROOT/bin/aib-broker-handler" </dev/null 2>"$WORK/err")
+check grep -qx 'reason=broker_misconfigured' <<<"$out"
+printf '\nbroker_anchor_fault_spec: %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" = 0 ]
