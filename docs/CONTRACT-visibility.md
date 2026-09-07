@@ -325,7 +325,7 @@ A frame-intact record containing invalid UTF-8 does not make the stream corrupt.
 listed in `stream.undecodable_records`, and `anomalies.undecodable_records` counts these records.
 Projection skips that record and continues with later decodable records. An ended record referring
 to a skipped decided record cannot create an attempt. The legacy `bin/attempts` text view retains
-byte-transparent scalar extraction for the malformed record, preserving its historical output;
+byte-transparent scalar extraction through the original Bash/awk accessors for the malformed record, preserving its historical output;
 the projection never exposes undecodable strings as trusted structured state.
 
 `bin/attempts` is refactored to call this function and **MUST produce byte-identical output** to the

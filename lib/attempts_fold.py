@@ -7,6 +7,8 @@ transparent scanner/awk behavior for scalar fields in those records.
 import json
 import os
 import re
+import subprocess
+from pathlib import Path
 import sys
 
 
@@ -25,6 +27,25 @@ def unique_pairs(pairs):
             raise ValueError('duplicate JSON object key')
         out[key] = value
     return out
+
+
+def legacy_record(data):
+    # Only undecodable records use this compatibility path. Reuse exactly the
+    # scalar accessors of the old CLI rather than inventing a lossy JSON repair.
+    script = r''' . "$1"
+IFS= read -r -d "" json || :
+for key in event_type attempt_id agent_uid occurred_at; do
+  printf '%s\0' "$(aib_event_field "$json" "$key")"
+done
+for key in decision pid exit.class exit.code; do
+  printf '%s\0' "$(aib_event_payload_field "$json" "$key")"
+done
+'''
+    raw = subprocess.check_output(['bash', '-c', script, '_', str(Path(__file__).with_name('aibobnet.sh'))], input=data)
+    values = [v.decode('utf-8', errors='surrogateescape') for v in raw.split(b'\0')[:-1]]
+    kind, ident, agent, occurred, decision, pid, exit_class, code = values
+    return dict(event_type=kind, attempt_id=ident, agent_uid=agent, occurred_at=occurred,
+                payload=dict(decision=decision, pid=pid, exit={'class':exit_class, 'code':code}))
 
 
 def fold_records(records, legacy=False):
@@ -106,10 +127,9 @@ def fold(path, status, highest, next_seq, torn, reason, present, readable):
                     text = data.decode('utf-8')
                     undecodable = False
                 except UnicodeDecodeError:
-                    text = data.decode('utf-8', errors='surrogateescape')
                     undecodable = True
                     out['undecodable_records'].append(int(seq))
-                record = json.loads(text, object_pairs_hook=unique_pairs)
+                record = legacy_record(data) if undecodable else json.loads(text, object_pairs_hook=unique_pairs)
                 records.append((int(seq), record, undecodable))
         # Compute the legacy view first for its established semantic diagnostics.
         out['legacy_attempts'] = fold_records(records, legacy=True)
