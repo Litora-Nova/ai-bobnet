@@ -305,7 +305,8 @@ The `.example` suffix prevents the sample from being applied before site configu
 ## Read-only visibility commands
 
 `bin/project` and `bin/attempts` require Python 3.9+ (standard library only; `zoneinfo` uses the
-host timezone database), plus the existing Bash/awk registry reader. Projection strings, including
+host timezone database), plus the existing Bash/awk registry reader. Python runs in isolated mode
+(`-I`), ignoring ambient Python import paths and the current working directory. Projection strings, including
 messages, pass through `aib_json` in one batched shell encoder invocation. The projector uses
 GNU coreutils `realpath`, `mktemp`, `mkdir`, `cat`, `chmod`, `mv` (with `-T`), and `rm` for path checking and atomic
 publication; it never invokes `flock` or opens an admission lease. Python remains optional for the

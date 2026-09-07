@@ -35,4 +35,4 @@ aib_attempts_fold "$AIB_EVENT_FILE" > "$scan_output" || aib_die $? "event stream
 if [ "$AIB_ATTEMPTS_FOLD_STATUS" = corrupt ]; then
   aib_die 2 "event stream is corrupt — refusing partial attempt fold"
 fi
-python3 "$REPO_ROOT/lib/attempts_fold.py" --text < "$scan_output"
+python3 -I "$REPO_ROOT/lib/attempts_fold.py" --text < "$scan_output"

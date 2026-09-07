@@ -524,6 +524,31 @@ run_project acme
 eq "symlink heartbeat refuses publication" "$RUN_RC" 2
 rm "$log_path"; mv "$WORK/log-saved" "$log_path"
 
+# The root must also stay outside every OTHER registered project's home.
+old_root="$PROJROOT"; PROJROOT="$WORK/empty/unsafe-output"
+run_project acme
+eq "output under another registered project home is refused" "$RUN_RC" 2
+eq "another project's unsafe output directory is not created" "$([ -e "$PROJROOT" ] && printf yes || printf no)" no
+rm -rf "$PROJROOT"
+PROJROOT="$old_root"
+
+# Agent-controlled working directories and PYTHONPATH must not supply parser code.
+poison_marker="$WORK/import-executed"
+printf 'open(%s, "w").write("executed")\nraise RuntimeError("untrusted import")\n' \
+  "$("$PY" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$poison_marker")" > "$WORK/acme/json.py"
+(
+  cd "$WORK/acme" || exit 1
+  run_project acme
+  printf '%s\n' "$RUN_RC" > "$WORK/import-cwd-rc"
+)
+eq "agent-controlled cwd cannot supply a Python module" "$(cat "$WORK/import-cwd-rc")" 0
+eq "cwd module code is never executed" "$([ -e "$poison_marker" ] && printf yes || printf no)" no
+rm -f "$poison_marker"
+PYTHONPATH="$WORK/acme" run_project acme
+eq "ambient PYTHONPATH cannot supply a Python module" "$RUN_RC" 0
+eq "PYTHONPATH module code is never executed" "$([ -e "$poison_marker" ] && printf yes || printf no)" no
+rm -f "$WORK/acme/json.py" "$poison_marker"
+
 # =========================================================================
 # K — rebuild acceptance (CONTRACT-visibility.md SS17, docs/DOMAIN.md SS11(e))
 # =========================================================================

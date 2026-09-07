@@ -19,17 +19,24 @@ _aib_check_registry_snapshot
 projects="$(_aib_snapshot_query projects keys)" || aib_die 2 'cannot list projects'
 agents="$(_aib_snapshot_query agents keys)" || aib_die 2 'cannot list agents'
 
+# One output root serves the fleet; it must be outside every registered home,
+# including homes belonging to projects other than the one requested here.
+physical_root=$(realpath -m -- "$projection_root") || aib_die 2 'cannot resolve output root'
+while IFS= read -r protected_uid; do
+  [ -n "$protected_uid" ] || continue
+  project_home="$(_aib_snapshot_query projects field "$protected_uid" home)" || continue
+  case "$project_home" in /*) ;; *) continue;; esac
+  protected_home=$(realpath -m -- "$project_home") || aib_die 2 'cannot resolve protected home'
+  case "$physical_root/" in "$protected_home/"*) aib_die 2 'output root must be outside every registered project home';; esac
+done <<< "$projects"
+
 _project_one() (
   local uid="$1" standup home agent owner scratch='' temp='' output_fd
   aib_validate_token "$uid" project_uid
   standup="$(_aib_snapshot_query projects field "$uid" standup_dir)" || aib_die 2 "cannot resolve standup_dir for $uid"
   home="$(_aib_snapshot_query projects field "$uid" home)" || aib_die 2 "cannot resolve home for $uid"
   [ -d "$standup" ] && [ -r "$standup" ] && [ -x "$standup" ] || aib_die 2 "standup_dir unavailable for $uid"
-  # Fail a misconfigured output root rather than writing inside this agent boundary.
-  local physical_root physical_home
-  physical_root=$(realpath -m -- "$projection_root") || aib_die 2 'cannot resolve output root'
-  physical_home=$(realpath -e -- "$home") || aib_die 2 "cannot resolve home for $uid"
-  case "$physical_root/" in "$physical_home/"*) aib_die 2 'output root must be outside project home';; esac
+  [ -d "$home" ] || aib_die 2 "home unavailable for $uid"
   trap 'rm -rf -- "$scratch"; [ -z "$temp" ] || rm -f -- "$temp"' EXIT
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/aib-project.XXXXXX") || aib_die 2 'cannot create reader scratch directory'
   : > "$scratch/agents"
@@ -41,7 +48,7 @@ _project_one() (
     printf '%s\n' "$agent" >> "$scratch/agents" || aib_die 2 'cannot buffer agent roster'
   done <<< "$agents"
   aib_attempts_fold "$AIB_EVENT_ROOT/$uid/main.events" > "$scratch/fold" || aib_die 2 "fold failed for $uid"
-  python3 - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" > "$scratch/result" <<'PY'
+  python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" > "$scratch/result" <<'PY'
 import datetime as dt
 import errno
 import json

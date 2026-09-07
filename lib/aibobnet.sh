@@ -2632,7 +2632,7 @@ aib_attempts_fold() {
   # A regular scratch file lets mapfile buffer large JSON lines. On a pipe,
   # Bash reads these lines bytewise; that alone exceeds the projection budget.
   buffer=$(mktemp "${TMPDIR:-/tmp}/aib-fold.XXXXXX") || return 2
-  if python3 "${REPO_ROOT}/lib/attempts_fold.py" "$1" > "$buffer"; then
+  if python3 -I "${REPO_ROOT}/lib/attempts_fold.py" "$1" > "$buffer"; then
     mapfile -t lines < "$buffer" || rc=$?
   else
     rc=$?

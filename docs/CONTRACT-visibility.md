@@ -501,7 +501,8 @@ Every field, documented:
 - The shared fold uses a single Python 3 reader with C-backed POSIX CRC computation, rather than
   forking parsers per record. Its JSON result exposes status, reason, scan counters, presence and
   readability, and ordered attempts (including display state and durable open/ended facts separately).
-  Python 3.9+ is required by the two read-only commands. The writer's scanner and event schema are
+  Python 3.9+ is required by the two read-only commands. Both use isolated mode (`-I`),
+  so agent-controlled working directories and ambient Python import paths cannot provide parser code. The writer's scanner and event schema are
   unchanged. Duplicate JSON keys and malformed attempt payloads report corruption, never a partial fold.
 - A degraded scan (sequence loss) maps to projection `stream.status=corrupt` with a sequence-gap
   reason, because schema 1 has no `degraded` member. `bin/attempts` retains its existing
@@ -520,7 +521,7 @@ Every field, documented:
   makes the final exit code 2 while the other projects continue.
 - Directory/file ownership is provisioned; this command creates missing output directories with mode
   0750 and publishes mode 0640. Existing root permissions are not repaired by the reader. The configured
-  root is refused if it resolves inside the current project's home. GNU `mv -T` makes a directory
+  root is refused if it resolves inside any registered project's home. GNU `mv -T` makes a directory
   at the destination an error, never a container for the temporary file. The units remain deployment text.
 
 ## 19. Not in V-1
