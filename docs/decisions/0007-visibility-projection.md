@@ -69,8 +69,14 @@ the amendment for later hands the same mistake to the next artifact.
 `0644`/`0750` already gives via the group without ever granting write) is dropped for the same reason
 listed above. This ADR fixes, tighter than the consult's own `0644` suggestion:
 
-- Directory `aib-broker:aib-shared 0750` — broker writes, shared group reads, no one else, and no
-  group-write anywhere in the chain.
+- Directory owned **`root:aib-broker`, mode `2770`**, with a POSIX ACL granting the shared reader group
+  `r-x` on the directory and a default ACL of `r--` on every file — the broker (group member) writes,
+  the shared group reads, no one else. Ownership stays with root and not with the writer for the same
+  reason as the event-stream directory: `chmod` is an owner right that Landlock (up to ABI 6) does not
+  mediate, so a writer-owned directory could be opened by the confined child with a single `chmod`.
+  (Amended 2026-09-08 after the provisioning review; the first cut said `aib-broker:aib-shared 0750`.)
+  Residual, stated: the files inside stay writer-owned, so a confined child could `chmod` a file it
+  cannot open for writing — the root is outside `LL_RW`, so no content write is possible either way.
 - File `<root>/<project_uid>.json`, mode `0640`.
 - Publish via `mktemp` (in `AIB_PROJECTION_ROOT` itself, `O_EXCL`, random suffix) then `rename(2)`,
   never a fixed temp name — the consult's fixed-temp-name concern (a pre-planted symlink at a known

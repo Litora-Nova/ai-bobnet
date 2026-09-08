@@ -378,8 +378,10 @@ event stream, not inventing a new one:
 - **`AIB_PROJECTION_ROOT`** — unit-environment-only, never request- or registry-supplied (the same
   restriction already stated for `AIB_EVENT_ROOT` and `AIB_CONFINE_BIN`). Default
   `/var/lib/aib/projection`.
-- **Directory** `<AIB_PROJECTION_ROOT>` owned `aib-broker:aib-shared`, mode **`0750`** — the broker
-  writes, the shared group (dashboard, operators) reads, no one else.
+- **Directory** `<AIB_PROJECTION_ROOT>` owned **`root:aib-broker`**, mode **`2770`**, readers granted by
+  a POSIX ACL (`r-x` on the directory, default `r--` on files) — the broker writes as a group member,
+  the shared group (dashboard, operators) reads, no one else; root owns it so the writer cannot
+  `chmod` it open (ADR-0007 §B).
 - **File** `<AIB_PROJECTION_ROOT>/<project_uid>.json`, mode **`0640`** — group-read only, never
   group-write. `docs/CONFINEMENT.md`'s §2.1 minimum list gains this root explicitly (§16 below):
   granting a confined child `LL_RW` over a project `home` must never also grant it a route to this
@@ -552,8 +554,8 @@ Every field, documented:
   prior projection. A stdout error therefore leaves the previous file untouched; consumers must check
   the exit status because a later rename failure can still follow stdout output. `--all --stdout` emits one JSON line per successful project. Any failed project
   makes the final exit code 2 while the other projects continue.
-- Directory/file ownership is provisioned; this command creates missing output directories with mode
-  0750 and publishes mode 0640. Existing root permissions are not repaired by the reader. The configured
+- Directory/file ownership is provisioned (root-owned, group `aib-broker`, readers via ACL); this command
+  creates a missing output directory only as a fallback (mode 0750) and publishes mode 0640. Existing root permissions are not repaired by the reader. The configured
   root is refused if it resolves inside any registered project's home. GNU `mv -T` makes a directory
   at the destination an error, never a container for the temporary file. The units remain deployment text.
 

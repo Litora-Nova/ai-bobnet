@@ -263,6 +263,12 @@ removed after the install, through the mediated package wrapper.
 
 ### The install step, concretely
 
+After every registry change that adds or removes a project, provisioning must (re)create the
+reader-facing symlinks `<standup_dir>/_projection.json -> <AIB_PROJECTION_ROOT>/<project_uid>.json`
+for all registered projects (a root-owned helper, callable by the deploy account) — the projector
+never creates them.
+
+
 ```
 cc -O2 -Wall -o /opt/aib/engine/libexec/landlock-exec src/landlock-exec.c
 chown root:aib-broker /opt/aib/engine/libexec/landlock-exec
@@ -313,4 +319,4 @@ messages, pass through `aib_json` in one batched shell encoder invocation. The p
 GNU coreutils `realpath`, `mktemp`, `mkdir`, `cat`, `chmod`, `mv` (with `-T`), and `rm` for path checking and atomic
 publication; it never invokes `flock` or opens an admission lease. Python remains optional for the
 broker's connection-liveness probe; neither admission nor event commits acquire a Python dependency.
-Output ownership (`aib-broker:aib-shared`) belongs to provisioning, not the reader.
+Output ownership (root-owned, group `aib-broker`, readers via ACL — ADR-0007 §B) belongs to provisioning, not the reader.
