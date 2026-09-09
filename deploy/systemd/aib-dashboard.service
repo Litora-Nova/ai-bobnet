@@ -1,0 +1,68 @@
+[Unit]
+Description=BobNet visibility dashboard - read-only schema-2 render of the projection root
+Documentation=file:/opt/aib/engine/docs/CONTRACT-visibility.md
+Documentation=file:/opt/aib/engine/docs/decisions/0008-dashboard.md
+
+[Service]
+Type=simple
+ExecStart=/opt/aib/engine/bin/dashboard
+User=aib-dash
+Group=aib-dash
+# ACL-granted read on the projection root (docs/CONTRACT-visibility.md SS14: "the shared group
+# (dashboard, operators) reads") - the same group aib-broker's own ACL already names, never a
+# path to aib-broker's own group membership. Provisioning grants aib-dash's group r-x on the
+# directory / r-- on files via the same POSIX ACL ADR-0007 SSB set up for the projector's readers.
+SupplementaryGroups=aib-shared
+
+# Wrapper-free: this unit binds directly, no address translation happens outside the process.
+# Unit-environment-only, per docs/decisions/0008-dashboard.md SSE - never request-supplied
+# (there is no request; this is a standing daemon, not a per-call handler). No safe default for
+# the bind address: bin/dashboard refuses to bind 0.0.0.0 unless this names it explicitly.
+# Provisioning sets this to the tailnet IPv4 address - Tailscale is this deployment's access
+# boundary today (docs/decisions/0008-dashboard.md SSE).
+Environment=AIB_DASHBOARD_BIND=REPLACE_WITH_TAILNET_IPV4
+Environment=AIB_DASHBOARD_PORT=3030
+
+# Read-only consumer of the broker's own projection output - never a second write path, never a
+# second reader of engine truth (docs/CONTRACT-visibility.md SS4/SS5, docs/decisions/0008-dashboard.md
+# SSD). Must equal the projector's own AIB_PROJECTION_ROOT (deploy/systemd/aib-projection.service) -
+# two separate files, hand-edited independently; nothing enforces agreement between them.
+Environment=AIB_PROJECTION_ROOT=/var/lib/aib/projection
+
+# Rendering-only threshold (docs/CONTRACT-visibility.md SS19): how old generated_at may be before
+# a render marks the whole snapshot stale. Distinct from any of bin/project's own env - the
+# projector never reads this variable, and bin/dashboard never reads AIB_PROJECTION_DEAD_MINUTES.
+Environment=AIB_PROJECTION_STALE_SECONDS=60
+
+# Timestamps already offset-bearing ISO 8601 in the projection file (docs/CONTRACT-visibility.md
+# SS9) render correctly regardless of this unit's own zone; TZ is set here only for this unit's own
+# journal timestamps and any future "as of <local time>" display line, for the same consistency
+# reason every other broker-family unit in this repository sets it. Replace with the fleet's actual
+# DEV_TEAM_TZ value, matching deploy/systemd/aib-projection.service - not a safe default to leave
+# unedited.
+Environment=TZ=Europe/Berlin
+
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=2s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+# bin/dashboard never reads the credential directory or the event stream - it renders the
+# projection root only (docs/decisions/0008-dashboard.md SSD/SSE). Both are inaccessible outright,
+# tighter than aib-projection.service (which needs ReadOnlyPaths on the event root to fold it).
+InaccessiblePaths=/var/lib/aib/auth /var/lib/aib/events
+# The one path this process opens, and only for reading. No ReadWritePaths anywhere in this unit:
+# bin/dashboard has no write path, by construction (docs/CONTRACT-visibility.md SS4).
+ReadOnlyPaths=/var/lib/aib/projection
+
+# Site drop-ins: if AIB_PROJECTION_ROOT is overridden to a path outside /var/lib/aib, add a
+# ReadOnlyPaths= drop-in for it the same way aib-broker@.service.d/site.conf.example does for
+# ReadWritePaths - this unit never writes into the projection root or anywhere else.

@@ -47,6 +47,13 @@ missing runtime dependency fails closed with exit 6. The optional localhost HTTP
 standard library only; it has no pip dependency. RM-0 through RM-2 add no daemon, network call, or
 development server of their own.
 
+**The visibility dashboard (`bin/dashboard`, schema 2, [ADR-0008](docs/decisions/0008-dashboard.md)) is
+the one standing daemon in this repository.** It is a zero-dependency Python 3 (3.9+) standard-library
+`http.server`, server-side rendered with no JavaScript and no build step; it reads only the projection
+root `bin/project` publishes, under its own account (`aib-dash`), and never the registry or the event
+stream. `docs/CONTRACT-visibility.md` §19 fixes its rendering rules; `deploy/systemd/aib-dashboard.service`
+is the deployment text.
+
 **Deployment precondition (RM-1): provider authentication must be file-based.** The managed launcher builds
 the child environment from an allow-list — `HOME`, `PATH`, and the explicit managed `AIBOBNET_*` exports —
 so an API key supplied only as an environment variable, for example `OPENAI_API_KEY`, does not survive

@@ -203,7 +203,9 @@ exists, never inside it:
   plus a capability probe **at `aib_event_commit`'s own entry**, alongside `flock`/`cksum`, and
   **never at library load** — a load-time check would turn a commit-path dependency into a load-path
   one and brick every read-only consumer that merely sources `lib/aibobnet.sh` (the fold,
-  `bin/attempts`, the dashboard, the specs) on a host whose `sync` predates file-argument support.
+  `bin/attempts`, the specs) on a host whose `sync` predates file-argument support. (The dashboard is
+  no longer on this list, and never was after `docs/decisions/0008-dashboard.md`: `bin/dashboard`
+  does not source `lib/aibobnet.sh` at all — see the runtime-dependency note below.)
   Absence fails closed with `aib_die 6`. The probe **never falls back to argument-less `sync`**: bare
   `sync` returns 0 and flushes the whole system, which would make a broken capability check read as
   "satisfied" while the anchor's durability claim (ADR-0006, part A) is silently false. `sync -d
@@ -232,6 +234,16 @@ absent, `_aib_enact_conn_alive` returns "alive" unconditionally and enactment de
 next-write-only detection — never a crash, never a hang, and the probe never writes a byte to the
 wire either way. An operator auditing this path's runtime dependencies should install `python3` if
 they want the sharper detection; its absence is a documented degradation, not a defect.
+
+**`bin/dashboard`'s own runtime dependency is `python3` (3.9+) standard library only** — `http.server`
+(`ThreadingHTTPServer`, `BaseHTTPRequestHandler`), `html`, `json`, `os`, `pathlib` — no third-party
+package, no build step, no `pip install` (`docs/decisions/0008-dashboard.md` §B). Unlike the fold and
+`bin/attempts`/`bin/project` above, it is not a "read-only consumer of `lib/aibobnet.sh`": it never
+sources that library and never runs inside the broker account at all. It runs under its own account,
+`aib-dash`, with read access to `AIB_PROJECTION_ROOT` only — never the credential directory, never the
+event stream, never the registry (`docs/decisions/0008-dashboard.md` §D/§E,
+`deploy/systemd/aib-dashboard.service`). Its absence is a hard failure, not a degradation: there is no
+fallback render.
 
 ### Exhausted process-group cleanup
 
