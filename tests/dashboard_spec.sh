@@ -430,6 +430,68 @@ hasnt "SS19: an aging/unregistered file is never rendered as an error" "$lower_s
 eq "POST / is a 405" "$(code_of / -X POST)" 405
 eq "POST /api/fleet is a 405" "$(code_of /api/fleet -X POST)" 405
 
+# =========================================================================
+# E — theming: tokens, cookie-selected class, no JS (CONTRACT-visibility.md SS19 "Theming",
+#     docs/decisions/0008-dashboard.md SSG; PO amendment 2026-09-09)
+# =========================================================================
+get_cookie() { curl_ok && "$CURL" -sS --max-time 2 -b "aib_theme=$2" "http://127.0.0.1:$DASH_PORT$1"; }
+
+css="$( [ -n "$PY" ] && printf '%s' "$html_fleet" | "$PY" -c '
+import re, sys
+m = re.search(r"<style>(.*?)</style>", sys.stdin.read(), re.S)
+print(m.group(1) if m else "")
+' 2>/dev/null || true)"
+
+if [ -n "$PY" ]; then
+  color_leaks="$(printf '%s' "$css" | "$PY" -c '
+import re, sys
+css = sys.stdin.read()
+allowed = {":root", "body.light", "body.c64"}
+leaks = []
+for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+    sel = m.group(1).strip()
+    if sel in allowed:
+        continue
+    if re.search(r"#[0-9a-fA-F]{3,8}\b|rgb\(", m.group(2)):
+        leaks.append(sel)
+print(len(leaks))
+' 2>/dev/null || printf 'na')"
+  if [ "$color_leaks" = na ]; then
+    no "every colour literal is confined to :root{}/body.light{}/body.c64{} (could not parse served CSS)"
+  else
+    eq "every colour literal is confined to :root{}/body.light{}/body.c64{}" "$color_leaks" 0
+  fi
+  c64_upper="$(printf '%s' "$css" | "$PY" -c '
+import re, sys
+css = sys.stdin.read()
+m = re.search(r"body\.c64\s*\{([^{}]*)\}", css)
+print("yes" if m and re.search(r"text-transform\s*:\s*uppercase", m.group(1)) else "no")
+' 2>/dev/null || printf 'na')"
+  eq "body.c64{} contains text-transform:uppercase" "$c64_upper" yes
+else
+  skip "colour-literal confinement + body.c64 uppercase (python3 not present)"
+fi
+has ":root declares the pinned dark-default token names" "$css" "--bg"
+has "a prefers-color-scheme: light media block exists" "$css" "prefers-color-scheme: light"
+
+theme_light_headers="$(head_of "/?theme=light")"
+has "?theme=light sets Set-Cookie: aib_theme=light" "$theme_light_headers" "Set-Cookie: aib_theme=light"
+theme_light_body="$(get "/?theme=light")"
+has '?theme=light renders <body class="light">' "$theme_light_body" 'body class="light"'
+
+cookie_only_body="$(get_cookie / light)"
+has 'aib_theme=light cookie alone renders <body class="light">' "$cookie_only_body" 'body class="light"'
+
+bogus_headers="$(head_of "/?theme=bogus")"
+hasnt "?theme=bogus never sets a Set-Cookie" "$bogus_headers" "Set-Cookie"
+bogus_body="$(get "/?theme=bogus")"
+hasnt '?theme=bogus never renders an explicit body class (falls back to auto)' "$bogus_body" "<body class="
+
+theme_links="$(get /p/acme)"
+has "the header carries a path-preserving ?theme=dark link" "$theme_links" "?theme=dark"
+has "the header carries a path-preserving ?theme=light link" "$theme_links" "?theme=light"
+has "the header carries a path-preserving ?theme=c64 link" "$theme_links" "?theme=c64"
+
 kill "$DASH_PID" 2>/dev/null; wait "$DASH_PID" 2>/dev/null; DASH_PID=""
 
 # Bind refusal: 0.0.0.0 without an explicit AIB_DASHBOARD_BIND=0.0.0.0 must refuse to start.
