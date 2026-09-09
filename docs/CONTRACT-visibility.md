@@ -7,9 +7,8 @@
 
 ## 0. Why this exists
 
-`plan/BobNet_3.0_ENTSCHEID_sichtbarkeit-und-vm-split.md` (PO decision, 2026-08-15) made visibility a
-**pillar acceptance criterion**: *"Kein Pfeiler gilt als fertig, solange sein Zustand nicht sichtbar
-ist"* — no pillar is done until its state is visible, checked mechanically per sprint: does the
+The product-owner decision record on visibility and the VM split (private planning, 2026-08-15) made visibility a
+**pillar acceptance criterion**: no pillar is done until its state is visible, checked mechanically per sprint: does the
 pillar emit the events this contract names. It also made a **thin, read-only projection** the
 precondition for any agent going live on the production VM (Decision 4); on the current dev VM,
 admin-SSH oversight substitutes for it.
