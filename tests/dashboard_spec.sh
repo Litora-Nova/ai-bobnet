@@ -575,6 +575,28 @@ PYEOF
   eq "HTTP boundary corpus: methods, HEAD, nofollow/FIFO, bad files, replacement, cookies and slow clients" "$?" 0
 fi
 
+if [ -n "$PY" ]; then
+  "$PY" - "$SRC_ROOT" "$DROOT" <<'PYEOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from dashboard.reader import ProjectionRoot, instant
+from dashboard.render import project_page
+from dashboard.server import configuration
+root = Path(sys.argv[2])
+p = json.loads((root/'acme.json').read_text())
+reader = ProjectionRoot(root)
+at = instant(p['generated_at'])
+for age, stale in [(59.9, False), (60, False), (60.1, True), (-1, False)]:
+    row = next(row for row in reader.fleet(at + age, 60)['projects'] if row['project_uid'] == 'acme')
+    assert row['stale'] is stale, ('fleet', age, row['stale'])
+    rendered = project_page(p, at + age, 60, 'auto')
+    assert ('stale since ' in rendered) is stale, ('project', age)
+assert configuration({'AIB_DASHBOARD_BIND':'0.0.0.0'})[0] == ('0.0.0.0', 3030)
+PYEOF
+  eq "freshness compares exact elapsed time; wildcard bind requires explicit opt-in" "$?" 0
+fi
+
 kill "$DASH_PID" 2>/dev/null; wait "$DASH_PID" 2>/dev/null; DASH_PID=""
 
 # Bind refusal: 0.0.0.0 without an explicit AIB_DASHBOARD_BIND=0.0.0.0 must refuse to start.

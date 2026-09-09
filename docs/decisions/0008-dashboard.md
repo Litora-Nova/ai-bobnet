@@ -293,6 +293,9 @@ White-label: example project id `acme`; no real names, infrastructure, or hosts 
   effective for display, as clarified in the rendering contract. Future timestamps
   display their clock lead rather than a negative "old" age. Stale snapshots use
   neutral text; stream status and agent state keep the schema vocabulary.
+  Freshness compares the exact elapsed duration strictly against the threshold;
+  only the displayed `age_seconds` is rounded down. Exactly 60 seconds is fresh
+  at the default threshold, while 60.1 seconds is stale.
 - Layout and density follow the approved HTML draft, but no sample values or
   inferred "unregistered project" labels are imported. The dashboard has no
   registry knowledge. Full capped reasons remain readable, without a fabricated

@@ -1,7 +1,7 @@
 # ai-bobnet — Visibility Contract (V-1)
 
-> **Status: implemented V-1 (schema 1, superseded 2026-09-09); schema 2 pinned 2026-09-09,
-> build pending.** This contract remains the normative consumer interface. Schema 2 adds the
+> **Status: schema 2 implemented 2026-09-09; replaces V-1 schema 1.**
+> This contract remains the normative consumer interface. Schema 2 adds the
 > per-agent `launch` object (§18) and the dashboard's rendering obligations (§19);
 > `docs/decisions/0008-dashboard.md` records why.
 

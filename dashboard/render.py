@@ -130,11 +130,12 @@ def attempt_cell(attempt, stream_status):
 
 def project_page(p, now, threshold, theme):
     uid = p['project_uid']
-    age = math.floor(now - instant(p['generated_at']))
+    elapsed = now - instant(p['generated_at'])
+    age = math.floor(elapsed)
     body = '<a class="back" href="/">Back to Fleet</a>'
     body += f'<div class="page-title"><h1>{code(uid)}</h1><span class="eyebrow">Project · schema {escaped(p["schema"])}</span></div>'
     body += ('<div class="snapshot"><span><span class="key">generated_at</span> ' + stamp(p['generated_at']) + '</span>' +
-             freshness(age, age > threshold) + '<span>' + field('attested_sources', ', '.join(p['attested_sources'])) + '</span></div>')
+             freshness(age, elapsed > threshold) + '<span>' + field('attested_sources', ', '.join(p['attested_sources'])) + '</span></div>')
     stream, capacity = p['stream'], p['capacity']
     facts = [('status', badge(stream['status'])), ('last_seq', code(stream['last_seq'])), ('anchor.value', code(stream['anchor']['value'])),
              ('anchor.relationship', code(stream['anchor']['relationship'])), ('torn_tail', code(stream['torn_tail'])), ('undecodable_records', code(stream['undecodable_records']))]

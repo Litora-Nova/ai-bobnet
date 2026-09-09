@@ -156,8 +156,9 @@ class ProjectionRoot:
                            generated_at=None, age_seconds=None, stale=None, stream_status=None,
                            capacity=None, attention_count=None, agents_by_state=None)
                 if value is not None:
-                    age = math.floor(now - instant(value['generated_at']))
-                    row.update(generated_at=value['generated_at'], age_seconds=age, stale=age > threshold,
+                    elapsed = now - instant(value['generated_at'])
+                    age = math.floor(elapsed)
+                    row.update(generated_at=value['generated_at'], age_seconds=age, stale=elapsed > threshold,
                         stream_status=value['stream']['status'], capacity=value['capacity'], attention_count=len(value['attention']),
                         agents_by_state={state: sum(a['state'] == state for a in value['agents'].values()) for state in STATES})
                 result['projects'].append(row)
