@@ -586,15 +586,34 @@ fi
 # =========================================================================
 # M — non-consumption clause + the prod rule is never a runtime gate
 #     (CONTRACT-visibility.md SS3, SS5)
+#     Widened for the dashboard (schema 2, docs/decisions/0008-dashboard.md, CONTRACT-visibility.md
+#     SS3): bin/dashboard, tests/dashboard_spec.sh, docs/decisions/0008-dashboard.md, and
+#     deploy/systemd/aib-dashboard.service join the ALLOWLIST as the one permitted dashboard render
+#     and its own docs/tests/unit — exactly those four, no more. A second, counter-pin grep below
+#     asserts bin/dashboard, once inside that ALLOWLIST, never reaches for the engine truth the
+#     projection merely summarizes (never lib/aibobnet.sh, AIBOBNET_REGISTRY, AIB_EVENT_ROOT, or the
+#     _projection.json symlink name) — the mechanical form of CONTRACT-visibility.md SS4/SS5 and
+#     docs/decisions/0008-dashboard.md SSD's "import-level, not repo-level" separation.
 # =========================================================================
-ALLOWLIST='^(docs/CONTRACT-visibility\.md|docs/decisions/0007-visibility-projection\.md|docs/CONFINEMENT\.md|docs/CONTRACT-execution-binding\.md|deploy/systemd/aib-projection\.(service|timer)|bin/project|tests/projection_spec\.sh|tests/visibility_delta_spec\.sh|tests/visibility_mutation_spec\.sh|tests/fixtures/projection_jget\.py|tests/fixtures/projection_bulk_stream\.py)$'
+ALLOWLIST='^(docs/CONTRACT-visibility\.md|docs/decisions/0007-visibility-projection\.md|docs/decisions/0008-dashboard\.md|docs/CONFINEMENT\.md|docs/CONTRACT-execution-binding\.md|deploy/systemd/aib-projection\.(service|timer)|deploy/systemd/aib-dashboard\.service|bin/project|bin/dashboard|tests/projection_spec\.sh|tests/dashboard_spec\.sh|tests/visibility_delta_spec\.sh|tests/visibility_mutation_spec\.sh|tests/fixtures/projection_jget\.py|tests/fixtures/projection_bulk_stream\.py)$'
 hits="$(cd "$SRC_ROOT" && grep -rlE 'AIB_PROJECTION_ROOT|_projection\.json' --exclude-dir=.git . 2>/dev/null | sed 's#^\./##' | grep -vE "$ALLOWLIST" || true)"
-eq "non-consumption: nothing outside bin/project + its own fixtures + docs references the projection" "$hits" ""
+eq "non-consumption: nothing outside bin/project + bin/dashboard + their own fixtures + docs references the projection" "$hits" ""
 
 hasnt "the broker handler never references the projection root" \
   "$(cat "$SRC_ROOT/bin/aib-broker-handler")" "AIB_PROJECTION_ROOT"
 hasnt "the broker handler never references the projection filename" \
   "$(cat "$SRC_ROOT/bin/aib-broker-handler")" "_projection.json"
+
+# Counter-pin (docs/decisions/0008-dashboard.md SSD): the dashboard is a consumer of the projection
+# root, never a second reader of the engine's own truth. bin/dashboard does not exist yet on this
+# unbuilt tree, so `cat` on it is empty and every assertion below passes vacuously until it is
+# built — the pin becomes load-bearing the moment bin/dashboard exists (tests/dashboard_spec.sh
+# pins its existence separately).
+dashboard_src="$(cat "$SRC_ROOT/bin/dashboard" 2>/dev/null || true)"
+hasnt "bin/dashboard never sources lib/aibobnet.sh" "$dashboard_src" "aibobnet.sh"
+hasnt "bin/dashboard never references the registry env var" "$dashboard_src" "AIBOBNET_REGISTRY"
+hasnt "bin/dashboard never references the event root env var" "$dashboard_src" "AIB_EVENT_ROOT"
+hasnt "bin/dashboard never references the standup symlink name" "$dashboard_src" "_projection.json"
 
 # =========================================================================
 # N — timezone coupling (CONTRACT-visibility.md SS9)
