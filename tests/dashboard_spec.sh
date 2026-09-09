@@ -552,6 +552,21 @@ for uid in ['broken', 'array']:
     rows = json.loads(request('/api/fleet')[2])['projects']
     row = next(p for p in rows if p['project_uid'] == uid)
     assert row['present'] is False and row['agents_by_state'] is None
+for uid in ['duplicate', 'nonfinite', 'surrogate', 'bad-utf8']:
+    p = json.loads(original); p['project_uid'] = uid
+    if uid == 'nonfinite':
+        p['extra'] = float('nan')
+    if uid == 'surrogate':
+        p['agents']['acme-core']['message'] = '\ud800'
+    raw = json.dumps(p, separators=(',', ':')).encode()
+    if uid == 'duplicate':
+        raw = raw.replace(b'"schema":2', b'"schema":2,"schema":2', 1)
+    if uid == 'bad-utf8':
+        raw = raw.replace(b'"schema":2', b'"extra":"\xff","schema":2', 1)
+    (root/(uid+'.json')).write_bytes(raw)
+    assert request('/api/project/'+uid)[0] == 404, uid
+    row = next(p for p in json.loads(request('/api/fleet')[2])['projects'] if p['project_uid'] == uid)
+    assert row['present'] is False and row['agents_by_state'] is None, uid
 p = json.loads(original); p['project_uid']='other'
 (root/'mismatch.json').write_text(json.dumps(p))
 assert request('/api/project/mismatch')[0] == 404
@@ -594,6 +609,20 @@ for age, stale in [(59.9, False), (60, False), (60.1, True), (-1, False)]:
     rendered = project_page(p, at + age, 60, 'auto')
     assert ('stale since ' in rendered) is stale, ('project', age)
 assert configuration({'AIB_DASHBOARD_BIND':'0.0.0.0'})[0] == ('0.0.0.0', 3030)
+for key, values in [('AIB_DASHBOARD_BIND', ['', 'localhost', '::1']),
+                    ('AIB_DASHBOARD_PORT', ['-1', '65536', 'bad']),
+                    ('AIB_PROJECTION_STALE_SECONDS', ['-1', 'bad', '1000000000'])]:
+    for value in values:
+        try:
+            configuration(dict({'AIB_DASHBOARD_BIND':'127.0.0.1'}, **{key:value}))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((key, value))
+assert reader.read('../acme') == (None, 'invalid_uid')
+assert ProjectionRoot(root/'absent').fleet(at, 60)['root_status'] == 'unknown'
+(root/'linked-root').symlink_to(root, target_is_directory=True)
+assert ProjectionRoot(root/'linked-root').fleet(at, 60)['root_status'] == 'unknown'
 PYEOF
   eq "freshness compares exact elapsed time; wildcard bind requires explicit opt-in" "$?" 0
 fi
