@@ -5,6 +5,7 @@ classification, next sequence and exact intact records against this fast pass.
 Undecodable payloads are record anomalies, never frame failures by themselves.
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -141,6 +142,47 @@ done
     return dict(event_type=kind, attempt_id=ident, payload=payload)
 
 
+def launch_binding(payload):
+    """Display-only binding data; faults must never change legacy fold health."""
+    required = {
+        'provider': ('requested', 'resolved', 'source', 'effective'),
+        'model': ('requested', 'resolved', 'source', 'effective'),
+        'effort': ('requested', 'resolved', 'source', 'effective'),
+        'sandbox': ('requested', 'effective'),
+        'adapter': ('source',),
+    }
+    for name, keys in required.items():
+        value = payload.get(name)
+        if not isinstance(value, dict):
+            return None
+        if any(key not in value or (value[key] is not None and not isinstance(value[key], str)) for key in keys):
+            return None
+    reasons = payload.get('reasons', '')
+    if not isinstance(reasons, str):
+        return None
+    launch = {name: payload[name] for name in ('provider', 'model', 'effort', 'sandbox')}
+    launch['adapter'] = {'source': payload['adapter']['source']}
+    # The canonical projection encoder cannot transport NUL or surrogate text.
+    # Validate all retained strings, including additive object fields, before it.
+    def text_safe(value):
+        if isinstance(value, str):
+            value.encode('utf-8')
+            return '\0' not in value
+        if isinstance(value, dict):
+            return all(text_safe(k) and text_safe(v) for k, v in value.items())
+        if isinstance(value, list):
+            return all(text_safe(v) for v in value)
+        return value is None or isinstance(value, (bool, int)) or (isinstance(value, float) and math.isfinite(value))
+    try:
+        if not text_safe(launch) or not text_safe(reasons):
+            return None
+        launch['reasons'] = reasons.encode('utf-8')[:512].decode('utf-8', errors='ignore')
+    except (UnicodeError, RecursionError):
+        return None
+    launch['attested'] = True
+    return launch
+
+
 def fold_records(records, legacy=False):
     attempts = {}
     excluded = set()
@@ -172,6 +214,8 @@ def fold_records(records, legacy=False):
                 decided_at=record.get('occurred_at'), decision=decision, pid=pid,
                 state='open' if decision == 'allow' else 'deny', exit_code='null',
                 open=decision == 'allow', last={'class':None, 'stage':None, 'ended_at':None})
+            if not legacy:
+                attempts[ident]['launch'] = launch_binding(payload)
         elif kind == 'attempt.ended':
             if not legacy and ident in excluded:
                 continue
@@ -207,7 +251,7 @@ def fold_records(records, legacy=False):
 def fold(path):
     frame, intact = scan(path)
     out = dict(frame, scan_status=frame['status'], scan_reason=frame['reason'],
-               attempts=[], legacy_attempts=[], undecodable_records=[], diagnostic='')
+               attempts=[], legacy_attempts=[], undecodable_records=[], diagnostic='', launch_malformed=0)
     if frame['status'] == 'corrupt':
         out['diagnostic'] = f"event stream is corrupt ({frame['reason']}) — refusing partial attempt fold"
         return out
@@ -225,6 +269,7 @@ def fold(path):
         # Compute the legacy view first for its established semantic diagnostics.
         out['legacy_attempts'] = fold_records(records, legacy=True)
         out['attempts'] = fold_records(records)
+        out['launch_malformed'] = sum(a['launch'] is None for a in out['attempts'])
     except (ValueError, TypeError, KeyError, OverflowError) as error:
         out.update(status='corrupt', reason=str(error), diagnostic=str(error), attempts=[], legacy_attempts=[])
     return out

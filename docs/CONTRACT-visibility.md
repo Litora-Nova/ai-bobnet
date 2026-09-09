@@ -1,6 +1,9 @@
 # ai-bobnet — Visibility Contract (V-1)
 
-> **Status: implemented V-1, schema 1 frozen.** This contract remains the normative consumer interface.
+> **Status: schema 2 implemented 2026-09-09; replaces V-1 schema 1.**
+> This contract remains the normative consumer interface. Schema 2 adds the
+> per-agent `launch` object (§18) and the dashboard's rendering obligations (§19);
+> `docs/decisions/0008-dashboard.md` records why.
 
 ## 0. Why this exists
 
@@ -68,6 +71,14 @@ it were uniformly true.
 - `stream` and `capacity` are always broker-derived; they are not individually tagged because the
   whole object is attested — see `attested_sources` (§18).
 
+**`agents[uid].attempt` and `agents[uid].launch` are stream-derived and attested; the enclosing
+entry's `attested:false` speaks only for `state|since|message`.** Schema 1 already had this
+asymmetry for `attempt` and never wrote it down; schema 2's `launch` (§18) makes it load-bearing —
+`agents[uid].launch.attested` is always `true` when `launch` is non-`null`, inside an entry whose own
+`attested` field is always `false` (§18, `agents[uid].attested`). A reader that treats the enclosing
+`false` as covering the whole entry will misreport a broker-attested `launch`/`attempt` as an
+unverified claim.
+
 **Consumers MUST render this distinction** — e.g., a claimed `idle` next to an open, un-ended
 `attempt.decided(allow)` is not resolved by picking a side; it is folded into a `disagreement`
 attention item (§9) and both facts stay visible. The projection never overwrites one side with the
@@ -87,9 +98,24 @@ under exactly two conditions, both mandatory:
    slice that needs "is agent X alive" will be tempted to read this file instead of the stream it
    summarizes — and this clause exists to name that temptation before it is acted on.
 
+**The permitted dashboard render is named, not left implicit: `bin/dashboard`**
+(`docs/decisions/0008-dashboard.md`). It is the one process this clause's "a human or a dashboard
+render" phrase authorizes to open the projection root, and it is authorized as a *reader of the
+projection*, never as a second reader of the engine's own truth (§4, §5): `bin/dashboard` reads
+`AIB_PROJECTION_ROOT` directly and nothing else — it never sources `lib/aibobnet.sh`, and it never
+references `AIBOBNET_REGISTRY`, `AIB_EVENT_ROOT`, or the `_projection.json` symlink name. Both halves
+are enforced mechanically below.
+
 This is **enforced mechanically**, not left to review discipline: `tests/projection_spec.sh` greps the
 whole engine tree for a reference to the projection root or the `_projection.json` name outside
-`bin/project` itself, its own tests, and documentation, and fails if one is found.
+`bin/project` itself, its own tests, and documentation — the ALLOWLIST names `bin/dashboard`,
+`tests/dashboard_spec.sh`, `docs/decisions/0008-dashboard.md`, and
+`deploy/systemd/aib-dashboard.service` alongside `bin/project`'s own entries — and fails if a
+reference is found outside it. A second, counter-pin in the same test greps `bin/dashboard` and its
+private `dashboard/*.py` helpers (the root environment lookup remains in `bin/dashboard`)
+for `AIBOBNET_REGISTRY`, `AIB_EVENT_ROOT`, and `_projection.json`, and fails if any is found: the
+ALLOWLIST says where the projection root name may legitimately appear, the counter-pin says
+`bin/dashboard` may never reach for the engine truth the projection merely summarizes.
 
 ---
 
@@ -454,14 +480,24 @@ that always rebuilds identically cannot silently drift into being the truth.
 
 ---
 
-## 18. Output shape — schema 1 (frozen)
+## 18. Output shape — schema 2 (current; schema 1 superseded 2026-09-09)
+
+Schema 2 is additive over schema 1: every schema-1 field keeps its meaning and position; the only new
+content is the per-agent `launch` object and one new anomaly counter. A schema-1 file is not
+rewritten in place — `bin/project` simply starts emitting `"schema": 2` and the `launch` key from the
+first tick a schema-2-aware projector runs. `docs/decisions/0008-dashboard.md` records why this is a
+version bump rather than a silent additive grow (S1 there): the one existing consumer that pins
+`=== 1` (the engine's retiring 2.0 dashboard) would otherwise be lied to about which fields it can
+trust, and bumping is the honest reading of this document's own rule that a reader "MUST NOT branch on
+[`schema`] beyond 'is this at least the version I understand.'" One table below, with a **Since**
+column, replaces keeping two separate field tables in sync by hand.
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "generated_at": "2026-09-07T14:32:10+02:00",
   "project_uid": "acme",
-  "attested_sources": ["stream", "capacity"],
+  "attested_sources": ["stream", "capacity", "launch"],
   "stream": {
     "status": "ok",
     "last_seq": 42,
@@ -481,57 +517,99 @@ that always rebuilds identically cannot silently drift into being the truth.
         "id": "acme-main-41", "decided_at": "2026-09-07T14:29:55+02:00",
         "decision": "allow", "open": true,
         "last": { "class": null, "stage": null, "ended_at": null }
+      },
+      "launch": {
+        "provider": { "requested": null, "resolved": "codex", "source": "agent:acme-core", "effective": "codex" },
+        "model": { "requested": null, "resolved": "gpt-6-astra", "source": "project:acme", "effective": "gpt-6-astra" },
+        "effort": { "requested": null, "resolved": "xhigh", "source": "team:acme", "effective": "high" },
+        "sandbox": { "requested": "workspace-write", "effective": "workspace-write" },
+        "adapter": { "source": "agent:acme-core" },
+        "reasons": "",
+        "attested": true
       }
     }
   },
-  "anomalies": { "unregistered_logs": 0, "unparsable_lines": 0, "uid_mismatches": 0, "undecodable_records": 0 }
+  "anomalies": { "unregistered_logs": 0, "unparsable_lines": 0, "uid_mismatches": 0, "undecodable_records": 0, "launch_malformed": 0 }
 }
 ```
 
+On a **deny**, `launch`'s four `effective` cells (`provider`, `model`, `effort`, `sandbox`) are all
+`null` while `resolved` (and `sandbox.requested`) stay populated — the composer blanks `effective` on
+denial, it does not erase what it resolved before the policy decision point ran
+(`lib/aibobnet.sh`'s `aib_event_compose_decided_payload` comment, "§B7"):
+
+```json
+"launch": {
+  "provider": { "requested": null, "resolved": "codex", "source": "team:acme", "effective": null },
+  "model": { "requested": null, "resolved": "gpt-6-astra", "source": "team:acme", "effective": null },
+  "effort": { "requested": null, "resolved": "high", "source": "project:acme", "effective": null },
+  "sandbox": { "requested": "workspace-write", "effective": null },
+  "adapter": { "source": "team:acme" },
+  "reasons": "needs:t4 not satisfied — deploy key rotation pending on the build host",
+  "attested": true
+}
+```
+
+A third shape is reserved, additive, and not emitted by today's composer: `resolved: null` alongside
+`effective: null` on a `decision: "allow"` record is a **genuinely unresolved** value, distinguishable
+from the deny shape above by `decision` alone (§19 states the render rule for each). `requested` is
+frozen `null` for `provider`/`model`/`effort` by every composer in RM-2/RM-3 — no direct CLI request
+exists for these three today — but the slot is reserved additively, exactly like `sandbox.requested`,
+which is the one dimension with a real CLI request today.
+
 Every field, documented:
 
-| Field | Type | Meaning |
-|---|---|---|
-| `schema` | integer, always `1` | This document's own version. Readers MUST tolerate unknown fields added by a later, additive-only bump — the same rule `docs/DOMAIN.md` §5 states for the event envelope — and MUST NOT branch on it beyond "is this at least the version I understand." |
-| `generated_at` | ISO 8601, offset-bearing | When this specific file was written. The only freshness signal (§4). |
-| `project_uid` | string | The project this file describes. Matches the filename. |
-| `attested_sources` | array of string | Which of `"stream"` / `"capacity"` the projector could actually read this tick — `"stream"` absent means `stream.status` reflects an unreadable/absent stream rather than a real fold; `"capacity"` absent means `.live` was unreadable (§10). Lets a consumer distinguish "reported ok" from "could not check." |
-| `stream.status` | `ok\|corrupt\|absent\|unreadable` | Mirrors `AIB_ATTEMPTS_FOLD_STATUS`/`AIB_EVENT_SCAN_STATUS` (§12), plus `absent` (no stream file yet — a new project) and `unreadable` (a permissions/IO failure distinct from a corrupt parse). |
-| `stream.last_seq` | integer | The highest valid `seq` the fold observed (0 if none). |
-| `stream.anchor.value` | integer or `null` | The `high_water` anchor's own value, or `null` if the anchor file is absent. |
-| `stream.anchor.relationship` | `ok\|lag\|ahead\|absent` | Exactly `bin/anchor status`'s own vocabulary (`docs/decisions/0006-anchor-and-capacity.md`) — the projector re-derives this read-only, it does not shell out to `bin/anchor`. |
-| `stream.torn_tail` | boolean | Mirrors `AIB_EVENT_SCAN_TORN_TAIL`. |
-| `capacity.limit` | integer | `AIB_BROKER_CAPACITY` from the projector's own unit environment (§10). |
-| `capacity.live` | integer or `null` | The `.live` file's content, or `null` per §10. |
-| `capacity.as_of` | ISO 8601 or `null` | The `.live` file's mtime, or `null` when `live` is `null`. |
-| `attention[].kind` | string | One of §7's six `needs:` kinds or §8's three broker-derived kinds. |
-| `attention[].agent` | string or `null` | The owning agent's `uid`, or `null` for a project-level item (`stream_unhealthy`). |
-| `attention[].reason` | string | Free text, `aib_json`-escaped. Agent-written for `needs:` items (§7); a fixed, projector-composed sentence for broker-derived items (§8). |
-| `attention[].since` | ISO 8601, offset-bearing | See §7/§8 for which instant, per kind. |
-| `attention[].attested` | boolean | `false` for `needs:` items, `true` for broker-derived items (§2). |
-| `agents` | object, keys = registered agent uids only | See §11. An agent with no heartbeat log yet still appears as a key, with `state: "unknown"`, `since: null`, `stale: true`, `attempt: null` — absence in the registry-derived key set is never confused with absence of activity. |
-| `agents[uid].state` | `busy\|idle\|blocked\|done\|unknown` | The heartbeat's own claimed status, or `unknown` when no readable heartbeat line exists at all. |
-| `agents[uid].since` | ISO 8601 or `null` | The claimed line's own timestamp (§9/§11), or `null` for `unknown`. |
-| `agents[uid].message` | string | The heartbeat message, `aib_json`-escaped, untrusted agent text. |
-| `agents[uid].stale` | boolean | Per §11's `beats.mjs`-identical staleness rule. |
-| `agents[uid].attested` | boolean, always `false` | Every `agents[uid]` entry is a claim (§2) — present in the schema for symmetry with `attention[]`, not because it can ever be `true` in V-1. |
-| `agents[uid].attempt` | object or `null` | `null` when the agent has no `attempt.decided` in the current fold. |
-| `agents[uid].attempt.id` | string | The `decided` event's own `event_id` (= `attempt_id`, `docs/CONTRACT-execution-binding.md` §8.2). |
-| `agents[uid].attempt.decided_at` | ISO 8601 | The `decided` record's own timestamp. |
-| `agents[uid].attempt.decision` | `allow\|deny` | Mirrors `bin/attempts`' own fold. |
-| `agents[uid].attempt.open` | boolean | `true` when `decision = allow` and no matching `ended` record exists yet. |
-| `agents[uid].attempt.last.class` | exit class or `null` | Mirrors `bin/attempts`' terminal `exit_class`, `null` while `open`. |
-| `agents[uid].attempt.last.stage` | stage or `null` | `docs/CONTRACT-execution-binding.md` §8.1's `exit.stage`, `null` when absent (schema-1 stream records) or `open`. |
-| `agents[uid].attempt.last.ended_at` | ISO 8601 or `null` | The `ended` record's own timestamp, `null` while `open`. |
-| `anomalies.unregistered_logs` | integer | Count of `<name>.log` files in `standup_dir` with no matching registry agent (§11). |
-| `anomalies.unparsable_lines` | integer | Count of heartbeat lines whose native UTC or engine timestamp cannot be parsed. |
-| `anomalies.uid_mismatches` | integer | Native heartbeat lines whose UID differs from the registry/file UID; never replace state. |
-| `anomalies.undecodable_records` | integer | Number of frame-intact stream records with invalid UTF-8. |
-| `stream.undecodable_records` | integer array | Sequence numbers of those records, in scan order. |
+| Field | Type | Since | Meaning |
+|---|---|---|---|
+| `schema` | integer, `1` (superseded) or `2` (current) | 1 | This document's own version. Readers MUST tolerate unknown fields added by a later, additive-only bump — the same rule `docs/DOMAIN.md` §5 states for the event envelope — and MUST NOT branch on it beyond "is this at least the version I understand." |
+| `generated_at` | ISO 8601, offset-bearing | 1 | When this specific file was written. The only freshness signal (§4). |
+| `project_uid` | string | 1 | The project this file describes. Matches the filename. |
+| `attested_sources` | array of string | 1 (gains `"launch"` at 2) | Which of `"stream"` / `"capacity"` / `"launch"` the projector could actually read this tick — `"stream"` absent means `stream.status` reflects an unreadable/absent stream rather than a real fold; `"capacity"` absent means `.live` was unreadable (§10); `"launch"` is present under the identical condition as `"stream"` (the fold was present and readable this tick) and therefore stays present even when `stream.status` is `"corrupt"` — presence/readability attests the scan, not a partial attempt fold. A corrupt or degraded stream yields no agent `attempt` or `launch`; an uncommitted torn tail alone leaves the intact committed fold usable (§12). Its presence in this array is not a promise that every agent's `launch` is non-`null` this tick; see `agents[uid].launch` and §19. |
+| `stream.status` | `ok\|corrupt\|absent\|unreadable` | 1 | Mirrors `AIB_ATTEMPTS_FOLD_STATUS`/`AIB_EVENT_SCAN_STATUS` (§12), plus `absent` (no stream file yet — a new project) and `unreadable` (a permissions/IO failure distinct from a corrupt parse). |
+| `stream.last_seq` | integer | 1 | The highest valid `seq` the fold observed (0 if none). |
+| `stream.anchor.value` | integer or `null` | 1 | The `high_water` anchor's own value, or `null` if the anchor file is absent. |
+| `stream.anchor.relationship` | `ok\|lag\|ahead\|absent` | 1 | Exactly `bin/anchor status`'s own vocabulary (`docs/decisions/0006-anchor-and-capacity.md`) — the projector re-derives this read-only, it does not shell out to `bin/anchor`. |
+| `stream.torn_tail` | boolean | 1 | Mirrors `AIB_EVENT_SCAN_TORN_TAIL`. |
+| `capacity.limit` | integer | 1 | `AIB_BROKER_CAPACITY` from the projector's own unit environment (§10). |
+| `capacity.live` | integer or `null` | 1 | The `.live` file's content, or `null` per §10. |
+| `capacity.as_of` | ISO 8601 or `null` | 1 | The `.live` file's mtime, or `null` when `live` is `null`. |
+| `attention[].kind` | string | 1 | One of §7's six `needs:` kinds or §8's three broker-derived kinds. |
+| `attention[].agent` | string or `null` | 1 | The owning agent's `uid`, or `null` for a project-level item (`stream_unhealthy`). |
+| `attention[].reason` | string | 1 | Free text, `aib_json`-escaped. Agent-written for `needs:` items (§7); a fixed, projector-composed sentence for broker-derived items (§8). |
+| `attention[].since` | ISO 8601, offset-bearing | 1 | See §7/§8 for which instant, per kind. |
+| `attention[].attested` | boolean | 1 | `false` for `needs:` items, `true` for broker-derived items (§2). |
+| `agents` | object, keys = registered agent uids only | 1 | See §11. An agent with no heartbeat log yet still appears as a key, with `state: "unknown"`, `since: null`, `stale: true`, `attempt: null`, `launch: null` — absence in the registry-derived key set is never confused with absence of activity. |
+| `agents[uid].state` | `busy\|idle\|blocked\|done\|unknown` | 1 | The heartbeat's own claimed status, or `unknown` when no readable heartbeat line exists at all. |
+| `agents[uid].since` | ISO 8601 or `null` | 1 | The claimed line's own timestamp (§9/§11), or `null` for `unknown`. |
+| `agents[uid].message` | string | 1 | The heartbeat message, `aib_json`-escaped, untrusted agent text. |
+| `agents[uid].stale` | boolean | 1 | Per §11's `beats.mjs`-identical staleness rule. |
+| `agents[uid].attested` | boolean, always `false` | 1 | Every `agents[uid]` entry is a claim (§2) — present in the schema for symmetry with `attention[]`, not because it can ever be `true` in V-1. Does not speak for `attempt`/`launch`, which carry their own `attested` (§2). |
+| `agents[uid].attempt` | object or `null` | 1 | `null` when the agent has no `attempt.decided` in the current fold, or when `stream.status != "ok"` (§19). |
+| `agents[uid].attempt.id` | string | 1 | The `decided` event's own `event_id` (= `attempt_id`, `docs/CONTRACT-execution-binding.md` §8.2). |
+| `agents[uid].attempt.decided_at` | ISO 8601 | 1 | The `decided` record's own timestamp. |
+| `agents[uid].attempt.decision` | `allow\|deny` | 1 | Mirrors `bin/attempts`' own fold. |
+| `agents[uid].attempt.open` | boolean | 1 | `true` when `decision = allow` and no matching `ended` record exists yet. |
+| `agents[uid].attempt.last.class` | exit class or `null` | 1 | Mirrors `bin/attempts`' terminal `exit_class`, `null` while `open`. |
+| `agents[uid].attempt.last.stage` | stage or `null` | 1 | `docs/CONTRACT-execution-binding.md` §8.1's `exit.stage`, `null` when absent (schema-1 stream records) or `open`. |
+| `agents[uid].attempt.last.ended_at` | ISO 8601 or `null` | 1 | The `ended` record's own timestamp, `null` while `open`. |
+| `agents[uid].launch` | object or `null` | 2 | Derived from the same `attempt.decided` record that selects `agents[uid].attempt` — same record, same selection rule (latest in stream order). `null` when that record is absent (§19: "never launched" vs "unknown"), or when its binding objects are malformed (`anomalies.launch_malformed`, never a fold failure). Always broker-attested (`launch.attested: true`) when non-`null` — see §2's amended sentence. Never `label`, never `prompt.*`, never the adapter's filesystem path: this is a tailnet-reachable render, and those are host/user-input detail this contract does not project. |
+| `agents[uid].launch.provider` | object `{requested, resolved, source, effective}` | 2 | Copied verbatim from the `decided` payload's own `provider` object (`lib/aibobnet.sh` payload doc) — never reinterpreted. `requested` is `null` in every payload RM-2/RM-3 composes today (reserved slot). `source` is one of `agent:<uid>`, `team:<uid>`, `project:<uid>` (§14, `AIB_RESOLVED_SOURCE`) — never a value a render invents. |
+| `agents[uid].launch.model` | object, same shape as `.provider` | 2 | Same copy-verbatim rule, for the resolved model. |
+| `agents[uid].launch.effort` | object, same shape as `.provider` | 2 | Same copy-verbatim rule, for the resolved effort tier. |
+| `agents[uid].launch.sandbox` | object `{requested, effective}` | 2 | The one binding dimension with a real CLI `requested` value today; no `resolved`/`source` slot (the payload has none). `effective: null` on `deny` renders "denied" (§19). |
+| `agents[uid].launch.adapter` | object `{source}` | 2 | Only the resolution `source`; the adapter's absolute filesystem path (`effective_path` in the underlying payload) is never projected — a confined-child host detail, and this render is reachable from the tailnet (§14). |
+| `agents[uid].launch.reasons` | string | 2 | The broker-composed verdict text (`AIB_VERDICT_REASONS`, `'; '`-joined PDP causes) — not raw user input; `aib_json`-escaped like every other string in this schema, and capped at 512 bytes by the fold (never in the underlying event, which is unbounded) before that escaping runs. Empty string, not `null`, when there is nothing to report (an `allow` with no clamp). |
+| `agents[uid].launch.attested` | boolean, always `true` when `launch` is non-`null` | 2 | See §2's amended sentence: the enclosing `agents[uid].attested: false` never speaks for this field. |
+| `anomalies.unregistered_logs` | integer | 1 | Count of `<name>.log` files in `standup_dir` with no matching registry agent (§11). |
+| `anomalies.unparsable_lines` | integer | 1 | Count of heartbeat lines whose native UTC or engine timestamp cannot be parsed. |
+| `anomalies.uid_mismatches` | integer | 1 | Native heartbeat lines whose UID differs from the registry/file UID; never replace state. |
+| `anomalies.undecodable_records` | integer | 1 | Number of frame-intact stream records with invalid UTF-8. |
+| `anomalies.launch_malformed` | integer | 2 | Count of `attempt.decided` records that would otherwise have selected `agents[uid].launch` but were tolerated as `null` instead, because a required `provider`/`model`/`effort`/`sandbox`/`adapter` sub-object was absent or not a JSON object — the pre-launch-object shape a legacy (RM-2) `{decision, pid}`-only payload has. Mirrors `anomalies.undecodable_records`'s tolerate-and-count shape, but at the fold's semantic layer rather than the frame layer: a malformed binding object is never a `ValueError` (§12; that would flip `bin/attempts`' exit code on old fixtures and break the byte-identity pin). |
+| `stream.undecodable_records` | integer array | 1 | Sequence numbers of those records, in scan order. |
 
 ---
 
-### Implementation decisions within schema 1
+### Implementation decisions within schema 2
 
 - The shared fold uses a single Python 3 reader with C-backed POSIX CRC computation, rather than
   forking parsers per record. Its JSON result exposes status, reason, scan counters, presence and
@@ -545,6 +623,23 @@ Every field, documented:
   publication: schema 1 has no corrupt-anchor relationship, so the previous file ages honestly.
 - The latest decided record in stream order selects `agents[uid].attempt`. Broker attention checks
   **all** still-open attempts, including an older open attempt followed by a newer terminal one.
+- **`agents[uid].launch` is selected by the identical record as `agents[uid].attempt`** — one fold
+  pass, one selection rule, two views of the same `decided` record. `launch`'s four binding
+  sub-objects (`provider`, `model`, `effort`, `sandbox`) and `adapter.source` are passed through as
+  raw JSON, never through the fold's `scalar()` helper — `scalar()` turns `None` into `''`, which
+  would erase the distinction between "resolved but blanked by a deny" and "genuinely unresolved"
+  that this schema's `null` shapes exist to preserve. A `provider`/`model`/`effort`/`sandbox`/`adapter`
+  value that is absent, not a JSON object, missing required members, or has a non-string/non-null binding member (a legacy RM-2 `{decision, pid}`-only payload, or any
+  other malformed binding) yields `launch: null` plus one count in `anomalies.launch_malformed` —
+  **never** a `ValueError`: `fold()` catches `ValueError` as stream-wide corruption, and a malformed
+  binding object flipping that would turn old, already-folded fixtures into a corrupt-stream exit,
+  breaking the byte-identity pin the paragraph below states for `bin/attempts`. `launch.reasons` is
+  truncated to at most 512 bytes at a UTF-8 code-point boundary (never mid-codepoint, which would
+  produce invalid UTF-8) before `aib_json`-escaping — the cap lives in the fold, not in the original
+  event, which is unbounded. Retained strings containing NUL or invalid Unicode, and non-string
+  reasons, are likewise tolerated as malformed launch data so the canonical string encoder cannot
+  turn a display-only anomaly into a publication failure. The counter covers every malformed
+  decided record in a completed semantic fold, including older attempts, not only the latest.
 - Heartbeat framing whitespace is trimmed; message bytes inside that framing (including pipe spacing)
   are preserved. A malformed timestamp remains stale. If an attention item cannot be dated from its
   source, publication fails instead of inventing a timestamp or emitting an invalid schema-1 `since`.
@@ -559,20 +654,112 @@ Every field, documented:
   root is refused if it resolves inside any registered project's home. GNU `mv -T` makes a directory
   at the destination an error, never a container for the temporary file. The units remain deployment text.
 
-## 19. Not in V-1
+## 19. Rendering obligations
+
+Every schema-2 render — `bin/dashboard` (§3, `docs/decisions/0008-dashboard.md`) is the concrete
+instance, and the one this section is written against — MUST follow one display vocabulary, so two
+renders of the same file never disagree in a way this contract could have prevented. This section
+binds *content* rendering; `bin/dashboard`'s own process/network obligations (bind refusal, hardening)
+are the unit's and ADR-0008's concern, not this contract's.
+
+- **`effective` is the primary cell** for `provider`, `model`, `effort`, and `sandbox`. Append
+  `resolved` only when it is non-`null` and differs from `effective`; append `requested` only when it
+  is non-`null` and differs from `resolved`. Today `requested` is `null` for `provider`/`model`/`effort`
+  in every emitted record, so it is never appended for those three yet — the rule is stated generally
+  because the slot is reserved, not because today's data exercises it. `sandbox.requested` is real
+  today; because sandbox has no `resolved` slot, compare its request with `effective`
+  instead (show a non-null request only when it differs).
+- **`effective: null` on `decision: "deny"` renders `"denied"`, never `"unknown"`.** This applies to
+  every one of `provider.effective`, `model.effective`, `effort.effective`, and `sandbox.effective` —
+  a deny blanks all four together (§18).
+- **`effective: null` together with `resolved: null` on `decision: "allow"`** — the reserved,
+  not-yet-emitted "genuinely unresolved" shape (§18) — renders `"unknown"`, never `"denied"`:
+  `decision` alone distinguishes the two null-effective cases, and only a deny is a "denied" fact.
+- **`launch: null` renders `"never launched"` when `stream.status == "ok"`**, and `"unknown"` for any
+  other `stream.status` — mirroring `attempt: null`'s own rule, because `bin/project` fills `latest`
+  (and therefore both `attempt` and `launch`) only from a fully-`"ok"` fold pass (§12). A render MUST
+  NOT infer "never launched" merely from `launch` being absent; it must check `stream.status` first.
+- **`source` is rendered verbatim from the schema's own vocabulary** — exactly `agent:<uid>`,
+  `team:<uid>`, or `project:<uid>` (§14, `AIB_RESOLVED_SOURCE`) — never a value invented for a mockup
+  or draft layout (`docs/decisions/0008-dashboard.md` records why a draft's sample values are not
+  the schema).
+- **A whole snapshot is "stale" when `generated_at` is older than a threshold the render owns, not
+  the schema.** `AIB_PROJECTION_STALE_SECONDS` (dashboard-unit-environment-only, default `60`) is
+  `bin/dashboard`'s own setting, distinct from any of `bin/project`'s env (§14/§16) — nothing in the
+  file self-reports its own staleness beyond the per-agent `stale` flag (§4), so every render computes
+  project-level freshness itself, from the one honest signal, `generated_at`.
+- **Display ages in compact English units, flooring without rounding up:** under 90 seconds,
+  `N s`; under 90 minutes, `N min`; under 48 hours, `N h M min`; otherwise, `N d M h`.
+  Apply this to fresh/stale ages and clock lead in both views; keep the exact ISO `generated_at`
+  alongside it. JSON `age_seconds` and the exact stale-threshold comparison remain unchanged.
+- **A projection-root file for a `project_uid` the render does not otherwise expect to see is shown as
+  `"stale since <age>"`, never as an alarm or error badge.** The render never consults the registry
+  (§4, §5) — it is a consumer of the projection root only — so it cannot itself know *why* an
+  unregistered or deregistered project's file persists; an aging, unexplained file is exactly what
+  §11's `anomalies.unregistered_logs` gap and `bin/project --all`'s registry-driven write set already
+  predict (a project dropped from the registry keeps its last file forever, §13).
+- **A missing `<project_uid>.json` renders `"unknown"`, never an empty roster** (§4) — the identical
+  rule already stated for consumers in general, restated here because it is the first rendering
+  obligation an operator notices.
+
+**Theming (PO amendment, 2026-09-09; mechanism pinned here, colour values are the builder's to tune —
+`docs/decisions/0008-dashboard.md` §G records why this is server-rendered, never JavaScript):**
+
+- **Every colour is a CSS custom property, never a literal outside the token block.** `bin/dashboard`
+  ships four colour blocks in its served CSS: `:root{}` (dark defaults for
+  `--bg --bg2 --titb --fg --dim --ink --coral --amber --green --line`), `body.light{}`,
+  `body.dark{}`, and `body.c64{}` (flat blue backdrop, `text-transform: uppercase`, monospace
+  everywhere). The ten token names are a shared vocabulary so a palette can be swapped without
+  touching the layout. Alias tokens `--dark-*` / `--light-*` are permitted, with `body.dark{}`
+  restoring explicit dark on a light OS; every colour literal must stay inside those four blocks.
+  No other rule may name a literal colour (`#`-hex or `rgb(`/`rgba(`): it reads a `var(--token)`
+  instead. A `@media (prefers-color-scheme: light)` block applies light token aliases to a bare
+  `body` selector for auto; explicit theme classes out-specify it.
+- **Theme selection is a server-rendered class from a cookie, never a client-side toggle.** A
+  `?theme=dark|light|c64|auto` query parameter, present on *any* route, makes `bin/dashboard` set
+  `Set-Cookie: aib_theme=<value>` (`Path=/; SameSite=Strict`, no `Secure` requirement stated here
+  because the render's own transport boundary is Tailscale, §5's ADR-0008) and render
+  `<body class="<value>">` — `auto` (and the cookie's own absence) renders no class at all. The same
+  cookie, with no query parameter present, reproduces the identical class on every later request:
+  the choice persists without any script. An invalid or unrecognized `theme` value is silently
+  treated as `auto` — no `Set-Cookie`, no class, never an error response; a render MUST NOT reject a
+  request merely for carrying a theme value it does not recognize (the identical fail-open posture
+  §7's `needs:` "other" catch-all already takes for a token this schema does not recognize).
+- **The header carries three plain links** (`?theme=dark`, `?theme=light`, `?theme=c64`), each
+  preserving the current path and any `<uid>` in it — choosing a theme from the fleet page keeps the
+  viewer on the fleet page, from a project page keeps them on that project. No link clears the cookie
+  back to `auto`; a viewer who wants `auto` back edits the query string or clears the cookie
+  themselves — this render adds no fourth link for a state that already has no explicit representation.
+- **Font stacks are system stacks, never a web font.** `ui-monospace, SFMono-Regular, Menlo, Consolas,
+  monospace` renders every identifier (`uid`, model/provider names, ids) and the entirety of the
+  `c64` theme's text; the system UI stack renders body text otherwise. No `@font-face`, no external
+  stylesheet — consistent with the CSP this contract already fixes for `bin/dashboard`
+  (`default-src 'none'; style-src 'unsafe-inline'`, §19 above), which a remote font request would
+  violate.
+
+---
+
+## 20. Not in V-1
 
 Recorded so a later reader does not assume these were forgotten rather than deliberately deferred; each
 gets its own ADR before it is built:
 
-- The dashboard's own rendering of this file (a separate engine slice, `claude-bobnet`, tracked
-  there — this contract fixes the shape it will consume).
 - Spine event types for agent state (§1.1).
 - A consumer cursor or resync signal over this file (it has none — a consumer re-reads the whole file
-  every poll, exactly as the dashboard already does for heartbeat logs today).
+  every poll, exactly as `bin/dashboard` does for the projection root today, §16).
 - Incremental folding (§16).
 - A separate `aib-projector` reader account, distinct from `aib-broker` (§14 keeps `User=aib-broker`
-  for V-1, hardened by the unit's `InaccessiblePaths`/`ReadOnlyPaths`; a distinct low-privilege account
-  is the end state named as a follow-up, not built here — see `docs/decisions/0007-visibility-projection.md`).
+  for the projector's own V-1, hardened by the unit's `InaccessiblePaths`/`ReadOnlyPaths`; a distinct
+  low-privilege account is the end state named as a follow-up, not built here — see
+  `docs/decisions/0007-visibility-projection.md`). `bin/dashboard` is unaffected by this deferral: it
+  runs under its own distinct `aib-dash` account from the start (`docs/decisions/0008-dashboard.md`),
+  because it did not exist when ADR-0007 accepted `aib-broker` as V-1's projector account.
+
+`bin/dashboard`'s own rendering of this file — out of scope for the *projection's* V-1 (§4's "this
+contract fixes the shape it will consume") — is no longer a deferred item once schema 2 ships: it is
+specified by §19 above and built in this same repository (`docs/decisions/0008-dashboard.md`). A
+superseded revision of this section once pointed to the separate `claude-bobnet` engine for that work;
+`docs/decisions/0008-dashboard.md`'s Q1 records why it moved here instead.
 
 ---
 
@@ -592,6 +779,12 @@ Env (unit-environment-only, never request/registry-supplied):
 Library:
   aib_attempts_fold <events_path>   (§12 — new, shared by bin/attempts and bin/project)
 ```
+
+`bin/dashboard`'s own interface (routes, env, hardening) is specified in full by
+`docs/decisions/0008-dashboard.md` and `deploy/systemd/aib-dashboard.service`, not repeated here — it
+is a schema-2 *consumer* (§19), not a projector, and carries its own, distinct env
+(`AIB_DASHBOARD_BIND`, `AIB_DASHBOARD_PORT`, `AIB_PROJECTION_STALE_SECONDS`) that is never read by
+`bin/project`.
 
 ---
 White-label: example project id `acme`; no real names, hosts, or infrastructure in this repository.
