@@ -693,6 +693,42 @@ are the unit's and ADR-0008's concern, not this contract's.
   rule already stated for consumers in general, restated here because it is the first rendering
   obligation an operator notices.
 
+**Theming (PO amendment, 2026-09-09; mechanism pinned here, colour values are the builder's to tune —
+`docs/decisions/0008-dashboard.md` §G records why this is server-rendered, never JavaScript):**
+
+- **Every colour is a CSS custom property, never a literal outside the token block.** `bin/dashboard`
+  ships exactly three colour blocks in its served CSS: `:root{}` (the token declarations, dark by
+  default: `--bg --bg2 --titb --fg --dim --ink --coral --amber --green --line` — the same names as
+  the trendgegner terminal theme, so an operator who knows that palette recognizes these on sight),
+  `body.light{}` (overrides), and `body.c64{}` (a full takeover: flat blue backdrop, its own token
+  overrides, `text-transform: uppercase`, monospace everywhere). No other rule in the page may name a
+  literal colour (`#`-hex or `rgb(`/`rgba(`) — every other rule reads a `var(--token)` instead. A
+  `@media (prefers-color-scheme: light)` block applies the light token values for a viewer who chose
+  no explicit theme; because a class selector (`body.light`, `body.c64`) always out-specifies a bare
+  `body` selector, this media block never has to guard itself against an explicit choice — the
+  cascade already resolves it correctly.
+- **Theme selection is a server-rendered class from a cookie, never a client-side toggle.** A
+  `?theme=dark|light|c64|auto` query parameter, present on *any* route, makes `bin/dashboard` set
+  `Set-Cookie: aib_theme=<value>` (`Path=/; SameSite=Strict`, no `Secure` requirement stated here
+  because the render's own transport boundary is Tailscale, §5's ADR-0008) and render
+  `<body class="<value>">` — `auto` (and the cookie's own absence) renders no class at all. The same
+  cookie, with no query parameter present, reproduces the identical class on every later request:
+  the choice persists without any script. An invalid or unrecognized `theme` value is silently
+  treated as `auto` — no `Set-Cookie`, no class, never an error response; a render MUST NOT reject a
+  request merely for carrying a theme value it does not recognize (the identical fail-open posture
+  §7's `needs:` "other" catch-all already takes for a token this schema does not recognize).
+- **The header carries three plain links** (`?theme=dark`, `?theme=light`, `?theme=c64`), each
+  preserving the current path and any `<uid>` in it — choosing a theme from the fleet page keeps the
+  viewer on the fleet page, from a project page keeps them on that project. No link clears the cookie
+  back to `auto`; a viewer who wants `auto` back edits the query string or clears the cookie
+  themselves — this render adds no fourth link for a state that already has no explicit representation.
+- **Font stacks are system stacks, never a web font.** `ui-monospace, SFMono-Regular, Menlo, Consolas,
+  monospace` renders every identifier (`uid`, model/provider names, ids) and the entirety of the
+  `c64` theme's text; the system UI stack renders body text otherwise. No `@font-face`, no external
+  stylesheet — consistent with the CSP this contract already fixes for `bin/dashboard`
+  (`default-src 'none'; style-src 'unsafe-inline'`, §19 above), which a remote font request would
+  violate.
+
 ---
 
 ## 20. Not in V-1

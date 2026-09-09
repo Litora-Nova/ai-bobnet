@@ -155,6 +155,25 @@ decommission — makes this window unavoidable and bounded; it ends the moment t
 dashboard checkout is removed, which is item (3) of the same PO decision, tracked separately
 (Remote Bob's `prox-init` revier, per `~/CLAUDE.md`'s topology table), not by this ADR.
 
+### G. Theming: a server-rendered class from a cookie, never JavaScript (PO amendment, 2026-09-09)
+
+Dark, light, and a third "c64" retro theme are required, and §B's "zero JavaScript, server-side
+rendered" decision already answers *how*: a theme is state about the viewer's own preference, and
+this render already has exactly one mechanism for viewer-specific state that survives a request —
+a cookie — and exactly one mechanism for viewer action — a link, which is a `GET` to a URL this
+process already parses. Adding a client-side toggle would be the first JavaScript in a codebase
+whose escaping argument (§B, finding 3) rests on there being none; adding a server-side session
+store would be new state this disposable, out-of-band render (`docs/CONTRACT-visibility.md` §4) has
+no business keeping. A `?theme=` query parameter that sets a cookie and a `<body class>` the CSS
+already keys off of costs nothing beyond what the process already does per request, and degrades
+exactly as gracefully as everything else here: a client that drops the cookie, or that never sends
+the query parameter at all, simply gets `auto` — the `prefers-color-scheme` media query's own light
+values, or the `:root` dark default absent even that signal — never an error and never a blank page.
+Every colour value the three theme blocks carry is a CSS custom property, never a literal, for the
+same reason `docs/CONTRACT-visibility.md` §19 states mechanically: a builder who later adds a fourth
+render surface (a status line, an alert colour) must reach for `var(--token)` by construction, not
+by remembering to.
+
 ## Alternatives Considered
 
 ### Reusing or extending the engine's 2.0 dashboard on the VM
