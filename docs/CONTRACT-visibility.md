@@ -111,7 +111,8 @@ whole engine tree for a reference to the projection root or the `_projection.jso
 `bin/project` itself, its own tests, and documentation — the ALLOWLIST names `bin/dashboard`,
 `tests/dashboard_spec.sh`, `docs/decisions/0008-dashboard.md`, and
 `deploy/systemd/aib-dashboard.service` alongside `bin/project`'s own entries — and fails if a
-reference is found outside it. A second, counter-pin in the same test greps `bin/dashboard` itself
+reference is found outside it. A second, counter-pin in the same test greps `bin/dashboard` and its
+private `dashboard/*.py` helpers (the root environment lookup remains in `bin/dashboard`)
 for `AIBOBNET_REGISTRY`, `AIB_EVENT_ROOT`, and `_projection.json`, and fails if any is found: the
 ALLOWLIST says where the projection root name may legitimately appear, the counter-pin says
 `bin/dashboard` may never reach for the engine truth the projection merely summarizes.

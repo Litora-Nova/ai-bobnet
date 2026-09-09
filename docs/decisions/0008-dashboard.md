@@ -114,7 +114,8 @@ become a second reader of engine truth. This ADR's mechanical enforcement of tha
 - **`tests/projection_spec.sh`'s §3 ALLOWLIST is widened by exactly `bin/dashboard`,
   `tests/dashboard_spec.sh`, `docs/decisions/0008-dashboard.md`, and
   `deploy/systemd/aib-dashboard.service`** — no more, no fewer — and a second, counter-pin grep in the
-  same test block asserts `bin/dashboard` never mentions `AIBOBNET_REGISTRY`, `AIB_EVENT_ROOT`, or
+  same test block asserts `bin/dashboard` and its private `dashboard/*.py` helpers never mention
+  `AIBOBNET_REGISTRY`, `AIB_EVENT_ROOT`, or
   `_projection.json` (the standup symlink name). The ALLOWLIST says where the projection root's own
   name may legitimately appear outside `bin/project`; the counter-pin says `bin/dashboard`, once it is
   one of those places, may never also reach for the engine truth the projection merely summarizes.
@@ -260,6 +261,9 @@ White-label: example project id `acme`; no real names, infrastructure, or hosts 
 - `bin/dashboard` starts Python in isolated mode with bytecode writes disabled. Its
   only application imports are the checkout's `dashboard/` package; HTTP requests
   cannot select imports or filesystem paths outside the configured projection root.
+  Environment configuration stays in this entry point; helpers receive its validated
+  values explicitly. The projection-reference allowlist keeps exactly the pinned
+  entries, while the forbidden-dependency counter-pin also scans every Python helper.
 - Bind configuration is mandatory and accepts literal IPv4 addresses. An unset/empty
   `AIB_DASHBOARD_BIND` refuses before listening; explicitly naming `0.0.0.0` is allowed.
   The original RED bind check accidentally supplied that explicit opt-in while testing

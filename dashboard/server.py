@@ -1,9 +1,7 @@
 """Explicit GET/HEAD routes for the disposable projection reader."""
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import ipaddress
 import json
-import os
 import re
 import sys
 import time
@@ -125,23 +123,8 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
 
-def configuration(env):
-    bind = env.get('AIB_DASHBOARD_BIND')
-    if not bind:
-        raise ValueError('AIB_DASHBOARD_BIND must explicitly name an IPv4 address; there is no wildcard default')
-    ipaddress.IPv4Address(bind)
-    port = env.get('AIB_DASHBOARD_PORT', '3030')
-    threshold = env.get('AIB_PROJECTION_STALE_SECONDS', '60')
-    if not re.fullmatch(r'[0-9]{1,5}', port) or not 0 <= int(port) <= 65535:
-        raise ValueError('invalid AIB_DASHBOARD_PORT')
-    if not re.fullmatch(r'[0-9]{1,9}', threshold):
-        raise ValueError('invalid AIB_PROJECTION_STALE_SECONDS')
-    return (bind, int(port)), env.get('AIB_PROJECTION_ROOT', '/var/lib/aib/projection'), int(threshold)
-
-
-def main():
+def main(address, root, threshold):
     try:
-        address, root, threshold = configuration(os.environ)
         with DashboardServer(address, root, threshold) as server:
             if address[1] == 0:
                 print(f'port={server.server_port}', flush=True)

@@ -582,7 +582,8 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from dashboard.reader import ProjectionRoot, instant
 from dashboard.render import project_page
-from dashboard.server import configuration
+import runpy
+configuration = runpy.run_path(str(Path(sys.argv[1])/'bin/dashboard'))['configuration']
 root = Path(sys.argv[2])
 p = json.loads((root/'acme.json').read_text())
 reader = ProjectionRoot(root)

@@ -2,10 +2,32 @@
 """Serve the visibility dashboard using only Python's standard library."""
 from pathlib import Path
 import sys
+import os
+import re
+import ipaddress
 
 # Isolated mode excludes ambient import paths; only this checkout supplies code.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dashboard.server import main
 
+def configuration(env):
+    bind = env.get('AIB_DASHBOARD_BIND')
+    if not bind:
+        raise ValueError('AIB_DASHBOARD_BIND must explicitly name an IPv4 address; there is no wildcard default')
+    ipaddress.IPv4Address(bind)
+    port = env.get('AIB_DASHBOARD_PORT', '3030')
+    threshold = env.get('AIB_PROJECTION_STALE_SECONDS', '60')
+    if not re.fullmatch(r'[0-9]{1,5}', port) or not 0 <= int(port) <= 65535:
+        raise ValueError('invalid AIB_DASHBOARD_PORT')
+    if not re.fullmatch(r'[0-9]{1,9}', threshold):
+        raise ValueError('invalid AIB_PROJECTION_STALE_SECONDS')
+    return (bind, int(port)), env.get('AIB_PROJECTION_ROOT', '/var/lib/aib/projection'), int(threshold)
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        settings = configuration(os.environ)
+    except ValueError as error:
+        print(f'dashboard: {error}', file=sys.stderr)
+        sys.exit(64)
+    sys.exit(main(*settings))

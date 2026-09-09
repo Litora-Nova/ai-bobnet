@@ -608,8 +608,9 @@ hasnt "the broker handler never references the projection filename" \
 # root, never a second reader of the engine's own truth. bin/dashboard does not exist yet on this
 # unbuilt tree, so `cat` on it is empty and every assertion below passes vacuously until it is
 # built — the pin becomes load-bearing the moment bin/dashboard exists (tests/dashboard_spec.sh
-# pins its existence separately).
-dashboard_src="$(cat "$SRC_ROOT/bin/dashboard" 2>/dev/null || true)"
+# pins its existence separately). Scan its private Python helpers too: moving a
+# forbidden dependency behind an import must not evade this boundary.
+dashboard_src="$(cat "$SRC_ROOT/bin/dashboard" "$SRC_ROOT"/dashboard/*.py 2>/dev/null || true)"
 hasnt "bin/dashboard never sources lib/aibobnet.sh" "$dashboard_src" "aibobnet.sh"
 hasnt "bin/dashboard never references the registry env var" "$dashboard_src" "AIBOBNET_REGISTRY"
 hasnt "bin/dashboard never references the event root env var" "$dashboard_src" "AIB_EVENT_ROOT"
