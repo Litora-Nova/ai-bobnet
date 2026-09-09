@@ -66,3 +66,6 @@ ReadOnlyPaths=/var/lib/aib/projection
 # Site drop-ins: if AIB_PROJECTION_ROOT is overridden to a path outside /var/lib/aib, add a
 # ReadOnlyPaths= drop-in for it the same way aib-broker@.service.d/site.conf.example does for
 # ReadWritePaths - this unit never writes into the projection root or anywhere else.
+
+[Install]
+WantedBy=multi-user.target
