@@ -407,7 +407,7 @@ start_dashboard() {
 curl_ok() { [ -n "$CURL" ] && [ -n "${DASH_PORT:-}" ]; }
 get() { curl_ok && "$CURL" -sS --max-time 2 "http://127.0.0.1:$DASH_PORT$1"; }
 head_of() { curl_ok && "$CURL" -sSD - -o /dev/null --max-time 2 "http://127.0.0.1:$DASH_PORT$1"; }
-code_of() { curl_ok && "$CURL" -sS -o /dev/null -w '%{http_code}' --max-time 2 "$@" "http://127.0.0.1:$DASH_PORT$1"; }
+code_of() { local path="$1"; shift; curl_ok && "$CURL" -sS -o /dev/null -w '%{http_code}' --max-time 2 "$@" "http://127.0.0.1:$DASH_PORT$path"; }
 
 if start_dashboard; then
   ok "bin/dashboard starts on AIB_DASHBOARD_BIND=127.0.0.1 AIB_DASHBOARD_PORT=0 and prints its port"
@@ -520,6 +520,60 @@ theme_links="$(get /p/acme)"
 has "the header carries a path-preserving ?theme=dark link" "$theme_links" "?theme=dark"
 has "the header carries a path-preserving ?theme=light link" "$theme_links" "?theme=light"
 has "the header carries a path-preserving ?theme=c64 link" "$theme_links" "?theme=c64"
+
+if [ -n "$PY" ] && [ -n "$DASH_PORT" ]; then
+  "$PY" - "$DASH_PORT" "$DROOT" <<'PYEOF'
+import http.client, json, os, socket, sys, time
+from pathlib import Path
+port, root = int(sys.argv[1]), Path(sys.argv[2])
+def request(path, method='GET', headers=None):
+    client = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
+    client.request(method, path, headers=headers or {})
+    response = client.getresponse(); data = response.read()
+    result = response.status, dict(response.getheaders()), data
+    client.close(); return result
+original = (root/'acme.json').read_bytes()
+for method in ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT']:
+    status, headers, body = request('/api/project/acme', method)
+    assert status == 405 and headers['Allow'] == 'GET, HEAD', method
+assert (root/'acme.json').read_bytes() == original
+status, headers, body = request('/api/project/acme', 'HEAD')
+assert status == 200 and body == b''
+assert int(headers['Content-Length']) == len(request('/api/project/acme')[2])
+assert headers['Cache-Control'] == 'no-store'
+assert request('/api/project/evil')[0] == 404
+os.mkfifo(root/'pipe.json')
+assert request('/api/project/pipe')[0] == 404
+assert 'pipe' not in request('/api/fleet')[2].decode()
+(root/'broken.json').write_text('{')
+(root/'array.json').write_text('[]')
+for uid in ['broken', 'array']:
+    assert request('/api/project/'+uid)[0] == 404
+    rows = json.loads(request('/api/fleet')[2])['projects']
+    row = next(p for p in rows if p['project_uid'] == uid)
+    assert row['present'] is False and row['agents_by_state'] is None
+p = json.loads(original); p['project_uid']='other'
+(root/'mismatch.json').write_text(json.dumps(p))
+assert request('/api/project/mismatch')[0] == 404
+p = json.loads(original); p['stream']['last_seq']=987
+(root/'acme.new').write_text(json.dumps(p)); os.replace(root/'acme.new', root/'acme.json')
+assert json.loads(request('/api/project/acme')[2])['stream']['last_seq'] == 987
+(root/'acme.json').write_bytes(original)
+status, headers, body = request('/p/acme?theme=light')
+assert 'SameSite=Strict' in headers['Set-Cookie'] and 'Path=/' in headers['Set-Cookie']
+assert b'href="/p/acme?theme=c64"' in body
+assert b'<body class="dark">' in request('/p/acme?theme=dark', headers={'Cookie':'aib_theme=light'})[2]
+assert b'<body class=' not in request('/p/acme?theme=bogus', headers={'Cookie':'aib_theme=light'})[2]
+assert b'<body class=' not in request('/p/acme?theme=auto')[2]
+assert 'Set-Cookie' not in request('/p/acme?theme=%22%3E%3Cscript%3E')[1]
+assert b'<script>' not in request('/p/acme?theme=%22%3E%3Cscript%3E')[2]
+with socket.create_connection(('127.0.0.1', port)) as slow:
+    slow.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n')
+    started=time.monotonic(); assert request('/api/fleet')[0] == 200
+    assert time.monotonic()-started < 2
+PYEOF
+  eq "HTTP boundary corpus: methods, HEAD, nofollow/FIFO, bad files, replacement, cookies and slow clients" "$?" 0
+fi
 
 kill "$DASH_PID" 2>/dev/null; wait "$DASH_PID" 2>/dev/null; DASH_PID=""
 

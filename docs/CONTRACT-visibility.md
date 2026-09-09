@@ -666,7 +666,8 @@ are the unit's and ADR-0008's concern, not this contract's.
   is non-`null` and differs from `resolved`. Today `requested` is `null` for `provider`/`model`/`effort`
   in every emitted record, so it is never appended for those three yet — the rule is stated generally
   because the slot is reserved, not because today's data exercises it. `sandbox.requested` is real
-  today and follows the identical rule.
+  today; because sandbox has no `resolved` slot, compare its request with `effective`
+  instead (show a non-null request only when it differs).
 - **`effective: null` on `decision: "deny"` renders `"denied"`, never `"unknown"`.** This applies to
   every one of `provider.effective`, `model.effective`, `effort.effective`, and `sandbox.effective` —
   a deny blanks all four together (§18).

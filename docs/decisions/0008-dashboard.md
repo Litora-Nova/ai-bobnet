@@ -253,3 +253,47 @@ This ADR extends ADR-0007; it reverses neither ADR-0007 nor ADR-0006.
 
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts in this repository.
+
+
+## Implementation decisions (2026-09-09)
+
+- `bin/dashboard` starts Python in isolated mode with bytecode writes disabled. Its
+  only application imports are the checkout's `dashboard/` package; HTTP requests
+  cannot select imports or filesystem paths outside the configured projection root.
+- Bind configuration is mandatory and accepts literal IPv4 addresses. An unset/empty
+  `AIB_DASHBOARD_BIND` refuses before listening; explicitly naming `0.0.0.0` is allowed.
+  The original RED bind check accidentally supplied that explicit opt-in while testing
+  the default refusal. The check now unsets the variable. Port defaults to 3030;
+  threshold defaults to 60 seconds (zero allowed); invalid values refuse startup.
+- The root directory is opened with `O_DIRECTORY|O_NOFOLLOW`; enumeration and file
+  opens use that directory descriptor. Files use `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` and
+  a regular-file `fstat` check, including direct project requests. These operations
+  are read-only and tolerate disappearance during atomic replacement.
+- Schema-2-or-newer files must preserve known fields/types and match their filename's
+  UID. Duplicate keys, invalid UTF-8/Unicode, nonfinite JSON and malformed shapes are
+  unavailable snapshots. Extra fields survive the JSON project response unchanged.
+  A validly named regular file that cannot be read/parsed remains an unknown fleet
+  row, not a zero count. The same direct project request returns 404 JSON with
+  `error: "unknown"` and a short reason. Missing roots show an unknown project set.
+- `/api/project/<uid>` returns the projection object. `/api/fleet` returns
+  `observed_at`, `root_status`, `files_seen`, and `projects`. Each row has `project_uid`,
+  `present`, `reason`, `generated_at`, `age_seconds`, `stale`, `stream_status`, `capacity`,
+  `attention_count`, and `agents_by_state`; unavailable values are null. UIDs are
+  sorted, without inventing registry membership or an urgency ordering.
+- GET and HEAD are the only accepted methods. Other methods receive 405 and
+  `Allow: GET, HEAD`, with a closed connection (request bodies are not consumed).
+  Every response carries no-store, the fixed CSP and nosniff. Socket reads time out
+  after five seconds; separate request threads let other clients continue.
+- Invalid themes override even a valid cookie to auto without setting a cookie.
+  Duplicate theme query values are likewise auto. The preference cookie also has
+  HttpOnly; it is not an authentication cookie. Explicit dark stays dark under a
+  light OS preference via `body.dark` variable aliases. Auto reuses light palette
+  aliases declared in the root token block, avoiding literals in the media rule.
+- Sandbox has no resolved slot. Its non-null requested value is compared with
+  effective for display, as clarified in the rendering contract. Future timestamps
+  display their clock lead rather than a negative "old" age. Stale snapshots use
+  neutral text; stream status and agent state keep the schema vocabulary.
+- Layout and density follow the approved HTML draft, but no sample values or
+  inferred "unregistered project" labels are imported. The dashboard has no
+  registry knowledge. Full capped reasons remain readable, without a fabricated
+  count of hidden causes.

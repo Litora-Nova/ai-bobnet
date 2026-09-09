@@ -1,0 +1,11 @@
+#!/usr/bin/env -S python3 -I -B
+"""Serve the visibility dashboard using only Python's standard library."""
+from pathlib import Path
+import sys
+
+# Isolated mode excludes ambient import paths; only this checkout supplies code.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from dashboard.server import main
+
+if __name__ == '__main__':
+    sys.exit(main())
