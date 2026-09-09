@@ -42,12 +42,25 @@ def badge(value):
     return f'<span class="badge {color}">{escaped(value)}</span>'
 
 
+def compact_age(seconds):
+    if seconds < 90:
+        return f'{seconds} s'
+    minutes = seconds // 60
+    if minutes < 90:
+        return f'{minutes} min'
+    hours = minutes // 60
+    if hours < 48:
+        return f'{hours} h {minutes % 60} min'
+    return f'{hours // 24} d {hours % 24} h'
+
+
 def freshness(age, stale):
     if age is None:
         return 'unknown'
     if age < 0:
-        return f'<span class="quiet">clock ahead by {escaped(-age)} s</span>'
-    return f'<span class="quiet">stale since {escaped(age)} s</span>' if stale else f'<span class="quiet">fresh · {escaped(age)} s old</span>'
+        return f'<span class="quiet">clock ahead by {escaped(compact_age(-age))}</span>'
+    label = escaped(compact_age(age))
+    return f'<span class="quiet">stale since {label}</span>' if stale else f'<span class="quiet">fresh · {label} old</span>'
 
 
 def page(title, body, theme, uid=None):

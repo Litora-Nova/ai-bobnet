@@ -98,8 +98,6 @@ meter { width:100%; height:9px; accent-color:var(--green); }
 .missing { background:var(--bg2); border:1px solid var(--line); padding:20px; margin-top:16px; }
 .draft-note { padding:10px 24px; border-top:1px solid var(--line); font-size:11px; color:var(--dim); }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-.stale-value { color:var(--amber); background:var(--titb); padding:1px 3px; }
-.denied-value { color:var(--amber); background:var(--titb); padding:1px 3px; }
 @media(max-width:1050px) { main { padding:16px; } .topbar { padding:10px 16px; } .health { grid-template-columns:3fr 2fr; gap:12px; } .health-box dl { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media(max-width:650px) { main { padding:12px; } .topbar { padding:8px 12px; flex-wrap:wrap; gap:10px; } .brand span { display:block; margin:4px 0 0; } .health { grid-template-columns:1fr; } .snapshot { gap:8px; } .page-title { flex-wrap:wrap; } .draft-note { padding:10px 12px; } }
 

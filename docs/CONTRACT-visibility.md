@@ -688,6 +688,10 @@ are the unit's and ADR-0008's concern, not this contract's.
   `bin/dashboard`'s own setting, distinct from any of `bin/project`'s env (§14/§16) — nothing in the
   file self-reports its own staleness beyond the per-agent `stale` flag (§4), so every render computes
   project-level freshness itself, from the one honest signal, `generated_at`.
+- **Display ages in compact English units, flooring without rounding up:** under 90 seconds,
+  `N s`; under 90 minutes, `N min`; under 48 hours, `N h M min`; otherwise, `N d M h`.
+  Apply this to fresh/stale ages and clock lead in both views; keep the exact ISO `generated_at`
+  alongside it. JSON `age_seconds` and the exact stale-threshold comparison remain unchanged.
 - **A projection-root file for a `project_uid` the render does not otherwise expect to see is shown as
   `"stale since <age>"`, never as an alarm or error badge.** The render never consults the registry
   (§4, §5) — it is a consumer of the projection root only — so it cannot itself know *why* an
@@ -702,16 +706,15 @@ are the unit's and ADR-0008's concern, not this contract's.
 `docs/decisions/0008-dashboard.md` §G records why this is server-rendered, never JavaScript):**
 
 - **Every colour is a CSS custom property, never a literal outside the token block.** `bin/dashboard`
-  ships exactly three colour blocks in its served CSS: `:root{}` (the token declarations, dark by
-  default: `--bg --bg2 --titb --fg --dim --ink --coral --amber --green --line` — the same names as
-  the trendgegner terminal theme, so an operator who knows that palette recognizes these on sight),
-  `body.light{}` (overrides), and `body.c64{}` (a full takeover: flat blue backdrop, its own token
-  overrides, `text-transform: uppercase`, monospace everywhere). No other rule in the page may name a
-  literal colour (`#`-hex or `rgb(`/`rgba(`) — every other rule reads a `var(--token)` instead. A
-  `@media (prefers-color-scheme: light)` block applies the light token values for a viewer who chose
-  no explicit theme; because a class selector (`body.light`, `body.c64`) always out-specifies a bare
-  `body` selector, this media block never has to guard itself against an explicit choice — the
-  cascade already resolves it correctly.
+  ships four colour blocks in its served CSS: `:root{}` (dark defaults for
+  `--bg --bg2 --titb --fg --dim --ink --coral --amber --green --line`), `body.light{}`,
+  `body.dark{}`, and `body.c64{}` (flat blue backdrop, `text-transform: uppercase`, monospace
+  everywhere). The ten token names are a shared vocabulary so a palette can be swapped without
+  touching the layout. Alias tokens `--dark-*` / `--light-*` are permitted, with `body.dark{}`
+  restoring explicit dark on a light OS; every colour literal must stay inside those four blocks.
+  No other rule may name a literal colour (`#`-hex or `rgb(`/`rgba(`): it reads a `var(--token)`
+  instead. A `@media (prefers-color-scheme: light)` block applies light token aliases to a bare
+  `body` selector for auto; explicit theme classes out-specify it.
 - **Theme selection is a server-rendered class from a cookie, never a client-side toggle.** A
   `?theme=dark|light|c64|auto` query parameter, present on *any* route, makes `bin/dashboard` set
   `Set-Cookie: aib_theme=<value>` (`Path=/; SameSite=Strict`, no `Secure` requirement stated here

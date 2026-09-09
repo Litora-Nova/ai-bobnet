@@ -10,17 +10,18 @@ Accepted
 
 ## Context
 
-`plan/BobNet_3.0_ENTSCHEID_sichtbarkeit-und-vm-split.md` (PO decision, 2026-08-15) named a dashboard
+The product-owner decision record on visibility and the VM split (private planning,
+2026-08-15) named a dashboard
 as the third of three items behind visibility: (1) `docs/CONTRACT-visibility.md`'s schema, (2) a
 dashboard that reads only the projection, (3) decommissioning the engine's 2.0 dashboard on the dev
 VM, which the PO found to be a clone with dead links. A design note
 (`standup/_design_aib-dashboard.md`, v2) proposed the shape; an architecture consult
-(`standup/_advisor_aib-dashboard.md`, Tim, GO_WITH_NOTES, no NO_GO) verified it against the running
+(GO_WITH_NOTES, no NO_GO) verified it against the running
 code (`lib/aibobnet.sh`'s payload composer, `bin/aib-broker-handler`, `tests/projection_spec.sh`'s
 §3 non-consumption pin, `bin/project`) and produced twelve findings, all adopted into the v2 design
 this ADR records the reasoning behind. `docs/CONTRACT-visibility.md` is the *what* (schema 2, §19's
-rendering obligations); this document is the *why*. The PO signed off the layout draft
-(`standup/_design_aib-dashboard/henry-4.html`) on 2026-09-09 ("kann so gebaut werden").
+rendering obligations); this document is the *why*. The layout follows the draft the product
+owner signed off on 2026-09-09.
 
 ## Decision
 
@@ -136,8 +137,7 @@ become a second reader of engine truth. This ADR's mechanical enforcement of tha
   it explicitly (never a default) — the same "explicit, not a default" posture
   `docs/CONTRACT-visibility.md` §14 already states for `AIB_PROJECTION_ROOT`. Provisioning sets
   `AIB_DASHBOARD_BIND` to the tailnet IPv4 address, so the service is reachable exactly where Tailscale
-  already is this deployment's access boundary (`~/CLAUDE.md`'s "Tailscale is the boundary today,"
-  restated in the design note's Scope). `AIB_DASHBOARD_PORT` (default `3030`) is unprivileged, and
+  already is this deployment's access boundary, as set by the provisioning owner. `AIB_DASHBOARD_PORT` (default `3030`) is unprivileged, and
   port `0` is honored for tests: the process binds an ephemeral port and prints it, so a test harness
   never has to guess or hardcode one.
 - **`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`** on every HTML response,
@@ -154,7 +154,7 @@ above) states it, and advisor finding 7 verified nothing else in this codebase's
 depends on the literal value `1`. The ordering PO Decision fixed — schema, then dashboard, then
 decommission — makes this window unavoidable and bounded; it ends the moment the VM's engine
 dashboard checkout is removed, which is item (3) of the same PO decision, tracked separately
-(Remote Bob's `prox-init` revier, per `~/CLAUDE.md`'s topology table), not by this ADR.
+as the provisioning owner's responsibility, not by this ADR.
 
 ### G. Theming: a server-rendered class from a cookie, never JavaScript (PO amendment, 2026-09-09)
 
@@ -170,7 +170,7 @@ already keys off of costs nothing beyond what the process already does per reque
 exactly as gracefully as everything else here: a client that drops the cookie, or that never sends
 the query parameter at all, simply gets `auto` — the `prefers-color-scheme` media query's own light
 values, or the `:root` dark default absent even that signal — never an error and never a blank page.
-Every colour value the three theme blocks carry is a CSS custom property, never a literal, for the
+Every colour value outside the four theme token blocks reads a CSS custom property, never a literal, for the
 same reason `docs/CONTRACT-visibility.md` §19 states mechanically: a builder who later adds a fourth
 render surface (a status line, an alert colour) must reach for `var(--token)` by construction, not
 by remembering to.

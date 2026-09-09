@@ -367,6 +367,21 @@ write_json acme "$(cat <<JSON
  "anomalies":{"unregistered_logs":0,"unparsable_lines":0,"uid_mismatches":0,"undecodable_records":0,"launch_malformed":0}}
 JSON
 )"
+if [ -n "$PY" ]; then
+  "$PY" - "$DROOT/acme.json" <<'PYEOF'
+import copy, json, sys
+from pathlib import Path
+path = Path(sys.argv[1]); p = json.loads(path.read_text())
+a = copy.deepcopy(p['agents']['acme-core'])
+a['message'] = 'unresolved launch binding'
+a['attempt']['id'] = 'acme-main-3'
+for dimension in ['provider', 'model', 'effort', 'sandbox']:
+    a['launch'][dimension]['effective'] = None
+a['launch']['model']['resolved'] = None
+p['agents']['acme-unresolved'] = a
+path.write_text(json.dumps(p))
+PYEOF
+fi
 write_json acme-corrupt "$(cat <<JSON
 {"schema":2,"generated_at":"$(now_iso)","project_uid":"acme-corrupt","attested_sources":["stream","capacity","launch"],
  "stream":{"status":"corrupt","last_seq":1,"anchor":{"value":1,"relationship":"ok"},"torn_tail":false,"undecodable_records":[]},
@@ -447,6 +462,38 @@ has "GET /p/acme escapes hostile launch.reasons text" "$html_proj" "&lt;img src=
 has "SS19: deny renders effective as denied" "$html_proj" "denied"
 has "SS19: no decided record + ok stream renders never launched" "$html_proj" "never launched"
 
+if [ -n "$PY" ] && [ -n "$DASH_PORT" ]; then
+  "$PY" - "$DASH_PORT" <<'PYEOF'
+from html.parser import HTMLParser
+from urllib.request import urlopen
+import re, sys
+class Rows(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.rows=[]; self.row=None; self.cell=None
+    def handle_starttag(self, tag, attrs):
+        if tag == 'tr': self.row=[]
+        if tag in ('td', 'th'): self.cell=[]
+    def handle_data(self, data):
+        if self.cell is not None: self.cell.append(data)
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th') and self.cell is not None:
+            self.row.append(' '.join(self.cell)); self.cell=None
+        if tag == 'tr' and self.row is not None:
+            self.rows.append(self.row); self.row=None
+with urlopen('http://127.0.0.1:'+sys.argv[1]+'/p/acme', timeout=2) as response:
+    assert response.status == 200
+    parser=Rows(); parser.feed(response.read().decode())
+rows=[row for row in parser.rows if row and row[0].split()[0] == 'acme-unresolved']
+assert len(rows) == 1 and len(rows[0]) == 7, rows
+row=rows[0]
+assert re.search(r'\bdecision\s+allow\b', row[6]), row[6]
+for cell in row[2:6]:
+    assert re.search(r'\beffective\s+unknown\b', cell), cell
+assert not re.search(r'\bdenied\b', ' '.join(row)), row
+PYEOF
+  eq "HTTP unresolved allow: own agent row renders unknown, never denied" "$?" 0
+fi
+
 html_corrupt="$(get /p/acme-corrupt)"
 has "SS19: no decided record + corrupt stream renders unknown, not never launched" "$html_corrupt" "unknown"
 
@@ -475,21 +522,35 @@ if [ -n "$PY" ]; then
   color_leaks="$(printf '%s' "$css" | "$PY" -c '
 import re, sys
 css = sys.stdin.read()
-allowed = {":root", "body.light", "body.c64"}
+allowed = {":root", "body.light", "body.dark", "body.c64"}
 leaks = []
 for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
     sel = m.group(1).strip()
     if sel in allowed:
         continue
-    if re.search(r"#[0-9a-fA-F]{3,8}\b|rgb\(", m.group(2)):
+    if re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", m.group(2)):
         leaks.append(sel)
 print(len(leaks))
 ' 2>/dev/null || printf 'na')"
   if [ "$color_leaks" = na ]; then
-    no "every colour literal is confined to :root{}/body.light{}/body.c64{} (could not parse served CSS)"
+    no "every colour literal is confined to :root{}/body.light{}/body.dark{}/body.c64{} (could not parse served CSS)"
   else
-    eq "every colour literal is confined to :root{}/body.light{}/body.c64{}" "$color_leaks" 0
+    eq "every colour literal is confined to :root{}/body.light{}/body.dark{}/body.c64{}" "$color_leaks" 0
   fi
+  "$PY" - "$css" <<'PYEOF'
+import re, sys
+css = sys.argv[1]
+blocks = {}
+for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+    blocks.setdefault(match[1].strip(), []).append(match[2])
+for selector in [':root', 'body.light', 'body.dark', 'body.c64']:
+    assert len(blocks.get(selector, [])) == 1, selector
+for token in ['bg','bg2','titb','fg','dim','ink','coral','amber','green','line']:
+    for theme in ['dark', 'light']:
+        assert re.search(r'--'+theme+'-'+token+r'\s*:', blocks[':root'][0]), (theme, token)
+        assert re.search(r'--'+token+r'\s*:\s*var\(--'+theme+'-'+token+r'\)', blocks['body.'+theme][0]), (theme, token)
+PYEOF
+  eq "four theme token blocks retain explicit dark/light alias overrides" "$?" 0
   c64_upper="$(printf '%s' "$css" | "$PY" -c '
 import re, sys
 css = sys.stdin.read()
@@ -596,7 +657,7 @@ import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from dashboard.reader import ProjectionRoot, instant
-from dashboard.render import project_page
+from dashboard.render import fleet_page, freshness, project_page
 import runpy
 configuration = runpy.run_path(str(Path(sys.argv[1])/'bin/dashboard'))['configuration']
 root = Path(sys.argv[2])
@@ -608,6 +669,17 @@ for age, stale in [(59.9, False), (60, False), (60.1, True), (-1, False)]:
     assert row['stale'] is stale, ('fleet', age, row['stale'])
     rendered = project_page(p, at + age, 60, 'auto')
     assert ('stale since ' in rendered) is stale, ('project', age)
+for age, human in [(89, '89 s'), (90, '1 min'), (5399, '89 min'), (5400, '1 h 30 min'),
+                   (172799, '47 h 59 min'), (172800, '2 d 0 h')]:
+    fleet = reader.fleet(at + age, 60)
+    row = next(row for row in fleet['projects'] if row['project_uid'] == 'acme')
+    assert row['age_seconds'] == age, row
+    for rendered in [fleet_page(fleet, 'auto', 60), project_page(p, at + age, 60, 'auto')]:
+        assert 'stale since '+human+'</span>' in rendered, (age, human)
+        assert p['generated_at'] in rendered, age
+    assert 'fresh · '+human+' old</span>' in freshness(age, False), age
+    assert 'clock ahead by '+human+'</span>' in freshness(-age, False), age
+assert freshness(None, False) == 'unknown'
 assert configuration({'AIB_DASHBOARD_BIND':'0.0.0.0'})[0] == ('0.0.0.0', 3030)
 for key, values in [('AIB_DASHBOARD_BIND', ['', 'localhost', '::1']),
                     ('AIB_DASHBOARD_PORT', ['-1', '65536', 'bad']),
@@ -624,7 +696,7 @@ assert ProjectionRoot(root/'absent').fleet(at, 60)['root_status'] == 'unknown'
 (root/'linked-root').symlink_to(root, target_is_directory=True)
 assert ProjectionRoot(root/'linked-root').fleet(at, 60)['root_status'] == 'unknown'
 PYEOF
-  eq "freshness compares exact elapsed time; wildcard bind requires explicit opt-in" "$?" 0
+  eq "freshness keeps exact thresholds and compact age boundaries; bind remains explicit" "$?" 0
 fi
 
 kill "$DASH_PID" 2>/dev/null; wait "$DASH_PID" 2>/dev/null; DASH_PID=""
