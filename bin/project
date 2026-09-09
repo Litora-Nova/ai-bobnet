@@ -189,10 +189,12 @@ if fold['present'] and fold['readable']:
     sources.append('stream')
 if live is not None:
     sources.append('capacity')
-result = dict(schema=1, generated_at=iso(now), project_uid=uid, attested_sources=sources,
+if fold['present'] and fold['readable']:
+    sources.append('launch')
+result = dict(schema=2, generated_at=iso(now), project_uid=uid, attested_sources=sources,
     stream=dict(status=status, last_seq=fold['highest'], anchor=dict(value=anchor, relationship=relationship), torn_tail=fold['torn'], undecodable_records=fold['undecodable_records']),
     capacity=dict(limit=int(limit), live=live, as_of=iso(live_mtime) if live is not None else None),
-    attention=[], agents={}, anomalies=dict(unregistered_logs=0, unparsable_lines=0, uid_mismatches=0, undecodable_records=len(fold['undecodable_records'])))
+    attention=[], agents={}, anomalies=dict(unregistered_logs=0, unparsable_lines=0, uid_mismatches=0, undecodable_records=len(fold['undecodable_records']), launch_malformed=fold['launch_malformed']))
 def attention(kind, agent, reason, since, attested=True):
     if since is None:
         raise ValueError('cannot date attention from an unparsable heartbeat')
@@ -218,8 +220,10 @@ for agent in roster:
     result['anomalies']['unparsable_lines'] += bad
     result['anomalies']['uid_mismatches'] += mismatches
     entry['attempt'] = None
+    entry['launch'] = None
     attempt = latest.get(agent)
     if attempt:
+        entry['launch'] = attempt['launch']
         ended_at = attempt['last']['ended_at']
         entry['attempt'] = dict(id=attempt['id'], decided_at=iso(event_epoch(attempt['decided_at'])), decision=attempt['decision'], open=attempt['open'],
             last=dict(attempt['last'], ended_at=iso(event_epoch(ended_at)) if ended_at else None))

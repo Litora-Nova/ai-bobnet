@@ -300,6 +300,35 @@ else
   skip "fold raw-JSON passthrough (python3 not present)"
 fi
 
+# Binding faults are display anomalies, including malformed leaves. Neither raw
+# nulls nor multibyte reasons may turn a legacy-compatible fold into corruption.
+if [ -n "$PY" ]; then
+  "$PY" - "$FOLD_PY" <<'PYEOF'
+import copy, importlib.util, sys
+spec = importlib.util.spec_from_file_location('reader', sys.argv[1])
+reader = importlib.util.module_from_spec(spec); spec.loader.exec_module(reader)
+binding = dict(requested=None, resolved='codex', source='project:acme', effective='codex')
+payload = dict(decision='allow', pid=1, provider=binding, model=binding, effort=binding,
+               sandbox=dict(requested='read-only', effective='read-only'),
+               adapter=dict(source='project:acme', effective_path='/private/adapter'), reasons='é' * 257)
+def fold(p):
+    record = dict(attempt_id='acme-main-1', agent_uid='acme-core', occurred_at='2026-09-09T00:00:00Z', event_type='attempt.decided', payload=p)
+    return reader.fold_records([(1, record, False)])[0]
+launch = fold(payload)['launch']
+assert launch['reasons'] == 'é' * 256
+assert launch['adapter'] == dict(source='project:acme')
+assert launch['provider']['requested'] is None
+for key in ['provider', 'model', 'effort', 'sandbox', 'adapter']:
+    for value in [None, [], 'bad', {}]:
+        p = copy.deepcopy(payload); p[key] = value
+        assert fold(p)['launch'] is None, (key, value)
+for key, value in [('reasons', []), ('model', dict(binding, effective=3)), ('effort', dict(binding, source='bad\0source'))]:
+    p = copy.deepcopy(payload); p[key] = value
+    assert fold(p)['launch'] is None, key
+PYEOF
+  eq "launch malformed corpus: nulls, privacy, UTF-8 cap and leaf faults stay nonfatal" "$?" 0
+fi
+
 # =========================================================================
 # C — bin/dashboard HTTP surface (CONTRACT-visibility.md SS19, docs/decisions/0008-dashboard.md)
 #     A hand-built projection root, independent of whether bin/project emits schema 2 yet.
@@ -496,7 +525,7 @@ kill "$DASH_PID" 2>/dev/null; wait "$DASH_PID" 2>/dev/null; DASH_PID=""
 
 # Bind refusal: 0.0.0.0 without an explicit AIB_DASHBOARD_BIND=0.0.0.0 must refuse to start.
 if [ -x "$DASHBOARD_BIN" ]; then
-  AIB_DASHBOARD_BIND=0.0.0.0 AIB_DASHBOARD_PORT=0 AIB_PROJECTION_ROOT="$DROOT" \
+  env -u AIB_DASHBOARD_BIND AIB_DASHBOARD_PORT=0 AIB_PROJECTION_ROOT="$DROOT" \
     timeout 2 "$DASHBOARD_BIN" >"$WORK/bind.out" 2>"$WORK/bind.err"
   bind_rc=$?
   eq "refuses to bind 0.0.0.0 by default (nonzero exit)" "$([ "$bind_rc" -ne 0 ] && printf yes || printf no)" yes

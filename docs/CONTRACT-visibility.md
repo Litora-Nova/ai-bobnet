@@ -563,7 +563,7 @@ Every field, documented:
 | `schema` | integer, `1` (superseded) or `2` (current) | 1 | This document's own version. Readers MUST tolerate unknown fields added by a later, additive-only bump — the same rule `docs/DOMAIN.md` §5 states for the event envelope — and MUST NOT branch on it beyond "is this at least the version I understand." |
 | `generated_at` | ISO 8601, offset-bearing | 1 | When this specific file was written. The only freshness signal (§4). |
 | `project_uid` | string | 1 | The project this file describes. Matches the filename. |
-| `attested_sources` | array of string | 1 (gains `"launch"` at 2) | Which of `"stream"` / `"capacity"` / `"launch"` the projector could actually read this tick — `"stream"` absent means `stream.status` reflects an unreadable/absent stream rather than a real fold; `"capacity"` absent means `.live` was unreadable (§10); `"launch"` is present under the identical condition as `"stream"` (the fold was present and readable this tick) and therefore stays present even when `stream.status` is `"corrupt"` — a fold that scanned but found a torn/corrupt tail still lets earlier, intact `launch` values through (§12). Its presence in this array is not a promise that every agent's `launch` is non-`null` this tick; see `agents[uid].launch` and §19. |
+| `attested_sources` | array of string | 1 (gains `"launch"` at 2) | Which of `"stream"` / `"capacity"` / `"launch"` the projector could actually read this tick — `"stream"` absent means `stream.status` reflects an unreadable/absent stream rather than a real fold; `"capacity"` absent means `.live` was unreadable (§10); `"launch"` is present under the identical condition as `"stream"` (the fold was present and readable this tick) and therefore stays present even when `stream.status` is `"corrupt"` — presence/readability attests the scan, not a partial attempt fold. A corrupt or degraded stream yields no agent `attempt` or `launch`; an uncommitted torn tail alone leaves the intact committed fold usable (§12). Its presence in this array is not a promise that every agent's `launch` is non-`null` this tick; see `agents[uid].launch` and §19. |
 | `stream.status` | `ok\|corrupt\|absent\|unreadable` | 1 | Mirrors `AIB_ATTEMPTS_FOLD_STATUS`/`AIB_EVENT_SCAN_STATUS` (§12), plus `absent` (no stream file yet — a new project) and `unreadable` (a permissions/IO failure distinct from a corrupt parse). |
 | `stream.last_seq` | integer | 1 | The highest valid `seq` the fold observed (0 if none). |
 | `stream.anchor.value` | integer or `null` | 1 | The `high_water` anchor's own value, or `null` if the anchor file is absent. |
@@ -628,14 +628,17 @@ Every field, documented:
   raw JSON, never through the fold's `scalar()` helper — `scalar()` turns `None` into `''`, which
   would erase the distinction between "resolved but blanked by a deny" and "genuinely unresolved"
   that this schema's `null` shapes exist to preserve. A `provider`/`model`/`effort`/`sandbox`/`adapter`
-  value that is absent or not a JSON object (a legacy RM-2 `{decision, pid}`-only payload, or any
+  value that is absent, not a JSON object, missing required members, or has a non-string/non-null binding member (a legacy RM-2 `{decision, pid}`-only payload, or any
   other malformed binding) yields `launch: null` plus one count in `anomalies.launch_malformed` —
   **never** a `ValueError`: `fold()` catches `ValueError` as stream-wide corruption, and a malformed
   binding object flipping that would turn old, already-folded fixtures into a corrupt-stream exit,
   breaking the byte-identity pin the paragraph below states for `bin/attempts`. `launch.reasons` is
   truncated to at most 512 bytes at a UTF-8 code-point boundary (never mid-codepoint, which would
   produce invalid UTF-8) before `aib_json`-escaping — the cap lives in the fold, not in the original
-  event, which is unbounded.
+  event, which is unbounded. Retained strings containing NUL or invalid Unicode, and non-string
+  reasons, are likewise tolerated as malformed launch data so the canonical string encoder cannot
+  turn a display-only anomaly into a publication failure. The counter covers every malformed
+  decided record in a completed semantic fold, including older attempts, not only the latest.
 - Heartbeat framing whitespace is trimmed; message bytes inside that framing (including pipe spacing)
   are preserved. A malformed timestamp remains stale. If an attention item cannot be dated from its
   source, publication fails instead of inventing a timestamp or emitting an invalid schema-1 `since`.
