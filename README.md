@@ -33,6 +33,10 @@ the RM-0 boundary decision; the [managed-policy-gate ADR](docs/decisions/0003-ma
 the RM-1 PDP/PEP split, effective-authority capping, absolute adapter map, and allow-list environment; the
 [attempt-audit ADR](docs/decisions/0004-durable-attempt-audit.md) records the RM-2 durable attempt records,
 the framed event stream, and the honesty boundary (audit through the seam, not completeness).
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md) documents each registered `providers.<name>` entry — placement,
+the operator's own credential recipe, and the effort/sandbox/exit-code mapping; the `codex` adapter's own
+ABI amendment is [`docs/CONTRACT-codex-run.md`](docs/CONTRACT-codex-run.md) §4.1
+([ADR-0009](docs/decisions/0009-codex-adapter.md)).
 
 ## Runtime requirements
 

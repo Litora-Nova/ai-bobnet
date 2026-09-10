@@ -7,6 +7,13 @@
       "cap_tier": "t3",
       "cap_effort": "high",
       "cap_timeout": "3600"
+    },
+    "stub": {
+      "adapter": "/opt/aib/adapters/stub-codex",
+      "cap_sandbox": "workspace-write",
+      "cap_tier": "t1",
+      "cap_effort": "low",
+      "cap_timeout": "60"
     }
   },
   "projects": {
