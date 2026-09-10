@@ -103,7 +103,7 @@ expect_targeted_failure() {
 }
 
 # 68, not 67: gate delta D5 added one assertion there (stage=exec on the
-# unsupported-provider refusal, never stage:null).
+# non-executable-adapter refusal, never stage:null).
 expect_baseline_green "$SRC_ROOT/tests/managed_launch_spec.sh" \
   "68 checks: 68 ok / 0 fail" "$WORK/clean-launch.out"
 expect_baseline_green "$SRC_ROOT/tests/codex_run_spec.sh" \
@@ -122,17 +122,16 @@ expect_targeted_failure "launch-resolves-legacy" \
   "schema 2 managed launch is refused" \
   "$WORK/launch-resolves-legacy.out"
 
-# 2. Accepting an unknown provider adapter drives a foreign provider from the map
-# instead of refusing everything but the codex adapter CLI the PEP knows how to shape.
-UNKNOWN_PROVIDER="$(make_mutant unknown-provider-accepted)"
-replace_exact "$UNKNOWN_PROVIDER/bin/launch-agent" \
-  '  *) aib_die 64 "unsupported registry provider '"'"'$AIB_PROVIDER'"'"' (this launcher drives only the codex adapter CLI)";;' \
-  '  *) : ;; # mutation: unknown provider accepted'
-record_mutation "unknown-provider-accepted" "$?"
-expect_targeted_failure "unknown-provider-accepted" \
-  "$UNKNOWN_PROVIDER/tests/managed_launch_spec.sh" \
-  "unsupported provider is refused" \
-  "$WORK/unknown-provider-accepted.out"
+# 2. Restoring a codex-only gate rejects a valid registered adapter sharing the ABI.
+REGISTERED_PROVIDER="$(make_mutant registered-provider-rejected)"
+replace_exact "$REGISTERED_PROVIDER/bin/launch-agent" \
+  '# Every registered adapter accepts the frozen ABI; provider validity is resolved' \
+  '[ "$AIB_PROVIDER" = codex ] || aib_die 64 "mutation: codex-only dispatch"'
+record_mutation "registered-provider-rejected" "$?"
+expect_targeted_failure "registered-provider-rejected" \
+  "$REGISTERED_PROVIDER/tests/managed_launch_spec.sh" \
+  "registered second provider succeeds" \
+  "$WORK/registered-provider-rejected.out"
 
 # 3. Restoring --model as an authority reopens the removed CLI override: the migration
 # refusal (exit 64) turns into an accepted launch.
