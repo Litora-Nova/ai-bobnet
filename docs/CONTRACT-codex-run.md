@@ -156,7 +156,8 @@ adapter process once that argv arrives: every adapter, `codex` first, accepts th
 is a shape refusal — never a silent tolerance of an unrecognized token), and only then re-shapes what
 it hands to the concrete binary it wraps. A non-`codex` adapter built later (e.g. a claude-code
 adapter) accepts the identical ABI and performs its own translation; the PEP never learns or cares
-what that translation looks like.
+what that translation looks like. The model value must be nonempty and is passed verbatim;
+the adapter does not resolve a model or supply a default.
 
 The `codex` adapter's translation, concretely:
 
@@ -165,8 +166,11 @@ The `codex` adapter's translation, concretely:
   binary. It is delivered on the wrapped binary's stdin, byte-exact, with no trailing newline added
   (a bare `<<<` here-string is wrong here — it appends one — the adapter uses a process substitution
   instead), and the wrapped binary is invoked with a bare `-` positional prompt token telling it to
-  read stdin. This keeps the prompt out of `/proc/<pid>/cmdline` for the whole run: anyone reading
-  argv while the provider works sees only the fixed flags below, never prompt content.
+  read stdin. The wrapped binary's argv contains no prompt. The incoming adapter argv and the
+  process-substitution feeder can still carry it until those transient processes exec or finish;
+  a large prompt may keep the feeder alive while the provider reads. This is not a guarantee of
+  prompt invisibility across the entire process tree. The provisioning-side process visibility
+  boundary and the shared-broker-uid limitation remain as documented in `docs/CONFINEMENT.md`.
 - **Fixed flags, each exactly once, appended by the adapter after validation, never received from the
   PEP:** `--skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox`. None of these
   three is negotiable per-request; the registry and the PDP do not carry them.
@@ -183,10 +187,10 @@ The `codex` adapter's translation, concretely:
   (`docs/PROVIDERS.md`) exits **78** (`EX_CONFIG`). Neither number collides with the PDP's own `64`
   (`docs/CONTRACT-execution-binding.md` §7.6) — an adapter refusal must never read, from the exit code
   alone, as a policy deny the caller never actually issued. The adapter never itself exits **124**,
-  **126**, or **127** — those stay reserved for the watchdog, the confinement helper, and the wrapped
-  binary's own `exec` failure respectively; if the wrapped binary is missing or not executable, the
-  adapter does not pre-check and substitute its own code, it lets bash's native `exec` failure (127)
-  surface unmasked, because that 127 belongs to the binary, not to the adapter's own judgment.
+  **126**, or **127**. It does not pre-check the wrapped binary: Bash's native exec failure
+  surfaces unchanged (127 for a missing binary, 126 for a non-executable file). A running binary
+  likewise returns its own status unchanged; the existing PEP maps 124 to timeout and 126/127 to
+  io-refused, without this wrapper manufacturing or translating those codes.
 
 **Why the wrapped binary's own sandbox is bypassed, and Landlock is the sandbox of record.** Codex's
 Linux sandbox (as of the pinned static build) runs everything through `bubblewrap`, which needs

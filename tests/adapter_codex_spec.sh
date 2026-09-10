@@ -60,7 +60,7 @@ skip(){ printf 'ok   - (skipped: %s)\n' "$1"; }
 eq(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi; }
 has(){ case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3')";; esac; }
 hasnt(){ case "$2" in *"$3"*) no "$1 (unexpected '$3')";; *) ok "$1";; esac; }
-count_matches_in_string(){ local n; n="$(printf '%s\n' "$2" | grep -c -- "$1" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+count_matches_in_string(){ local n; [ "${1-}" != -- ] || shift; n="$(printf '%s\n' "$2" | grep -c -- "$1" 2>/dev/null)"; printf '%s' "${n:-0}"; }
 file_byte_count(){ [ -e "$1" ] && wc -c < "$1" 2>/dev/null || printf 0; }
 
 # =============================================================================
@@ -212,6 +212,24 @@ else
   no "A: adapters/codex execs into the wrapped binary (fake pid == wrapper pid) (wrapper='$wrapper_pid' fake='$fake_pid')"
 fi
 
+for registry_effort in low medium high max; do
+  expected_effort="$registry_effort"; [ "$registry_effort" != max ] || expected_effort=xhigh
+  call_adapter read-only "$registry_effort" 'effort check'
+  argv="$(cat "$FAKE_ARGV_OUT" 2>/dev/null)"
+  if [ "$ADAPTER_RC" -eq 0 ] && [[ "$argv" == *"[model_reasoning_effort=\"$expected_effort\"]"* ]]; then
+    ok "A: read-only effort $registry_effort maps to $expected_effort"
+  else no "A: read-only effort $registry_effort maps to $expected_effort"; fi
+done
+for prompt_kind in trailing-newlines pipe-sized; do
+  if [ "$prompt_kind" = trailing-newlines ]; then edge_prompt=$'last line\n\n'
+  else printf -v edge_prompt '%65536s' ''; fi
+  call_adapter read-only low "$edge_prompt"
+  printf '%s' "$edge_prompt" > "$WORK/expect-edge-prompt"
+  if [ "$ADAPTER_RC" -eq 0 ] && cmp -s "$WORK/expect-edge-prompt" "$FAKE_STDIN_OUT"; then
+    ok "A: $prompt_kind prompt is byte-exact on stdin"
+  else no "A: $prompt_kind prompt is byte-exact on stdin"; fi
+done
+
 # =============================================================================
 # Block B — refusals
 # =============================================================================
@@ -302,6 +320,73 @@ ADAPTER_OUT="$(
 )" || ADAPTER_RC=$?
 eq "B7: a missing wrapped binary surfaces its own unmasked 127" "$ADAPTER_RC" 127
 
+# Extra rejection paths use only this fixture's synthetic auth file.
+for bad_shape in empty-model unknown-sandbox unquoted-effort; do
+  write_auth_ok
+  case "$bad_shape" in
+    empty-model) MODEL='' call_adapter read-only high "$PROMPT_MARKER" ;;
+    unknown-sandbox) call_adapter arbitrary high "$PROMPT_MARKER" ;;
+    unquoted-effort) call_adapter_raw exec -m "$MODEL" -s read-only -c model_reasoning_effort=high -c 'approval_policy="never"' -- "$PROMPT_MARKER" ;;
+  esac
+  eq "B8: $bad_shape is refused" "$ADAPTER_RC" 65
+  if ! provider_was_called && [[ "$ADAPTER_OUT" != *"$PROMPT_MARKER"* ]]; then ok "B8: $bad_shape neither runs nor exposes the prompt"
+  else no "B8: $bad_shape neither runs nor exposes the prompt"; fi
+done
+for unsafe in dir-mode auth-symlink dir-symlink auth-directory auth-fifo empty-home; do
+  rm -rf "$FIXTURE_CODEX_DIR" "$WORK/linked-state"
+  write_auth_ok
+  case "$unsafe" in
+    dir-mode) chmod 0750 "$FIXTURE_CODEX_DIR" ;;
+    auth-symlink) mv "$FIXTURE_CODEX_DIR/auth.json" "$FIXTURE_CODEX_DIR/saved"; ln -s saved "$FIXTURE_CODEX_DIR/auth.json" ;;
+    dir-symlink) mv "$FIXTURE_CODEX_DIR" "$WORK/linked-state"; ln -s "$WORK/linked-state" "$FIXTURE_CODEX_DIR" ;;
+    auth-directory) rm "$FIXTURE_CODEX_DIR/auth.json"; mkdir "$FIXTURE_CODEX_DIR/auth.json" ;;
+    auth-fifo) rm "$FIXTURE_CODEX_DIR/auth.json"; mkfifo "$FIXTURE_CODEX_DIR/auth.json" ;;
+  esac
+  if [ "$unsafe" = empty-home ]; then FIXTURE_HOME='' call_adapter read-only high "$PROMPT_MARKER"
+  else call_adapter read-only high "$PROMPT_MARKER"; fi
+  eq "B9: $unsafe is a credential refusal" "$ADAPTER_RC" 78
+  if ! provider_was_called && [[ "$ADAPTER_OUT" != *"$PROMPT_MARKER"* ]]; then ok "B9: $unsafe neither runs nor exposes the prompt"
+  else no "B9: $unsafe neither runs nor exposes the prompt"; fi
+done
+rm -rf "$FIXTURE_CODEX_DIR" "$WORK/linked-state"
+write_auth_ok
+# Exercise ownership and stat failure even when chown is unavailable. Only the
+# synthetic metadata command is substituted; the real chown integration stays above.
+REAL_STAT="$(command -v stat)"
+mkdir -p "$WORK/metadata-bin"
+for stat_case in foreign-owner metadata-failure; do
+  if [ "$stat_case" = foreign-owner ]; then stat_result="printf '%s\\n' '$foreign_uid:600'"
+  else stat_result='exit 1'; fi
+  cat > "$WORK/metadata-bin/stat" <<EOF
+#!/usr/bin/env bash
+if [ "\$2" = '%u:%a' ]; then $stat_result
+else exec "$REAL_STAT" "\$@"; fi
+EOF
+  chmod +x "$WORK/metadata-bin/stat"
+  SYSTEM_PATH="$WORK/metadata-bin:$SYSTEM_PATH" call_adapter read-only high "$PROMPT_MARKER"
+  eq "B10: $stat_case is a credential refusal" "$ADAPTER_RC" 78
+  if ! provider_was_called && [[ "$ADAPTER_OUT" != *"$PROMPT_MARKER"* ]]; then ok "B10: $stat_case neither runs nor exposes the prompt"
+  else no "B10: $stat_case neither runs nor exposes the prompt"; fi
+done
+# Native exec failures and provider statuses are not wrapper-owned refusals.
+cp "$FAKE_CODEX" "$WORK/fake-saved"
+chmod 0600 "$FAKE_CODEX"
+call_adapter read-only high 'native exec check'
+eq "B11: a non-executable wrapped binary surfaces native 126" "$ADAPTER_RC" 126
+cat > "$FAKE_CODEX" <<'EXITSTUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'provider stdout\n'
+printf 'provider stderr\n' >&2
+exit 42
+EXITSTUB
+chmod +x "$FAKE_CODEX"
+call_adapter read-only high 'exit check'
+eq "B11: a provider exit remains unmodified" "$ADAPTER_RC" 42
+has "B11: provider stdout is relayed" "$ADAPTER_OUT" 'provider stdout'
+has "B11: provider stderr is relayed" "$ADAPTER_OUT" 'provider stderr'
+cp "$WORK/fake-saved" "$FAKE_CODEX"; chmod +x "$FAKE_CODEX"
+
 # =============================================================================
 # Block C — run_confined's LL_RW derivation (docs/CONFINEMENT.md, "Effective-sandbox -> LL_RW")
 # =============================================================================
@@ -328,7 +413,7 @@ _cfg="$(cd "$(dirname "$0")" && pwd)/landlock.conf"
 {
   printf 'LL_RO=%s\n' "${LL_RO-<unset>}"
   printf 'LL_RW=%s\n' "${LL_RW-<unset>}"
-  printf '---\n'
+  printf '%s\n' '---'
 } >> "${STUB_LL_LOG:-/dev/null}"
 if [ -n "${LL_STATUS_FD-}" ]; then eval "exec ${LL_STATUS_FD}>&-"; fi
 exec "$@"

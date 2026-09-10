@@ -23,8 +23,8 @@ decisions (v2, all adopted) and the alternatives they replaced.
 ### A. An exec wrapper, not a driver
 
 `adapters/codex` is a thin, `≤ 80`-line bash script: it validates its own received argv against the
-frozen ABI (`docs/CONTRACT-codex-run.md` §4.1), re-shapes it for the wrapped binary, and `exec`s —
-never forks. This keeps the broker's process-group, watchdog, and exit model (`lib/aibobnet.sh`'s
+frozen ABI (`docs/CONTRACT-codex-run.md` §4.1), re-shapes it for the wrapped binary, and `exec`s. Its only longer-lived fork is the process-substitution stdin feeder;
+that feeder remains in the same process group. This keeps the broker's process-group, watchdog, and exit model (`lib/aibobnet.sh`'s
 `set -m` group-leader mechanics) exactly as already pinned: the adapter is one more link in a single
 exec chain (helper → adapter → wrapped binary), never a second process the manager has to track.
 
@@ -77,9 +77,11 @@ shape) could deadlock a launch until the watchdog fires.
 **Adopted:** the adapter delivers the prompt on the wrapped binary's stdin, byte-exact (a process
 substitution, not a `<<<` here-string, which appends a newline), with a bare `-` positional token
 telling the wrapped binary to read it. The adapter itself pins stdin closed to that exact byte range
-(no trailing bytes, no inherited fd), so a hostile or malformed prompt can begin with `--dangerously`
+(no trailing bytes, no inherited fd), so a prompt can begin with `--dangerously`
 and still never be interpreted as a flag — the validation happens on argv before `--`, and the prompt
-after `--` is never inspected as anything but bytes.
+after `--` is never inspected as anything but bytes. The transient adapter/feeder argv can
+still expose those bytes before completion; only the wrapped binary's argv is prompt-free.
+Process visibility restrictions do not isolate attempts sharing the same broker uid.
 
 ### E. Broker-account divergence, recorded rather than fixed here
 
@@ -94,8 +96,9 @@ used for `LL_RO=/`, rather than silently shipping it undocumented.
 
 Rejected (v1, unchanged in v2). The per-role `config.toml` is the operator's own knob for defaults the
 broker does not pass (MCP servers, hooks, `shell_environment_policy`); suppressing it would remove
-that knob for no offsetting safety gain, since `config.toml` is already root-owned and immune to a
-prior attempt (`docs/PROVIDERS.md`).
+that knob for no offsetting safety gain, operator defaults must remain available. Root ownership prevents in-place writes to
+`config.toml`, but its writable parent still permits replacement (`docs/PROVIDERS.md`); stronger
+configuration isolation is a provisioning follow-up, not a property of this wrapper.
 
 ### A denylist of `--dangerously-*` tokens in the prompt
 

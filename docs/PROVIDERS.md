@@ -17,9 +17,10 @@ it.
 | `CODEX_HOME` | `/var/lib/aib/.codex` | aib-broker:aib-broker 0700, created empty by provisioning |
 | `config.toml` inside it | `/var/lib/aib/.codex/config.toml` | root:aib-broker 0644 |
 
-`/opt/aib/codex/<version>/codex` is versioned, not a bare `current` path, so an upgrade is a new
-directory plus a registry edit, never an in-place binary swap under a running broker. The adapter
-resolves it from a compiled-in default; `AIB_CODEX_BIN` overrides that default when set, a deploy/test
+`/opt/aib/codex/<version>/codex` is an immutable versioned install. Provisioning updates the
+`/opt/aib/codex/current` symlink to select a version; the adapter defaults to
+`/opt/aib/codex/current/codex`, while the registry continues to name the adapter. There is no
+in-place binary rewrite. The adapter resolves the binary from that default; `AIB_CODEX_BIN` overrides that default when set, a deploy/test
 seam analogous to `AIBOBNET_REGISTRY`'s "advanced/test locator" (`docs/CONTRACT-execution-binding.md`
 §3) — never propagated by the broker's own `env -i` allow-list, never influenced by the request, and
 absent in every production invocation. `tests/adapter_codex_spec.sh` is the one caller that sets it,
@@ -45,10 +46,14 @@ stated in `docs/CONTRACT-execution-binding.md` §7.5 for the seam as a whole:
 
 The adapter refuses to start (exit **78**, one line, never the prompt) unless, at launch time:
 
-- `$HOME/.codex/auth.json` exists and is a regular file;
+- `$HOME/.codex/auth.json` exists and is a regular file, not a symlink;
 - it is owned by the adapter's own running uid;
 - its mode is `0600`;
-- `$HOME/.codex` itself is `0700`.
+- `$HOME/.codex` itself is a directory with mode `0700`, not a symlink.
+
+An unset/empty HOME or failed metadata lookup is also a credential refusal. The Linux wrapper
+uses GNU `stat` and compares the file owner with Bash's running effective uid; it never reads the
+credential contents, compares mtimes, or caches a check across launches.
 
 The check tolerates an **OAuth refresh rewrite** of `auth.json` (owner and mode are re-checked on
 every launch; mtime and content are never compared against a prior value) — the wrapped binary is
@@ -90,7 +95,7 @@ at different seams (compatibility CLI vs. adapter ABI) and neither substitutes f
 
 The adapter never itself exits `124`, `126`, or `127` — see `docs/CONTRACT-codex-run.md` §4.1. `65`
 and `78` are both disjoint from the PDP's own `64` (`docs/CONTRACT-execution-binding.md` §7.6), which
-the PEP maps to `attempt.ended(io-refused, stage=provider)` via `_aib_enact_map_status`
+the PEP maps to `attempt.ended(provider-failure, stage=provider)` via `_aib_enact_map_status`
 (`lib/aibobnet.sh`) exactly like any other non-zero, non-signal provider exit.
 
 ### One shared `CODEX_HOME`
@@ -102,9 +107,12 @@ still accumulate across attempts), one `thread_history` and persistent-memory da
 `config.toml`. `--ephemeral` is a fixed flag precisely because it is the cheap half of that mitigation
 available today; the full fix (a `CODEX_HOME` per project, keyed off `AIBOBNET_PROJECT_UID`, each with
 its own `auth.json`) is a later slice and its own T4 decision, not built here. Provisioning owns
-`config.toml` as `root:aib-broker 0644` so that no attempt, however it behaves, can rewrite operator
-defaults (MCP servers, hooks, `model_provider`, `shell_environment_policy`) for the attempts that
-follow it.
+`config.toml` as `root:aib-broker 0644` to prevent in-place writes to that inode. This does not
+make operator defaults immutable: the broker-owned writable parent directory permits unlink or
+replacement, which the current Landlock write grant also permits. Protecting the configuration
+from replacement needs a separate provisioning boundary; it is a follow-up, not a guarantee of
+this slice. MCP servers, hooks, `model_provider` and `shell_environment_policy` remain shared
+operator defaults under the documented cooperative-with-audit boundary.
 
 ### Registry entry (example, `acme`)
 
