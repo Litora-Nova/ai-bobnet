@@ -174,13 +174,14 @@ path it has no legitimate reason to open. It stays absent from both rows above, 
 (below) lists it explicitly as a path the real launch must **not** need to touch, not merely one that
 happens to be unlisted.
 
-**`hidepid=invisible`.** Between this confinement change and the finding that the prompt is otherwise
-visible in `/proc/<pid>/cmdline` for the whole run (closed at the adapter layer — see
-`docs/CONTRACT-codex-run.md` §4.1's stdin delivery), provisioning is expected to mount `/proc` with
-`hidepid=invisible`: no process on the host, including `aib-agent` or `aib-dash`, should be able to
-enumerate another uid's `/proc/<pid>` entries at all. Nothing in this repository's own read paths (the
-projection is file-based, never a `/proc` scan) depends on being able to see another account's
-processes, so this is a pure hardening addition with no functional cost here.
+**`hidepid=invisible`.** The adapter delivers the prompt on stdin, keeping it out of the wrapped
+binary's argv; the transient adapter or a blocked stdin feeder can still retain it in
+`/proc/<pid>/cmdline` (`docs/CONTRACT-codex-run.md` §4.1). Provisioning is expected to mount `/proc`
+with `hidepid=invisible` to prevent unprivileged accounts such as `aib-agent` or `aib-dash` from
+enumerating another uid's process entries. This does not isolate attempts sharing the broker uid,
+and privileged observers remain outside that protection. Nothing in this repository's own read
+paths (the projection is file-based, never a `/proc` scan) depends on seeing another account's
+processes.
 
 **Documented divergence: the confined child runs as the broker account.** `deploy/systemd/
 aib-broker@.service` sets `User=aib-broker`, and nothing in the confined enactment path switches uid

@@ -94,9 +94,9 @@ at different seams (compatibility CLI vs. adapter ABI) and neither substitutes f
 | any other | the wrapped binary's own exit code, passed through unmodified |
 
 The adapter never itself exits `124`, `126`, or `127` — see `docs/CONTRACT-codex-run.md` §4.1. `65`
-and `78` are both disjoint from the PDP's own `64` (`docs/CONTRACT-execution-binding.md` §7.6), which
-the PEP maps to `attempt.ended(provider-failure, stage=provider)` via `_aib_enact_map_status`
-(`lib/aibobnet.sh`) exactly like any other non-zero, non-signal provider exit.
+and `78` are both disjoint from the PDP's own `64` (`docs/CONTRACT-execution-binding.md` §7.6).
+For provider exits `65` and `78`, the existing `_aib_enact_map_status` (`lib/aibobnet.sh`) records
+`attempt.ended(provider-failure, stage=provider)`; no terminal mapping changes are needed.
 
 ### One shared `CODEX_HOME`
 

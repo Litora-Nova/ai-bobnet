@@ -23,8 +23,9 @@ decisions (v2, all adopted) and the alternatives they replaced.
 ### A. An exec wrapper, not a driver
 
 `adapters/codex` is a thin, `≤ 80`-line bash script: it validates its own received argv against the
-frozen ABI (`docs/CONTRACT-codex-run.md` §4.1), re-shapes it for the wrapped binary, and `exec`s. Its only longer-lived fork is the process-substitution stdin feeder;
-that feeder remains in the same process group. This keeps the broker's process-group, watchdog, and exit model (`lib/aibobnet.sh`'s
+frozen ABI (`docs/CONTRACT-codex-run.md` §4.1), re-shapes it for the wrapped binary, and `exec`s. Its
+only longer-lived fork is the process-substitution stdin feeder; that feeder remains in the same
+process group. This keeps the broker's process-group, watchdog, and exit model (`lib/aibobnet.sh`'s
 `set -m` group-leader mechanics) exactly as already pinned: the adapter is one more link in a single
 exec chain (helper → adapter → wrapped binary), never a second process the manager has to track.
 
