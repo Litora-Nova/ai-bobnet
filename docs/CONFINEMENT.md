@@ -129,7 +129,87 @@ nothing to either list). This is looser than the minimum stated above, and it is
 deliberate, dated divergence rather than left implicit: guessing the adapter's true read set without
 a VM to observe it against breaks at the first real run, and a wrong guess that under-grants is a
 launch-stopper while a wrong guess that over-grants is silently unsafe. Narrowing `LL_RO` to the
-resolved adapter and its credential directory is a slice-4/VM item, tracked there, not here.
+resolved adapter and its credential directory is a slice-4/VM item, tracked there, not here. This
+paragraph is about `LL_RO` only — `LL_RW`'s own formula is amended below, and stays a positive list
+composed from the unit environment and the verdict's effective sandbox, never from the request.
+
+### Effective-sandbox → `LL_RW` (RM-3/slice I-B-1 amendment, ADR-0009)
+
+The flat `LL_RW = <home>:/tmp:/var/tmp:/dev` above composed the same rights regardless of the
+effective (clamped) sandbox — which meant `read-only` was, in practice, not enforced by anything at
+the filesystem layer: the project home was writable under `read-only` exactly as it was under
+`workspace-write`. Building the `codex` adapter is the trigger to close that (`standup/
+_advisor_codex-adapter.md` F1): `run_confined` now derives `LL_RW` from the verdict's **effective
+sandbox**, not from the registry snapshot alone:
+
+| Effective sandbox | `LL_RW` |
+|---|---|
+| `read-only` | `/tmp:/var/tmp:/dev:$HOME/.codex` |
+| `workspace-write` | `/tmp:/var/tmp:/dev:$HOME/.codex:${resolved_root}` |
+
+`${resolved_root}` (the project `home`) is present only at `workspace-write` and above. This is the
+actual filesystem-level enforcement of the refusal `docs/CONTRACT-codex-run.md` §2 already documented
+at the policy-gate level (`danger-full-access` rejected) but that, before this amendment,
+`run_confined` never wired through to the cage itself. This stays inside D-B2
+(`docs/SPEC-wire-format.md`): the effective sandbox is the PDP's own clamp, so a request can only
+narrow what `LL_RW` grants, never widen it — the request itself still contributes nothing to either
+list.
+
+**`$HOME/.codex` is unconditional, in both rows, because the adapter cannot start without it.**
+Measured against the pinned static binary with an empty `$CODEX_HOME` (`standup/
+_advisor_codex-adapter.md` F2): on first start it creates `config.toml`, `installation_id`, six
+sqlite databases with WAL/SHM files (`state_5`, `logs_2`, `queue_1`, `memories_1`, `goals_1`,
+`thread_history_1`), `sessions/`, `shell_snapshots/`, `skills/`, `tmp/`, `thread-writer-locks/`, and
+`mcp-oauth-locks/`, and it extracts its own helper binaries under `$CODEX_HOME` — a step it refuses
+outright when `$CODEX_HOME` resolves under `/tmp` (already in `LL_RW`, but not an acceptable
+substitute: the adapter's own carve-out is unconditional and independent of where `/tmp` happens to
+be mounted). It also rewrites `auth.json` in place on an OAuth token refresh, so the credential file
+itself must sit inside a writable, not merely readable, directory. `LL_RW` grants execute as well as
+read/write, which the extracted helper binaries need to run at all.
+
+**`/var/lib/aib/auth` is never in `LL_RW`.** That path is the broker's own trust store — distinct from
+the provider's file-based credential precondition (`docs/CONTRACT-execution-binding.md` §7.5) — and
+the confined child must not traverse it: granting it, even read-only, would hand a provider process a
+path it has no legitimate reason to open. It stays absent from both rows above, and A11's measurement
+(below) lists it explicitly as a path the real launch must **not** need to touch, not merely one that
+happens to be unlisted.
+
+**`hidepid=invisible`.** The adapter delivers the prompt on stdin, keeping it out of the wrapped
+binary's argv; the transient adapter or a blocked stdin feeder can still retain it in
+`/proc/<pid>/cmdline` (`docs/CONTRACT-codex-run.md` §4.1). Provisioning is expected to mount `/proc`
+with `hidepid=invisible` to prevent unprivileged accounts such as `aib-agent` or `aib-dash` from
+enumerating another uid's process entries. This does not isolate attempts sharing the broker uid,
+and privileged observers remain outside that protection. Nothing in this repository's own read
+paths (the projection is file-based, never a `/proc` scan) depends on seeing another account's
+processes.
+
+**Documented divergence: the confined child runs as the broker account.** `deploy/systemd/
+aib-broker@.service` sets `User=aib-broker`, and nothing in the confined enactment path switches uid
+before `exec`ing the confinement helper — every agent's provider process, whatever the request names
+as `agent_uid`, runs under that one shared broker account today, so `CODEX_HOME` resolves to
+`/var/lib/aib/.codex` for every agent alike. Role accounts are the RM-3 target; this slice does not
+build the switch. It is recorded here, as a dated divergence rather than left implicit, for the same
+reason `LL_RO=/` is above: **the role-uid switch is a pending slice**, not a defect of this one. Until
+it lands, `docs/CONTRACT-execution-binding.md` §8.6's existing caution — "the `agent_uid` in these
+records is an assertion the launcher accepts rather than a fact it verifies" — extends to the OS-level
+identity the confined child actually runs as: it is always `aib-broker`, never a per-agent account,
+regardless of which `agent_uid` the request named.
+
+**A11 — the measurement that feeds `LL_RO` narrowing, not the narrowing itself.** `LL_RO=/` above
+stays exactly as dated and unbuilt as before this amendment; this slice's real `codex` launch is the
+first opportunity to measure the wrapped binary's actual read set, per the standing precondition
+("Narrowing `LL_RO`... is a slice-4/VM item"). The method: `strace -f -o <file> -e trace=%file` (not a
+fixed syscall trio — `%file` catches `newfstatat`/`statx`/`readlink`/`execve`/`mkdir`/`rename`/
+`unlink`/`connect` alongside the obvious `openat`/`stat`/`access`), run as `aib-broker` under the same
+unit constraints the real launch runs under (`systemd-run --uid=aib-broker -p PrivateTmp=yes -p
+ProtectHome=yes -p ProtectSystem=strict …`, matching `deploy/systemd/aib-broker@.service`) — not as an
+arbitrary shell, because the accessible paths differ by unit. Three prompts, not one: no command, one
+shell command, one file edit — the read set for "answer without touching the sandbox" is not the read
+set for "run `ls`," and neither is the read set for "write a file." ABI 6 (this host's Landlock
+version) has no audit mode; a second launch under the narrowed lists derived from this measurement,
+diffed for new `stage=provider` failures, is the audit substitute until ABI 7 (Linux 6.15+) is
+available. The output is a list in this document, not a code change — narrowing `LL_RO` from `/` to
+that list is its own next slice, with numbers behind it instead of a guess.
 
 ### The VM exercise's precondition — the metadata gap
 

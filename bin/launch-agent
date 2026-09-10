@@ -199,8 +199,8 @@ _pep_commit_ended() {
   # 4-arg shape (class, stage, code, signal) — matches _aib_enact_commit_ended's
   # shape in lib/aibobnet.sh now that stage is required on every ended record
   # (gate delta, Ikarus D5): the composer fails closed on a missing stage, so
-  # this pre-enactment IO-hygiene helper (unsupported provider / non-executable
-  # adapter — neither ever reaches aib_enact_launch) must supply one too.
+  # this pre-enactment IO-hygiene helper (non-executable adapter, which never
+  # reaches aib_enact_launch) must supply one too.
   local exit_class="$1" stage="$2" exit_code="${3-}" signal="${4-}" ended_kv ended_payload
   [ "$_terminal_written" -eq 0 ] ||
     aib_die 2 "attempt '$_decided_event_id' already entered a terminal path"
@@ -240,19 +240,8 @@ timeout_s="$AIB_VERDICT_EFFECTIVE_TIMEOUT"
 # on stderr before the busy heartbeat, and a bare "effective_timeout=<n>" line ahead
 # of it (on every allow, including paths that go on to refuse enactment) broke that.
 
-# The PEP drives only a codex-CLI-shaped adapter. The pure PDP cannot derive that
-# launcher-specific argv support from its frozen snapshot, so B1 uses option (b):
-# persist allow intent first, then close the unsupported enactment as io-refused.
-case "$AIB_PROVIDER" in
-  codex) ;;
-  *)
-    _pep_commit_ended io-refused exec 64
-    ;;
-esac
-case "$AIB_PROVIDER" in
-  codex) ;;
-  *) aib_die 64 "unsupported registry provider '$AIB_PROVIDER' (this launcher drives only the codex adapter CLI)";;
-esac
+# Every registered adapter accepts the frozen ABI; provider validity is resolved
+# before enactment. Filesystem executability is checked below.
 
 # IO hygiene (not authority): the PDP is pure and never stats the disk, so the PEP
 # confirms the resolved adapter is actually executable before heartbeat/provider

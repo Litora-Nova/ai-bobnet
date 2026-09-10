@@ -227,17 +227,16 @@ wait_launch() {
   wait "$LAUNCH_PID" || RUN_RC=$?
 }
 
-# B1(b): the current pure PDP cannot derive the launcher's codex-only argv support
-# from its frozen snapshot without changing Lane A. The support refusal therefore
-# occurs after a durable allow decision and closes with ended(io-refused).
+# Registered adapters share the frozen ABI. A second provider must execute after
+# a durable allow decision and close the same audit chain as the codex provider.
 reset_case
-write_registry claude-code "$ADAPTER"
-run_sync ok --as acme-core --label unsupported --prompt x
-eq "B1(b): unsupported resolved provider keeps exit 64" "$RUN_RC" 64
-eq "B1(b): unsupported resolved provider writes decided plus ended" "$(event_count)" 2
-eq "B1(b): first record is the durable allow decision" "$(event_value 1 '.event_type + ":" + .payload.decision')" "attempt.decided:allow"
-eq "B1(b): refusal closes as io-refused" "$(event_value 2 '.event_type + ":" + .payload.exit.class')" "attempt.ended:io-refused"
-[ ! -e "$CALLED" ] && ok "B1(b): unsupported provider never starts" || no "B1(b): unsupported provider never starts"
+write_registry stub "$ADAPTER"
+run_sync ok --as acme-core --label registered --prompt x
+eq "registered provider preserves successful exit" "$RUN_RC" 0
+eq "registered provider writes decided plus ended" "$(event_count)" 2
+eq "registered provider first records durable allow" "$(event_value 1 '.event_type + ":" + .payload.decision')" "attempt.decided:allow"
+eq "registered provider closes as ok" "$(event_value 2 '.event_type + ":" + .payload.exit.class')" "attempt.ended:ok"
+[ -e "$CALLED" ] && ok "registered provider starts" || no "registered provider starts"
 
 # A PDP deny is terminal in the decided record: exactly one durable record, no ended.
 reset_case

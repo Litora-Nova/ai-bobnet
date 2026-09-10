@@ -18,6 +18,14 @@ Environment=AIB_EVENT_ROOT=/var/lib/aib/events
 Environment=AIB_CONFINE_BIN=/opt/aib/engine/libexec/landlock-exec
 Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
 
+# Sprint I-B slice 1 (docs/PROVIDERS.md, ADR-0009): this unit's own User= line above already
+# fixes HOME=/var/lib/aib (from the aib-broker passwd entry), so the codex adapter's
+# CODEX_HOME resolves to /var/lib/aib/.codex with no Environment= line here to set it — no
+# behaviour change to this unit. Provisioning must create that directory (aib-broker:aib-broker
+# 0700, empty) and its config.toml (root:aib-broker 0644) before the codex provider is
+# registered; run_confined adds $HOME/.codex to LL_RW itself (docs/CONFINEMENT.md,
+# "Effective-sandbox -> LL_RW"), unit-derived, never request-derived.
+
 # RM-3 slice 5 (ADR-0006): ONE capacity ceiling for the WHOLE BROKER — every project,
 # every agent, one shared pool, checked by flock leases in AIB_EVENT_ROOT/attempts/
 # before agent_uid is resolved and before the registry is ever read for a connection.

@@ -146,6 +146,69 @@ pre-resolved primitive to preserve the one-snapshot launch invariant. That primi
 internal process-local bundle; no public option or ambient environment variable may inject its identity or
 path.
 
+### 4.1 The adapter ABI (RM-3/slice I-B-1 amendment, ADR-0009)
+
+The argv block in point 4 above is the frozen shape the PEP always builds and always executes against
+`adapter_path` — this amendment does not change it. What it fixes is what happens **inside** the
+adapter process once that argv arrives: every adapter, `codex` first, accepts this exact shape
+(`exec -m <model> -s <sandbox> -c model_reasoning_effort="<effort>" -c approval_policy="never" --
+<prompt>`) as its own frozen ABI, validates it positively token-by-token before `--` (anything else
+is a shape refusal — never a silent tolerance of an unrecognized token), and only then re-shapes what
+it hands to the concrete binary it wraps. A non-`codex` adapter built later (e.g. a claude-code
+adapter) accepts the identical ABI and performs its own translation; the PEP never learns or cares
+what that translation looks like. The model value must be nonempty and is passed verbatim;
+the adapter does not resolve a model or supply a default.
+
+The `codex` adapter's translation, concretely:
+
+- **Prompt on stdin, not argv.** The adapter's own last argv token (`<prompt>`, received byte-exact
+  from the PEP, embedded newlines included) is never re-emitted as an argv token to the wrapped
+  binary. It is delivered on the wrapped binary's stdin, byte-exact, with no trailing newline added
+  (a bare `<<<` here-string is wrong here — it appends one — the adapter uses a process substitution
+  instead), and the wrapped binary is invoked with a bare `-` positional prompt token telling it to
+  read stdin. The wrapped binary's argv contains no prompt. The incoming adapter argv and the
+  process-substitution feeder can still carry it until those transient processes exec or finish;
+  a large prompt may keep the feeder alive while the provider reads. This is not a guarantee of
+  prompt invisibility across the entire process tree. The provisioning-side process visibility
+  boundary and the shared-broker-uid limitation remain as documented in `docs/CONFINEMENT.md`.
+- **Fixed flags, each exactly once, appended by the adapter after validation, never received from the
+  PEP:** `--skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox`. None of these
+  three is negotiable per-request; the registry and the PDP do not carry them.
+- **`SHELL=/bin/bash TERM=dumb`, wrapper-exported.** The adapter sets these in its own environment
+  before `exec`ing the wrapped binary; they are not part of `AIB_ENV_ALLOW_DEFAULT`
+  (`docs/CONTRACT-execution-binding.md` §7.5, still `HOME PATH`), and the PEP's allow-list is
+  unchanged by this amendment — the adapter adds them itself, downstream of the allow-list gate,
+  because the wrapped binary falls back to `/bin/sh` and fails its own shell-snapshot step without a
+  `SHELL` value under the broker account's `nologin` shell.
+- **Exit codes are the adapter's own, disjoint from the PDP's.** A shape, effort, or sandbox refusal
+  (an argv token that fails positive validation, an effort outside `low|medium|high|max`, or the
+  `danger-full-access` sandbox token — refused unconditionally, regardless of what the registry cap
+  allows) exits **65** (`EX_DATAERR`). A missing, wrong-mode, or wrong-owner credential
+  (`docs/PROVIDERS.md`) exits **78** (`EX_CONFIG`). Neither number collides with the PDP's own `64`
+  (`docs/CONTRACT-execution-binding.md` §7.6) — an adapter refusal must never read, from the exit code
+  alone, as a policy deny the caller never actually issued. The adapter never itself exits **124**,
+  **126**, or **127**. It does not pre-check the wrapped binary: Bash's native exec failure
+  surfaces unchanged (127 for a missing binary, 126 for a non-executable file). A running binary
+  likewise returns its own status unchanged; the existing PEP maps 124 to timeout and 126/127 to
+  io-refused, without this wrapper manufacturing or translating those codes.
+
+**Why the wrapped binary's own sandbox is bypassed, and Landlock is the sandbox of record.** Codex's
+Linux sandbox (as of the pinned static build) runs everything through `bubblewrap`, which needs
+`mount`/`pivot_root` in a fresh mount namespace — syscalls a Landlock-restricted task cannot make (the
+kernel's Landlock filesystem hooks return `EPERM` for exactly that mount-topology class, independent
+of any other namespace setting). Every model-run shell command under `codex`'s own `-s
+read-only|workspace-write` would therefore fail inside `run_confined`, in a way that reads to the
+model as a shell error rather than to the operator as a sandbox conflict — a landlocked child cannot
+also run bubblewrap. The adapter's fixed `--dangerously-bypass-approvals-and-sandbox` flag is the
+wrapped binary's own documented mode for exactly this case ("externally sandboxed"): it turns off
+`codex`'s internal enforcement and lets the process run as an ordinary child of the confinement
+helper. **Landlock is then the sole sandbox of record** for this provider — the sandbox token
+(`read-only`/`workspace-write`) is no longer enforced by the wrapped binary at all, only by the
+`LL_RW` set `run_confined` derives from the effective sandbox (`docs/CONFINEMENT.md`,
+"Effective-sandbox → `LL_RW`"). The `danger-full-access` token is refused by the adapter regardless of
+what the registry cap declares, so a request can only ever narrow the cage the confinement helper
+already installs, never widen it by asking the wrapped binary to open one of its own.
+
 ## 5. Executable and environment seam
 
 `CODEX_RUN_BIN` has no production or test-seam role and is removed before provider execution. Under RM-1 the

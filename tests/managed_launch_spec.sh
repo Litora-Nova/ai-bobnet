@@ -288,6 +288,9 @@ run_launch "$GHOST" --as acme-core --label ghost-adapter --prompt x
 eq "non-existent adapter fails closed 127" "$RUN_RC" 127
 not_called "non-existent adapter refusal happens before provider start"
 eq "non-existent adapter refusal writes no heartbeat" "$(wc -l < "$HBLOG" 2>/dev/null || printf 0)" 0
+# This pre-enactment IO refusal must preserve the required exec stage (D5).
+has "non-existent adapter ended record carries stage=exec (D5)" \
+  "$(tail -1 "$STATE/acme/standup/events/main.events" 2>/dev/null)" '"stage":"exec"'
 
 # A schema-4 adapter that is not absolute is a config error (exit 2), not 127.
 RELADAPT="$WORK/reladapter.json"; write_v4 "$RELADAPT" codex high "$STATE/acme/standup" "relative/codex"
@@ -303,21 +306,14 @@ run_launch "$V2" --as acme-core --prompt x
 eq "schema 2 managed launch is refused" "$RUN_RC" 3
 not_called "schema 2 refusal happens before provider start"
 
-# The PEP drives only the codex adapter CLI: a provider present in the map but not
-# codex is a support refusal (64), before the PDP call and any heartbeat.
-UNKNOWN="$WORK/unknown-provider.json"; write_v4 "$UNKNOWN" claude-code high
+# Every registered provider accepts the frozen adapter ABI, including this stub.
+REGISTERED="$WORK/registered-provider.json"; write_v4 "$REGISTERED" stub high
 : > "$HBLOG"
-run_launch "$UNKNOWN" --as acme-core --prompt x
-eq "unsupported provider is refused" "$RUN_RC" 64
-has "unsupported provider error names the registry provider" "$RUN_OUT" "unsupported registry provider 'claude-code'"
-not_called "unsupported provider refusal happens before provider start"
-eq "unsupported provider refusal writes no heartbeat" "$(wc -l < "$HBLOG" 2>/dev/null || printf 0)" 0
-# D5 (gate delta, Ikarus, MEDIUM): this refusal never reaches aib_enact_launch —
-# it must carry stage=exec, never the stage:null this exact fixture used to
-# commit before this delta (the composer now fails closed on a missing stage,
-# so a regression here would abort the whole launch, not silently null it).
-has "…and its ended record carries stage=exec, never stage:null (D5)" \
-  "$(tail -1 "$STATE/acme/standup/events/main.events" 2>/dev/null)" '"stage":"exec"'
+run_launch "$REGISTERED" --as acme-core --prompt x
+eq "registered second provider succeeds" "$RUN_RC" 0
+has "registered second provider relays output" "$RUN_OUT" "STUB_BUILT_OK"
+[ -e "$SENTINEL" ] && ok "registered second provider executes" || no "registered second provider executes"
+eq "registered second provider writes busy and done heartbeats" "$(wc -l < "$HBLOG" 2>/dev/null || printf 0)" 2
 
 # An unrecognised registry effort is denied by the PDP (64), before any provider.
 BAD_EFFORT="$WORK/bad-effort.json"; write_v4 "$BAD_EFFORT" codex turbo

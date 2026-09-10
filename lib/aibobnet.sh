@@ -1884,8 +1884,11 @@ aib_enact_launch__run_confined() {
     return 0
   fi
 
-  # --- D-B2: positive lists, registry + constants only, request contributes nothing ---
-  local ll_ro="/" ll_rw="${resolved_root}:/tmp:/var/tmp:/dev"
+  # --- D-B2: effective verdict, registry root, unit HOME, constants; no request path ---
+  local ll_ro="/" ll_rw="/tmp:/var/tmp:/dev:${HOME}/.codex"
+  # The PDP already validated/clamped sandbox. HOME is the manager's unit env;
+  # only read-only omits the project grant. Direct enactment never uses this list.
+  [ "$sandbox" = read-only ] || ll_rw="${ll_rw}:${resolved_root}"
 
   local _internal_fifo _status_file _cwd_fail_marker _provider_status_file _escalated_marker
   _internal_fifo="$("$_mktemp_bin" -u "${TMPDIR:-/tmp}/aibobnet-relay.XXXXXX")"

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Translate the frozen adapter ABI; the broker owns confinement and timeouts.
+set -u
+
+refuse() { printf 'codex adapter: %s\n' "$2" >&2; exit "$1"; }
+[[ $# -eq 11 && $1 == exec && $2 == -m && -n $3 && $4 == -s &&
+   $6 == -c && $8 == -c && $9 == 'approval_policy="never"' && ${10} == -- ]] ||
+  refuse 65 'invalid adapter argv'
+model=$3 sandbox=$5 prompt=${11}
+case "$sandbox" in
+  read-only|workspace-write) ;;
+  *) refuse 65 'unsupported sandbox' ;;
+esac
+case "$7" in
+  'model_reasoning_effort="low"') effort=low ;;
+  'model_reasoning_effort="medium"') effort=medium ;;
+  'model_reasoning_effort="high"') effort=high ;;
+  'model_reasoning_effort="max"') effort=xhigh ;;
+  *) refuse 65 'invalid effort setting' ;;
+esac
+
+[[ -n ${HOME:-} ]] || refuse 78 'credential unavailable or unsafe'
+codex_home="$HOME/.codex"
+auth="$codex_home/auth.json"
+[[ -d $codex_home && ! -L $codex_home && -f $auth && ! -L $auth ]] ||
+  refuse 78 'credential unavailable or unsafe'
+dir_mode=$(stat -c '%a' -- "$codex_home" 2>/dev/null) ||
+  refuse 78 'credential unavailable or unsafe'
+auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
+  refuse 78 'credential unavailable or unsafe'
+[[ $dir_mode == 700 && $auth_meta == "$EUID:600" ]] ||
+  refuse 78 'credential unavailable or unsafe'
+
+export SHELL=/bin/bash TERM=dumb
+exec "${AIB_CODEX_BIN:-/opt/aib/codex/current/codex}" exec \
+  -m "$model" -s "$sandbox" -c "model_reasoning_effort=\"$effort\"" \
+  -c 'approval_policy="never"' --skip-git-repo-check --ephemeral \
+  --dangerously-bypass-approvals-and-sandbox -- - < <(printf '%s' "$prompt")
