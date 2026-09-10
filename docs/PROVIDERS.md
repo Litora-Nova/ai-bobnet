@@ -114,6 +114,12 @@ from replacement needs a separate provisioning boundary; it is a follow-up, not 
 this slice. MCP servers, hooks, `model_provider` and `shell_environment_policy` remain shared
 operator defaults under the documented cooperative-with-audit boundary.
 
+The adapter's credential checks are metadata-only and sequential (type and symlink test, then directory
+mode, then owner and file mode). A writer who already has write access to `CODEX_HOME` could replace
+`auth.json` between two of those checks. That writer sits inside the same trust boundary as the shared
+home itself, so the gap adds no authority beyond what this section already grants; it closes with the
+per-project `CODEX_HOME` and the role-uid switch recorded as follow-up slices.
+
 ### Registry entry (example, `acme`)
 
 ```json
