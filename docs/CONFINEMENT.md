@@ -412,3 +412,17 @@ GNU coreutils `realpath`, `mktemp`, `mkdir`, `cat`, `chmod`, `mv` (with `-T`), a
 publication; it never invokes `flock` or opens an admission lease. Python remains optional for the
 broker's connection-liveness probe; neither admission nor event commits acquire a Python dependency.
 Output ownership (root-owned, group `aib-broker`, readers via ACL — ADR-0007 §B) belongs to provisioning, not the reader.
+
+### Measured read set of the codex adapter (input to the `LL_RO` narrowing)
+
+Measured on the dev host (Landlock ABI 6, `strace -f -e trace=%file` as the broker account, outside Landlock,
+three prompts: no command, one command, one file create+delete). Successful **writes** occurred only under
+`$HOME/.codex` (plugins, cache, shell snapshots, tmp, six sqlite databases with WAL/SHM), `/dev/null` and
+`/dev/tty`; the project home was written only by the model's own command; the broker trust store under
+`/var/lib/aib/auth` was never opened. Successful **reads**: `/usr` (locale, ssl, shared objects, the shell
+and coreutils the model invokes), `/lib`, `/etc` (CA bundle and certificates, `hosts`, `passwd`,
+`resolv.conf`, `localtime`, `os-release`, `profile.d`, `codex/hooks.json`), `/proc/self` and `/proc/version`,
+`/sys/fs/cgroup` (cpu.max), `/dev`, the binary tree, the project home plus `.git` probes up the tree.
+Proposed narrowed list for the next slice, to be confirmed by a launch under it:
+`/usr:/lib:/lib64:/etc:/proc:/sys:/dev:<binary tree>:<adapter dir>:$HOME/.codex:${resolved_root}` — never
+`/var/lib/aib` as a whole, never `/home`, never the parent of the project home.

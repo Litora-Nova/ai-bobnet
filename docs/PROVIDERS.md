@@ -32,17 +32,30 @@ against an unwritable `$CODEX_HOME` (measured write set: `config.toml`, `install
 databases, `sessions/`, `shell_snapshots/`, extracted helper binaries — see `docs/CONFINEMENT.md` for
 the full list).
 
+### Sibling binary
+
+The static build extracts nothing at runtime, but it spawns a **sibling executable** it expects next to
+itself (`codex-code-mode-host`, shipped in the same package under `vendor/<triple>/bin/`). Without it the
+run still ends `ok`, yet the tool router logs "failed to spawn code-mode host" and the model executes no
+command — an answer without an action. Provisioning installs both files from the same pinned archive.
+
 ### Credential recipe (the operator's step, T4)
 
 The adapter's credential check is file-based only, matching the deployment precondition already
 stated in `docs/CONTRACT-execution-binding.md` §7.5 for the seam as a whole:
 
-1. On a trusted machine — never the broker host — run the wrapped binary's own login flow
-   (`codex login`), producing `auth.json`.
-2. Copy that file to the broker host, at `/var/lib/aib/.codex/auth.json`, over an already-authenticated
-   channel (SSH). This is a T4 (credential) action: PO-only, per the standing tier rule this repository
-   inherits — no code path in this repository performs step 1 or step 2 on the operator's behalf.
-3. `chown aib-broker:aib-broker /var/lib/aib/.codex/auth.json && chmod 0600 /var/lib/aib/.codex/auth.json`.
+1. Preferred: run the wrapped binary's own login flow **on the broker host, as the broker account**, so the
+   credential is created in place and never exists as a copy elsewhere. The browser callback the login
+   opens on `localhost` is reached through an SSH port forward from the operator's machine:
+   `ssh -L 1455:127.0.0.1:1455 <operator>@<host>`, then
+   `sudo -u aib-broker -H env HOME=/var/lib/aib CODEX_HOME=/var/lib/aib/.codex /opt/aib/codex/current/codex login`
+   and open the printed URL locally. (`codex login --with-api-key` reads a key from stdin and needs no
+   browser.) This is a T4 (credential) action: PO-only, per the standing tier rule this repository
+   inherits — no code path in this repository performs it on the operator's behalf.
+2. Alternative: log in on a trusted machine and copy `auth.json` to `/var/lib/aib/.codex/auth.json`
+   over an already-authenticated channel (SSH); the credential is not bound to the machine.
+3. Verify `ls -l /var/lib/aib/.codex/auth.json` shows `aib-broker aib-broker` and mode `0600`; otherwise
+   `chown aib-broker:aib-broker` and `chmod 0600` it.
 
 The adapter refuses to start (exit **78**, one line, never the prompt) unless, at launch time:
 
