@@ -266,14 +266,25 @@ hasnt "A: ANTHROPIC_API_KEY never reaches the wrapped binary's own env" "$env_ou
 hasnt "A: CLAUDE_CODE_OAUTH_TOKEN never reaches the wrapped binary's own env" "$env_out" "leaked-oauth-token"
 
 # Exec identity: adapters/claude-code must exec into the wrapped binary, never fork.
+#
+# HARNESS FIX (Ikarus build report, standup/_build_ikarus_claude-code-adapter.md, "Blocking spec
+# defect"): backgrounding the compound list `cd "$FIXTURE_CWD" && env ... &` makes `$!` the pid of
+# the intermediate AND-list subshell bash forks to run it asynchronously, not the pid the adapter's
+# own exec chain ends up running as (observed off-by-one: wrapper=427, fake=428) -- a spec bug, not
+# an adapter bug: the adapter already ends in a bare `exec`, and no production change can make a
+# child process replace its own parent shell. Fixed by making the `cd` complete BEFORE anything is
+# backgrounded, and using `exec` (not `&`'s own optimization) to guarantee this exact subshell's pid
+# is what actually keeps running: `( cd ... && exec env ... )` backgrounded as one unit means $! is
+# this subshell's own pid, and `exec env` replaces that same process (same pid) rather than forking a
+# new one, so the pid survives unchanged through env -> adapter -> the fake binary's own final exec.
 reset_fake_outputs
 (
-  cd "$FIXTURE_CWD" && env -i HOME="$FIXTURE_HOME" PATH="$SYSTEM_PATH" AIB_CLAUDE_BIN="$FAKE_CLAUDE" \
-    FAKE_ARGV_OUT="$FAKE_ARGV_OUT" FAKE_ENV_OUT="$FAKE_ENV_OUT" FAKE_CWD_OUT="$FAKE_CWD_OUT" \
-    FAKE_PID_OUT="$FAKE_PID_OUT" FAKE_STDIN_OUT="$FAKE_STDIN_OUT" \
-    "$ADAPTER" exec -m "$MODEL" -s workspace-write \
-      -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "pid-check" \
-    >"$WORK/pidcheck-out" 2>&1 &
+  ( cd "$FIXTURE_CWD" && exec env -i HOME="$FIXTURE_HOME" PATH="$SYSTEM_PATH" AIB_CLAUDE_BIN="$FAKE_CLAUDE" \
+      FAKE_ARGV_OUT="$FAKE_ARGV_OUT" FAKE_ENV_OUT="$FAKE_ENV_OUT" FAKE_CWD_OUT="$FAKE_CWD_OUT" \
+      FAKE_PID_OUT="$FAKE_PID_OUT" FAKE_STDIN_OUT="$FAKE_STDIN_OUT" \
+      "$ADAPTER" exec -m "$MODEL" -s workspace-write \
+        -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "pid-check" \
+      >"$WORK/pidcheck-out" 2>&1 ) &
   wrapper_pid=$!
   wait "$wrapper_pid"
   printf '%s' "$wrapper_pid" > "$WORK/wrapper-pid"
