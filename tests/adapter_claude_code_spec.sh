@@ -673,7 +673,7 @@ STUBEOF
 chmod +x "$C3_ADAPTER"
 
 c3_case_n=0
-for bad_state_dir in '../x' 'a/b' '.' ''; do
+for bad_state_dir in '../x' 'a/b' '.' '..' ''; do
   c3_case_n=$((c3_case_n+1))
   C3_REG="$WORK/c3-registry-$c3_case_n.json"
   printf '%s\n' "{
