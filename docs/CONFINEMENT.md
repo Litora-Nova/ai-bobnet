@@ -155,6 +155,60 @@ at the policy-gate level (`danger-full-access` rejected) but that, before this a
 narrow what `LL_RW` grants, never widen it — the request itself still contributes nothing to either
 list.
 
+### Effective sandbox × provider `state_dir` → `LL_RW` (RM-3/slice I-B-2 amendment, ADR-0010, target)
+
+Building the second real adapter (`claude-code`, `$HOME/.claude` instead of `$HOME/.codex`) is what
+turns the table above from "the codex row" into a real per-provider axis: `run_confined`'s `LL_RW`
+formula is `.codex`-literal today (`lib/aibobnet.sh:1888`), the **only** place outside `adapters/codex`
+and registry example data that names a provider by a hard-coded path. The design this slice pins:
+
+- New registry field `providers.<name>.state_dir` (schema 4, additive — `SCHEMA_VERSION` unchanged),
+  a single relative path component matching `^\.[A-Za-z0-9_-]+$` (no `/`, no `..`, non-empty). `codex`
+  gets `"state_dir": ".codex"` (behaviour byte-identical to today — a regression guard, not a change),
+  `claude-code` gets `".claude"`, `stub` declares none.
+- The table generalises to `LL_RW = /tmp:/var/tmp:/dev:$HOME/<state_dir>[:${resolved_root}]` (the
+  bracketed segment present only at `workspace-write` and above, unchanged from the row above), where
+  `<state_dir>` is the **resolved provider's own** value — absent for a provider that declares none,
+  never another provider's, never request-derived (D-B2 holds unchanged).
+- A `state_dir` that fails the format regex above is a **registry data** error, refused the same way
+  `_aib_resolve_provider_caps` already refuses an absent `cap_sandbox`/`cap_tier`/`cap_effort`/
+  `cap_timeout` (`lib/aibobnet.sh:842-870`): `aib_die 3 "registry: provider '<name>' ..."`, at
+  registry-resolve time, before any launch — the same exit **3** already used for "provider is not
+  declared in the schema-4 adapter map." This is a format check on the registry string, not a
+  filesystem check, and it runs before `run_confined` is ever reached.
+
+**Real-code seam this generalisation needs (not yet built — pinned here, not assumed away).** The enact
+record `run_confined` actually receives (`bin/launch-agent:316`, consumed via `_aib_record_field` in
+`aib_enact_launch`) carries exactly `adapter, root, cwd, sandbox, effort, model, timeout` — no provider
+*name* and no `state_dir` field. `run_confined` has never read the registry directly (it only ever sees
+the manager's own process environment and the enact record's already-resolved values, by the same
+purity discipline as the PDP itself, `lib/aibobnet.sh:880-885`), and this slice does not change that.
+Generalising the hard-coded `.codex` therefore means threading a new `state_dir` field onto the enact
+record itself — resolved from `providers.<provider>.state_dir` at the same call site that already
+resolves `adapter`/`cap_*` (`_aib_resolve_provider_caps`) and carried through the verdict record the
+same way `adapter` already is — not a provider-name lookup added inside `run_confined`. Until that
+field exists, `run_confined` cannot honour it, which is exactly why the two rows above stay
+`.codex`-only in the *shipped* code today; this section documents the target, not a claim that it is
+already wired.
+
+**A missing or symlinked `$HOME/<state_dir>` must refuse, not silently widen or silently fail past
+the adapter (F7, `standup/_advisor_claude-code-adapter.md`).** `src/landlock-exec.c:84` opens every
+`LL_RW` path with `O_PATH`, which **follows symlinks** — a symlinked state dir would grant Landlock
+rights on whatever it points at, not the intended directory. A missing path fails the helper's own
+add-rule step (`:188`) before the adapter's own credential pre-flight ever runs, so the failure would
+surface as a bare confinement failure, never as the adapter's own **78**. The fix belongs in
+`run_confined`, applies to **both** providers alike (not a `claude-code`-only guard), and is cheap:
+before composing `LL_RW`, require `[ -d "$HOME/$state_dir" ] && [ ! -L "$HOME/$state_dir" ]`; on
+failure, refuse the launch the same way the pre-flight above already does for "confinement is not
+available right now" — `exit_class=io-refused`, `stage=confine`, `reason=confinement_unavailable`
+(`aib_enact_launch__write_terminal`'s existing vocabulary, `lib/aibobnet.sh:2298-2326`). **This exact
+mapping is this pin's own inference, not a literal sentence in the v2 design** (which says only
+"refuse," `standup/_design_claude-code-adapter.md` B15) — it is the closest existing vocabulary this
+code already has for "the cage cannot be composed as asked," and the RED spec pins it as the target;
+the builder should keep it unless a documented reason says otherwise, and if it changes, this
+paragraph moves with it. `$HOME/.codex` today has no such guard either — F7 applies to it too, fixed
+once, generically, in the same amendment that adds the field.
+
 **`$HOME/.codex` is unconditional, in both rows, because the adapter cannot start without it.**
 Measured against the pinned static binary with an empty `$CODEX_HOME` (`standup/
 _advisor_codex-adapter.md` F2): on first start it creates `config.toml`, `installation_id`, six
@@ -426,3 +480,21 @@ and coreutils the model invokes), `/lib`, `/etc` (CA bundle and certificates, `h
 Proposed narrowed list for the next slice, to be confirmed by a launch under it:
 `/usr:/lib:/lib64:/etc:/proc:/sys:/dev:<binary tree>:<adapter dir>:$HOME/.codex:${resolved_root}` — never
 `/var/lib/aib` as a whole, never `/home`, never the parent of the project home.
+
+### `claude-code`'s footprint — probed, not yet strace-measured
+
+`strace` is unavailable on this dev host for `codex` too (the gap the section above already documents);
+for `claude-code` the same live-VM `LL_RO` narrowing is deferred identically, tracked as the same
+slice-4/VM item, not built here. What is known without it (`standup/_facts_claude-code-adapter.md`,
+`standup/_advisor_claude-code-adapter.md` F5, unauthenticated `env -i HOME=<empty>` runs and a local
+fake Messages API — never a real Anthropic endpoint): the wrapped binary is a dynamically-linked ELF
+(needs the dynamic loader plus `libc`/`libm`/`librt`/`libpthread`/`libdl` readable at exec, unlike
+`codex`'s static build — `LL_RO=/` already covers this), and it writes to `$HOME` **unconditionally,
+even unauthenticated** (`.claude.json` and its backups, `.claude/{sessions,projects/<slug>/memory,
+session-env}`) — a second, independent reason `$HOME/.claude` must be unconditionally in `LL_RW`, in
+both rows, parallel to `$HOME/.codex`. With `CLAUDE_CONFIG_DIR=$HOME/.claude` set, all of that (plus
+`.claude.json` itself) moves inside `.claude`, confirmed by probe (F5). Two footnotes carried into
+`docs/PROVIDERS.md` rather than repeated here: an MCP server session additionally writes cache files
+under `$HOME/.cache/claude-cli-nodejs/...` unless `XDG_CACHE_HOME` is redirected inside `.claude`, and
+`$TMPDIR/claude-<uid>/` is covered by the existing `/tmp` grant, shared across attempts like every
+other `/tmp` write in this cage.

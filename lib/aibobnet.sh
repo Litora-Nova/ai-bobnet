@@ -779,6 +779,7 @@ aib_resolve_agent_snapshot() {
   AIB_CAP_TIER=""
   AIB_CAP_EFFORT=""
   AIB_CAP_TIMEOUT=""
+  AIB_STATE_DIR=""
 
   AIB_HOME="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" home)"
   AIB_STANDUP_DIR="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" standup_dir)"
@@ -840,9 +841,10 @@ aib_resolve_agent_snapshot() {
 }
 
 # _aib_resolve_provider_caps <provider> — read providers.<provider>.{adapter,
-# cap_sandbox,cap_tier,cap_effort} from the active snapshot into AIB_ADAPTER_PATH /
-# AIB_CAP_*. A provider absent from the map is fail-closed (the map is the authority
-# for what a provider may do); each present field must be a decodable JSON string.
+# state_dir,cap_sandbox,cap_tier,cap_effort} from the active snapshot into
+# AIB_ADAPTER_PATH / AIB_STATE_DIR / AIB_CAP_*. A provider absent from the map is
+# fail-closed (the map is the authority for what a provider may do); each present
+# field must be a decodable JSON string.
 _aib_resolve_provider_caps() {
   local provider="$1"
   if ! _aib_snapshot_query providers has "$provider"; then
@@ -852,6 +854,12 @@ _aib_resolve_provider_caps() {
     aib_die 3 "registry: provider '$provider' has no adapter path in the adapter map"
   AIB_ADAPTER_PATH="$AIB_SNAPSHOT_FIELD_VALUE"
   AIB_ADAPTER_SOURCE="provider:$provider"
+  AIB_STATE_DIR=""
+  if _aib_snapshot_field providers "$provider" state_dir "provider '$provider'"; then
+    AIB_STATE_DIR="$AIB_SNAPSHOT_FIELD_VALUE"
+    [[ "$AIB_STATE_DIR" =~ ^\.[A-Za-z0-9_-]+$ ]] ||
+      aib_die 3 "registry: provider '$provider' declares invalid state_dir '$AIB_STATE_DIR'"
+  fi
   _aib_snapshot_field providers "$provider" cap_sandbox "provider '$provider'" ||
     aib_die 3 "registry: provider '$provider' declares no cap_sandbox capability"
   AIB_CAP_SANDBOX="$AIB_SNAPSHOT_FIELD_VALUE"
@@ -1461,7 +1469,7 @@ aib_event_compose_ended_payload() {
 #   framing, because launch-agent's stdout has never been a broker connection and
 #   docs/CONTRACT-codex-run.md §4 already specifies "relay to stdout" byte-for-byte.
 #
-# <enact-record> (newline key=value): adapter (absolute path) · root (the
+# <enact-record> (newline key=value): adapter (absolute path) · optional state_dir · root (the
 # registry-derived Landlock/containment root) · cwd (already-authorized, RE-CHECKED
 # here, never trusted) · sandbox / effort / model / timeout (all EFFECTIVE, already
 # clamped). <prompt> is its own argument, never a record line — see the spec-fixture
@@ -1497,13 +1505,17 @@ aib_event_compose_ended_payload() {
 aib_enact_launch() {
   local enact_record="${1-}" prompt="${2-}" events_path="${3-}" lock_path="${4-}"
   local envelope_kv="${5-}" decided_id="${6-}" mode="${7:-confined}"
-  local adapter root cwd_req sandbox effort model timeout_s resolved_root
+  local adapter state_dir root cwd_req sandbox effort model timeout_s resolved_root
 
   case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
   [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$decided_id" ] ||
     aib_die 2 "aib_enact_launch requires events-path, lock-path and a decided-event-id"
 
   adapter="$(_aib_record_field "$enact_record" adapter)" || aib_die 2 "enact record requires adapter"
+  # Legacy internal callers predate this field and are codex-shaped. Production
+  # callers always emit it, including an explicit empty value for providers with
+  # no declared state directory.
+  state_dir="$(_aib_record_field "$enact_record" state_dir)" || state_dir=.codex
   root="$(_aib_record_field "$enact_record" root)" || aib_die 2 "enact record requires root"
   cwd_req="$(_aib_record_field "$enact_record" cwd)" || cwd_req="$root"
   sandbox="$(_aib_record_field "$enact_record" sandbox)" || aib_die 2 "enact record requires sandbox"
@@ -1857,8 +1869,15 @@ aib_enact_launch__run_confined() {
   _python_bin="$(command -v python3 2>/dev/null || true)"
 
   # --- D-A / D-A2: pre-flight, before ANYTHING else runs -----------------------
-  local _preflight_tmp _preflight_rc=1
-  if [ -n "${AIB_CONFINE_BIN:-}" ] && [ -x "$AIB_CONFINE_BIN" ]; then
+  local _preflight_tmp _preflight_rc=1 state_path=""
+  if [ -z "$state_dir" ]; then
+    _preflight_rc=0
+  elif [ -n "${HOME:-}" ]; then
+    state_path="$HOME/$state_dir"
+    [ -d "$state_path" ] && [ ! -L "$state_path" ] && _preflight_rc=0
+  fi
+  if [ "$_preflight_rc" -eq 0 ] && [ -n "${AIB_CONFINE_BIN:-}" ] && [ -x "$AIB_CONFINE_BIN" ]; then
+    _preflight_rc=1
     _preflight_tmp="$("$_mktemp_bin" -d "${TMPDIR:-/tmp}/aibobnet-preflight.XXXXXX")" || aib_die 2 "cannot create pre-flight tmp dir"
     LL_RO=/ LL_RW="$_preflight_tmp" "$AIB_CONFINE_BIN" /bin/true >/dev/null 2>&1
     _preflight_rc=$?
@@ -1885,7 +1904,8 @@ aib_enact_launch__run_confined() {
   fi
 
   # --- D-B2: effective verdict, registry root, unit HOME, constants; no request path ---
-  local ll_ro="/" ll_rw="/tmp:/var/tmp:/dev:${HOME}/.codex"
+  local ll_ro="/" ll_rw="/tmp:/var/tmp:/dev"
+  [ -z "$state_path" ] || ll_rw="${ll_rw}:${state_path}"
   # The PDP already validated/clamped sandbox. HOME is the manager's unit env;
   # only read-only omits the project grant. Direct enactment never uses this list.
   [ "$sandbox" = read-only ] || ll_rw="${ll_rw}:${resolved_root}"

@@ -313,8 +313,8 @@ hb() {
   aib_log_resolved "$AIB_STANDUP_DIR" "$AIB_AGENT_UID" "$1" "$2"
 }
 
-_enact_record="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=%s\neffort=%s\nmodel=%s\ntimeout=%s' \
-  "$adapter_path" "$AIB_HOME" "$cwd" "$sandbox" "$eff_effort" "$AIB_MODEL" "$timeout_s")"
+_enact_record="$(printf 'adapter=%s\nstate_dir=%s\nroot=%s\ncwd=%s\nsandbox=%s\neffort=%s\nmodel=%s\ntimeout=%s' \
+  "$adapter_path" "$AIB_STATE_DIR" "$AIB_HOME" "$cwd" "$sandbox" "$eff_effort" "$AIB_MODEL" "$timeout_s")"
 
 printf '%s\n' "$launch_binding_event" >&2
 
