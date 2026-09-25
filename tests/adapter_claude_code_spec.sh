@@ -644,6 +644,13 @@ if command -v aib_enact_launch >/dev/null 2>&1 || type aib_enact_launch >/dev/nu
   C4_CODEX_MISSING="$WORK/c4-broker-codex-missing"; mkdir -p "$C4_CODEX_MISSING"
   run_confined_ll workspace-write .codex "$C4_CODEX_MISSING"
   eq "C4c: a MISSING \$HOME/.codex refuses the launch too (exit_class=io-refused)" "$(c_resp_field exit_class)" "io-refused"
+
+  C4_CODEX_SYMLINK="$WORK/c4-broker-codex-symlink"; mkdir -p "$C4_CODEX_SYMLINK/elsewhere"
+  ln -s "$C4_CODEX_SYMLINK/elsewhere" "$C4_CODEX_SYMLINK/.codex"
+  run_confined_ll workspace-write .codex "$C4_CODEX_SYMLINK"
+  eq "C4d: a SYMLINKED \$HOME/.codex refuses the launch too (exit_class=io-refused)" "$(c_resp_field exit_class)" "io-refused"
+  eq "C4d: a SYMLINKED \$HOME/.codex refuses at stage=confine" "$(c_resp_field stage)" "confine"
+  hasnt "C4d: the symlink target is never granted through LL_RW for .codex either" "$(c_last_ll_rw)" "$C4_CODEX_SYMLINK/elsewhere"
 else
   no "C1/C2/C4: aib_enact_launch is defined (not built yet)"
 fi
