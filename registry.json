@@ -3,6 +3,15 @@
   "providers": {
     "codex": {
       "adapter": "/opt/acme/adapters/codex",
+      "state_dir": ".codex",
+      "cap_sandbox": "workspace-write",
+      "cap_tier": "t3",
+      "cap_effort": "high",
+      "cap_timeout": "3600"
+    },
+    "claude-code": {
+      "adapter": "/opt/acme/adapters/claude-code",
+      "state_dir": ".claude",
       "cap_sandbox": "workspace-write",
       "cap_tier": "t3",
       "cap_effort": "high",
