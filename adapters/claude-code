@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Translate the frozen adapter ABI; the broker owns confinement and timeouts.
+set -u
+
+refuse() { printf 'claude-code adapter: %s\n' "$2" >&2; exit "$1"; }
+[[ $# -eq 11 && $1 == exec && $2 == -m && -n $3 && $4 == -s &&
+   $6 == -c && $8 == -c && $9 == 'approval_policy="never"' && ${10} == -- ]] ||
+  refuse 65 'invalid adapter argv'
+model=$3 sandbox=$5 prompt=${11}
+case "$sandbox" in
+  read-only|workspace-write) ;;
+  *) refuse 65 'unsupported sandbox' ;;
+esac
+case "$7" in
+  'model_reasoning_effort="low"') effort=low ;;
+  'model_reasoning_effort="medium"') effort=medium ;;
+  'model_reasoning_effort="high"') effort=high ;;
+  'model_reasoning_effort="max"') effort=max ;;
+  *) refuse 65 'invalid effort setting' ;;
+esac
+
+[[ -n ${HOME:-} ]] || refuse 78 'credential unavailable or unsafe'
+claude_home="$HOME/.claude"
+auth="$claude_home/.credentials.json"
+[[ -d $claude_home && ! -L $claude_home && -f $auth && ! -L $auth ]] ||
+  refuse 78 'credential unavailable or unsafe'
+dir_mode=$(stat -c '%a' -- "$claude_home" 2>/dev/null) ||
+  refuse 78 'credential unavailable or unsafe'
+auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
+  refuse 78 'credential unavailable or unsafe'
+[[ $dir_mode == 700 && $auth_meta == "$EUID:600" ]] ||
+  refuse 78 'credential unavailable or unsafe'
+
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+export SHELL=/bin/bash TERM=dumb CLAUDE_CONFIG_DIR="$claude_home" DISABLE_AUTOUPDATER=1 \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
+  XDG_CACHE_HOME="$claude_home/cache" CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
+claude_args=(-p --model "$model" --effort "$effort" --permission-mode bypassPermissions
+  --no-session-persistence --output-format text --setting-sources "" --strict-mcp-config
+  --add-dir "$PWD")
+[ "$sandbox" != read-only ] || claude_args+=(--disallowedTools=Edit,Write,NotebookEdit)
+exec "${AIB_CLAUDE_BIN:-/opt/aib/claude-code/current/claude}" "${claude_args[@]}" \
+  < <(printf '%s' "$prompt")
