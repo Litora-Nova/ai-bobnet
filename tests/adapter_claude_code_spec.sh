@@ -267,12 +267,11 @@ hasnt "A: CLAUDE_CODE_OAUTH_TOKEN never reaches the wrapped binary's own env" "$
 
 # Exec identity: adapters/claude-code must exec into the wrapped binary, never fork.
 #
-# HARNESS FIX (Ikarus build report, standup/_build_ikarus_claude-code-adapter.md, "Blocking spec
-# defect"): backgrounding the compound list `cd "$FIXTURE_CWD" && env ... &` makes `$!` the pid of
+# HARNESS FIX: backgrounding the compound list `cd "$FIXTURE_CWD" && env ... &` makes `$!` the pid of
 # the intermediate AND-list subshell bash forks to run it asynchronously, not the pid the adapter's
-# own exec chain ends up running as (observed off-by-one: wrapper=427, fake=428) -- a spec bug, not
-# an adapter bug: the adapter already ends in a bare `exec`, and no production change can make a
-# child process replace its own parent shell. Fixed by making the `cd` complete BEFORE anything is
+# own exec chain ends up running as (observed off-by-one under load, e.g. wrapper=427, fake=428) -- a
+# spec harness bug, not an adapter bug: the adapter already ends in a bare `exec`, and no production
+# change can make a child process replace its own parent shell. Fixed by making the `cd` complete BEFORE anything is
 # backgrounded, and using `exec` (not `&`'s own optimization) to guarantee this exact subshell's pid
 # is what actually keeps running: `( cd ... && exec env ... )` backgrounded as one unit means $! is
 # this subshell's own pid, and `exec env` replaces that same process (same pid) rather than forking a
@@ -307,8 +306,8 @@ for registry_effort in low medium high max; do
   else no "A: effort $registry_effort passes through by identity (no rename)"; fi
 done
 
-# Model: non-empty, passed verbatim (the adapter's own check is load-bearing — claude itself accepts
-# --model "" per standup/_advisor_claude-code-adapter.md F9).
+# Model: non-empty, passed verbatim (the adapter's own check is load-bearing — the wrapped binary
+# itself does not refuse an empty --model value on its own).
 call_adapter workspace-write high 'model verbatim check'
 argv="$(cat "$FAKE_ARGV_OUT" 2>/dev/null)"
 has "A: --model carries the frozen ABI's model value verbatim" "$argv" "[--model]
