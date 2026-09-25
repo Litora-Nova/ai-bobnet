@@ -209,6 +209,29 @@ helper. **Landlock is then the sole sandbox of record** for this provider — th
 what the registry cap declares, so a request can only ever narrow the cage the confinement helper
 already installs, never widen it by asking the wrapped binary to open one of its own.
 
+### 4.1.1 The second adapter under the same ABI (RM-3/slice I-B-2 amendment, ADR-0010)
+
+`adapters/claude-code` is the ABI's second concrete instance — exactly the case §4.1 named in advance.
+It receives the identical eleven-token argv, validates it positively token-by-token before `--` with
+the same disjoint refusal codes (**65** shape/effort/sandbox, **78** credential), and does its own
+translation; the PEP still never learns or cares what that translation is. Everything this contract
+fixes above — the frozen argv shape, stdin-only prompt delivery (never re-emitted to the wrapped
+binary's own argv), the adapter's own `SHELL`/`TERM` exports, and the 65/78/never-124-126-127 exit
+discipline — is unchanged and is now proven non-`codex`-specific by a second, independently-built
+adapter accepting it. Where `claude-code`'s translation differs from `codex`'s is entirely inside the
+adapter, never in the shape above: its wrapped binary is a dynamically-linked ELF rather than a static
+one (`LL_RO=/` covers the loader either way, unaffected by this amendment); the wrapped binary's own
+"not logged in" exit is a plain, generic `1`, not a sysexits code, so the adapter's file-based
+credential pre-flight (`docs/PROVIDERS.md`) is what produces **78** — never an inference from the
+wrapped binary's own exit status; and its effort translation is closer to identity
+(`low|medium|high|max` → `--effort low|medium|high|max`) than `codex`'s `max→xhigh` rename. It also
+has no wrapped-binary sandbox flag of its own to translate `-s <sandbox>` into: the token is still
+validated for shape (refusing `danger-full-access` unconditionally, exit 65, same as `codex`), but the
+only thing it drives on the wrapped binary's side is one conditional tool-gate flag
+(`docs/PROVIDERS.md`), never a sandbox-shaped argument — Landlock remains the sole sandbox of record
+for both adapters alike. `docs/PROVIDERS.md` carries the full per-provider placement, credential, and
+flag detail; this section's contract is unchanged by adding a second adapter under it.
+
 ## 5. Executable and environment seam
 
 `CODEX_RUN_BIN` has no production or test-seam role and is removed before provider execution. Under RM-1 the
