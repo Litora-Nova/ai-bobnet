@@ -394,6 +394,13 @@ cp "$WORK/fake-saved" "$FAKE_CODEX"; chmod +x "$FAKE_CODEX"
 C_BROKER_HOME="$WORK/c-broker-home"
 CPROJECT_ROOT="$WORK/c-project-home"
 mkdir -p "$C_BROKER_HOME" "$CPROJECT_ROOT"
+# Fixture update (RM-3/slice I-B-2, ADR-0010 F7): run_confined now requires $HOME/.codex to exist as
+# a real, non-symlinked directory before it will compose LL_RW at all -- the F7 guard applies to
+# codex too, deliberately (docs/CONFINEMENT.md, "Effective sandbox x provider state_dir -> LL_RW").
+# This fixture predates that guard and never provisioned it; provisioning it here is the fixture
+# catching up to a real, intended behaviour change, not a weakened assertion (none below changed).
+mkdir -p "$C_BROKER_HOME/.codex"
+chmod 0700 "$C_BROKER_HOME/.codex"
 
 C_STUB_DIR="$WORK/c-stub-bin"
 mkdir -p "$C_STUB_DIR"
