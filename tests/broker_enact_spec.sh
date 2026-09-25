@@ -81,6 +81,19 @@ SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-enact.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# Isolate HOME for the whole spec (RM-3/ADR-0010, F7): the confined path's aib_enact_launch now
+# requires $HOME/.codex to exist as a real, non-symlinked directory before it will compose LL_RW
+# at all. Every direct aib_enact_launch call below runs confined and in-process (the library is
+# sourced here, never exec'd), so each one inherits whatever $HOME this script's own process has --
+# without an explicit, provisioned value, the suite's correctness would depend on incidental host
+# state (whether the account running the tests happens to already have a real ~/.codex) rather than
+# a controlled fixture. Provisioned the same way tests/adapter_codex_spec.sh's own Block C fixture
+# is (226397a).
+HOME="$WORK/broker-home"
+mkdir -p "$HOME/.codex"
+chmod 0700 "$HOME/.codex"
+export HOME
+
 pass=0; fail=0
 ok(){ pass=$((pass+1)); printf 'ok   - %s\n' "$1"; }
 no(){ fail=$((fail+1)); printf 'FAIL - %s\n' "$1"; }
