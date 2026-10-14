@@ -138,6 +138,7 @@ for _lease in "$_attempts"/*; do
     1)
       _live=$((_live+1))
       if [ "$AIB_REQ_OP" = leases ]; then
+        # AIB_REQ_AGENT_UID is interpolated into an ERE; safe only because the wire validated its token charset.
         if [[ "$_lease_name" =~ ^${AIB_REQ_AGENT_UID}\.sup\.[0-9]+$ ]]; then
           _supervised=$((_supervised+1))
         elif [[ "$_lease_name" =~ ^${AIB_REQ_AGENT_UID}\.[0-9]+$ ]]; then

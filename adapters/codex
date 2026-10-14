@@ -64,6 +64,7 @@ case "$mode:$session_kind" in
       --dangerously-bypass-approvals-and-sandbox -- -)
     ;;
   session-turn:resume)
+    # -s is validated above but not forwarded: `codex exec resume` has no -s; Landlock enforces the sandbox.
     codex_args=(exec resume "$session_id" --json -m "$model" -c "model_reasoning_effort=\"$effort\""
       -c 'approval_policy="never"' --skip-git-repo-check
       --dangerously-bypass-approvals-and-sandbox -- -)
