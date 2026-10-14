@@ -81,15 +81,32 @@ if ! aib_wire_read_request; then
 fi
 
 case "${AIB_REQ_OP:-}" in
-  launch) : ;;
+  launch|leases) : ;;
   # Gate delta (should-fix LOW, Riker): exit 3 for every `denied`, exit 2 for every
   # `error` — the discipline this diff formalises everywhere else in this file. This
   # was the one denied answer still exiting 2, a leftover from slice 1.
   *) aib_wire_write_response denied "reason=unknown_operation"; exit 3 ;;
 esac
 
-# One broker-global pool, before any registry/PDP/stream access. Keep the
-# admission lock only for count/create; the lease remains open for this connection.
+# A lease query is read-only and bypasses admission, but the label still has to
+# resolve through the broker-owned registry before any count is disclosed.
+if [ "$AIB_REQ_OP" = leases ]; then
+  _leases_resolve_out="$(aib_resolve_managed_agent "$AIB_REQ_AGENT_UID" 2>&1)"
+  _leases_resolve_rc=$?
+  if [ "$_leases_resolve_rc" -ne 0 ]; then
+    case "$_leases_resolve_rc:$_leases_resolve_out" in
+      2:*) aib_wire_write_response error "reason=registry_unavailable"; exit 2 ;;
+      3:*"unknown agent_uid"*)
+        aib_wire_write_response denied "reason=unknown_agent"
+        exit 3
+        ;;
+      *) aib_wire_write_response error "reason=registry_config"; exit 2 ;;
+    esac
+  fi
+fi
+
+# One broker-global pool. Keep the admission lock only for count/create; the
+# lease remains open for a launch connection. Queries only sample held locks.
 _broker_store_error() {
   printf 'ai-bobnet: admission store unavailable: %s\n' "$1" >&2
   aib_wire_write_response error "reason=event_store_unavailable"
@@ -102,20 +119,41 @@ _attempts="$AIB_EVENT_ROOT/attempts"
 exec {_admission_fd}>>"$_attempts/attempts.lock" || _broker_store_error 'cannot open attempts lock'
 flock -x -w 10 "$_admission_fd" || _broker_store_error 'attempts lock timeout'
 _live=0
+_supervised=0
+_other=0
 for _lease in "$_attempts"/*; do
   # This directory can also be the stream directory for a project named
-  # attempts. Only validated agent-label + decimal-index names are leases.
-  [[ "${_lease##*/}" =~ ^[a-z0-9]+(-[a-z0-9]+)+\.[0-9]+$ ]] || continue
+  # attempts. Only plain and supervised validated lease names are recognised.
+  _lease_name="${_lease##*/}"
+  [[ "$_lease_name" =~ ^[a-z0-9]+(-[a-z0-9]+)+(\.[0-9]+|\.sup\.[0-9]+)$ ]] || continue
   [ -e "$_lease" ] || continue
   exec {_probe_fd}>>"$_lease" || _broker_store_error 'cannot open lease'
   flock -n -x "$_probe_fd"; _lease_rc=$?
   case "$_lease_rc" in
-    0) rm -f -- "$_lease" || _broker_store_error 'cannot remove stale lease';;
-    1) _live=$((_live+1));;
+    0)
+      if [ "$AIB_REQ_OP" = launch ]; then
+        rm -f -- "$_lease" || _broker_store_error 'cannot remove stale lease'
+      fi
+      ;;
+    1)
+      _live=$((_live+1))
+      if [ "$AIB_REQ_OP" = leases ]; then
+        if [[ "$_lease_name" =~ ^${AIB_REQ_AGENT_UID}\.sup\.[0-9]+$ ]]; then
+          _supervised=$((_supervised+1))
+        elif [[ "$_lease_name" =~ ^${AIB_REQ_AGENT_UID}\.[0-9]+$ ]]; then
+          _other=$((_other+1))
+        fi
+      fi
+      ;;
     *) _broker_store_error 'cannot probe lease lock';;
   esac
   exec {_probe_fd}>&-
 done
+if [ "$AIB_REQ_OP" = leases ]; then
+  exec {_admission_fd}>&-
+  aib_wire_write_response ok "supervised=$_supervised" "other=$_other"
+  exit 0
+fi
 # Advisory count, sampled before allocating this connection's lease. Failure
 # cannot change admission: preserve the previous sample and journal the error.
 _live_tmp=$(mktemp "$_attempts/.live.XXXXXX")
@@ -131,9 +169,14 @@ if [ "$_live" -ge "$_capacity" ]; then
   exit 2
 fi
 _slot=0
-while [ -e "$_attempts/${AIB_REQ_AGENT_UID}.$_slot" ]; do _slot=$((_slot+1)); done
+if [ "${AIB_REQ_LEASE_CLASS:-}" = supervised ]; then
+  _lease_stem="${AIB_REQ_AGENT_UID}.sup"
+else
+  _lease_stem="$AIB_REQ_AGENT_UID"
+fi
+while [ -e "$_attempts/${_lease_stem}.$_slot" ]; do _slot=$((_slot+1)); done
 [ "$_slot" -lt "$_capacity" ] || _broker_store_error 'no free lease index'
-exec {AIB_BROKER_LEASE_FD}>>"$_attempts/${AIB_REQ_AGENT_UID}.$_slot" || _broker_store_error 'cannot create lease'
+exec {AIB_BROKER_LEASE_FD}>>"$_attempts/${_lease_stem}.$_slot" || _broker_store_error 'cannot create lease'
 flock -n -x "$AIB_BROKER_LEASE_FD" || _broker_store_error 'cannot acquire new lease'
 exec {_admission_fd}>&-
 
