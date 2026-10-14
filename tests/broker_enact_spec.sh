@@ -917,6 +917,7 @@ cat > "$FIXTURE_REG" <<JSON
     "acme": {
       "home": "$FIXTURE_HOME",
       "standup_dir": "$FIXTURE_STANDUP",
+      "data_class": "internal",
       "mux_session": "acme",
       "provider": "acme",
       "model": "team/model-v2",

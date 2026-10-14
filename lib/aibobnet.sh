@@ -780,10 +780,14 @@ aib_resolve_agent_snapshot() {
   AIB_CAP_EFFORT=""
   AIB_CAP_TIMEOUT=""
   AIB_STATE_DIR=""
+  AIB_DATA_CLASS="customer"
 
   AIB_HOME="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" home)"
   AIB_STANDUP_DIR="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" standup_dir)"
   AIB_MUX_SESSION="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" mux_session)"
+  if _aib_snapshot_field projects "$AIB_PROJECT_UID" data_class "project '$AIB_PROJECT_UID'"; then
+    AIB_DATA_CLASS="$AIB_SNAPSHOT_FIELD_VALUE"
+  fi
   AIB_INBOX_PATH="${AIB_STANDUP_DIR}/inbox/${agent}.md"
 
   # Schema 2 remains a legacy identity/context format. It never invents binding.
@@ -932,6 +936,24 @@ aib_resolve_managed_agent() {
 # documented deployment requirement (docs/CONTRACT-execution-binding.md), not a gap.
 AIB_ENV_ALLOW_DEFAULT="HOME PATH"
 
+# Per-deployment authority. Duplicate keys, malformed JSON and unsafe file modes
+# all fail closed. The deployment file is executable policy, not agent input.
+_aib_deployment_query() {
+  local key="${1-}" path="${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" root="${REPO_ROOT:-}"
+  if [ -z "$root" ]; then
+    root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || return 1
+  fi
+  python3 -I "$root/lib/aib_deployment.py" "$root" "$path" "$key"
+}
+
+aib_deployment_valid() {
+  _aib_deployment_query ""
+}
+
+aib_deployment_allow() {
+  _aib_deployment_query "${1-}"
+}
+
 # _aib_record_field <record> <key> -> value on stdout; rc 0 present, rc 1 absent.
 # Newline-delimited key=value; the FIRST '=' splits (a value may contain '='). Pure
 # parameter expansion: no here-string, no subshell, no temp file — deterministic over
@@ -992,6 +1014,7 @@ aib_authorize_launch() {
   local request="${1-}" snapshot="${2-}"
   local agent_uid req_sandbox cwd timeout label
   local clearance provider effort adapter cap_sandbox cap_tier cap_effort cap_timeout
+  local data_class deploy_customer_code
   local deny=0 code=0 reasons=""
   local eff_clearance="" eff_sandbox="" eff_effort="" eff_timeout=""
   local rreq rcap
@@ -1010,6 +1033,12 @@ aib_authorize_launch() {
   cap_tier="$(_aib_record_field "$snapshot" cap_tier)"    || cap_tier=""
   cap_effort="$(_aib_record_field "$snapshot" cap_effort)" || cap_effort=""
   cap_timeout="$(_aib_record_field "$snapshot" cap_timeout)" || cap_timeout=""
+  if _aib_record_field "$snapshot" data_class >/dev/null; then
+    data_class="$(_aib_record_field "$snapshot" data_class)"
+  else
+    data_class="internal"
+  fi
+  deploy_customer_code="$(_aib_record_field "$snapshot" deploy_customer_code)" || deploy_customer_code=""
 
   # --- deny checks, ordered by severity (adapter 127 > config 2 > refusal 64) --
   # Adapter map is the authority for what a provider may run: an absent adapter is a
@@ -1055,6 +1084,10 @@ aib_authorize_launch() {
   if [ -n "$timeout" ]; then
     _aib_valid_positive_int "$timeout" ||
       _aib_verdict_deny 64 "requested timeout '$timeout' is not a positive integer"
+  fi
+
+  if [ "$data_class" != internal ] && [ "$deploy_customer_code" != true ]; then
+    _aib_verdict_deny 78 "deployment_denied: customer code is not allowed on this deployment"
   fi
 
   if [ "$deny" -eq 0 ]; then
@@ -3130,4 +3163,7 @@ aib_build_pdp_request_record() {
 aib_build_pdp_snapshot_record() {
   printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
     "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+  if [ "$#" -ge 9 ]; then
+    printf '\ndata_class=%s\ndeploy_customer_code=%s' "$9" "${10-}"
+  fi
 }

@@ -528,6 +528,7 @@ printf '%s\n' "{
     \"acme\": {
       \"home\": \"$D_WORK/acme\",
       \"standup_dir\": \"$D_WORK/acme/standup\",
+      \"data_class\": \"internal\",
       \"mux_session\": \"acme\",
       \"provider\": \"stub\",
       \"model\": \"registry-model\",

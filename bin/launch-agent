@@ -14,6 +14,7 @@
 # Runtime options: --sandbox, --cwd, --timeout, --label, --supervised, --session.
 # Model and effort are registry-managed; provider is never a CLI/env input.
 set -euo pipefail
+export LC_ALL=C
 
 # --- locate engine root (symlink-safe) ---------------------------------------
 _src="${BASH_SOURCE[0]}"
@@ -200,9 +201,11 @@ _pep_request="$(printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' 
 # it. --timeout is validated above by this wrapper already; the PDP re-checks the
 # same shape independently (it must be safe to call in isolation) and takes
 # min(timeout_s, cap_timeout), never max.
-_pep_snapshot="$(printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
-  "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" "$AIB_ADAPTER_PATH" \
-  "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" "$AIB_CAP_TIMEOUT")"
+_deploy_customer_code=false
+aib_deployment_allow customer_code && _deploy_customer_code=true
+_pep_snapshot="$(aib_build_pdp_snapshot_record "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" \
+  "$AIB_ADAPTER_PATH" "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" \
+  "$AIB_CAP_TIMEOUT" "$AIB_DATA_CLASS" "$_deploy_customer_code")"
 aib_authorize_launch "$_pep_request" "$_pep_snapshot" || true
 
 # --- durable write-ahead decision --------------------------------------------

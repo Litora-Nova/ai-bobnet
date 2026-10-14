@@ -1,0 +1,14 @@
+polkit.addRule(function(action, subject) {
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    var unitAction = action.id === "org.freedesktop.systemd1.manage-units" &&
+        (verb === "start" || verb === "stop");
+    var unitFileAction = action.id === "org.freedesktop.systemd1.manage-unit-files" &&
+        (verb === "enable" || verb === "disable");
+
+    if (subject.isInGroup("aib-ops") &&
+        /^aib-agent@[a-z0-9-]+\.service$/.test(unit) &&
+        (unitAction || unitFileAction)) {
+        return polkit.Result.YES;
+    }
+});

@@ -43,6 +43,7 @@ write_registry() {
     \"acme\": {
       \"home\": \"$STATE/acme\",
       \"standup_dir\": \"$STATE/acme/standup\",
+      \"data_class\": \"internal\",
       \"mux_session\": \"acme\",
       \"provider\": \"codex\",
       \"model\": \"registry-model\",

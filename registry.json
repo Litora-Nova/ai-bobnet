@@ -29,6 +29,7 @@
     "acme": {
       "home": "/srv/acme",
       "standup_dir": "/srv/acme/standup",
+      "data_class": "internal",
       "mux_session": "acme",
       "provider": "codex",
       "model": "example-model",

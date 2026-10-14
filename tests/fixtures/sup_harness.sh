@@ -91,7 +91,7 @@ sup_world() {
 { "schema_version": 4,
   "providers": { "acme": { "adapter": "$SRC_ROOT/adapters/codex", "cap_sandbox": "workspace-write",
                            "cap_tier": "t2", "cap_effort": "high", "cap_timeout": "$cap" } },
-  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STANDUP", "mux_session": "acme",
+  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STANDUP", "mux_session": "acme", "data_class": "internal",
                           "provider": "acme", "model": "team/model-v2", "effort": "low" } },
   "teams": { "acme-engine": { "project": "acme", "model": "team/model-v2" } },
   "agents": {
@@ -151,7 +151,7 @@ sup_write_registry() {
 { "schema_version": 5,
   "providers": { "acme": { "adapter": "$SRC_ROOT/adapters/codex", "cap_sandbox": "workspace-write",
                            "cap_tier": "t2", "cap_effort": "high", "cap_timeout": "$cap" } },
-  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STANDUP", "mux_session": "acme",
+  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STANDUP", "mux_session": "acme", "data_class": "internal",
                           "provider": "acme", "model": "team/model-v2", "effort": "low" } },
   "teams": { "acme-engine": { "project": "acme", "model": "team/model-v2" } },
   "agents": {

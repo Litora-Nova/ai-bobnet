@@ -28,4 +28,4 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-ReadWritePaths=/var/lib/aib /run/aib /srv/aib/standup
+ReadWritePaths=/var/lib/aib /run/aib /srv/aib/standup /srv/aib/outbox
