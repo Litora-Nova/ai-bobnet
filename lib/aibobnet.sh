@@ -780,7 +780,7 @@ aib_resolve_agent_snapshot() {
   AIB_CAP_EFFORT=""
   AIB_CAP_TIMEOUT=""
   AIB_STATE_DIR=""
-  AIB_DATA_CLASS="internal"
+  AIB_DATA_CLASS="customer"
 
   AIB_HOME="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" home)"
   AIB_STANDUP_DIR="$(_aib_snapshot_project_field "$AIB_PROJECT_UID" standup_dir)"
@@ -939,50 +939,11 @@ AIB_ENV_ALLOW_DEFAULT="HOME PATH"
 # Per-deployment authority. Duplicate keys, malformed JSON and unsafe file modes
 # all fail closed. The deployment file is executable policy, not agent input.
 _aib_deployment_query() {
-  local key="${1-}" path="${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}"
-  python3 -I - "$path" "$key" <<'PY'
-import json, os, stat, sys
-
-path, key = sys.argv[1:]
-if key not in ("", "customer_code", "comms_secrets"):
-    raise SystemExit(2)
-
-def unique(pairs):
-    result = {}
-    for name, value in pairs:
-        if name in result:
-            raise ValueError("duplicate key")
-        result[name] = value
-    return result
-
-try:
-    info = os.stat(path)
-    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022 or not info.st_mode & 0o444:
-        raise ValueError("unsafe mode")
-    with open(path, encoding="utf-8") as stream:
-        value = json.load(stream, object_pairs_hook=unique)
-    if not isinstance(value, dict):
-        raise ValueError("root")
-    if not isinstance(value.get("deployment_id"), str) or not value["deployment_id"]:
-        raise ValueError("deployment_id")
-    allow = value.get("allow")
-    if not isinstance(allow, dict) or type(allow.get("customer_code")) is not bool or type(allow.get("comms_secrets")) is not bool:
-        raise ValueError("allow")
-    if "profile" in value and not isinstance(value["profile"], str):
-        raise ValueError("profile")
-    if "allowed_projects" in value and (not isinstance(value["allowed_projects"], list) or
-            any(not isinstance(item, str) for item in value["allowed_projects"])):
-        raise ValueError("allowed_projects")
-    if "role_map" in value and (not isinstance(value["role_map"], dict) or
-            any(not isinstance(k, str) or not isinstance(v, str) for k, v in value["role_map"].items())):
-        raise ValueError("role_map")
-except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-    raise SystemExit(1)
-
-if not key:
-    raise SystemExit(0)
-raise SystemExit(0 if allow[key] else 1)
-PY
+  local key="${1-}" path="${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" root="${REPO_ROOT:-}"
+  if [ -z "$root" ]; then
+    root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || return 1
+  fi
+  python3 -I "$root/lib/aib_deployment.py" "$root" "$path" "$key"
 }
 
 aib_deployment_valid() {

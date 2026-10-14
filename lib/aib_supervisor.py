@@ -21,6 +21,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aib_control import append_record, identity_for, requested_record
+from aib_deployment import deployment_allows
 
 
 class JournalCorruptError(ValueError):
@@ -100,7 +101,7 @@ class Supervisor:
         self.agent: dict[str, Any] = {}
         self.project_uid = ""
         self.team_uid = ""
-        self.data_class = "internal"
+        self.data_class = "customer"
         self.protected = ""
         self.ctl_dir = Path(os.environ.get("AIB_CTL_DIR", "/run/aib/ctl"))
         self.control_log = Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
@@ -265,34 +266,9 @@ class Supervisor:
             self.write_alarm("deployment_denied")
         return 78
 
-    @staticmethod
-    def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate deployment key")
-            result[key] = value
-        return result
-
     def deployment_allows(self, key: str) -> bool:
         path = Path(os.environ.get("AIB_DEPLOYMENT_CONFIG", "/etc/aib/deployment.json"))
-        try:
-            mode = path.stat().st_mode
-            if mode & 0o022 or not mode & 0o444:
-                return False
-            value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=self._unique_object)
-            allow = value["allow"]
-            return (
-                isinstance(value, dict)
-                and isinstance(value.get("deployment_id"), str)
-                and bool(value["deployment_id"])
-                and isinstance(allow, dict)
-                and type(allow.get("customer_code")) is bool
-                and type(allow.get("comms_secrets")) is bool
-                and allow[key] is True
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return False
+        return deployment_allows(path, key, self.root)
 
     def configure(self) -> str | None:
         if self.config_invalid:
@@ -321,7 +297,7 @@ class Supervisor:
             self.standup = Path(project["standup_dir"])
             self.project_uid = project_uid
             self.team_uid = agent["team_uid"]
-            self.data_class = project.get("data_class", "internal")
+            self.data_class = project.get("data_class", "customer")
             self.protected = agent.get("protected", "")
             if not all(isinstance(v, str) and v for v in (project_uid, self.project_home, str(self.standup), provider_uid)):
                 raise ValueError
