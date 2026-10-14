@@ -173,7 +173,7 @@ eq "T2: argv minus the pair is exactly the same base flags" "$rest" "$CLAUDE_BAS
 hasnt "T2: no --session-id on a resume" "$(argv)" "[--session-id]"
 
 # T3 closed shape: sid regex and token count -> 65, provider never invoked
-bad_sids=("new:" "new:not-a-uuid" "not-a-uuid" "" "new:${UUID1^^}" "${UUID1^^}" "new:new:$UUID1" "$UUID1 extra" "new:${UUID1}0" "${UUID1:0:35}" "-$UUID1" "new:../$UUID1")
+bad_sids=("new:" "new:not-a-uuid" "not-a-uuid" "" "new:${UUID1^^}" "${UUID1^^}" "new:new:$UUID1" "$UUID1 extra" "new:${UUID1}0" "${UUID1:0:35}" "-$UUID1" "new:../$UUID1" "new:${UUID1:0:1}A${UUID1:2}" "${UUID1:0:1}A${UUID1:2}" "new:${UUID1:0:2}G${UUID1:3}")
 for sid in "${bad_sids[@]}"; do
   turn claude "$sid" workspace-write high "p"
   eq "T3: sid '$sid' is refused with 65" "$RC" 65
@@ -264,6 +264,10 @@ if ran; then no "T9: a refused sandbox never reaches the provider"; else ok "T9:
 for sid in "new:" "not-a-uuid" "new:${UUID1^^}" "new:new:$UUID1"; do
   turn codex "$sid" workspace-write high p
   eq "T9: codex sid '$sid' is refused with 65" "$RC" 65
+done
+for w in --bg agents app-server remote-control resume --continue --fork-session; do
+  call codex "$w" -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- p
+  eq "T9: codex invented first token '$w' -> exactly 65" "$RC" 65
 done
 for w in --bg agents app-server remote-control; do
   call codex session-turn "$w" -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- p
