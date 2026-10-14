@@ -58,6 +58,7 @@ write_v4() {
     \"acme\": {
       \"home\": \"$STATE/acme\",
       \"standup_dir\": \"$standup_dir\",
+      \"data_class\": \"internal\",
       \"mux_session\": \"acme\",
       \"provider\": \"$provider\",
       \"model\": \"project-model\",
@@ -89,6 +90,7 @@ write_v3() {
     \"acme\": {
       \"home\": \"$STATE/acme\",
       \"standup_dir\": \"$standup_dir\",
+      \"data_class\": \"internal\",
       \"mux_session\": \"acme\",
       \"provider\": \"$provider\",
       \"model\": \"project-model\",
@@ -114,7 +116,7 @@ write_v2() {
   local path="$1"
   printf '%s\n' "{
   \"schema_version\": 2,
-  \"projects\": { \"acme\": { \"home\": \"$STATE/acme\", \"standup_dir\": \"$STATE/acme/standup\", \"mux_session\": \"acme\" } },
+  \"projects\": { \"acme\": { \"home\": \"$STATE/acme\", \"standup_dir\": \"$STATE/acme/standup\", \"data_class\": \"internal\", \"mux_session\": \"acme\" } },
   \"agents\": { \"acme-core\": { \"project\": \"acme\", \"profile\": \"engine-dev\", \"clearance\": \"t2\" } }
 }" > "$path"
 }

@@ -30,6 +30,7 @@ trap sup_cleanup EXIT
 umask 000
 upid_same() { [ "$(lj pid)" = "$SUP_PID" ]; }
 started() { jcount supervisor.started; }
+started_is() { [ "$(started)" = "$1" ]; }
 boot() { start_sup "${1:-acme-core}" "${CTLENV[@]}"; wait_for 10 lj_is state READY; }
 
 # --- T1 unaudited / mismatching requests are rejected by the executor ---------------------------
@@ -140,6 +141,42 @@ wait_for 15 state_is m-1 PROCESSED
 has "T5: standup runs the briefing turn first (call 2)" "$(prompt 2)" "routine:standup"
 has "T5: …then the waiting message (call 3)" "$(prompt 3)" "m-1"
 eq "T5: …off duty cleared" "$(lj state)|$(lj off_duty)" "READY|false"
+stop_sup
+
+# --- T5b feierabend / standup while a turn runs: rejected busy, never silently dropped ------------------------------------------
+ctl_world dutybusy; as human:operator
+boot; plan "0|3|slow turn"; m_send m-1 "a long job"
+wait_for 10 lj_is state WORKING
+for v in feierabend standup; do
+  s="$(audit $v acme-core human:operator)"; drop acme-core "$s" $v
+  wait_for 10 rej_for "$s"
+  eq "T5b: $v while WORKING => ctl.rejected busy (audited)" "$(rejreason "$s")|$(cf ctl.rejected -1 verb)" "busy|$v"
+done
+wait_for 15 state_is m-1 PROCESSED
+sleep 1
+eq "T5b: …no routine turn was queued behind the running one (one launch, still READY, not off duty)" "$(ncalls)|$(lj state)|$(lj off_duty)" "1|READY|false"
+s="$(audit feierabend acme-core human:operator)"; drop acme-core "$s" feierabend
+wait_for 15 done_for "$s"
+eq "T5b: once idle the same verb is accepted (guard)" "$(done_for "$s" && echo done)" done
+stop_sup
+
+# --- T5c neustart --fresh drops the stored session: the next turn starts a NEW session (journaled) ------------------------------
+ctl_world fresh; as human:operator
+plan "0||one" "0||two" "0||three"; boot
+m_send m-1 a; wait_for 10 state_is m-1 PROCESSED
+sid1="$(callf 1 session)"; sid1="${sid1#new:}"
+s="$(audit neustart acme-core human:operator)"; drop acme-core "$s" neustart
+wait_for 10 done_for "$s"; wait_for 10 lj_is state READY; wait_for 10 started_is 2
+m_send m-2 b; wait_for 10 state_is m-2 PROCESSED
+eq "T5c: a plain neustart keeps the session: call 2 RESUMES it" "$(callf 2 session)" "$sid1"
+s="$(audit neustart acme-core human:operator "" '{"fresh": true}')"; drop acme-core "$s" neustart
+wait_for 10 done_for "$s"; wait_for 10 started_is 3
+wait_for 10 lj_is state READY
+eq "T5c: --fresh: journal session.rotated reason fresh, naming the dropped session" "$(jcount session.rotated)|$(jfield session.rotated 1 reason)|$(jfield session.rotated 1 prev_sid)" "1|fresh|$sid1"
+m_send m-3 c; wait_for 10 state_is m-3 PROCESSED
+sid3="$(callf 3 session)"
+case "$sid3" in new:*) ok "T5c: …the next turn starts a NEW session (new:<uuid>)";; *) no "T5c: …the next turn starts a NEW session (got '$sid3')";; esac
+eq "T5c: …a different uuid than before, and it is the session now bound" "$([ "${sid3#new:}" != "$sid1" ] && echo different)|$(jfield session.bound -1 sid)" "different|${sid3#new:}"
 stop_sup
 
 # --- T6 abschalten and protected -----------------------------------------------------------------------

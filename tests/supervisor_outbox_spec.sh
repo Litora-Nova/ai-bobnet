@@ -75,4 +75,34 @@ eq "T4: the brake still trips and the loop keeps ticking with an unusable outbox
 eq "T4: …and the heartbeat blocked is still written" "$(hb_status | awk '{print $NF}')" blocked
 stop_sup
 
+# --- T5 the alarm is per EPISODE: reset-brake, then a second trip alarms again ---------------------------------------------------
+ctl_world episode; as human:operator
+default "1||E:boom"; for i in 1 2 3 4 5 6; do m_send m-$i x; done; start_sup acme-core "${CTLENV[@]}"
+wait_for 15 ob_has brake_tripped 1
+eq "T5: first trip, one alarm" "$(obn brake_tripped)" 1
+s="$(audit reset-brake acme-core human:operator)"; drop acme-core "$s" reset-brake
+wait_for 15 done_for "$s"
+wait_for 20 ob_has brake_tripped 2
+eq "T5: after reset-brake a SECOND trip alarms again (2 lines, 2 distinct ids)" "$(obn brake_tripped)|$(OB | awk -F' [|] ' '{print $2}' | sort -u | wc -l | tr -d ' ')" "2|2"
+sleep 1
+eq "T5: …and still only one per episode" "$(obn brake_tripped)" 2
+stop_sup
+
+# --- T6 a failed outbox write leaves a trace ------------------------------------------------------------------------------------
+ctl_world trace
+printf 'a file where the team directory should be' > "$OUTBOX/acme-engine"
+default "1||E:boom"; m_send m-1 a; m_send m-2 b; m_send m-3 c; start_sup acme-core "${CTLENV[@]}"
+wait_for 15 lj_is brake.consecutive 5
+af_ge1() { [ "$(jcount alarm.failed)" -ge 1 ]; }
+wait_for 10 af_ge1
+eq "T6: the failed alarm write is journalled (alarm.failed, kind brake_tripped), not swallowed" "$(jcount alarm.failed)|$(jfield alarm.failed 1 kind)" "1|brake_tripped"
+eq "T6: …and it is not recorded as sent" "$(jcount alarm.sent)" 0
+stop_sup
+
+# --- T7 the unit template lets the supervisor write the outbox -------------------------------------------------------------------
+UNIT="$SRC_ROOT/deploy/systemd/aib-agent@.service"
+rw="$(grep '^ReadWritePaths=' "$UNIT" 2>/dev/null)"
+has "T7: ReadWritePaths= includes the team outbox root" "$rw" "/srv/aib/outbox"
+has "T7: …and still the old paths (broker state, /run/aib, standup)" "$rw" "/run/aib"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

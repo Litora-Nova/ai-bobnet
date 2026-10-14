@@ -57,6 +57,7 @@ write_registry() {
     "acme": {
       "home": "$STATE/acme",
       "standup_dir": "$STANDUP",
+      "data_class": "internal",
       "mux_session": "acme",
       "provider": "$provider",
       "model": "project-model",
@@ -87,6 +88,7 @@ write_registry_without_adapter_map() {
     "acme": {
       "home": "$STATE/acme",
       "standup_dir": "$STANDUP",
+      "data_class": "internal",
       "mux_session": "acme",
       "provider": "codex",
       "model": "project-model",

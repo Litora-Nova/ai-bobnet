@@ -2,6 +2,13 @@
 # Builds on tests/fixtures/sup_harness.sh (the supervisor world) and adds the S1b seams.
 #
 # ===== THE INTERFACE THIS HARNESS PINS FOR bin/agentctl, bin/aib-gw AND THE SUPERVISOR'S CONTROL SIDE (S1b) =====
+# TEST-SEAM GATE (S1b delta, lead decision): bin/agentctl and bin/aib-gw honour the test seams below — AIBOBNET_REGISTRY,
+#   AIB_IDENTITY_CMD, AIB_CONTROL_LOG, AIB_CTL_DIR, AIB_SYSTEMCTL, AIB_SUP_STATE_ROOT, AIB_OUTBOX_ROOT (agentctl) and
+#   AIB_AGENTCTL, AIB_GW_PEERS, AIB_CONTROL_LOG, AIB_IDENTITY_CMD (aib-gw) — ONLY when AIB_TEST_SEAMS=1 is set AND the engine
+#   root holds NO install marker file `<engine root>/.aib-installed` (provisioning, root-owned, creates it on an installed
+#   engine). Otherwise every seam is ignored and the production defaults apply (registry <engine>/registry.json, log
+#   /srv/aib/standup/_control.jsonl, dir /run/aib/ctl, peers /etc/aib/gateway-peers, plain `systemctl`, getent identity).
+#   AIBOBNET_ACTOR is a recorded CLAIM, not a seam, and stays honoured. The same gate guards AIB_DEPLOYMENT_OWNER_UID below.
 # env seams (unit/test supplied; every one has a production default, none is request-derived):
 #   AIB_CTL_DIR            request directory                     (default /run/aib/ctl, root:aib-ctl 1770)
 #   AIB_CONTROL_LOG        audit log `_control.jsonl`            (default /srv/aib/standup/_control.jsonl)
@@ -16,6 +23,10 @@
 #   AIB_SUP_CANCEL_GRACE_S grace before `neustart --force` / `abschalten --force` cancels a running turn (default 30)
 #   AIB_OUTBOX_ROOT        per-team outbox root                  (default /srv/aib/outbox)
 #   AIB_DEPLOYMENT_CONFIG  deployment configuration file         (default /etc/aib/deployment.json)
+#   AIB_DEPLOYMENT_OWNER_UID  required owner uid of that file     (default 0 = root; overridable ONLY behind the seam gate, so a
+#                          file owned by anybody else is NOT a valid deployment config on an installed engine). ONE validator
+#                          semantics for the shell side (aib_deployment_*) and the supervisor: JSON shape, duplicate keys,
+#                          owner == required uid, no group/other write bit, regular file, readable.
 #
 # OPEN (not pinned, needs a PO/Remote-Bob decision): `status` and the projection read <state>/live.json, but the unit template sets
 #   StateDirectoryMode=0700 and the unit runs as the (role) account, so neither a human's agentctl nor the aib-broker projection
@@ -44,13 +55,14 @@ cf()  { CL field "$CLOG" "$1" "$2" "$3"; }
 
 # ctl_registry — schema-5 registry for the control specs: lead/protected/data_class are FLAT strings (the reader exposes depth-2 strings only)
 #   acme-core (supervised, lead) · acme-sib (supervised) · acme-guard (protected guardian) · acme-gate (protected gateway) · acme-solo (oneshot)
-ctl_registry() { # ctl_registry [data_class] [extra project fields]
-  local dc="${1:-internal}"
+ctl_registry() { # ctl_registry [data_class|-] [extra project fields]   ("-" = declare NO data_class: a project without one is CUSTOMER)
+  local dc="${1:-internal}" dcf=""
+  [ "$dc" = "-" ] || dcf="\"data_class\": \"$dc\", "
   cat > "$ENGINE/registry.json" <<JSON
 { "schema_version": 5,
   "providers": { "acme": { "adapter": "$SRC_ROOT/adapters/codex", "cap_sandbox": "workspace-write",
                            "cap_tier": "t2", "cap_effort": "high", "cap_timeout": "900" } },
-  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STANDUP", "mux_session": "acme", "data_class": "$dc",
+  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STANDUP", "mux_session": "acme", $dcf
                           "provider": "acme", "model": "team/model-v2", "effort": "low" } },
   "teams": { "acme-engine": { "project": "acme", "model": "team/model-v2" } },
   "agents": {
@@ -85,7 +97,8 @@ FAKE
   chmod +x "$W/fakes/identity" "$W/fakes/systemctl"
   printf '{"deployment_id":"acme-dev-1","profile":"dev","allow":{"customer_code":true,"comms_secrets":true}}' > "$DEPLOY"; chmod 644 "$DEPLOY"
   CTLENV=(AIB_CTL_DIR="$CTL" AIB_CONTROL_LOG="$CLOG" AIB_IDENTITY_CMD="$W/fakes/identity" AIB_SYSTEMCTL="$W/fakes/systemctl"
-          AIB_SUP_STATE_ROOT="$W/state" AIB_OUTBOX_ROOT="$OUTBOX" AIB_DEPLOYMENT_CONFIG="$DEPLOY" AIB_SUP_CANCEL_GRACE_S=0.3 AIB_CTL_WAIT_S=8)
+          AIB_SUP_STATE_ROOT="$W/state" AIB_OUTBOX_ROOT="$OUTBOX" AIB_DEPLOYMENT_CONFIG="$DEPLOY" AIB_SUP_CANCEL_GRACE_S=0.3 AIB_CTL_WAIT_S=8
+          AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$ME_UID")
 }
 as() { printf '%s=%s\n' "$ME_UID" "$1" > "$IDMAP"; }     # as human:operator | role:aib-agent | gateway:gw
 

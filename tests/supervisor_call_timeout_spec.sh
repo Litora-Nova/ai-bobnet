@@ -83,4 +83,50 @@ wait_for 30 state_is m-1 PROCESSED
 eq "T3: a 5 s turn with a 3 s call timeout completes (PROCESSED, one launch)" "$(m_state m-1)|$(ncalls)" "PROCESSED|1"
 stop_sup
 
+# --- T4 a grandchild that ESCAPED the process group and still holds the pipe must not block the loop (bounded wait after the kill) --------
+sup_world escape
+cat > "$ENGINE/bin/run-agent" <<FAKE
+#!/usr/bin/env bash
+echo \$\$ >> "$W/hang.pids"
+setsid sleep 31.9 &
+echo \$! >> "$W/gc.pids"
+wait
+FAKE
+chmod +x "$ENGINE/bin/run-agent"
+start_sup AIB_SUP_CALL_TIMEOUT_S=0.3
+wait_for 20 ge2 2
+s1="$(lj seq)"; wait_for 20 seq_ge "$((s1 + 5))"
+ge "T4: the loop keeps ticking although an escaped grandchild holds the call's stdout (>= +5 ticks in 20 s; blocked ~32 s otherwise)" "$(dl "$(lj seq)" "$s1")" 5
+eq "T4: …and the helper is retried (>= 2 calls started)" "$([ "$(gc_count)" -ge 2 ] && echo yes)" yes
+kill -TERM "$SUP_PID"; t0=$(date +%s.%N); rc=0; wait "$SUP_PID" || rc=$?; t1=$(date +%s.%N); SUP_PID=""
+eq "T4: SIGTERM still ends it with exit 0" "$rc" 0
+ge "T4: …within 5 s" "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print 5-(b-a)}')" 0
+pkill -9 -f 'sleep 31.9' 2>/dev/null
+
+# --- T5 the same for the broker client ----------------------------------------------------------------------------------------------
+sup_world escape2
+cat > "$W/fakes/broker-client" <<FAKE
+#!/usr/bin/env bash
+cat >/dev/null
+echo \$\$ >> "$W/hang.pids"
+setsid sleep 31.9 &
+echo \$! >> "$W/gc.pids"
+wait
+FAKE
+chmod +x "$W/fakes/broker-client"
+SID="3f2b8c1e-9d4a-4e6b-8a7c-1b2d3e4f5a6b"; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$JOURNAL" <<JSON
+{"seq":1,"ts":"$ts","event":"supervisor.started","pid":1,"reexec":false}
+{"seq":2,"ts":"$ts","event":"session.bound","agent":"acme-core","sid":"$SID","cwd":"$HOMEDIR"}
+{"seq":3,"ts":"$ts","event":"turn.started","msg_id":"m-1","sid":"$SID","attempt":1}
+JSON
+m_send m-1 "interrupted by a crash"
+env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- "$ENGINE4/bin/message" seen m-1 >/dev/null
+start_sup AIB_SUP_CALL_TIMEOUT_S=0.3
+wait_for 20 ge2 2
+s1="$(lj seq)"; wait_for 20 seq_ge "$((s1 + 5))"
+ge "T5: the leases query does not block the loop behind an escaped grandchild (>= +5 ticks in 20 s)" "$(dl "$(lj seq)" "$s1")" 5
+stop_sup
+pkill -9 -f 'sleep 31.9' 2>/dev/null
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

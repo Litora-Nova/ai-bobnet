@@ -259,6 +259,7 @@ cat > "$FIXTURE_REG" <<JSON
     "acme": {
       "home": "$FIXTURE_HOME",
       "standup_dir": "$WORK/standup",
+      "data_class": "internal",
       "mux_session": "acme",
       "provider": "acme",
       "model": "example-model",
@@ -267,6 +268,7 @@ cat > "$FIXTURE_REG" <<JSON
     "acme-bad": {
       "home": "$FIXTURE_HOME",
       "standup_dir": "$WORK/standup",
+      "data_class": "internal",
       "mux_session": "acme-bad",
       "provider": "acme-bad",
       "model": "example-model",

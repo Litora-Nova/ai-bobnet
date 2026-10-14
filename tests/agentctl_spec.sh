@@ -165,6 +165,17 @@ wait_exit "$SUP_PID"; eq "T7: …the supervisor stopped by itself (exit 0, no re
 eq "T7: …exactly one systemctl effect: disable --now" "$(grep -v '^is-active' "$W/systemctl.log")" "disable --now aib-agent@acme-core.service"
 eq "T7: …audit: done (stopping), then unit rc 0" "$(cf ctl.done -1 result)|$(cf ctl.unit -1 action)|$(cf ctl.unit -1 rc)" "stopping|disable --now|0"
 
+# --- T7b feierabend/standup while a turn runs => exit 75 busy, audited (end to end) ---------------------------------------------
+ctl_world busy75; as human:operator
+start_sup acme-core "${CTLENV[@]}"; wait_for 10 lj_is state READY
+plan "0|4|slow"; m_send b-1 "keep busy"; wait_for 10 lj_is state WORKING
+for v in feierabend standup; do
+  ctl -- "$v" acme-core
+  eq "T7b: $v while WORKING => 75" "$RC" 75
+  eq "T7b: …audited ctl.rejected busy" "$(cf ctl.rejected -1 reason)|$(cf ctl.rejected -1 verb)" "busy|$v"
+done
+stop_sup
+
 # --- T8 status ---------------------------------------------------------------------------------
 ctl_world status; as human:operator
 ctl -- status acme-core
