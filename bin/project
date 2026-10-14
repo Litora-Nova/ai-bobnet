@@ -31,7 +31,7 @@ while IFS= read -r protected_uid; do
 done <<< "$projects"
 
 _project_one() (
-  local uid="$1" standup home agent owner scratch='' temp='' output_fd
+  local uid="$1" standup home agent owner mode scratch='' temp='' output_fd
   aib_validate_token "$uid" project_uid
   standup="$(_aib_snapshot_query projects field "$uid" standup_dir)" || aib_die 2 "cannot resolve standup_dir for $uid"
   home="$(_aib_snapshot_query projects field "$uid" home)" || aib_die 2 "cannot resolve home for $uid"
@@ -40,12 +40,16 @@ _project_one() (
   trap 'rm -rf -- "$scratch"; [ -z "$temp" ] || rm -f -- "$temp"' EXIT
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/aib-project.XXXXXX") || aib_die 2 'cannot create reader scratch directory'
   : > "$scratch/agents"
+  : > "$scratch/agent-modes"
   while IFS= read -r agent; do
     [ -n "$agent" ] || continue
     owner="$(_aib_snapshot_query agents field "$agent" project)" || continue
     [ "$owner" = "$uid" ] || continue
     aib_validate_agent_uid "$agent"
     printf '%s\n' "$agent" >> "$scratch/agents" || aib_die 2 'cannot buffer agent roster'
+    mode=oneshot
+    mode="$(_aib_snapshot_query agents field "$agent" mode 2>/dev/null)" || mode=oneshot
+    printf '%s\t%s\n' "$agent" "$mode" >> "$scratch/agent-modes" || aib_die 2 'cannot buffer agent modes'
   done <<< "$agents"
   aib_attempts_fold "$AIB_EVENT_ROOT/$uid/main.events" > "$scratch/fold" || aib_die 2 "fold failed for $uid"
   python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" > "$scratch/result" <<'PY'
@@ -166,6 +170,7 @@ def integer_file(path):
 
 fold = json.loads((scratch/'fold').read_text())
 roster = (scratch/'agents').read_text().splitlines()
+agent_modes = dict(line.split('\t', 1) for line in (scratch/'agent-modes').read_text().splitlines())
 status = fold['status']
 reason = fold['reason']
 if not fold['present']:
@@ -199,6 +204,125 @@ def attention(kind, agent, reason, since, attested=True):
     if since is None:
         raise ValueError('cannot date attention from an unparsable heartbeat')
     result['attention'].append(dict(kind=kind, agent=agent, reason=reason, since=since, attested=attested))
+
+def read_json_file(path):
+    try:
+        data, _ = read_regular(path)
+        value = json.loads(data.decode('utf-8'))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+def journal_records(path):
+    try:
+        data, _ = read_regular(path)
+    except (OSError, ValueError):
+        return []
+    records = []
+    try:
+        for raw in data.decode('utf-8').splitlines():
+            if raw.strip():
+                value = json.loads(raw)
+                if isinstance(value, dict):
+                    records.append(value)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    return records
+
+def inbox_open(path):
+    try:
+        data, _ = read_regular(path)
+    except (FileNotFoundError, PermissionError, ValueError):
+        return 0
+    states = {}
+    for raw in data.decode('utf-8', errors='replace').splitlines():
+        fields = raw.split(' | ')
+        msg_id = event = None
+        persisted = False
+        for field in fields[1:]:
+            if field.startswith('id:') and msg_id is None:
+                msg_id = field[3:]
+            elif field.startswith('event:') and event is None:
+                event = field[6:]
+            elif field == 'state:PERSISTED':
+                persisted = True
+                break
+            elif field.startswith('reason:'):
+                break
+        if not msg_id:
+            continue
+        if persisted:
+            states[msg_id] = 'PERSISTED'
+        elif event:
+            states[msg_id] = event
+    return sum(state not in ('PROCESSED', 'FAILED') for state in states.values())
+
+def supervisor_projection(agent):
+    if agent_modes.get(agent, 'oneshot') != 'supervised':
+        return None
+    state_root = Path(os.environ.get('AIB_SUP_STATE_ROOT', '/var/lib/aib-sup'))
+    state_dir = state_root/agent
+    live = read_json_file(state_dir/'live.json')
+    journal = journal_records(state_dir/'journal.jsonl')
+    unit = {}
+    shown = subprocess.run(
+        ['systemctl', 'show', '--property=ActiveState', '--property=UnitFileState', f'aib-agent@{agent}.service'],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    for line in shown.stdout.splitlines():
+        key, sep, value = line.partition('=')
+        if sep:
+            unit[key] = value
+
+    tick_seq = tick_age = None
+    session_state = 'OFFLINE'
+    state_reason = ''
+    health = 'unhealthy'
+    current_turn = None
+    session_short = None
+    turns = 0
+    brake = {'consecutive': 0, 'tripped_at': None}
+    if live is not None:
+        session_state = live.get('state', 'OFFLINE')
+        state_reason = live.get('state_reason', '')
+        tick_seq = live.get('seq')
+        current_turn = live.get('turn')
+        turns = live.get('turns_in_session', 0)
+        if isinstance(live.get('brake'), dict):
+            brake = live['brake']
+        sid = live.get('session_id')
+        if isinstance(sid, str):
+            session_short = sid[:8]
+        try:
+            tick_age = max(0, int(now - event_epoch(live.get('ts'))))
+            tick_interval = float(live.get('interval_s'))
+            if tick_interval > 0 and tick_age <= 3 * tick_interval:
+                health = 'healthy'
+        except (TypeError, ValueError, OverflowError):
+            tick_age = None
+
+    restarts = 0
+    journal_seq = 0
+    for record in journal:
+        seq = record.get('seq')
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            journal_seq = max(journal_seq, seq)
+        if record.get('event') == 'supervisor.started' and record.get('reexec') is False:
+            try:
+                age = now - event_epoch(record.get('ts'))
+                if 0 <= age <= 86400:
+                    restarts += 1
+            except ValueError:
+                pass
+    return dict(
+        mode='supervised', account=None,
+        unit_state=unit.get('ActiveState', 'unknown'),
+        disabled=unit.get('UnitFileState') == 'disabled',
+        session_state=session_state, state_reason=state_reason, health=health,
+        tick_seq=tick_seq, tick_age_s=tick_age, current_turn=current_turn,
+        session_id_short=session_short, turns_in_session=turns,
+        restarts_24h=restarts, brake=brake, off_duty=False,
+        inbox_open=inbox_open(Path(standup)/'inbox'/(agent+'.md')),
+        last_control=None, journal_seq=journal_seq)
 if status != 'ok':
     attention('stream_unhealthy',None,'stream corrupt: '+reason if status == 'corrupt' else 'stream '+status,iso(now))
 if relationship == 'ahead':
@@ -221,6 +345,7 @@ for agent in roster:
     result['anomalies']['uid_mismatches'] += mismatches
     entry['attempt'] = None
     entry['launch'] = None
+    entry['supervisor'] = supervisor_projection(agent)
     attempt = latest.get(agent)
     if attempt:
         entry['launch'] = attempt['launch']

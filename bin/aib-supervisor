@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ai-bobnet — long-lived supervised-agent loop.
+set -euo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+  _src=$(readlink "$_src")
+  case "$_src" in /*) ;; *) _src="$_dir/$_src";; esac
+done
+_dir=$(cd -P "$(dirname "$_src")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
+
+exec python3 -I "$REPO_ROOT/lib/aib_supervisor.py" "$REPO_ROOT" "$@"

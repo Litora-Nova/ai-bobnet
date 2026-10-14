@@ -258,7 +258,7 @@ _aib_check_registry_with() {
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
     7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
     10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
-    11) aib_die 2 "registry schema_version must be the JSON number 2, 3, or 4 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
+    11) aib_die 2 "registry schema_version must be the JSON number 2, 3, 4, or 5 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
     12) aib_die 2 "registry contains a JSON string escape that decodes to an ASCII control character — refusing unsafe line/path data: $reg";;
     *) aib_die 2 "registry failed validation (code $rc): $reg";;
   esac
@@ -400,7 +400,7 @@ END {
   if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
 
   # schema_version is the compatibility gate, not decorative metadata. Only the
-  # exact JSON numbers 2, 3, and 4 at depth 1 select grammars implemented by this
+  # exact JSON numbers 2, 3, 4, and 5 at depth 1 select grammars implemented by this
   # reader; a nested lookalike, a string value, or an unknown version must fail
   # closed. Schema 4 adds the provider adapter map + declared capabilities on top of
   # the schema-3 execution binding — an old reader that knows only 2/3 still rejects it.
@@ -410,7 +410,7 @@ END {
     if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) { sdepth--; continue }
     if (sdepth==1 && ty[j]=="S" && tok[j]=="schema_version" && ty[j+1]=="P" && tok[j+1]==":") {
       schema_seen=1
-      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3" && tok[j+2]!="4")) exit 11
+      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3" && tok[j+2]!="4" && tok[j+2]!="5")) exit 11
       schema_value=tok[j+2]
     }
   }
@@ -756,8 +756,8 @@ aib_resolve_agent_snapshot() {
   # here — a schema-3 registry simply resolves an empty adapter and the gate denies it.
   if [ "$mode" = managed ]; then
     case "$schema" in
-      3|4) ;;
-      *) aib_die 3 "managed execution binding requires registry schema_version 3 or 4 (found $schema)";;
+      3|4|5) ;;
+      *) aib_die 3 "managed execution binding requires registry schema_version 3, 4, or 5 (found $schema)";;
     esac
   fi
 
@@ -788,7 +788,7 @@ aib_resolve_agent_snapshot() {
 
   # Schema 2 remains a legacy identity/context format. It never invents binding.
   case "$schema" in
-    3|4) ;;
+    3|4|5) ;;
     *) return 0;;
   esac
 
@@ -836,7 +836,7 @@ aib_resolve_agent_snapshot() {
   # top-level `providers` map (keyed by provider name). These are DECLARED registry
   # data, never runtime-probed. They form the trusted half of the snapshot the PDP
   # consumes; the PDP — not this resolver — decides whether they authorise a launch.
-  [ "$schema" = 4 ] || return 0
+  case "$schema" in 4|5) ;; *) return 0;; esac
   _aib_resolve_provider_caps "$provider"
 }
 
@@ -1505,7 +1505,7 @@ aib_event_compose_ended_payload() {
 aib_enact_launch() {
   local enact_record="${1-}" prompt="${2-}" events_path="${3-}" lock_path="${4-}"
   local envelope_kv="${5-}" decided_id="${6-}" mode="${7:-confined}"
-  local adapter state_dir root cwd_req sandbox effort model timeout_s resolved_root
+  local adapter state_dir root cwd_req sandbox effort model timeout_s session resolved_root
 
   case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
   [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$decided_id" ] ||
@@ -1522,6 +1522,7 @@ aib_enact_launch() {
   effort="$(_aib_record_field "$enact_record" effort)" || aib_die 2 "enact record requires effort"
   model="$(_aib_record_field "$enact_record" model)" || aib_die 2 "enact record requires model"
   timeout_s="$(_aib_record_field "$enact_record" timeout)" || aib_die 2 "enact record requires timeout"
+  session="$(_aib_record_field "$enact_record" session)" || session=""
   case "$timeout_s" in ''|*[!0-9]*) aib_die 2 "enact record timeout must be digits (got '$timeout_s')";; esac
   [ "$timeout_s" -gt 0 ] 2>/dev/null || aib_die 2 "enact record timeout must be > 0"
 
@@ -1686,8 +1687,10 @@ aib_enact_launch__run_direct() {
   local manager_pid_outer
 
   _aib_enact_exec_child_direct() {
+    local adapter_mode=(exec)
+    [ -z "$session" ] || adapter_mode=(session-turn "$session")
     exec "$_env_bin" -i "${_child_env[@]}" \
-      "$adapter" exec \
+      "$adapter" "${adapter_mode[@]}" \
       -m "$model" -s "$sandbox" \
       -c "model_reasoning_effort=\"$effort\"" \
       -c 'approval_policy="never"' \
@@ -1953,9 +1956,11 @@ aib_enact_launch__run_confined() {
     # stderr (after that handoff) lands on fd 1 — the same relay fifo every chunk
     # already goes through — never merged with the helper's own diagnostics,
     # because the dup2 happens strictly after them.
+    local adapter_mode=(exec)
+    [ -z "$session" ] || adapter_mode=(session-turn "$session")
     exec "$_env_bin" -i "${_child_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
       "LL_STATUS_FD=9" "LL_STDERR_FD=1" \
-      "$AIB_CONFINE_BIN" "$adapter" exec \
+      "$AIB_CONFINE_BIN" "$adapter" "${adapter_mode[@]}" \
       -m "$model" -s "$sandbox" \
       -c "model_reasoning_effort=\"$effort\"" \
       -c 'approval_policy="never"' \
@@ -2984,7 +2989,7 @@ aib_wire_read_request() {
     # themselves are never record-line keys, only their byte-count headers are. Everything else
     # (clearance, cap_*, env) stays refused without needing a rule about it.
     case "$key" in
-      op|agent_uid|lease_class|prompt_bytes|sandbox|timeout|cwd_bytes|label_bytes) : ;;
+      op|agent_uid|lease_class|session|prompt_bytes|sandbox|timeout|cwd_bytes|label_bytes) : ;;
       *) AIB_WIRE_ERROR="field '$key' is not accepted at this seam"; return 2 ;;
     esac
     # A repeated field must not silently win with its last value — for agent_uid that would be a
@@ -3002,6 +3007,8 @@ aib_wire_read_request() {
                    AIB_WIRE_ERROR="op is not a valid token"; return 2; } ;;
       lease_class) [ "$val" = supervised ] || {
                      AIB_WIRE_ERROR="lease_class '$val' is not recognised"; return 2; } ;;
+      session)    [[ "$val" =~ ^(new:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
+                     AIB_WIRE_ERROR="session is not a lower-case UUID"; return 2; } ;;
       sandbox)   _aib_rank sandbox "$val"
                  [ "$_AIB_RANK" -ne 0 ] || {
                    AIB_WIRE_ERROR="sandbox '$val' is not a recognised mode"; return 2; } ;;
