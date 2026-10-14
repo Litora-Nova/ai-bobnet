@@ -582,11 +582,14 @@ assert_streq "schema: version 3 remains usable by a legacy identity lookup" \
 assert_streq "schema: version 4 is usable by a legacy identity lookup" \
   "$(AIBOBNET_REGISTRY="$(bad_reg schema-v4 "{ \"schema_version\": 4, $GOOD_PROJ, $GOOD_AG }")" \
     "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
-schema_err="$(AIBOBNET_REGISTRY="$(bad_reg schema-unsupported "{ \"schema_version\": 5, $GOOD_PROJ, $GOOD_AG }")" \
+assert_streq "schema: version 5 is usable by a legacy identity lookup" \
+  "$(AIBOBNET_REGISTRY="$(bad_reg schema-v5 "{ \"schema_version\": 5, $GOOD_PROJ, $GOOD_AG }")" \
+    "$INBOX" acme-core 2>/dev/null)" "/s/inbox/acme-core.md"
+schema_err="$(AIBOBNET_REGISTRY="$(bad_reg schema-unsupported "{ \"schema_version\": 6, $GOOD_PROJ, $GOOD_AG }")" \
   "$INBOX" acme-core 2>&1 >/dev/null)"
 assert_grep "schema: the refusal names schema_version" "$schema_err" "schema_version"
 assert_fail "schema: an unsupported schema version is refused" \
-  env AIBOBNET_REGISTRY="$(bad_reg schema-v5 "{ \"schema_version\": 5, $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
+  env AIBOBNET_REGISTRY="$(bad_reg schema-v6 "{ \"schema_version\": 6, $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
 assert_fail "schema: a string that looks like version 2 is refused" \
   env AIBOBNET_REGISTRY="$(bad_reg schema-string "{ \"schema_version\": \"2\", $GOOD_PROJ, $GOOD_AG }")" "$INBOX" acme-core
 assert_fail "schema: a nested version cannot replace the top-level gate" \
