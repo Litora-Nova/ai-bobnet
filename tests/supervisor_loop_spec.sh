@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ai-bobnet — RED spec for the thin supervisor loop, part 1: process contract, tick, inbox turns
-# (Supervisor slice S1a-2; design standup/_design_supervisor.md B1/B6/B8 + "v2 amendments" F6/F9/F10).
+# (Supervisor slice S1a-2; the supervisor design B1/B6/B8 and its v2 amendments F6/F9/F10).
 #
 # WHAT THIS PINS (bin/aib-supervisor <uid>; interface comment in tests/fixtures/sup_harness.sh)
 #   - Startup: validates the agent against the registry; unknown / oneshot / invalid config => exit 0

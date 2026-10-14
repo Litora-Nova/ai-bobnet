@@ -206,7 +206,7 @@ m_dlq()   { env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- 
 m_inbox() { env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- "$ENGINE4/bin/message" inbox 2>/dev/null; }
 state_is() { [ "$(m_state "$1")" = "$2" ]; }
 # a human-lane line, as `agentctl say` will write it (from:human:<login>)
-m_human() { printf '%s | id:%s | from:human:austin | to:acme-core | state:PERSISTED | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$INBOX"; }
+m_human() { printf '%s | id:%s | from:human:operator | to:acme-core | state:PERSISTED | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$INBOX"; }
 # set the scripted launcher outcomes (one per call, head first) / the fallback after the plan runs out
 plan()    { : > "$W/plan"; local l; for l in "$@"; do printf '%s\n' "$l" >> "$W/plan"; done; }
 default() { printf '%s\n' "$1" > "$W/default"; }
