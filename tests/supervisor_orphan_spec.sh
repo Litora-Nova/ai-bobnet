@@ -78,5 +78,55 @@ eq "T3: a human's one-shot leases (other=3) do not stall the loop" "$(m_state m-
 eq "T3: …no orphan.timeout was needed" "$([ "$(m_state m-1)" = PROCESSED ] && jcount orphan.timeout)" 0
 stop_sup
 
+# --- T4 a FAILED leases query is "unknown", never "orphan gone" --------------------
+# Fail-closed: only an answer that says supervised=0 ends the wait. A client that fails, answers
+# nothing, answers without a supervised= line, or is denied, keeps the state ORPHANED and is retried
+# (bounded by cap_timeout like a live lease). No duplicate turn is started while the answer is unknown.
+for mode in rc empty noline denied; do
+  sup_world "unknown-$mode"
+  seed_unfinished
+  case "$mode" in
+    rc)     printf 'supervised=0\nother=0\nend=ok\n' > "$W/leases.answer"; echo 1 > "$W/leases.rc";;
+    empty)  : > "$W/leases.answer";;
+    noline) printf 'other=0\nend=ok\n' > "$W/leases.answer";;
+    denied) printf 'reason=unknown_agent\nend=denied\n' > "$W/leases.answer";;
+  esac
+  start_sup
+  wait_for 5 lj_is state ORPHANED
+  sleep 0.6
+  eq "T4($mode): state stays ORPHANED while the answer is unknown" "$(lj state)" ORPHANED
+  eq "T4($mode): …no duplicate turn is started" "$(ncalls)" 0
+  eq "T4($mode): …the dead turn is NOT closed as orphan_gone" "$(jcount turn.ended)" 0
+  ge "T4($mode): …and the query is retried (>= 3 frames)" "$(grep -c '^---$' "$W/frames.log")" 3
+  rm -f "$W/leases.rc"; printf 'supervised=0\nother=0\nend=ok\n' > "$W/leases.answer"
+  wait_for 8 state_is m-1 PROCESSED
+  eq "T4($mode): a good answer then adopts and replays once" "$(m_state m-1)|$(ncalls)" "PROCESSED|1"
+  eq "T4($mode): …closed as orphan_gone" "$(jfield turn.ended 1 class)" orphan_gone
+  stop_sup
+done
+
+# the unknown-answer wait is bounded by cap_timeout like a live lease
+sup_world unknown-bounded 1
+seed_unfinished
+echo 1 > "$W/leases.rc"
+start_sup
+wait_for 8 state_is m-1 PROCESSED
+eq "T4: a leases query that never works is given up after cap_timeout (1 s)" "$(m_state m-1)" PROCESSED
+eq "T4: …journalled as orphan.timeout" "$(jcount orphan.timeout)" 1
+stop_sup
+
+# --- T5 a HUNG broker client is bounded by the helper-call timeout -------------------
+sup_world hang
+seed_unfinished
+touch "$W/leases.hang"
+start_sup AIB_SUP_CALL_TIMEOUT_S=0.3
+wait_for 8 frames_ge 3
+# the fake appends its frame BEFORE it hangs, so >= 3 frames means the 1st and 2nd calls were abandoned
+ge "T5: the query is re-issued after the timeout (>= 3 frames with every call hanging)" "$(grep -c '^---$' "$W/frames.log" 2>/dev/null)" 3
+eq "T5: …state stays ORPHANED, no turn" "$(lj state)|$(ncalls)" "ORPHANED|0"
+ge "T5: …ticks keep running" "$(lj seq)" 3
+ge "T5: …hung clients are killed, not piled up (alive <= 1 of $(wc -l < "$W/hang.pids" | tr -d ' '))" "$(( 1 - $(alive_hung) ))" 0
+stop_sup
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

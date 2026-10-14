@@ -22,6 +22,12 @@
 #     AIB_SUP_INFRA_BACKOFF_MIN_S / _MAX_S   infra-class jittered backoff bounds (default 5 / 120)
 #     AIB_SUP_BLOCKED_AFTER_S    infra class this long -> heartbeat `blocked` (default 600)
 #     AIB_SUP_ORPHAN_POLL_S      leases poll while ORPHANED        (default 10)
+#     AIB_SUP_CALL_TIMEOUT_S     timeout for every helper subprocess the loop waits on (broker client,
+#                                bin/message, bin/run-agent); NOT for the launcher turn (default 30)
+#   exit codes: 0 = deliberate stop (SIGTERM); 78 (EX_CONFIG) = "will not run, a restart cannot help"
+#     (unknown / oneshot agent, invalid config, journal that cannot be trusted, another instance
+#     holds the lock). The unit marks 78 with RestartPreventExitStatus=78; 75 stays the
+#     RestartForceExitStatus code of a future `neustart --hard`.
 #   Every interval is handed to `sleep`, so a test may use 0.05. Time is therefore injectable by
 #   scaling the intervals. Positive waits are poll-until-condition with generous deadlines (wait_for);
 #   only NEGATIVE windows ("nothing happened") are fixed sleeps.
@@ -106,6 +112,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 n=$( ( flock 9; c=$(cat "$w/calls.n" 2>/dev/null || echo 0); echo $((c+1)) > "$w/calls.n"; echo $((c+1)) ) 9>"$w/calls.lock" )
+if [ -f "$w/stdinclose" ]; then echo $$ > "$w/stdinclose.pid"; exec 0<&-; exec sleep 30; fi
 prompt=$(cat); printf '%s' "$prompt" > "$w/prompts/$n"
 sid="${session#new:}"
 bound=0; grep -s 'session.bound' "$w/state/acme-core/journal.jsonl" | grep -qF "$sid" && bound=1
@@ -125,6 +132,7 @@ FAKE
 #!/usr/bin/env bash
 w=$(cd -P "$(dirname "$0")/.." && pwd)
 { cat; printf -- '---\n'; } >> "$w/frames.log"
+[ ! -f "$w/leases.hang" ] || { echo $$ >> "$w/hang.pids"; exec sleep 30; }
 if [ -f "$w/leases.rc" ]; then exit "$(cat "$w/leases.rc")"; fi
 cat "$w/leases.answer" 2>/dev/null || printf 'supervised=0\nother=0\nend=ok\n'
 FAKE
@@ -164,7 +172,7 @@ start_sup() {
     NOTIFY_SOCKET="$W/notify.sock" \
     AIB_SUP_TICK_S=0.1 AIB_SUP_POLL_S=0.1 AIB_SUP_BACKOFF_BASE_S=0.1 AIB_SUP_BACKOFF_CAP_S=0.4 \
     AIB_SUP_INFRA_BACKOFF_MIN_S=0.05 AIB_SUP_INFRA_BACKOFF_MAX_S=0.15 AIB_SUP_BLOCKED_AFTER_S=600 \
-    AIB_SUP_ORPHAN_POLL_S=0.1 "$@" \
+    AIB_SUP_ORPHAN_POLL_S=0.1 AIB_SUP_CALL_TIMEOUT_S=10 "$@" \
     "$ENGINE/bin/aib-supervisor" "$uid" >>"$W/sup.out" 2>&1 &
   SUP_PID=$!
 }
@@ -192,7 +200,11 @@ jcount()  { python3 -I "$SJ" count "$JOURNAL" "$1"; }
 jfield()  { python3 -I "$SJ" field "$JOURNAL" "$1" "$2" "$3"; }
 dl()      { awk -v a="$1" -v b="$2" 'BEGIN{ if (a ~ /^-?[0-9.]+$/ && b ~ /^-?[0-9.]+$/) print a-b; else print 0 }'; }
 seq_ge()  { [ "$(lj seq)" -ge "$1" ] 2>/dev/null; }
+frames_ge() { [ "$(grep -c '^---$' "$W/frames.log" 2>/dev/null)" -ge "$1" ]; }
+alive_hung() { local n=0 p; for p in $(cat "$W/hang.pids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && n=$((n+1)); done; echo "$n"; }
 wd_ge()   { [ "$(grep -cx 'WATCHDOG=1' "$W/notify.log")" -ge "$1" ]; }
+# wait_exit <pid> — wait up to 8 s for a refusal/exit; RC = its status, or -1 if it had to be killed
+wait_exit() { WAIT_DEAD_OK=1 wait_for 8 bash -c "! kill -0 $1 2>/dev/null"; if kill -0 "$1" 2>/dev/null; then kill -9 "$1" 2>/dev/null; wait "$1" 2>/dev/null; RC=-1; else RC=0; wait "$1" 2>/dev/null || RC=$?; fi; }
 lj_is()   { [ "$(lj "$1")" = "$2" ]; }
 ready_gt(){ [ "$(grep -cx 'READY=1' "$W/notify.log")" -gt "$1" ]; }
 ncalls()  { wc -l < "$W/calls.log" | tr -d ' '; }
@@ -209,6 +221,9 @@ m_dlq()   { env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- 
 m_inbox() { env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- "$ENGINE4/bin/message" inbox 2>/dev/null; }
 state_is() { [ "$(m_state "$1")" = "$2" ]; }
 # a human-lane line, as `agentctl say` will write it (from:human:<login>)
+m_self_handover() { # m_self_handover <id> — a handover note as the supervisor itself writes it (from = the agent)
+  env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- "$ENGINE4/bin/message" send acme-core "kind:handover reason:test" --id "$1" >/dev/null
+}
 m_human() { printf '%s | id:%s | from:human:operator | to:acme-core | state:PERSISTED | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$INBOX"; }
 # set the scripted launcher outcomes (one per call, head first) / the fallback after the plan runs out
 plan()    { : > "$W/plan"; local l; for l in "$@"; do printf '%s\n' "$l" >> "$W/plan"; done; }

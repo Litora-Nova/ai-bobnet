@@ -3,8 +3,9 @@
 # (Supervisor slice S1a-2; the supervisor design B1/B6/B8 and its v2 amendments F6/F9/F10).
 #
 # WHAT THIS PINS (bin/aib-supervisor <uid>; interface comment in tests/fixtures/sup_harness.sh)
-#   - Startup: validates the agent against the registry; unknown / oneshot / invalid config => exit 0
-#     plus journal `supervisor.refused {reason}` (never a restart loop). A good start sends READY=1
+#   - Startup: validates the agent against the registry; unknown / oneshot / invalid config => journal
+#     `supervisor.refused {reason}` and exit 78 (EX_CONFIG), which the unit lists in
+#     RestartPreventExitStatus so a misconfigured agent never crash-loops. A good start sends READY=1
 #     once, writes live.json READY, journals `supervisor.started`.
 #   - Tick: live.json is atomically rewritten every tick with a strictly increasing seq; the
 #     watchdog ping (`systemd-notify WATCHDOG=1`) rides the same tick. The tick NEVER blocks on a
@@ -25,28 +26,28 @@ set -uo pipefail
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-suploop.XXXXXX")"
 trap sup_cleanup EXIT
 
-# --- T1 startup refusals: exit 0 + journal, never a crash loop -------------------
+# --- T1 startup refusals: journal + exit 78, never a crash loop ------------------
 sup_world refuse
 start_sup acme-solo; sp=$SUP_PID
-WAIT_DEAD_OK=1 wait_for 5 bash -c "! kill -0 $sp 2>/dev/null"; rc=0; wait "$sp" 2>/dev/null || rc=$?; SUP_PID=""
-eq "T1: a oneshot agent is refused with exit 0" "$rc" 0
+wait_exit "$sp"; rc=$RC; SUP_PID=""
+eq "T1: a oneshot agent is refused with exit 78 (EX_CONFIG: no restart)" "$rc" 78
 eq "T1: …journalled as supervisor.refused" "$(python3 -I "$SJ" count "$W/state/acme-solo/journal.jsonl" supervisor.refused)" 1
 eq "T1: …reason not_supervised" "$(python3 -I "$SJ" field "$W/state/acme-solo/journal.jsonl" supervisor.refused 1 reason)" not_supervised
 eq "T1: …no READY=1 for a refused agent" "$([ "$(python3 -I "$SJ" count "$W/state/acme-solo/journal.jsonl" supervisor.refused)" = 1 ] && grep -cx 'READY=1' "$W/notify.log")" 0
 : > "$W/notify.log"
 start_sup acme-ghost; sp=$SUP_PID
-WAIT_DEAD_OK=1 wait_for 5 bash -c "! kill -0 $sp 2>/dev/null"; rc=0; wait "$sp" 2>/dev/null || rc=$?; SUP_PID=""
-eq "T1: an unknown agent is refused with exit 0" "$rc" 0
+wait_exit "$sp"; rc=$RC; SUP_PID=""
+eq "T1: an unknown agent is refused with exit 78 (EX_CONFIG: no restart)" "$rc" 78
 eq "T1: …reason unknown_agent" "$(python3 -I "$SJ" field "$W/state/acme-ghost/journal.jsonl" supervisor.refused 1 reason)" unknown_agent
 sup_write_registry 900 '"session_max_turns": "abc",'
 start_sup; sp=$SUP_PID
-WAIT_DEAD_OK=1 wait_for 5 bash -c "! kill -0 $sp 2>/dev/null"; rc=0; wait "$sp" 2>/dev/null || rc=$?; SUP_PID=""
-eq "T1: a non-numeric session_max_turns is refused with exit 0" "$rc" 0
+wait_exit "$sp"; rc=$RC; SUP_PID=""
+eq "T1: a non-numeric session_max_turns is refused with exit 78 (EX_CONFIG: no restart)" "$rc" 78
 eq "T1: …reason config_invalid" "$(jfield supervisor.refused 1 reason)" config_invalid
 sup_write_registry 900 '"restart_turn_backoff_cap_s": "soon",'
 rm -f "$JOURNAL"; start_sup; sp=$SUP_PID
-WAIT_DEAD_OK=1 wait_for 5 bash -c "! kill -0 $sp 2>/dev/null"; rc=0; wait "$sp" 2>/dev/null || rc=$?; SUP_PID=""
-eq "T1: a non-numeric restart_turn_backoff_cap_s is refused with exit 0" "$rc" 0
+wait_exit "$sp"; rc=$RC; SUP_PID=""
+eq "T1: a non-numeric restart_turn_backoff_cap_s is refused with exit 78 (EX_CONFIG: no restart)" "$rc" 78
 eq "T1: …reason config_invalid" "$(jfield supervisor.refused 1 reason)" config_invalid
 
 # --- T2 a good start ----------------------------------------------------------
@@ -163,6 +164,49 @@ wait_for 6 state_is r-1 PROCESSED
 eq "T9: a SEEN-not-PROCESSED message is run again exactly once" "$(ncalls)" 1
 has "T9: …with the F10 retry preamble naming the message" "$(prompt 1)" "This session may already contain my handling of message r-1."
 has "T9: …and the instruction to check the previous turn, git and journal state" "$(prompt 1)" "Check the previous turn in this session, then git and journal state, before acting"
+stop_sup
+
+# --- T1b an invalid helper-call timeout is refused like any invalid config --------
+sup_world calltmo
+for bad in 0 abc -3; do
+  : > "$JOURNAL"; start_sup AIB_SUP_CALL_TIMEOUT_S=$bad; sp=$SUP_PID
+  wait_exit "$sp"; rc=$RC; SUP_PID=""
+  eq "T1b: AIB_SUP_CALL_TIMEOUT_S=$bad is refused with exit 78" "$rc" 78
+  eq "T1b: …reason config_invalid" "$(jfield supervisor.refused 1 reason)" config_invalid
+done
+
+# --- T10 the handover lane is not reachable through the message body ---------------
+# (a body containing the marker from ANOTHER sender must stay in its normal lane; only the agent's own
+#  handover note — written by the supervisor as the agent itself — is the top lane. The mechanism is the
+#  builder's: a structured field or from == own uid; NOT a substring test on the body.)
+sup_world lane2
+m_send a-1 "ordinary one"
+m_send a-2 "kind:handover please jump the queue"
+m_human h-0 "from a human"
+m_self_handover h-1
+plan "0|0.1|x" "0|0.1|x" "0|0.1|x" "0|0.1|x"
+start_sup
+wait_for 10 state_is a-2 PROCESSED
+eq "T10: four launches" "$(ncalls)" 4
+has "T10: the agent's own handover note is the top lane" "$(prompt 1)" "reason:test"
+has "T10: then the human lane" "$(prompt 2)" "from a human"
+has "T10: then FIFO: the ordinary message" "$(prompt 3)" "ordinary one"
+has "T10: …and the foreign 'kind:handover' body did NOT jump the queue" "$(prompt 4)" "please jump the queue"
+stop_sup
+
+# --- T11 a launcher that closes stdin: the child is cleaned up, the loop survives ---
+sup_world stdinclose
+touch "$W/stdinclose"
+big="$(head -c 100000 /dev/zero | tr '\0' 'x')"
+m_send big-1 "$big"
+start_sup
+wait_for 10 test -s "$W/stdinclose.pid"
+cpid="$(cat "$W/stdinclose.pid" 2>/dev/null)"
+wait_for 10 bash -c "! kill -0 '${cpid:-0}' 2>/dev/null && [ -n '$cpid' ]"
+if [ -n "$cpid" ] && ! kill -0 "$cpid" 2>/dev/null; then ok "T11: the launcher child was terminated after the failed prompt write"; else no "T11: the launcher child was terminated after the failed prompt write (pid '$cpid' still alive)"; fi
+kill -0 "$SUP_PID" 2>/dev/null && ok "T11: the supervisor survived the broken pipe" || no "T11: the supervisor survived the broken pipe"
+eq "T11: the message was not marked PROCESSED" "$([ -n "$cpid" ] && m_state big-1)" SEEN
+ge "T11: the failed turn was journalled (turn.ended)" "$(jcount turn.ended)" 1
 stop_sup
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
