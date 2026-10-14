@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import fcntl
+import grp
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -36,10 +38,15 @@ def identity_for(numeric_uid: int) -> str:
             pass
     else:
         try:
-            import pwd
-
-            login = pwd.getpwuid(numeric_uid).pw_name
-            return f"human:{login}"
+            account = pwd.getpwuid(numeric_uid)
+            groups = {grp.getgrgid(account.pw_gid).gr_name}
+            groups.update(entry.gr_name for entry in grp.getgrall() if account.pw_name in entry.gr_mem)
+            if account.pw_name in ("aib-gw", "aib-gateway") or "aib-gateway" in groups:
+                return f"gateway:{account.pw_name}"
+            if account.pw_name.startswith("aib-"):
+                return f"role:{account.pw_name}"
+            if groups.intersection(("aib-shared", "aib-ops")):
+                return f"human:{account.pw_name}"
         except (KeyError, OSError):
             pass
     return f"unknown:{numeric_uid}"
