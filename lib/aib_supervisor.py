@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-import json
 import errno
 import fcntl
+import json
 import os
 import random
 import re
@@ -68,15 +68,17 @@ class Supervisor:
             self.journal("journal.repaired", dropped_bytes=dropped_bytes)
         self.tick_seq = self._old_tick_seq()
 
-        self.tick_s = interval("AIB_SUP_TICK_S", 30.0)
-        self.poll_s = interval("AIB_SUP_POLL_S", 2.0)
-        self.backoff_base = interval("AIB_SUP_BACKOFF_BASE_S", 10.0)
-        self.infra_min = interval("AIB_SUP_INFRA_BACKOFF_MIN_S", 5.0)
-        self.infra_max = interval("AIB_SUP_INFRA_BACKOFF_MAX_S", 120.0)
-        self.blocked_after = interval("AIB_SUP_BLOCKED_AFTER_S", 600.0)
-        self.orphan_poll = interval("AIB_SUP_ORPHAN_POLL_S", 10.0)
+        self.config_invalid = False
+        self.tick_s = self._configured_interval("AIB_SUP_TICK_S", 30.0)
+        self.poll_s = self._configured_interval("AIB_SUP_POLL_S", 2.0)
+        self.backoff_base = self._configured_interval("AIB_SUP_BACKOFF_BASE_S", 10.0)
+        self.infra_min = self._configured_interval("AIB_SUP_INFRA_BACKOFF_MIN_S", 5.0)
+        self.infra_max = self._configured_interval("AIB_SUP_INFRA_BACKOFF_MAX_S", 120.0)
+        self.blocked_after = self._configured_interval("AIB_SUP_BLOCKED_AFTER_S", 600.0)
+        self.orphan_poll = self._configured_interval("AIB_SUP_ORPHAN_POLL_S", 10.0)
+        self.call_timeout = self._configured_interval("AIB_SUP_CALL_TIMEOUT_S", 30.0)
         if self.infra_max < self.infra_min:
-            raise ValueError("infra backoff maximum is below minimum")
+            self.config_invalid = True
 
         self.launcher = shlex.split(os.environ.get("AIB_LAUNCH_AGENT", str(root / "bin/launch-agent")))
         self.broker_client = shlex.split(os.environ.get("AIB_BROKER_CLIENT", str(root / "bin/aib-broker-client")))
@@ -115,6 +117,13 @@ class Supervisor:
         self.reexec_requested = False
         self.next_tick = time.monotonic()
         self.next_poll = time.monotonic()
+
+    def _configured_interval(self, name: str, default: float) -> float:
+        try:
+            return interval(name, default)
+        except (TypeError, ValueError):
+            self.config_invalid = True
+            return default
 
     def _acquire_lock(self) -> int:
         inherited = os.environ.get("AIB_SUP_LOCK_FD") if os.environ.get("AIB_SUP_REEXEC") == "1" else None
@@ -235,9 +244,11 @@ class Supervisor:
 
     def refuse(self, reason: str) -> int:
         self.journal("supervisor.refused", reason=reason)
-        return 0
+        return 78
 
     def configure(self) -> str | None:
+        if self.config_invalid:
+            return "config_invalid"
         try:
             registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -314,14 +325,18 @@ class Supervisor:
 
     def message_command(self, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
         command = [str(self.run_agent), self.uid, "--", str(self.message), *args]
-        return subprocess.run(
-            command,
-            text=True,
-            check=False,
-            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=os.environ.copy(),
-        )
+        try:
+            return subprocess.run(
+                command,
+                text=True,
+                check=False,
+                stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=os.environ.copy(),
+                timeout=self.call_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return subprocess.CompletedProcess(command, 124, stdout="" if capture else None, stderr=None)
 
     def open_messages(self) -> list[dict[str, str]]:
         result = self.message_command("inbox", capture=True)
@@ -343,8 +358,9 @@ class Supervisor:
         messages = self.open_messages()
         if not messages:
             return None
+
         def lane(message: dict[str, str]) -> tuple[int, int]:
-            if "kind:handover" in message["body"]:
+            if message["from"] == self.uid:
                 priority = 0
             elif message["from"].startswith("human:"):
                 priority = 1
@@ -397,27 +413,48 @@ class Supervisor:
             self.add_handover_note("cwd_changed", previous)
             self.bind_session(rebound_from=previous, rebound=True)
 
-    def broker_leases(self) -> int:
+    def broker_leases(self) -> int | None:
         frame = f"op=leases\nagent_uid={self.uid}\nprompt_bytes=0\n\n"
         try:
-            result = subprocess.run(self.broker_client, input=frame, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
-        except OSError:
-            return 0
+            result = subprocess.run(
+                self.broker_client,
+                input=frame,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=self.call_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        fields: dict[str, str] = {}
         for line in result.stdout.splitlines():
-            if line.startswith("supervised="):
-                try:
-                    return int(line.split("=", 1)[1])
-                except ValueError:
-                    return 0
-        return 0
+            key, separator, value = line.partition("=")
+            if not separator or not key or key in fields:
+                return None
+            fields[key] = value
+        if set(fields) != {"supervised", "other", "end"} or fields["end"] != "ok":
+            return None
+        try:
+            supervised = int(fields["supervised"])
+            other = int(fields["other"])
+        except ValueError:
+            return None
+        if supervised < 0 or other < 0:
+            return None
+        return supervised
 
     def handle_orphan(self, unfinished: dict[str, Any]) -> bool:
         started = time.monotonic()
+        self.set_state("ORPHANED", "orphan")
+        self.current_turn = None
+        self.write_live()
         while not self.stop_requested:
-            if self.broker_leases() < 1:
+            lease_count = self.broker_leases()
+            if lease_count == 0:
                 break
-            self.set_state("ORPHANED", "orphan")
-            self.current_turn = None
             now = time.monotonic()
             if now >= self.next_tick:
                 self.tick()
@@ -460,7 +497,14 @@ class Supervisor:
             assert self.process.stdin is not None
             self.process.stdin.write(prompt.encode())
             self.process.stdin.close()
-        except OSError as error:
+        except (OSError, ValueError) as error:
+            if self.process is not None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=min(self.call_timeout, 1.0))
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
             self.output_file.write(str(error).encode())
             self.output_file.close()
             self.process = None
