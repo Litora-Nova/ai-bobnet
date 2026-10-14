@@ -258,7 +258,7 @@ _aib_check_registry_with() {
     6) aib_die 2 "registry is not valid JSON (unterminated string, invalid escape, bad structure, or trailing data) — refusing to resolve identity from it: $reg";;
     7) aib_die 2 "registry has a duplicate key in one object — refusing to guess which one wins: $reg";;
     10) aib_die 2 "registry uses a \\u escape in an OBJECT KEY, which this parser cannot decode. The file is valid JSON — write keys as raw UTF-8 (a key is identity-relevant, so it is never guessed): $reg";;
-    11) aib_die 2 "registry schema_version must be the JSON number 2, 3, or 4 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
+    11) aib_die 2 "registry schema_version must be the JSON number 2, 3, 4, or 5 at the top level — refusing an absent, mistyped, or unsupported schema: $reg";;
     12) aib_die 2 "registry contains a JSON string escape that decodes to an ASCII control character — refusing unsafe line/path data: $reg";;
     *) aib_die 2 "registry failed validation (code $rc): $reg";;
   esac
@@ -400,7 +400,7 @@ END {
   if (ty[1]!="P" || tok[1]!="{") exit 6        # the registry must be an object
 
   # schema_version is the compatibility gate, not decorative metadata. Only the
-  # exact JSON numbers 2, 3, and 4 at depth 1 select grammars implemented by this
+  # exact JSON numbers 2, 3, 4, and 5 at depth 1 select grammars implemented by this
   # reader; a nested lookalike, a string value, or an unknown version must fail
   # closed. Schema 4 adds the provider adapter map + declared capabilities on top of
   # the schema-3 execution binding — an old reader that knows only 2/3 still rejects it.
@@ -410,7 +410,7 @@ END {
     if (ty[j]=="P" && (tok[j]=="}" || tok[j]=="]")) { sdepth--; continue }
     if (sdepth==1 && ty[j]=="S" && tok[j]=="schema_version" && ty[j+1]=="P" && tok[j+1]==":") {
       schema_seen=1
-      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3" && tok[j+2]!="4")) exit 11
+      if (ty[j+2]!="V" || (tok[j+2]!="2" && tok[j+2]!="3" && tok[j+2]!="4" && tok[j+2]!="5")) exit 11
       schema_value=tok[j+2]
     }
   }
@@ -756,8 +756,8 @@ aib_resolve_agent_snapshot() {
   # here — a schema-3 registry simply resolves an empty adapter and the gate denies it.
   if [ "$mode" = managed ]; then
     case "$schema" in
-      3|4) ;;
-      *) aib_die 3 "managed execution binding requires registry schema_version 3 or 4 (found $schema)";;
+      3|4|5) ;;
+      *) aib_die 3 "managed execution binding requires registry schema_version 3, 4, or 5 (found $schema)";;
     esac
   fi
 
@@ -788,7 +788,7 @@ aib_resolve_agent_snapshot() {
 
   # Schema 2 remains a legacy identity/context format. It never invents binding.
   case "$schema" in
-    3|4) ;;
+    3|4|5) ;;
     *) return 0;;
   esac
 
@@ -836,7 +836,7 @@ aib_resolve_agent_snapshot() {
   # top-level `providers` map (keyed by provider name). These are DECLARED registry
   # data, never runtime-probed. They form the trusted half of the snapshot the PDP
   # consumes; the PDP — not this resolver — decides whether they authorise a launch.
-  [ "$schema" = 4 ] || return 0
+  case "$schema" in 4|5) ;; *) return 0;; esac
   _aib_resolve_provider_caps "$provider"
 }
 
