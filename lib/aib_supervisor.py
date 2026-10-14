@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import errno
+import fcntl
 import os
 import random
 import re
@@ -16,6 +18,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+class JournalCorruptError(ValueError):
+    """The durable journal cannot be trusted without operator repair."""
+
+
+class SupervisorLockError(OSError):
+    """Another supervisor already owns this agent's state directory."""
 
 
 def utc_now() -> str:
@@ -48,10 +58,14 @@ class Supervisor:
         state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
         self.state_dir = Path(os.environ.get("STATE_DIRECTORY", state_root / uid))
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock_path = self.state_dir / "supervisor.lock"
+        self.lock_fd = self._acquire_lock()
         self.journal_path = self.state_dir / "journal.jsonl"
         self.live_path = self.state_dir / "live.json"
-        self.records = self._load_records()
+        self.records, dropped_bytes = self._load_records()
         self.journal_seq = max((r.get("seq", 0) for r in self.records), default=0)
+        if dropped_bytes:
+            self.journal("journal.repaired", dropped_bytes=dropped_bytes)
         self.tick_seq = self._old_tick_seq()
 
         self.tick_s = interval("AIB_SUP_TICK_S", 30.0)
@@ -102,21 +116,59 @@ class Supervisor:
         self.next_tick = time.monotonic()
         self.next_poll = time.monotonic()
 
-    def _load_records(self) -> list[dict[str, Any]]:
+    def _acquire_lock(self) -> int:
+        inherited = os.environ.get("AIB_SUP_LOCK_FD") if os.environ.get("AIB_SUP_REEXEC") == "1" else None
+        if inherited is not None:
+            try:
+                lock_fd = int(inherited)
+                if lock_fd < 0 or not os.path.samestat(os.fstat(lock_fd), os.stat(self.lock_path)):
+                    raise ValueError
+            except (OSError, ValueError) as error:
+                raise SupervisorLockError("invalid inherited supervisor lock") from error
+        else:
+            lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if inherited is None:
+                os.close(lock_fd)
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                raise SupervisorLockError("supervisor lock is already held") from error
+            raise
+        os.set_inheritable(lock_fd, True)
+        return lock_fd
+
+    def _load_records(self) -> tuple[list[dict[str, Any]], int]:
         records: list[dict[str, Any]] = []
         try:
-            for line in self.journal_path.read_text(encoding="utf-8").splitlines():
+            data = self.journal_path.read_bytes()
+        except FileNotFoundError:
+            return records, 0
+
+        dropped_bytes = 0
+        complete = data
+        if data and not data.endswith(b"\n"):
+            boundary = data.rfind(b"\n") + 1
+            complete = data[:boundary]
+            dropped_bytes = len(data) - boundary
+        try:
+            for line in complete.decode("utf-8").splitlines():
                 if line.strip():
                     record = json.loads(line)
                     if not isinstance(record, dict):
                         raise ValueError("supervisor journal record is not an object")
                     records.append(record)
-        except FileNotFoundError:
-            pass
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise JournalCorruptError("supervisor journal contains a corrupt record") from error
         expected = list(range(1, len(records) + 1))
         if [record.get("seq") for record in records] != expected:
-            raise ValueError("supervisor journal sequence is corrupt")
-        return records
+            raise JournalCorruptError("supervisor journal sequence is corrupt")
+        if dropped_bytes:
+            with self.journal_path.open("r+b") as stream:
+                stream.truncate(len(complete))
+                stream.flush()
+                os.fsync(stream.fileno())
+        return records, dropped_bytes
 
     def _old_tick_seq(self) -> int:
         try:
@@ -549,6 +601,7 @@ class Supervisor:
     def reexec(self) -> None:
         environment = os.environ.copy()
         environment["AIB_SUP_REEXEC"] = "1"
+        environment["AIB_SUP_LOCK_FD"] = str(self.lock_fd)
         os.execve(sys.executable, [sys.executable, "-I", str(Path(__file__)), str(self.root), self.uid], environment)
 
     def run(self) -> int:
@@ -617,6 +670,9 @@ def main() -> int:
         return 64
     try:
         return Supervisor(root, uid).run()
+    except (JournalCorruptError, SupervisorLockError) as error:
+        print(f"aib-supervisor: {error}", file=sys.stderr)
+        return 78
     except (ValueError, OSError) as error:
         print(f"aib-supervisor: {error}", file=sys.stderr)
         return 2
