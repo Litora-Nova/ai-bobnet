@@ -3,15 +3,35 @@
 set -u
 
 refuse() { printf 'codex adapter: %s\n' "$2" >&2; exit "$1"; }
-[[ $# -eq 11 && $1 == exec && $2 == -m && -n $3 && $4 == -s &&
-   $6 == -c && $8 == -c && $9 == 'approval_policy="never"' && ${10} == -- ]] ||
-  refuse 65 'invalid adapter argv'
-model=$3 sandbox=$5 prompt=${11}
+mode=${1-}
+session_kind=
+case "$mode" in
+  exec)
+    [[ $# -eq 11 && $2 == -m && -n $3 && $4 == -s &&
+       $6 == -c && $8 == -c && $9 == 'approval_policy="never"' && ${10} == -- ]] ||
+      refuse 65 'invalid adapter argv'
+    model=$3 sandbox=$5 effort_setting=$7 prompt=${11}
+    ;;
+  session-turn)
+    [[ $# -eq 12 && $3 == -m && -n $4 && $5 == -s &&
+       $7 == -c && $9 == -c && ${10} == 'approval_policy="never"' && ${11} == -- ]] ||
+      refuse 65 'invalid adapter argv'
+    session_id=$2
+    session_kind=resume
+    case "$session_id" in
+      new:*) session_kind=new; session_id=${session_id#new:} ;;
+    esac
+    [[ $session_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+      refuse 65 'invalid session id'
+    model=$4 sandbox=$6 effort_setting=$8 prompt=${12}
+    ;;
+  *) refuse 65 'invalid adapter argv' ;;
+esac
 case "$sandbox" in
   read-only|workspace-write) ;;
   *) refuse 65 'unsupported sandbox' ;;
 esac
-case "$7" in
+case "$effort_setting" in
   'model_reasoning_effort="low"') effort=low ;;
   'model_reasoning_effort="medium"') effort=medium ;;
   'model_reasoning_effort="high"') effort=high ;;
@@ -32,7 +52,22 @@ auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
   refuse 78 'credential unavailable or unsafe'
 
 export SHELL=/bin/bash TERM=dumb
-exec "${AIB_CODEX_BIN:-/opt/aib/codex/current/codex}" exec \
-  -m "$model" -s "$sandbox" -c "model_reasoning_effort=\"$effort\"" \
-  -c 'approval_policy="never"' --skip-git-repo-check --ephemeral \
-  --dangerously-bypass-approvals-and-sandbox -- - < <(printf '%s' "$prompt")
+case "$mode:$session_kind" in
+  exec:*)
+    codex_args=(exec -m "$model" -s "$sandbox" -c "model_reasoning_effort=\"$effort\""
+      -c 'approval_policy="never"' --skip-git-repo-check --ephemeral
+      --dangerously-bypass-approvals-and-sandbox -- -)
+    ;;
+  session-turn:new)
+    codex_args=(exec --json -m "$model" -s "$sandbox" -c "model_reasoning_effort=\"$effort\""
+      -c 'approval_policy="never"' --skip-git-repo-check
+      --dangerously-bypass-approvals-and-sandbox -- -)
+    ;;
+  session-turn:resume)
+    codex_args=(exec resume "$session_id" --json -m "$model" -c "model_reasoning_effort=\"$effort\""
+      -c 'approval_policy="never"' --skip-git-repo-check
+      --dangerously-bypass-approvals-and-sandbox -- -)
+    ;;
+esac
+exec "${AIB_CODEX_BIN:-/opt/aib/codex/current/codex}" "${codex_args[@]}" \
+  < <(printf '%s' "$prompt")
