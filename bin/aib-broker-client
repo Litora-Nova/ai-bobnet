@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Copy one request/response frame over the activated broker Unix socket."""
+
+import os
+import socket
+import sys
+
+
+def main() -> int:
+    path = os.environ.get("AIB_BROKER_SOCKET", "/run/aib/broker.sock")
+    request = sys.stdin.buffer.read()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(path)
+            client.sendall(request)
+            client.shutdown(socket.SHUT_WR)
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+    except OSError as error:
+        print(f"aib-broker-client: {error}", file=sys.stderr)
+        return 69
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

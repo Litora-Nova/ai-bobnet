@@ -11,7 +11,7 @@
 #
 # Usage: launch-agent --as <agent_uid> [runtime options]
 #                     (--prompt <text> | --prompt-file <file> | -)
-# Runtime options: --sandbox, --cwd, --timeout, --label.
+# Runtime options: --sandbox, --cwd, --timeout, --label, --supervised, --session.
 # Model and effort are registry-managed; provider is never a CLI/env input.
 set -euo pipefail
 
@@ -27,13 +27,15 @@ REPO_ROOT=$(cd -P "$_dir/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
 . "$REPO_ROOT/lib/aibobnet.sh"
 
-_usage='usage: launch-agent --as <agent_uid> [--sandbox <s>] [--cwd <dir>] [--timeout <secs>] [--label <text>] (--prompt <text>|--prompt-file <file>|-)'
+_usage='usage: launch-agent --as <agent_uid> [--sandbox <s>] [--cwd <dir>] [--timeout <secs>] [--label <text>] [--supervised --session <new:UUID|UUID>] (--prompt <text>|--prompt-file <file>|-)'
 
 as=""
 sandbox="read-only"
 cwd="$PWD"
 timeout_s="1200"
 label=""
+supervised=0
+session=""
 prompt=""
 prompt_file=""
 prompt_source=""
@@ -42,6 +44,8 @@ seen_sandbox=0
 seen_cwd=0
 seen_timeout=0
 seen_label=0
+seen_supervised=0
+seen_session=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -69,6 +73,15 @@ while [ "$#" -gt 0 ]; do
       [ "$seen_label" -eq 0 ] || aib_die 64 "repeated --label ($_usage)"
       [ "$#" -ge 2 ] || aib_die 64 "--label needs text ($_usage)"
       label="$2"; seen_label=1; shift 2
+      ;;
+    --supervised)
+      [ "$seen_supervised" -eq 0 ] || aib_die 64 "repeated --supervised ($_usage)"
+      supervised=1; seen_supervised=1; shift
+      ;;
+    --session)
+      [ "$seen_session" -eq 0 ] || aib_die 64 "repeated --session ($_usage)"
+      [ "$#" -ge 2 ] || aib_die 64 "--session needs a value ($_usage)"
+      session="$2"; seen_session=1; shift 2
       ;;
     --prompt)
       [ -z "$prompt_source" ] || aib_die 64 "give exactly one prompt source (--prompt / --prompt-file / -)"
@@ -103,6 +116,13 @@ done
 # --- validate runtime input before any provider can start --------------------
 [ "$seen_as" -eq 1 ] && [ -n "$as" ] || aib_die 64 "missing --as ($_usage)"
 aib_validate_agent_uid "$as"
+if [ "$supervised" -eq 1 ]; then
+  [ "$seen_session" -eq 1 ] || aib_die 64 "--supervised requires --session ($_usage)"
+  [[ "$session" =~ ^(new:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+    aib_die 64 "invalid --session '$session' (expected new:UUID or UUID, lower-case)"
+elif [ "$seen_session" -eq 1 ]; then
+  aib_die 64 "--session requires --supervised ($_usage)"
+fi
 # Input hygiene at THIS entry point (fail-closed): danger-full-access is refused here
 # before the PDP ever sees it. The PDP has a danger->clamp branch instead, which allows
 # the request with the sandbox clamped to the capability.
@@ -135,6 +155,34 @@ _sha256_bin="$(command -v sha256sum)" || aib_die 6 "required runtime dependency 
 _env_bin="$(command -v env)" || aib_die 6 "required runtime dependency not found: env (coreutils)"
 _sleep_bin="$(command -v sleep)" || aib_die 6 "required runtime dependency not found: sleep (coreutils)"
 _mktemp_bin="$(command -v mktemp)" || aib_die 6 "required runtime dependency not found: mktemp (coreutils)"
+
+# Supervised turns use the broker-owned policy/confinement boundary. The ordinary
+# one-shot path below remains byte-for-byte on its existing direct PEP path.
+if [ "$supervised" -eq 1 ]; then
+  _broker_client_text="${AIB_BROKER_CLIENT:-$REPO_ROOT/bin/aib-broker-client}"
+  read -r -a _broker_client <<< "$_broker_client_text"
+  [ "${#_broker_client[@]}" -gt 0 ] || aib_die 69 "AIB_BROKER_CLIENT is empty"
+  _broker_response="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-broker-response.XXXXXX")" ||
+    aib_die 69 "cannot create broker response buffer"
+  LC_ALL=C
+  _cwd_len=${#cwd}; _label_len=${#label}; _prompt_len=${#prompt}
+  set +e
+  {
+    printf 'op=launch\nagent_uid=%s\nlease_class=supervised\nsession=%s\nsandbox=%s\ntimeout=%s\n' \
+      "$as" "$session" "$sandbox" "$timeout_s"
+    printf 'cwd_bytes=%s\nlabel_bytes=%s\nprompt_bytes=%s\n\n' "$_cwd_len" "$_label_len" "$_prompt_len"
+    printf '%s%s%s' "$cwd" "$label" "$prompt"
+  } | "${_broker_client[@]}" >"$_broker_response"
+  _broker_client_rc=$?
+  set -e
+  set +e
+  python3 -I "$REPO_ROOT/lib/aib_broker_response.py" "$_broker_response"
+  _broker_result_rc=$?
+  set -e
+  unlink "$_broker_response" 2>/dev/null || true
+  [ "$_broker_client_rc" -eq 0 ] || exit 69
+  exit "$_broker_result_rc"
+fi
 
 # --- exactly one managed resolution; everything below consumes this bundle ---
 aib_resolve_managed_agent "$as"
