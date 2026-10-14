@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Translate the frozen adapter ABI; the broker owns confinement and timeouts.
 set -u
+export LC_ALL=C
 
 refuse() { printf 'claude-code adapter: %s\n' "$2" >&2; exit "$1"; }
 mode=${1-}
