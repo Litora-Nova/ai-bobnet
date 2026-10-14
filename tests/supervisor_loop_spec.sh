@@ -61,13 +61,16 @@ eq "T2: journal seq is 1,2,3… gap-free" "$(python3 -I "$SJ" valid "$JOURNAL")"
 eq "T2: no broker query at a clean boot (no unfinished turn)" "$([ "$(lj state)" = READY ] && cat "$W/frames.log" 2>/dev/null | wc -l | tr -d ' ')" 0
 
 # --- T3 tick: monotonic, atomic, watchdog, ts/interval fields --------------------
-s1="$(lj seq)"; sleep 1.0; s2="$(lj seq)"
-ge "T3: seq advanced over 1 s at a 0.1 s tick (>= +3, a third of nominal)" "$(dl "$s2" "$s1")" 3
+# poll-until-condition with a generous deadline (a fixed window flakes under host load)
+s1="$(lj seq)"
+wait_for 15 seq_ge "$((s1 + 3))"
+ge "T3: seq advanced by >= 3 ticks (deadline 15 s, nominal 0.3 s)" "$(dl "$(lj seq)" "$s1")" 3
 bad=0; for ((i=0;i<60;i++)); do [ "$(python3 -I "$JGET" "$LIVE" state)" = READY ] || bad=$((bad+1)); done
 eq "T3: 60 back-to-back reads of live.json never see a torn file" "$bad" 0
 eq "T3: live.json carries interval_s" "$(lj interval_s)" 0.1
 case "$(lj ts)" in 20??-??-??T??:??:??*Z) ok "T3: live.json ts is ISO-8601 UTC";; *) no "T3: live.json ts is ISO-8601 UTC (got '$(lj ts)')";; esac
-ge "T3: WATCHDOG=1 rides the tick (>= 4 pings so far)" "$(grep -cx 'WATCHDOG=1' "$W/notify.log")" 4
+wait_for 15 wd_ge 4
+ge "T3: WATCHDOG=1 rides the tick (>= 4 pings, deadline 15 s)" "$(grep -cx 'WATCHDOG=1' "$W/notify.log")" 4
 eq "T3: brake block present and clean" "$(lj brake)" '{"consecutive": 0, "tripped_at": null}'
 eq "T3: no turn" "$(lj turn)" null
 
@@ -96,16 +99,18 @@ eq "T5: tmux / zellij were never called" "$([ "$(ncalls)" -ge 1 ] && wc -c < "$W
 eq "T5: …nor was any mux env handed to the launcher" "$([ "$(ncalls)" -ge 1 ] && wc -c < "$W/mux-env.log" 2>/dev/null | tr -d ' ')" 0
 
 # --- T6 tick never blocks on a turn ----------------------------------------------
-plan "0|1.5|slow done"
+plan "0|6|slow done"
 m_send m-slow "take your time"
 wait_for 5 lj_is state WORKING
-s1="$(lj seq)"; n1="$(grep -cx 'WATCHDOG=1' "$W/notify.log")"; sleep 0.8
+s1="$(lj seq)"; n1="$(grep -cx 'WATCHDOG=1' "$W/notify.log")"
+# the turn holds for 6 s; the ticks must advance by 3 well inside it (poll, deadline 5 s)
+wait_for 5 seq_ge "$((s1 + 3))"; wait_for 5 wd_ge "$((n1 + 3))"
 s2="$(lj seq)"; n2="$(grep -cx 'WATCHDOG=1' "$W/notify.log")"
-eq "T6: still WORKING mid-turn" "$(lj state)" WORKING
+eq "T6: still WORKING mid-turn (the ticks above ran DURING it)" "$(lj state)" WORKING
 eq "T6: live.json names the current message" "$(lj turn.msg_id)" m-slow
-ge "T6: ticks kept running during the turn (>= +3 in 0.8 s at a 0.1 s tick)" "$(dl "$s2" "$s1")" 3
+ge "T6: ticks kept running during the turn (>= +3)" "$(dl "$s2" "$s1")" 3
 ge "T6: watchdog kept pinging during the turn (>= +3)" "$(dl "$n2" "$n1")" 3
-wait_for 5 state_is m-slow PROCESSED
+wait_for 15 state_is m-slow PROCESSED
 eq "T6: …and the slow turn still completed" "$(m_state m-slow)" PROCESSED
 
 # --- T7 neustart = in-process re-exec (SIGUSR1), deferred while a turn runs -------

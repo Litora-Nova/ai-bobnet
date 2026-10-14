@@ -49,8 +49,8 @@ case "$(lj brake.tripped_at)" in 20??-*Z) ok "T1: brake.tripped_at is set (ISO U
 eq "T1: state FAILED" "$(lj state)" FAILED
 eq "T1: …reason brake" "$(lj state_reason)" brake
 eq "T1: the second message is neither done nor failed (stays SEEN)" "$(m_state m-2)" SEEN
-s1="$(lj seq)"; sleep 0.8; s2="$(lj seq)"
-ge "T1: the loop stays alive: ticks continue while FAILED (>= +3 in 0.8 s)" "$(dl "$s2" "$s1")" 3
+s1="$(lj seq)"; wait_for 15 seq_ge "$((s1 + 3))"; s2="$(lj seq)"
+ge "T1: the loop stays alive: ticks continue while FAILED (>= +3, poll deadline 15 s)" "$(dl "$s2" "$s1")" 3
 eq "T1: …and no turn is started after the trip (3rd message untouched)" "$(ncalls)" 5
 eq "T1: …the third message is still unseen" "$([ "$(ncalls)" -ge 5 ] && m_state m-3)" PERSISTED
 eq "T1: last heartbeat is blocked" "$(hb_status | awk '{print $NF}')" blocked

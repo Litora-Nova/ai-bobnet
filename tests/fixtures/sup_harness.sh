@@ -23,7 +23,8 @@
 #     AIB_SUP_BLOCKED_AFTER_S    infra class this long -> heartbeat `blocked` (default 600)
 #     AIB_SUP_ORPHAN_POLL_S      leases poll while ORPHANED        (default 10)
 #   Every interval is handed to `sleep`, so a test may use 0.05. Time is therefore injectable by
-#   scaling the intervals; no spec sleeps for real durations.
+#   scaling the intervals. Positive waits are poll-until-condition with generous deadlines (wait_for);
+#   only NEGATIVE windows ("nothing happened") are fixed sleeps.
 #   files under $STATE_DIRECTORY:
 #     journal.jsonl   append-only JSON Lines, one object per line, {"seq":N,"ts":"<ISO>","event":"...",...},
 #                     seq = 1,2,3,... and CONTINUES across restarts and re-exec (single writer: the supervisor)
@@ -190,6 +191,8 @@ lj()      { python3 -I "$JGET" "$LIVE" "$1"; }
 jcount()  { python3 -I "$SJ" count "$JOURNAL" "$1"; }
 jfield()  { python3 -I "$SJ" field "$JOURNAL" "$1" "$2" "$3"; }
 dl()      { awk -v a="$1" -v b="$2" 'BEGIN{ if (a ~ /^-?[0-9.]+$/ && b ~ /^-?[0-9.]+$/) print a-b; else print 0 }'; }
+seq_ge()  { [ "$(lj seq)" -ge "$1" ] 2>/dev/null; }
+wd_ge()   { [ "$(grep -cx 'WATCHDOG=1' "$W/notify.log")" -ge "$1" ]; }
 lj_is()   { [ "$(lj "$1")" = "$2" ]; }
 ready_gt(){ [ "$(grep -cx 'READY=1' "$W/notify.log")" -gt "$1" ]; }
 ncalls()  { wc -l < "$W/calls.log" | tr -d ' '; }
