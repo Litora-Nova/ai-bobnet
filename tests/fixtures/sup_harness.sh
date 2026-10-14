@@ -7,7 +7,7 @@
 # `bin/run-agent` / `bin/message` resolve their registry from the engine copy's registry.json.
 #
 # ===== THE INTERFACE THIS HARNESS PINS FOR bin/aib-supervisor (S1a-2) =====
-#   bin/aib-supervisor <agent_uid>          one long-lived process; exit 0 = deliberate stop / refusal
+#   bin/aib-supervisor <agent_uid>          one long-lived process; exit 0 = deliberate stop, 78 = refusal (table below)
 #   env (unit/test supplied, never agent- or request-derived):
 #     STATE_DIRECTORY            the per-agent state dir (systemd StateDirectory=aib-sup/%i)
 #     AIBOBNET_REGISTRY          registry file (the unit sets it)
