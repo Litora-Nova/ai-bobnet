@@ -1,0 +1,30 @@
+[Unit]
+Description=BobNet supervised agent %i
+Documentation=file:/opt/aib/engine/docs/DOMAIN.md
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/opt/aib/engine/bin/aib-supervisor %i
+Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
+WatchdogSec=90
+Restart=on-failure
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=300
+RestartForceExitStatus=75
+KillMode=mixed
+TimeoutStopSec=60
+StateDirectory=aib-sup/%i
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/aib /run/aib /srv/aib/standup
