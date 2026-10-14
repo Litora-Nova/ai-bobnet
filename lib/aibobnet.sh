@@ -2984,7 +2984,7 @@ aib_wire_read_request() {
     # themselves are never record-line keys, only their byte-count headers are. Everything else
     # (clearance, cap_*, env) stays refused without needing a rule about it.
     case "$key" in
-      op|agent_uid|prompt_bytes|sandbox|timeout|cwd_bytes|label_bytes) : ;;
+      op|agent_uid|lease_class|prompt_bytes|sandbox|timeout|cwd_bytes|label_bytes) : ;;
       *) AIB_WIRE_ERROR="field '$key' is not accepted at this seam"; return 2 ;;
     esac
     # A repeated field must not silently win with its last value — for agent_uid that would be a
@@ -3000,6 +3000,8 @@ aib_wire_read_request() {
                    AIB_WIRE_ERROR="agent_uid is not a valid token"; return 2; } ;;
       op)        ( aib_validate_token "$val" op ) >/dev/null 2>&1 || {
                    AIB_WIRE_ERROR="op is not a valid token"; return 2; } ;;
+      lease_class) [ "$val" = supervised ] || {
+                     AIB_WIRE_ERROR="lease_class '$val' is not recognised"; return 2; } ;;
       sandbox)   _aib_rank sandbox "$val"
                  [ "$_AIB_RANK" -ne 0 ] || {
                    AIB_WIRE_ERROR="sandbox '$val' is not a recognised mode"; return 2; } ;;
