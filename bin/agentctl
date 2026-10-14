@@ -16,6 +16,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
+    for name in (
+        "AIBOBNET_REGISTRY",
+        "AIB_IDENTITY_CMD",
+        "AIB_CONTROL_LOG",
+        "AIB_CTL_DIR",
+        "AIB_SYSTEMCTL",
+        "AIB_SUP_STATE_ROOT",
+        "AIB_OUTBOX_ROOT",
+    ):
+        os.environ.pop(name, None)
 sys.path.insert(0, str(ROOT / "lib"))
 from aib_control import append_record, identity_for, terminal_record, utc_now  # noqa: E402
 

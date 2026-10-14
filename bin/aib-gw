@@ -11,6 +11,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
+    for name in ("AIB_AGENTCTL", "AIB_GW_PEERS", "AIB_CONTROL_LOG", "AIB_IDENTITY_CMD"):
+        os.environ.pop(name, None)
 sys.path.insert(0, str(ROOT / "lib"))
 from aib_control import append_record, identity_for  # noqa: E402
 

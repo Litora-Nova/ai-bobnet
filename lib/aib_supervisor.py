@@ -361,6 +361,11 @@ class Supervisor:
                 self.brake_consecutive = 0
                 self.brake_tripped_at = None
                 self.message_failures.clear()
+            elif event == "session.rotated" and record.get("reason") == "fresh":
+                self.session_id = None
+                self.session_cwd = None
+                self.turns_in_session = 0
+                self.session_new = False
             elif event == "ctl.consumed" and isinstance(record.get("req"), int):
                 self.consumed.add(record["req"])
         if self.brake_consecutive >= self.brake_burst and self.brake_tripped_at is None:
@@ -512,7 +517,10 @@ class Supervisor:
             if verb == "abschalten" and self.protected in ("guardian", "gateway"):
                 self.reject_control(request, "protected", caller)
                 continue
-            if self.process is not None and verb in ("neustart", "abschalten") and not request.get("force", False):
+            busy = verb in ("feierabend", "standup") or (
+                verb in ("neustart", "abschalten") and not request.get("force", False)
+            )
+            if self.process is not None and busy:
                 self.reject_control(request, "busy", caller)
                 continue
 
@@ -525,6 +533,14 @@ class Supervisor:
                 self.done_control(request, "reset")
             elif verb == "neustart":
                 self.clear_brake()
+                if request.get("fresh", False):
+                    previous = self.session_id
+                    self.add_handover_note("fresh", previous)
+                    self.journal("session.rotated", reason="fresh", prev_sid=previous)
+                    self.session_id = None
+                    self.session_cwd = None
+                    self.turns_in_session = 0
+                    self.session_new = False
                 self.done_control(request, "restarting")
                 if request.get("hard", False):
                     self.exit_code = 75
