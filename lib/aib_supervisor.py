@@ -373,7 +373,13 @@ class Supervisor:
         return latest_start if latest_start is not None and latest_start_index > latest_end_index else None
 
     def write_alarm(self, kind: str, **details: Any) -> None:
-        if any(record.get("event") == "alarm.sent" and record.get("kind") == kind for record in self.records):
+        tripped_at = self.brake_tripped_at if kind == "brake_tripped" else None
+        if any(
+            record.get("event") == "alarm.sent"
+            and record.get("kind") == kind
+            and (kind != "brake_tripped" or record.get("tripped_at") == tripped_at)
+            for record in self.records
+        ):
             return
         body = f"alarm:{kind} agent:{self.uid}"
         for key, value in details.items():
@@ -388,9 +394,12 @@ class Supervisor:
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
-            self.journal("alarm.sent", kind=kind)
+            fields = {"kind": kind}
+            if tripped_at is not None:
+                fields["tripped_at"] = tripped_at
+            self.journal("alarm.sent", **fields)
         except OSError:
-            pass
+            self.journal("alarm.failed", kind=kind)
 
     def control_event(self, event: str, request: dict[str, Any], **fields: Any) -> None:
         values = {"req": request["seq"], "verb": request["verb"], "target": self.uid, **fields}
@@ -586,7 +595,19 @@ class Supervisor:
                 stdout, _ = process.communicate(input_text, timeout=self.call_timeout)
             except subprocess.TimeoutExpired:
                 self.terminate_group(process)
-                stdout, _ = process.communicate()
+                try:
+                    stdout, _ = process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    if process.stdin is not None and not process.stdin.closed:
+                        process.stdin.close()
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1.0)
+                    stdout = ""
                 return subprocess.CompletedProcess(command, 124, stdout=stdout if capture else None, stderr=None)
             return subprocess.CompletedProcess(command, process.returncode, stdout=stdout if capture else None, stderr=None)
         except OSError:
