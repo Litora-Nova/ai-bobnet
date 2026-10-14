@@ -108,10 +108,14 @@ class Supervisor:
             for line in self.journal_path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     record = json.loads(line)
-                    if isinstance(record, dict):
-                        records.append(record)
+                    if not isinstance(record, dict):
+                        raise ValueError("supervisor journal record is not an object")
+                    records.append(record)
         except FileNotFoundError:
             pass
+        expected = list(range(1, len(records) + 1))
+        if [record.get("seq") for record in records] != expected:
+            raise ValueError("supervisor journal sequence is corrupt")
         return records
 
     def _old_tick_seq(self) -> int:
@@ -326,12 +330,13 @@ class Supervisor:
     def add_handover_note(self, reason: str, previous: str | None) -> None:
         note_id = f"handover-{uuid.uuid4().hex}"
         body = f"kind:handover; reason:{reason}; previous_session:{previous or 'none'}; establish context before continuing queued work"
-        self.message_command("send", self.uid, body, "--id", note_id)
+        if self.message_command("send", self.uid, body, "--id", note_id).returncode != 0:
+            raise OSError("cannot persist handover note")
 
     def rotate_with_note(self, reason: str) -> None:
         previous = self.session_id
-        self.journal("session.rotated", reason=reason, prev_sid=previous)
         self.add_handover_note(reason, previous)
+        self.journal("session.rotated", reason=reason, prev_sid=previous)
         self.bind_session()
 
     def check_cwd_binding(self) -> None:
@@ -354,9 +359,9 @@ class Supervisor:
                     return 0
         return 0
 
-    def handle_orphan(self, unfinished: dict[str, Any]) -> None:
+    def handle_orphan(self, unfinished: dict[str, Any]) -> bool:
         started = time.monotonic()
-        while True:
+        while not self.stop_requested:
             if self.broker_leases() < 1:
                 break
             self.set_state("ORPHANED", "orphan")
@@ -368,6 +373,8 @@ class Supervisor:
                 self.journal("orphan.timeout", msg_id=unfinished.get("msg_id"), sid=unfinished.get("sid"))
                 break
             time.sleep(min(self.orphan_poll, max(0.01, self.next_tick - now)))
+        if self.stop_requested:
+            return False
         self.journal(
             "turn.ended",
             msg_id=unfinished.get("msg_id"),
@@ -376,6 +383,7 @@ class Supervisor:
             **{"class": "orphan_gone", "rc": 0, "brake": self.brake_consecutive},
         )
         self.set_state("READY")
+        return True
 
     def start_turn(self, work: dict[str, Any]) -> None:
         if self.session_id is None:
@@ -478,6 +486,7 @@ class Supervisor:
                 previous = self.session_id
                 self.journal("session.rotated", reason="max_turns", prev_sid=previous)
                 self.bind_session()
+                self.work = work["queued"]
             else:
                 if not work.get("synthetic"):
                     self.message_command("done", work["id"])
@@ -520,7 +529,6 @@ class Supervisor:
         self.retry_at = now + delay
 
     def begin_policy_handover(self, queued: dict[str, Any]) -> None:
-        self.work = queued
         synthetic = {
             "id": f"handover-max-turns-{uuid.uuid4().hex[:8]}",
             "from": self.uid,
@@ -528,7 +536,9 @@ class Supervisor:
             "retry": False,
             "synthetic": True,
             "rotate_after": "max_turns",
+            "queued": queued,
         }
+        self.work = synthetic
         self.start_turn(synthetic)
 
     def install_signals(self) -> None:

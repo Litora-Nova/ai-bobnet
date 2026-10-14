@@ -308,7 +308,8 @@ def supervisor_projection(agent):
             journal_seq = max(journal_seq, seq)
         if record.get('event') == 'supervisor.started' and record.get('reexec') is False:
             try:
-                if now - event_epoch(record.get('ts')) <= 86400:
+                age = now - event_epoch(record.get('ts'))
+                if 0 <= age <= 86400:
                     restarts += 1
             except ValueError:
                 pass
