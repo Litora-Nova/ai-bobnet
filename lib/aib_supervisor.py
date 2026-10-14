@@ -323,20 +323,39 @@ class Supervisor:
             self.brake_tripped_at = utc_now()
         return latest_start if latest_start is not None and latest_start_index > latest_end_index else None
 
-    def message_command(self, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
-        command = [str(self.run_agent), self.uid, "--", str(self.message), *args]
+    @staticmethod
+    def terminate_group(process: subprocess.Popen[Any], sig: signal.Signals = signal.SIGKILL) -> None:
         try:
-            return subprocess.run(
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def run_helper(
+        self, command: list[str], *, input_text: str | None = None, capture: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            process = subprocess.Popen(
                 command,
-                text=True,
-                check=False,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                text=True,
                 env=os.environ.copy(),
-                timeout=self.call_timeout,
+                start_new_session=True,
             )
-        except (OSError, subprocess.TimeoutExpired):
+            try:
+                stdout, _ = process.communicate(input_text, timeout=self.call_timeout)
+            except subprocess.TimeoutExpired:
+                self.terminate_group(process)
+                stdout, _ = process.communicate()
+                return subprocess.CompletedProcess(command, 124, stdout=stdout if capture else None, stderr=None)
+            return subprocess.CompletedProcess(command, process.returncode, stdout=stdout if capture else None, stderr=None)
+        except OSError:
             return subprocess.CompletedProcess(command, 124, stdout="" if capture else None, stderr=None)
+
+    def message_command(self, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+        command = [str(self.run_agent), self.uid, "--", str(self.message), *args]
+        return self.run_helper(command, capture=capture)
 
     def open_messages(self) -> list[dict[str, str]]:
         result = self.message_command("inbox", capture=True)
@@ -415,18 +434,7 @@ class Supervisor:
 
     def broker_leases(self) -> int | None:
         frame = f"op=leases\nagent_uid={self.uid}\nprompt_bytes=0\n\n"
-        try:
-            result = subprocess.run(
-                self.broker_client,
-                input=frame,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=self.call_timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+        result = self.run_helper(self.broker_client, input_text=frame, capture=True)
         if result.returncode != 0:
             return None
         fields: dict[str, str] = {}
@@ -493,17 +501,24 @@ class Supervisor:
         self.output_file = self.output_path.open("wb")
         command = [*self.launcher, "--as", self.uid, "--supervised", "--session", session_arg, "--cwd", self.project_home, "-"]
         try:
-            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=self.output_file, stderr=subprocess.STDOUT, env=os.environ.copy())
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=self.output_file,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
             assert self.process.stdin is not None
             self.process.stdin.write(prompt.encode())
             self.process.stdin.close()
         except (OSError, ValueError) as error:
             if self.process is not None:
-                self.process.terminate()
+                self.terminate_group(self.process, signal.SIGTERM)
                 try:
                     self.process.wait(timeout=min(self.call_timeout, 1.0))
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
+                    self.terminate_group(self.process)
                     self.process.wait()
             self.output_file.write(str(error).encode())
             self.output_file.close()
@@ -689,11 +704,11 @@ class Supervisor:
             time.sleep(0.02)
 
         if self.process is not None:
-            self.process.terminate()
+            self.terminate_group(self.process, signal.SIGTERM)
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                self.terminate_group(self.process)
                 self.process.wait()
         self.set_state("STOPPING")
         self.current_turn = None
