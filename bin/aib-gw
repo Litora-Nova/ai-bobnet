@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Fail-closed forced-command gateway for the safe control verb subset."""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_control import append_record, identity_for  # noqa: E402
+
+ID_RE = re.compile(r"[a-z0-9_-]{1,32}\Z", re.ASCII)
+UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
+ALLOWED = {"status", "standup", "feierabend", "neustart", "say"}
+
+
+def audit(reason: str, peer: str, verb: str = "", target: str = "") -> int:
+    try:
+        append_record(
+            Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl")),
+            "ctl.rejected",
+            req=None,
+            verb=verb,
+            target=target,
+            caller=identity_for(os.geteuid()),
+            actor=f"gateway-peer:{peer}",
+            reason=reason,
+        )
+    except (OSError, ValueError):
+        return 73
+    return 64 if reason == "gateway_malformed" else 77
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2 or argv[0] != "--id" or ID_RE.fullmatch(argv[1]) is None:
+        return 64
+    peer = argv[1]
+    command = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if command is None:
+        return 64
+    if len(command.encode()) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in command):
+        return audit("gateway_malformed", peer)
+    peers = Path(os.environ.get("AIB_GW_PEERS", "/etc/aib/gateway-peers"))
+    try:
+        allowed_peers = {line.strip() for line in peers.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except OSError:
+        allowed_peers = set()
+    if peer not in allowed_peers:
+        return audit("gateway_peer_denied", peer)
+
+    if not command:
+        return audit("gateway_malformed", peer)
+    first = command.split(" ", 1)[0] if command else ""
+    if first not in ALLOWED:
+        return audit("gateway_verb_denied", peer, first)
+    if first == "say":
+        match = re.fullmatch(r"say ([a-z0-9]+(?:-[a-z0-9]+)+) (.+)", command, re.ASCII)
+        if match is None:
+            return audit("gateway_malformed", peer, first)
+        target, text = match.groups()
+        args = ["say", target, text]
+    else:
+        match = re.fullmatch(r"(status|standup|feierabend|neustart) ([a-z0-9]+(?:-[a-z0-9]+)+)", command, re.ASCII)
+        if match is None:
+            return audit("gateway_malformed", peer, first)
+        verb, target = match.groups()
+        args = [verb, target]
+    if UID_RE.fullmatch(args[1]) is None:
+        return audit("gateway_malformed", peer, first, args[1])
+    executable = shlex.split(os.environ.get("AIB_AGENTCTL", str(ROOT / "bin" / "agentctl")))
+    environment = os.environ.copy()
+    environment["AIBOBNET_ACTOR"] = f"gateway-peer:{peer}"
+    try:
+        return subprocess.run([*executable, *args], env=environment, check=False).returncode
+    except OSError:
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aib_control import append_record, identity_for, requested_record
+
 
 class JournalCorruptError(ValueError):
     """The durable journal cannot be trusted without operator repair."""
@@ -93,6 +96,16 @@ class Supervisor:
         self.session_max_turns = 200
         self.brake_burst = 5
         self.backoff_cap = 600.0
+        self.registry: dict[str, Any] = {}
+        self.agent: dict[str, Any] = {}
+        self.project_uid = ""
+        self.team_uid = ""
+        self.data_class = "internal"
+        self.protected = ""
+        self.ctl_dir = Path(os.environ.get("AIB_CTL_DIR", "/run/aib/ctl"))
+        self.control_log = Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
+        self.outbox_root = Path(os.environ.get("AIB_OUTBOX_ROOT", "/srv/aib/outbox"))
+        self.cancel_grace = self._configured_interval("AIB_SUP_CANCEL_GRACE_S", 30.0)
 
         self.state = "STARTING"
         self.state_reason = ""
@@ -104,6 +117,8 @@ class Supervisor:
         self.brake_consecutive = 0
         self.brake_tripped_at: str | None = None
         self.message_failures: dict[str, int] = {}
+        self.off_duty = False
+        self.consumed: set[int] = set()
 
         self.process: subprocess.Popen[bytes] | None = None
         self.output_file: Any = None
@@ -115,6 +130,7 @@ class Supervisor:
         self.last_heartbeat: str | None = None
         self.stop_requested = False
         self.reexec_requested = False
+        self.exit_code = 0
         self.next_tick = time.monotonic()
         self.next_poll = time.monotonic()
 
@@ -208,6 +224,7 @@ class Supervisor:
             "brake": {"consecutive": self.brake_consecutive, "tripped_at": self.brake_tripped_at},
             "session_id": self.session_id,
             "turns_in_session": self.turns_in_session,
+            "off_duty": self.off_duty,
         }
         temporary = self.state_dir / f".live.{os.getpid()}.tmp"
         temporary.write_text(json.dumps(live, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -244,7 +261,38 @@ class Supervisor:
 
     def refuse(self, reason: str) -> int:
         self.journal("supervisor.refused", reason=reason)
+        if reason == "deployment_denied":
+            self.write_alarm("deployment_denied")
         return 78
+
+    @staticmethod
+    def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate deployment key")
+            result[key] = value
+        return result
+
+    def deployment_allows(self, key: str) -> bool:
+        path = Path(os.environ.get("AIB_DEPLOYMENT_CONFIG", "/etc/aib/deployment.json"))
+        try:
+            mode = path.stat().st_mode
+            if mode & 0o022 or not mode & 0o444:
+                return False
+            value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=self._unique_object)
+            allow = value["allow"]
+            return (
+                isinstance(value, dict)
+                and isinstance(value.get("deployment_id"), str)
+                and bool(value["deployment_id"])
+                and isinstance(allow, dict)
+                and type(allow.get("customer_code")) is bool
+                and type(allow.get("comms_secrets")) is bool
+                and allow[key] is True
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return False
 
     def configure(self) -> str | None:
         if self.config_invalid:
@@ -259,6 +307,8 @@ class Supervisor:
         if not isinstance(agents, dict) or self.uid not in agents or not isinstance(agents[self.uid], dict):
             return "unknown_agent"
         agent = agents[self.uid]
+        self.registry = registry
+        self.agent = agent
         mode = agent.get("mode", "oneshot")
         if mode != "supervised":
             return "not_supervised" if mode in ("oneshot", None) else "config_invalid"
@@ -269,6 +319,10 @@ class Supervisor:
             provider = registry["providers"][provider_uid]
             self.project_home = project["home"]
             self.standup = Path(project["standup_dir"])
+            self.project_uid = project_uid
+            self.team_uid = agent["team_uid"]
+            self.data_class = project.get("data_class", "internal")
+            self.protected = agent.get("protected", "")
             if not all(isinstance(v, str) and v for v in (project_uid, self.project_home, str(self.standup), provider_uid)):
                 raise ValueError
             self.cap_timeout = positive_int(provider.get("cap_timeout"), 900)
@@ -282,6 +336,10 @@ class Supervisor:
         self.inbox = self.standup / "inbox" / f"{self.uid}.md"
         self.transcript = self.standup / "transcripts" / f"{self.uid}.log"
         self.transcript.parent.mkdir(parents=True, exist_ok=True)
+        if self.data_class != "internal" and not self.deployment_allows("customer_code"):
+            return "deployment_denied"
+        if self.protected == "gateway" and not self.deployment_allows("comms_secrets"):
+            return "deployment_denied"
         return None
 
     def restore(self) -> dict[str, Any] | None:
@@ -319,9 +377,198 @@ class Supervisor:
                         self.turns_in_session += 1
                     if isinstance(msg_id, str):
                         self.message_failures.pop(msg_id, None)
+            elif event == "duty.off":
+                self.off_duty = True
+            elif event == "duty.on":
+                self.off_duty = False
+            elif event == "brake.reset":
+                self.brake_consecutive = 0
+                self.brake_tripped_at = None
+                self.message_failures.clear()
+            elif event == "ctl.consumed" and isinstance(record.get("req"), int):
+                self.consumed.add(record["req"])
         if self.brake_consecutive >= self.brake_burst and self.brake_tripped_at is None:
             self.brake_tripped_at = utc_now()
         return latest_start if latest_start is not None and latest_start_index > latest_end_index else None
+
+    def write_alarm(self, kind: str, **details: Any) -> None:
+        if any(record.get("event") == "alarm.sent" and record.get("kind") == kind for record in self.records):
+            return
+        body = f"alarm:{kind} agent:{self.uid}"
+        for key, value in details.items():
+            body += f" {key}:{value}"
+        destination = self.outbox_root / self.team_uid / "outbox.md"
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"{utc_now()} | id:alarm-{uuid.uuid4().hex} | from:{self.uid} | "
+                    f"to:human:{self.team_uid} | state:PERSISTED | {body}\n"
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.journal("alarm.sent", kind=kind)
+        except OSError:
+            pass
+
+    def control_event(self, event: str, request: dict[str, Any], **fields: Any) -> None:
+        values = {"req": request["seq"], "verb": request["verb"], "target": self.uid, **fields}
+        self.journal(event, **values)
+        append_record(self.control_log, event, **values)
+
+    def reject_control(self, request: dict[str, Any], reason: str, caller: str = "") -> None:
+        self.control_event("ctl.rejected", request, caller=caller or request.get("caller", ""), reason=reason)
+        self.journal("ctl.consumed", req=request["seq"])
+        self.consumed.add(request["seq"])
+
+    def accept_control(self, request: dict[str, Any]) -> None:
+        self.control_event("ctl.accepted", request, result="accepted")
+        self.journal("ctl.consumed", req=request["seq"])
+        self.consumed.add(request["seq"])
+
+    def done_control(self, request: dict[str, Any], result: str) -> None:
+        self.control_event("ctl.done", request, result=result)
+
+    def control_authorized(self, request: dict[str, Any]) -> bool:
+        caller = request.get("caller", "")
+        verb = request.get("verb", "")
+        if verb in ("neustart", "feierabend", "standup"):
+            if caller.startswith(("human:", "gateway:")):
+                return True
+            actor = request.get("actor", "")
+            claimed = self.registry.get("agents", {}).get(actor, {})
+            return caller.startswith("role:") and isinstance(claimed, dict) and claimed.get("lead") == "true"
+        if verb in ("abschalten", "reset-brake"):
+            return caller.startswith("human:")
+        return False
+
+    def clear_brake(self) -> None:
+        if self.brake_consecutive or self.brake_tripped_at:
+            self.journal("brake.reset", previous=self.brake_consecutive)
+        self.brake_consecutive = 0
+        self.brake_tripped_at = None
+        self.message_failures.clear()
+        self.retry_at = time.monotonic()
+
+    def cancel_turn(self) -> None:
+        if self.process is None:
+            return
+        deadline = time.monotonic() + self.cancel_grace
+        while self.process.poll() is None and time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= self.next_tick:
+                self.tick()
+            time.sleep(0.02)
+        if self.process.poll() is not None:
+            self.collect_turn()
+            return
+        self.terminate_group(self.process)
+        self.process.wait()
+        assert self.attempt is not None and self.output_path is not None
+        if self.output_file is not None:
+            self.output_file.close()
+        work = self.attempt["work"]
+        attempt_id = self.attempt["attempt_id"]
+        try:
+            output = self.output_path.read_text(encoding="utf-8", errors="replace")
+            self.output_path.unlink()
+        except OSError:
+            output = ""
+        self.append_transcript(output)
+        self.end_turn(work, attempt_id, "cancelled", 137)
+        self.work = {**work, "retry": True}
+        self.process = None
+        self.attempt = None
+        self.output_file = None
+        self.output_path = None
+        self.current_turn = None
+        self.set_state("READY")
+
+    def begin_control_routine(self, request: dict[str, Any], verb: str) -> None:
+        self.work = {
+            "id": f"control-{verb}-{request['seq']}",
+            "from": request["caller"],
+            "body": f"routine:{verb}; follow the supervised {verb} checklist",
+            "retry": False,
+            "synthetic": True,
+            "control": request,
+            "control_action": verb,
+        }
+        self.start_turn(self.work)
+
+    def process_controls(self) -> None:
+        try:
+            candidates = sorted(
+                self.ctl_dir.glob(f"{self.uid}.*.*"),
+                key=lambda path: int(path.name.split(".", 2)[1]) if path.name.split(".", 2)[1].isdigit() else 2**63,
+            )
+        except OSError:
+            return
+        for path in candidates:
+            match = re.fullmatch(rf"{re.escape(self.uid)}\.([0-9]+)\.([a-z-]+)", path.name)
+            if match is None:
+                continue
+            sequence = int(match.group(1))
+            verb = match.group(2)
+            if sequence in self.consumed:
+                continue
+            try:
+                owner = path.stat().st_uid
+            except OSError:
+                continue
+            caller = identity_for(owner)
+            request = requested_record(self.control_log, sequence)
+            if (
+                request is None
+                or request.get("target") != self.uid
+                or request.get("verb") != verb
+                or request.get("caller") != caller
+            ):
+                request = {"seq": sequence, "verb": verb, "target": self.uid, "caller": caller}
+                self.reject_control(request, "unaudited", caller)
+                continue
+            if verb not in ("neustart", "feierabend", "standup", "abschalten", "reset-brake"):
+                self.reject_control(request, "unknown_verb", caller)
+                continue
+            if not self.control_authorized(request):
+                self.reject_control(request, "unauthorized", caller)
+                continue
+            if verb == "abschalten" and self.protected in ("guardian", "gateway"):
+                self.reject_control(request, "protected", caller)
+                continue
+            if self.process is not None and verb in ("neustart", "abschalten") and not request.get("force", False):
+                self.reject_control(request, "busy", caller)
+                continue
+
+            self.accept_control(request)
+            if self.process is not None and request.get("force", False):
+                self.cancel_turn()
+            if verb == "reset-brake":
+                self.clear_brake()
+                self.set_state("READY")
+                self.done_control(request, "reset")
+            elif verb == "neustart":
+                self.clear_brake()
+                self.done_control(request, "restarting")
+                if request.get("hard", False):
+                    self.exit_code = 75
+                    self.stop_requested = True
+                else:
+                    self.reexec()
+            elif verb == "feierabend":
+                if self.process is None:
+                    self.begin_control_routine(request, verb)
+            elif verb == "standup":
+                self.off_duty = False
+                self.journal("duty.on", req=sequence)
+                if self.process is None:
+                    self.begin_control_routine(request, verb)
+            elif verb == "abschalten":
+                self.set_state("STOPPING")
+                self.heartbeat("done", f"shut down by {caller}")
+                self.done_control(request, "stopping")
+                self.stop_requested = True
+            break
 
     @staticmethod
     def terminate_group(process: subprocess.Popen[Any], sig: signal.Signals = signal.SIGKILL) -> None:
@@ -554,6 +801,7 @@ class Supervisor:
             stream.write(output)
             if not output.endswith("\n"):
                 stream.write("\n")
+        self.transcript.chmod(0o640)
 
     def end_turn(self, work: dict[str, Any], attempt_id: str, result_class: str, rc: int) -> None:
         self.journal(
@@ -593,6 +841,22 @@ class Supervisor:
             self.infra_since = None
             self.turns_in_session += 1
             self.end_turn(work, attempt_id, result_class, rc)
+            control_action = work.get("control_action")
+            if control_action == "feierabend":
+                self.off_duty = True
+                self.journal("duty.off", req=work["control"]["seq"])
+                self.work = None
+                self.set_state("WAITING", "off_duty")
+                self.done_control(work["control"], "off_duty")
+                self.retry_at = now
+                return
+            if control_action == "standup":
+                self.off_duty = False
+                self.work = None
+                self.set_state("READY")
+                self.done_control(work["control"], "ready")
+                self.retry_at = now
+                return
             if work.get("rotate_after") == "max_turns":
                 previous = self.session_id
                 self.journal("session.rotated", reason="max_turns", prev_sid=previous)
@@ -615,6 +879,7 @@ class Supervisor:
             self.set_state("WAITING", reason)
             if now - self.infra_since >= self.blocked_after:
                 self.heartbeat("blocked", f"supervisor waiting on {reason}")
+                self.write_alarm("infra_blocked")
             self.retry_at = now + random.uniform(self.infra_min, self.infra_max)
             return
 
@@ -628,6 +893,7 @@ class Supervisor:
         if self.brake_tripped_at is not None:
             self.set_state("FAILED", "brake")
             self.heartbeat("blocked", "supervisor provider-failure brake tripped")
+            self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
             self.retry_at = float("inf")
             return
         if failures >= 3 and not work.get("synthetic"):
@@ -675,6 +941,10 @@ class Supervisor:
         if self.brake_tripped_at:
             self.set_state("FAILED", "brake")
             self.heartbeat("blocked", "supervisor provider-failure brake tripped")
+            self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
+        elif self.off_duty:
+            self.set_state("WAITING", "off_duty")
+            self.heartbeat("done", "supervisor off duty")
         else:
             self.set_state("READY")
             self.heartbeat("idle", "supervisor ready")
@@ -688,11 +958,14 @@ class Supervisor:
             now = time.monotonic()
             if now >= self.next_tick:
                 self.tick()
+            self.process_controls()
+            if self.stop_requested:
+                break
             if self.process is not None:
                 self.collect_turn()
             elif self.reexec_requested:
                 self.reexec()
-            elif self.brake_tripped_at is None and now >= self.retry_at and now >= self.next_poll:
+            elif not self.off_duty and self.brake_tripped_at is None and now >= self.retry_at and now >= self.next_poll:
                 self.next_poll = now + self.poll_s
                 if self.work is None:
                     self.work = self.choose_message()
@@ -715,7 +988,7 @@ class Supervisor:
         self.journal("supervisor.stopping", pid=os.getpid())
         self.write_live()
         self.heartbeat("done", "supervisor stopped")
-        return 0
+        return self.exit_code
 
 
 def main() -> int:

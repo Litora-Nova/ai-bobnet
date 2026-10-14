@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Audited local control client for supervised agents."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_control import append_record, identity_for, terminal_record, utc_now  # noqa: E402
+
+USAGE = "usage: agentctl <status|neustart|feierabend|standup|abschalten|start|reset-brake|say|attach> <uid>"
+QUEUED = {"neustart", "feierabend", "standup", "abschalten", "reset-brake"}
+ALL_VERBS = QUEUED | {"status", "start", "say", "attach"}
+UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
+
+
+def die(code: int, text: str = "") -> int:
+    if text:
+        print(text, file=sys.stderr)
+    return code
+
+
+def load_registry() -> dict:
+    path = Path(os.environ.get("AIBOBNET_REGISTRY", ROOT / "registry.json"))
+    with path.open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def parse(argv: list[str]) -> tuple[str, str, dict[str, object]] | None:
+    if len(argv) < 2 or argv[0] not in ALL_VERBS or UID_RE.fullmatch(argv[1]) is None:
+        return None
+    verb, uid = argv[:2]
+    rest = argv[2:]
+    options: dict[str, object] = {"force": False, "hard": False, "fresh": False, "reason": "", "text": ""}
+    if verb in ("say", "attach", "status", "start"):
+        if verb == "say":
+            if len(rest) != 1 or not rest[0]:
+                return None
+            options["text"] = rest[0]
+        elif rest:
+            return None
+        return verb, uid, options
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--force" and verb in ("neustart", "abschalten") and not options["force"]:
+            options["force"] = True
+        elif token == "--hard" and verb == "neustart" and not options["hard"]:
+            options["hard"] = True
+        elif token == "--fresh" and verb == "neustart" and not options["fresh"]:
+            options["fresh"] = True
+        elif token == "--reason" and index + 1 < len(rest) and not options["reason"]:
+            index += 1
+            options["reason"] = rest[index]
+        else:
+            return None
+        index += 1
+    return verb, uid, options
+
+
+def authorized(verb: str, caller: str, actor: str, registry: dict) -> bool:
+    if caller.startswith("unknown:"):
+        return False
+    if verb == "status":
+        return caller.startswith(("human:", "role:", "gateway:"))
+    if verb in ("neustart", "feierabend", "standup"):
+        if caller.startswith(("human:", "gateway:")):
+            return True
+        claimed = registry.get("agents", {}).get(actor, {})
+        return caller.startswith("role:") and isinstance(claimed, dict) and claimed.get("lead") == "true"
+    if verb in ("abschalten", "start", "reset-brake", "attach"):
+        return caller.startswith("human:")
+    if verb == "say":
+        return caller.startswith(("human:", "gateway:"))
+    return False
+
+
+def audit_rejection(log: Path, verb: str, uid: str, caller: str, actor: str, reason: str) -> int:
+    try:
+        append_record(log, "ctl.rejected", req=None, verb=verb, target=uid, caller=caller, actor=actor, reason=reason)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 73
+    return 77
+
+
+def systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+    command = shlex.split(os.environ.get("AIB_SYSTEMCTL", "systemctl"))
+    try:
+        return subprocess.run([*command, *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        return subprocess.CompletedProcess(command, 127, stdout="", stderr="")
+
+
+def unit_action(log: Path, request: dict, unit: str, action: tuple[str, ...], result: str) -> int:
+    outcome = systemctl(*action, unit)
+    append_record(log, "ctl.unit", req=request["seq"], unit=unit, action=" ".join(action), rc=outcome.returncode)
+    if outcome.returncode != 0:
+        return 69
+    append_record(
+        log,
+        "ctl.done",
+        req=request["seq"],
+        verb=request["verb"],
+        target=request["target"],
+        result=result,
+    )
+    return 0
+
+
+def inbox_open(registry: dict, uid: str) -> int:
+    agent = registry["agents"][uid]
+    project = registry["projects"][agent["project"]]
+    path = Path(project["standup_dir"]) / "inbox" / f"{uid}.md"
+    states: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parts = line.split(" | ")
+            msg_id = next((p[3:] for p in parts if p.startswith("id:")), "")
+            if not msg_id:
+                continue
+            for part in parts:
+                if part == "state:PERSISTED":
+                    states[msg_id] = "PERSISTED"
+                elif part.startswith("event:"):
+                    states[msg_id] = part[6:]
+    except OSError:
+        pass
+    return sum(state not in ("PROCESSED", "FAILED") for state in states.values())
+
+
+def status(registry: dict, uid: str) -> int:
+    unit = f"aib-agent@{uid}.service"
+    unit_state = systemctl("is-active", unit).stdout.strip() or "unknown"
+    live_path = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup")) / uid / "live.json"
+    try:
+        live = json.loads(live_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        live = {}
+    state = live.get("state", "STOPPED")
+    tick_age = -1
+    health = "unhealthy"
+    try:
+        timestamp = datetime.fromisoformat(str(live["ts"]).replace("Z", "+00:00"))
+        tick_age = max(0, int((datetime.now(timezone.utc) - timestamp).total_seconds()))
+        health = "healthy" if tick_age <= 3 * float(live.get("interval_s", 30)) else "unhealthy"
+    except (KeyError, TypeError, ValueError):
+        pass
+    brake = live.get("brake") if isinstance(live.get("brake"), dict) else {}
+    values = {
+        "unit_state": unit_state,
+        "state": state,
+        "health": health,
+        "tick_age_s": tick_age,
+        "brake_consecutive": brake.get("consecutive", 0),
+        "off_duty": str(bool(live.get("off_duty", False))).lower(),
+        "inbox_open": inbox_open(registry, uid),
+    }
+    for key, value in values.items():
+        print(f"{key}={value}")
+    return 0
+
+
+def send_message(registry: dict, uid: str, caller: str, text: str) -> str:
+    project = registry["projects"][registry["agents"][uid]["project"]]
+    inbox = Path(project["standup_dir"]) / "inbox" / f"{uid}.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    message_id = f"msg-{uuid.uuid4().hex}"
+    lock = Path(f"{inbox}.lock")
+    import fcntl
+
+    with lock.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        with inbox.open("a", encoding="utf-8") as journal:
+            journal.write(f"{utc_now()} | id:{message_id} | from:{caller} | to:{uid} | state:PERSISTED | {text}\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+    return message_id
+
+
+def attach(registry: dict, uid: str, caller: str) -> int:
+    project = registry["projects"][registry["agents"][uid]["project"]]
+    transcript = Path(project["standup_dir"]) / "transcripts" / f"{uid}.log"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.touch(exist_ok=True)
+    stop = threading.Event()
+
+    def follow() -> None:
+        with transcript.open(encoding="utf-8", errors="replace") as stream:
+            while not stop.is_set():
+                line = stream.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                else:
+                    stop.wait(0.05)
+
+    follower = threading.Thread(target=follow, daemon=True)
+    follower.start()
+    try:
+        for line in sys.stdin:
+            text = line.rstrip("\r\n")
+            if text:
+                send_message(registry, uid, caller, text)
+    finally:
+        stop.set()
+        follower.join(timeout=2)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parsed = parse(argv)
+    if parsed is None:
+        return die(64, USAGE)
+    verb, uid, options = parsed
+    try:
+        registry = load_registry()
+    except (OSError, json.JSONDecodeError, TypeError):
+        return 66
+    agent = registry.get("agents", {}).get(uid)
+    if not isinstance(agent, dict) or agent.get("mode", "oneshot") != "supervised":
+        return 66
+    caller = identity_for(os.geteuid())
+    actor = os.environ.get("AIBOBNET_ACTOR", "")
+    log = Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
+    if not authorized(verb, caller, actor, registry):
+        return audit_rejection(log, verb, uid, caller, actor, "unauthorized")
+    if verb == "abschalten" and agent.get("protected") in ("guardian", "gateway"):
+        return audit_rejection(log, verb, uid, caller, actor, "protected")
+    if verb == "status":
+        return status(registry, uid)
+    if verb == "say":
+        print(send_message(registry, uid, caller, str(options["text"])))
+        return 0
+    if verb == "attach":
+        return attach(registry, uid, caller)
+
+    try:
+        requested = append_record(
+            log,
+            "ctl.requested",
+            verb=verb,
+            target=uid,
+            caller=caller,
+            actor=actor,
+            reason=options["reason"],
+            force=options["force"],
+            hard=options["hard"],
+            fresh=options["fresh"],
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 73
+    request = int(requested["seq"])
+    unit = f"aib-agent@{uid}.service"
+
+    if verb == "start":
+        try:
+            return unit_action(log, requested, unit, ("enable", "--now"), "started")
+        except OSError:
+            return 73
+
+    active = systemctl("is-active", unit).returncode == 0
+    if verb == "standup" and not active:
+        outcome = systemctl("start", unit)
+        try:
+            append_record(log, "ctl.unit", req=request, unit=unit, action="start", rc=outcome.returncode)
+        except OSError:
+            return 73
+        if outcome.returncode != 0:
+            return 69
+    if verb == "abschalten" and not active:
+        try:
+            return unit_action(log, requested, unit, ("disable", "--now"), "stopping")
+        except OSError:
+            return 73
+
+    ctl_dir = Path(os.environ.get("AIB_CTL_DIR", "/run/aib/ctl"))
+    request_path = ctl_dir / f"{uid}.{request}.{verb}"
+    try:
+        descriptor = os.open(request_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+        os.close(descriptor)
+    except OSError:
+        return 73
+    deadline = time.monotonic() + float(os.environ.get("AIB_CTL_WAIT_S", "30"))
+    while time.monotonic() < deadline:
+        terminal = terminal_record(log, request)
+        if terminal is not None:
+            print(json.dumps(terminal, separators=(",", ":")))
+            try:
+                request_path.unlink()
+            except OSError:
+                pass
+            if terminal["event"] == "ctl.rejected":
+                return 75 if terminal.get("reason") == "busy" else 77
+            if verb == "abschalten":
+                outcome = systemctl("disable", "--now", unit)
+                try:
+                    append_record(log, "ctl.unit", req=request, unit=unit, action="disable --now", rc=outcome.returncode)
+                except OSError:
+                    return 73
+                return 0 if outcome.returncode == 0 else 69
+            return 0
+        time.sleep(0.05)
+    return 124
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
