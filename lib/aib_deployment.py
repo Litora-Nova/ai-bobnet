@@ -59,17 +59,16 @@ def load_deployment(path: Path, root: Path) -> dict[str, Any] | None:
         return None
     if "profile" in value and not isinstance(value["profile"], str):
         return None
-    projects = value.get("allowed_projects")
-    if projects is not None and (
-        not isinstance(projects, list) or any(not isinstance(item, str) for item in projects)
-    ):
-        return None
-    role_map = value.get("role_map")
-    if role_map is not None and (
-        not isinstance(role_map, dict)
-        or any(not isinstance(key, str) or not isinstance(item, str) for key, item in role_map.items())
-    ):
-        return None
+    if "allowed_projects" in value:
+        projects = value["allowed_projects"]
+        if not isinstance(projects, list) or any(not isinstance(item, str) for item in projects):
+            return None
+    if "role_map" in value:
+        role_map = value["role_map"]
+        if not isinstance(role_map, dict) or any(
+            not isinstance(key, str) or not isinstance(item, str) for key, item in role_map.items()
+        ):
+            return None
     return value
 
 
