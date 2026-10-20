@@ -7,5 +7,5 @@ OnFailure=aib-alarm@%n.service
 Type=oneshot
 User=aib-broker
 ExecStart=/opt/aib/engine/bin/aib-login-watch
-ReadOnlyPaths=/var/lib/aib/login
-ReadWritePaths=/run/aib/login-status /var/lib/aib/login-state /srv/aib/outbox/_server
+ReadOnlyPaths=-/var/lib/aib/login
+ReadWritePaths=-/run/aib/login-status -/var/lib/aib/login-state -/srv/aib/outbox/_server

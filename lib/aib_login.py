@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime as dt
+import fcntl
+import grp
 import json
 import os
+import pwd
 import re
 import stat
 import tempfile
@@ -63,6 +67,64 @@ def read_object(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _account_id(value: str, *, group: bool) -> int | None:
+    if value.isdecimal():
+        return int(value)
+    try:
+        return grp.getgrnam(value).gr_gid if group else pwd.getpwnam(value).pw_uid
+    except KeyError:
+        return None
+
+
+def expected_store_ids() -> tuple[int | None, int | None]:
+    """Resolve the configured owner/group for broker-owned credential files."""
+    if test_seams_enabled():
+        owner_default = str(os.geteuid())
+        group_default = str(os.getegid())
+    else:
+        owner_default = "aib-broker"
+        group_default = "aib-login"
+    owner = _account_id(setting("AIB_LOGIN_STORE_OWNER", owner_default), group=False)
+    group = _account_id(setting("AIB_LOGIN_STORE_GROUP", group_default), group=True)
+    return owner, group
+
+
+def trusted_store_file(path: Path, mode: int = 0o640) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    owner, group = expected_store_ids()
+    return (
+        owner is not None
+        and group is not None
+        and stat.S_ISREG(info.st_mode)
+        and stat.S_IMODE(info.st_mode) == mode
+        and info.st_uid == owner
+        and info.st_gid == group
+    )
+
+
+@contextlib.contextmanager
+def store_lock():
+    """Serialize store publishers without following an attacker-supplied lock symlink."""
+    root = login_root()
+    root.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(root / ".lock", flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("unsafe login-store lock")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def jwt_exp(token: Any) -> int | None:

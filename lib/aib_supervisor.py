@@ -352,6 +352,8 @@ class Supervisor:
                 msg_id = record.get("msg_id")
                 if record.get("class") == "provider_failure" and isinstance(msg_id, str):
                     self.message_failures[msg_id] = self.message_failures.get(msg_id, 0) + 1
+                    self.infra_episode = None
+                    self.infra_login_hint = False
                 elif record.get("class") == "infra":
                     if self.infra_episode is None:
                         attempt_id = record.get("attempt_id")
@@ -856,9 +858,9 @@ class Supervisor:
         self.current_turn = None
         lowered = output.lower()
         login_hint = (
-            "hint:login" in lowered
+            (rc == 78 and "hint:login" in lowered)
             or "not logged in" in lowered
-            or re.search(r"(?:^|\D)401(?:\D|$)", lowered) is not None
+            or "failed to authenticate. api error" in lowered
         )
         if rc != 0 and session_arg.startswith("new:") and "already in use" in lowered:
             self.end_turn(work, attempt_id, "session_in_use", rc)

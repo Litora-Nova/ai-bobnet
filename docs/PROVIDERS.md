@@ -111,27 +111,26 @@ and `78` are both disjoint from the PDP's own `64` (`docs/CONTRACT-execution-bin
 For provider exits `65` and `78`, the existing `_aib_enact_map_status` (`lib/aibobnet.sh`) records
 `attempt.ended(provider-failure, stage=provider)`; no terminal mapping changes are needed.
 
-### One shared `CODEX_HOME`
+### Per-role `CODEX_HOME`, shared subscription credential
 
-Every agent and every project's attempt runs as the one broker account (`docs/CONFINEMENT.md`,
-"Documented divergence"), so they all share one `$CODEX_HOME`: one `sessions/` history (mitigated —
-not eliminated — by `--ephemeral`, verified to suppress `sessions/` writes; the sqlite state files
-still accumulate across attempts), one `thread_history` and persistent-memory database, and one
-`config.toml`. `--ephemeral` is a fixed flag precisely because it is the cheap half of that mitigation
-available today; the full fix (a `CODEX_HOME` per project, keyed off `AIBOBNET_PROJECT_UID`, each with
-its own `auth.json`) is a later slice and its own T4 decision, not built here. Provisioning owns
-`config.toml` as `root:aib-broker 0644` to prevent in-place writes to that inode. This does not
-make operator defaults immutable: the broker-owned writable parent directory permits unlink or
-replacement, which the current Landlock write grant also permits. Protecting the configuration
-from replacement needs a separate provisioning boundary; it is a follow-up, not a guarantee of
-this slice. MCP servers, hooks, `model_provider` and `shell_environment_policy` remain shared
-operator defaults under the documented cooperative-with-audit boundary.
+Each role process now receives its own 0700 home under `/var/lib/aib-sup/<agent>/`, so Codex history,
+sqlite state, caches, helpers and `config.toml` are isolated per role. `--ephemeral` remains fixed to
+reduce session persistence. The exception is subscription authentication: provisioning creates
+`$HOME/.codex/auth.json` as a pinned symlink to `/var/lib/aib/login/codex/auth.json`, a regular
+`aib-broker:aib-login 0640` shared credential. See `docs/CONFINEMENT.md`, "Documented divergence:
+shared subscription login". API-key proxy mode is reserved, fail-closed, and is the later path that
+restores the stronger "agent never sees the shared credential" property.
+
+Codex does not publish a refresh-token expiry. Consequently `login_expires_at` in the broker-owned
+metadata is an operator-configured lifetime estimate (`AIB_LOGIN_LIFETIME_S`, 56 days by default),
+not a provider assertion. Expiry monitoring and status output preserve that distinction; access-token
+validity is independently decoded from the JWT and enforced before every turn.
 
 The adapter's credential checks are metadata-only and sequential (type and symlink test, then directory
 mode, then owner and file mode). A writer who already has write access to `CODEX_HOME` could replace
 `auth.json` between two of those checks. That writer sits inside the same trust boundary as the shared
 home itself, so the gap adds no authority beyond what this section already grants; it closes with the
-per-project `CODEX_HOME` and the role-uid switch recorded as follow-up slices.
+the broker-owned login publisher and the role-account boundary described above.
 
 ### Registry entry (example, `acme`)
 
@@ -346,9 +345,8 @@ probed individually enough to trust.
 root/sudo privileges for security reasons") — `codex`'s own bypass flag has no such refusal
 (`adapters/codex:37`). This adapter does not pass `--dangerously-skip-permissions` at all (it uses
 `--permission-mode bypassPermissions`, which has no such self-refusal), so the finding is moot while
-`aib-broker` runs as a non-root account; it is recorded here because the pending role-uid slice may
-change which account this confined child runs as, and that slice's design must know this refusal exists
-before choosing an account model for `claude-code` specifically.
+role processes run as non-root dedicated accounts; the refusal remains relevant when provisioning
+those accounts and is why uid 0 is never an allowed role uid.
 
 ### Exit codes
 
@@ -365,16 +363,14 @@ The adapter never itself exits `124`, `126`, or `127` — same discipline as `co
 `attempt.ended(provider-failure, stage=provider)` via the existing `_aib_enact_map_status`, no new
 terminal mapping needed — identical to `codex`'s own table entry above.
 
-### One shared `$CLAUDE_CONFIG_DIR`
+### Per-role `$CLAUDE_CONFIG_DIR`, descriptor-delivered subscription token
 
-Every agent and every project's attempt runs as the one broker account (`docs/CONFINEMENT.md`,
-"Documented divergence"), exactly as for `codex`, so they all share one `$CLAUDE_CONFIG_DIR`: one
-`sessions/`/`projects/` history (mitigated, not eliminated, by `--no-session-persistence`, which does
-**not** stop those directories from being created — `standup/_advisor_claude-code-adapter.md` F5;
-do not assert their absence anywhere), one auto-memory store per project slug (mitigated by
-`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` above), and one `.credentials.json`. A `CLAUDE_CONFIG_DIR` per
-project is the same class of later slice `codex`'s own per-project `CODEX_HOME` is (`docs/
-PROVIDERS.md`'s `codex` section, "One shared `CODEX_HOME`"), not built here.
+Each role process receives a private 0700 `.claude` history/config directory. The broker does not
+place `.credentials.json` there in shared subscription mode: it extracts the access token to an
+unlinked mode-0600 buffer and passes an already-open descriptor, named by
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`. This isolates histories but not subscription authority;
+every server role may request the same shared token. API-key proxy mode is the later "never sees"
+path. See the dated divergence in `docs/CONFINEMENT.md`.
 
 ### Registry entry (example, `acme`)
 

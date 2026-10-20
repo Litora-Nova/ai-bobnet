@@ -1,0 +1,10 @@
+[Service]
+# Replace these example role ids with the dedicated account for this instance.
+Environment=AIB_SUP_STATE_ROOT=/var/lib/aib-sup
+Environment=AIB_ROLE_UID=20001
+Environment=AIB_ROLE_GID=20001
+Environment=AIB_ROLE_UIDS=20001
+Environment=AIB_LOGIN_MAX_TURN_S=900
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+SupplementaryGroups=aib-login

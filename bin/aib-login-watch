@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
-import json
-import os
 import sys
+import datetime as dt
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from aib_deployment import load_deployment  # noqa: E402
-from aib_login import (PROVIDERS, atomic_json, credential_path, integer, iso, login_root, now,
+from aib_login import (PROVIDERS, atomic_json, credential_path, integer, iso, now,
                        read_object, setting, write_alarm)  # noqa: E402
 
 
@@ -52,8 +51,17 @@ def inspect(provider: str) -> tuple[str, int | None, str]:
 
 
 def process(provider: str) -> None:
-    state, end, hint = inspect(provider)
     status_dir = Path(setting("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status"))
+    current = read_object(status_dir / f"{provider}.json") or {}
+    if current.get("state") == "pending":
+        try:
+            checked = dt.datetime.fromisoformat(str(current["checked_at"]).replace("Z", "+00:00"))
+            age = now() - int(checked.timestamp())
+        except (KeyError, TypeError, ValueError):
+            age = integer("AIB_LOGIN_WINDOW_S", 1800) + 1
+        if 0 <= age <= integer("AIB_LOGIN_WINDOW_S", 1800):
+            return
+    state, end, hint = inspect(provider)
     atomic_json(status_dir / f"{provider}.json", {
         "provider": provider, "state": state, "expires_at": iso(end) if end is not None else None,
         "label": label_for(provider), "id_hint": hint, "checked_at": iso(now()),
@@ -79,18 +87,16 @@ def process(provider: str) -> None:
 def main(argv: list[str]) -> int:
     providers = argv
     if not providers:
-        try:
-            providers = sorted(item.name for item in login_root().iterdir() if item.is_dir())
-        except OSError:
-            providers = []
+        providers = sorted(PROVIDERS)
     if any(provider not in PROVIDERS for provider in providers):
         return 64
-    try:
-        for provider in providers:
+    failed = False
+    for provider in providers:
+        try:
             process(provider)
-    except OSError:
-        return 1
-    return 0
+        except OSError:
+            failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

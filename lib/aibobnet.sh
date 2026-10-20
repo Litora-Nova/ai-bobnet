@@ -1559,7 +1559,8 @@ aib_enact_launch() {
   local adapter state_dir root cwd_req sandbox effort model timeout_s session provider resolved_root
   local _s1c_enabled=0 _engine_root _agent_uid="" _agent_home="" _credential_mode="file"
   local _credential_source="login" _login_root="/var/lib/aib/login" _login_store_path=""
-  local _credential_tmp="" _credential_fd_open=0 _role_uid="${AIB_ROLE_UID:-}" _role_gid="${AIB_ROLE_GID:-}"
+  local _credential_tmp="" _credential_error="" _credential_fd_open=0 _credential_refusal=0
+  local _role_uid="${AIB_ROLE_UID:-}" _role_gid="${AIB_ROLE_GID:-}"
 
   case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
   [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$decided_id" ] ||
@@ -1998,13 +1999,26 @@ aib_enact_launch__run_confined() {
       proxy) _preflight_rc=1 ;;
       fd)
         _credential_tmp="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-credential.XXXXXX")" || aib_die 2 "cannot create credential buffer"
+        _credential_error="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-credential-error.XXXXXX")" || aib_die 2 "cannot create credential error buffer"
         chmod 600 "$_credential_tmp" || aib_die 2 "cannot protect credential buffer"
+        chmod 600 "$_credential_error" || aib_die 2 "cannot protect credential error buffer"
         local _token_args=("$_engine_root/bin/aib-login-token" "$provider")
         [ "$_credential_source" = login ] || _token_args+=(--source "$_credential_source")
-        AIB_TURN_TIMEOUT_S="$timeout_s" "${_token_args[@]}" >"$_credential_tmp" || _preflight_rc=1
+        local _token_rc=0
+        AIB_TURN_TIMEOUT_S="$timeout_s" "${_token_args[@]}" >"$_credential_tmp" 2>"$_credential_error" || _token_rc=$?
+        if [ "$_token_rc" -ne 0 ]; then
+          _preflight_rc=1
+          if [ "$_token_rc" -eq 78 ]; then
+            _credential_refusal=78
+          fi
+        fi
         if [ "$_preflight_rc" -eq 0 ]; then
           exec 3<"$_credential_tmp" || _preflight_rc=1
-          [ "$_preflight_rc" -ne 0 ] || _credential_fd_open=1
+          if [ "$_preflight_rc" -eq 0 ]; then
+            _credential_fd_open=1
+            rm -f -- "$_credential_tmp" 2>/dev/null || true
+            _credential_tmp=""
+          fi
         fi
         ;;
       *) _preflight_rc=1 ;;
@@ -2020,7 +2034,15 @@ aib_enact_launch__run_confined() {
   if [ "$_preflight_rc" -ne 0 ]; then
     [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
     [ -z "$_credential_tmp" ] || rm -f -- "$_credential_tmp" 2>/dev/null || true
-    _aib_enact_commit_ended io-refused confine 126
+    local _reported_refusal=126
+    [ "$_credential_refusal" -ne 78 ] || _reported_refusal=78
+    _aib_enact_commit_ended io-refused confine "$_reported_refusal"
+    if [ "$_credential_refusal" -eq 78 ] && [ -n "$_credential_error" ]; then
+      case "$("$_cat_bin" "$_credential_error" 2>/dev/null)" in
+        *hint:login*) AIB_ENACT_REASON="credential_unavailable:hint:login" ;;
+      esac
+    fi
+    [ -z "$_credential_error" ] || rm -f -- "$_credential_error" 2>/dev/null || true
     # R4 (gate delta 2, Ikarus MEDIUM): _aib_enact_commit_ended's own D8 incident
     # branch can fire right here too (event store gone/corrupt before the
     # provider ever ran, not just after) — it sets AIB_ENACT_INCIDENT and returns
@@ -2065,6 +2087,7 @@ aib_enact_launch__run_confined() {
     [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
     rm -f -- "$_internal_fifo" "$_status_file" "$_cwd_fail_marker" "$_provider_status_file" "$_escalated_marker" 2>/dev/null || true
     [ -z "$_credential_tmp" ] || rm -f -- "$_credential_tmp" 2>/dev/null || true
+    [ -z "$_credential_error" ] || rm -f -- "$_credential_error" 2>/dev/null || true
   }
 
   _aib_enact_exec_child_confined() {

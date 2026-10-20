@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import shutil
-import stat
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,11 +15,62 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_login import PROVIDERS, access_expiry, credential_path, integer, now, read_object, setting  # noqa: E402
+from aib_login import (PROVIDERS, access_expiry, credential_path, integer, now, read_object,
+                       setting, store_lock, trusted_store_file)  # noqa: E402
 
 
 def cadence() -> int:
     return max(1, integer("AIB_LOGIN_ACCESS_LIFETIME_S", 3600) // 2 - 1)
+
+
+def force_private_expiry(provider: str, path: Path) -> bytes:
+    """Move only the private copy into the CLIs' measured <=300 s refresh window."""
+    data = read_object(path)
+    if data is None:
+        raise ValueError("invalid credential")
+    forced = now() + 60
+    if provider == "claude-code":
+        oauth = data.get("claudeAiOauth")
+        if not isinstance(oauth, dict):
+            raise ValueError("invalid Claude credential")
+        oauth["expiresAt"] = forced * 1000
+    else:
+        tokens = data.get("tokens")
+        token = tokens.get("access_token") if isinstance(tokens, dict) else None
+        if not isinstance(token, str) or len(token.split(".")) != 3:
+            raise ValueError("invalid Codex credential")
+        header, payload, signature = token.split(".")
+        decoded = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if not isinstance(decoded, dict):
+            raise ValueError("invalid Codex JWT")
+        decoded["exp"] = forced
+        changed = base64.urlsafe_b64encode(
+            json.dumps(decoded, separators=(",", ":")).encode()
+        ).rstrip(b"=").decode()
+        tokens["access_token"] = f"{header}.{changed}.{signature}"
+    path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    return path.read_bytes()
+
+
+def run_cli(command: list[str], environment: dict[str, str]) -> int:
+    process = subprocess.Popen(
+        command,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        process.communicate(timeout=integer("AIB_LOGIN_CLI_TIMEOUT_S", 120))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        return 1
+    return process.returncode
 
 
 def main(argv: list[str]) -> int:
@@ -29,58 +82,73 @@ def main(argv: list[str]) -> int:
     provider = argv[0]
     path = credential_path(provider)
     try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return 66
-    except OSError:
-        return 78
-    if not stat.S_ISREG(info.st_mode):
-        return 78
-    original = path.read_bytes()
-    data = read_object(path)
-    expiry = access_expiry(provider, data or {})
-    if expiry is None:
-        return 78
-    threshold = integer("AIB_LOGIN_REFRESH_BELOW_S", cadence() + integer("AIB_LOGIN_MAX_TURN_S", 900)
-                        + integer("AIB_LOGIN_MARGIN_S", 300) + integer("AIB_LOGIN_SLACK_S", 600))
-    if expiry - now() > threshold:
-        return 0
-
-    private = Path(tempfile.mkdtemp(prefix=f"aib-login-{provider}."))
-    os.chmod(private, 0o700)
-    try:
-        shutil.copytree(path.parent, private, dirs_exist_ok=True)
-        local = private / path.name
-        env = os.environ.copy()
-        if provider == "claude-code":
-            env["CLAUDE_CONFIG_DIR"] = str(private)
-            command = [setting("AIB_CLAUDE_BIN", "claude"), "-p"]
-        else:
-            env["CODEX_HOME"] = str(private)
-            command = [setting("AIB_CODEX_BIN", "codex"), "features", "list"]
-        result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if result.returncode != 0:
-            return 1
-        updated = local.read_bytes()
-        if updated == original:
-            return 1
-        fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        tmp = Path(raw)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(updated)
-            os.chmod(tmp, 0o640)
-            os.replace(tmp, path)
-        finally:
+        with store_lock():
             try:
-                tmp.unlink()
+                path.lstat()
             except FileNotFoundError:
-                pass
-        return 0
-    except (OSError, subprocess.SubprocessError):
+                print(f"aib-login-refresh: no {provider} login yet", file=sys.stderr)
+                return 0
+            except OSError:
+                return 78
+            if not trusted_store_file(path):
+                return 78
+            original = path.read_bytes()
+            data = read_object(path)
+            expiry = access_expiry(provider, data or {})
+            if expiry is None:
+                return 78
+            threshold = integer("AIB_LOGIN_REFRESH_BELOW_S", cadence() + integer("AIB_LOGIN_MAX_TURN_S", 900)
+                                + integer("AIB_LOGIN_MARGIN_S", 300) + integer("AIB_LOGIN_SLACK_S", 600))
+            if expiry - now() > threshold:
+                return 0
+
+            private = Path(tempfile.mkdtemp(prefix=f"aib-login-{provider}."))
+            os.chmod(private, 0o700)
+            try:
+                shutil.copytree(path.parent, private, dirs_exist_ok=True)
+                local = private / path.name
+                forced = force_private_expiry(provider, local)
+                env = os.environ.copy()
+                if provider == "claude-code":
+                    env["CLAUDE_CONFIG_DIR"] = str(private)
+                    command = [setting("AIB_CLAUDE_BIN", "claude"), "-p", "ok"]
+                else:
+                    env["CODEX_HOME"] = str(private)
+                    command = [setting("AIB_CODEX_BIN", "codex"), "features", "list"]
+                if run_cli(command, env) != 0:
+                    return 1
+                updated = local.read_bytes()
+                if provider == "codex" and updated == forced:
+                    # Codex 0.155.x does not initialize authentication for `features list`.
+                    # app-server initializes the auth manager and exits cleanly on our closed
+                    # stdin without starting a model turn. Older/fake CLIs may already have
+                    # refreshed above, so retain the cheap compatibility trigger first.
+                    if run_cli([setting("AIB_CODEX_BIN", "codex"), "app-server"], env) != 0:
+                        return 1
+                    updated = local.read_bytes()
+                if updated == forced:
+                    print(f"aib-login-refresh: {provider} credential unchanged", file=sys.stderr)
+                    return 0
+                if path.read_bytes() != original:
+                    print(f"aib-login-refresh: newer {provider} login preserved", file=sys.stderr)
+                    return 0
+                fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+                tmp = Path(raw)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(updated)
+                    os.chmod(tmp, 0o640)
+                    os.replace(tmp, path)
+                finally:
+                    try:
+                        tmp.unlink()
+                    except FileNotFoundError:
+                        pass
+                return 0
+            finally:
+                shutil.rmtree(private, ignore_errors=True)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return 1
-    finally:
-        shutil.rmtree(private, ignore_errors=True)
 
 
 if __name__ == "__main__":

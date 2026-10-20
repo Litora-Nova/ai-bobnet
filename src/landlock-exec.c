@@ -167,9 +167,24 @@ static int role_refuse(const char *message){
   return 3;
 }
 
-static int drop_capability_bounding_set(void){
+static int runtime_last_cap(void){
+  int fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  char raw[32] = {0};
+  ssize_t length = read(fd, raw, sizeof(raw) - 1);
+  close(fd);
+  if (length <= 0) return -1;
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(raw, &end, 10);
+  while (end && (*end == '\n' || *end == '\r')) ++end;
+  if (errno || !end || *end || value < 0 || value > INT_MAX) return -1;
+  return (int)value;
+}
+
+static int drop_capability_bounding_set(int last_cap){
   int saw_eperm = 0, saw_other_failure = 0;
-  for (int cap = 0; cap <= CAP_LAST_CAP; ++cap){
+  for (int cap = 0; cap <= last_cap; ++cap){
     if (!prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)) continue;
     if (errno == EPERM) saw_eperm = 1;
     else saw_other_failure = 1;
@@ -188,7 +203,7 @@ static int clear_capabilities(void){
   return (int)syscall(SYS_capset, &header, data);
 }
 
-static int unprivileged_state_verified(void){
+static int unprivileged_state_verified(int last_cap){
   if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return 0;
   struct __user_cap_header_struct header = {
     .version = _LINUX_CAPABILITY_VERSION_3,
@@ -198,7 +213,7 @@ static int unprivileged_state_verified(void){
   if (syscall(SYS_capget, &header, data)) return 0;
   for (size_t i = 0; i < sizeof(data) / sizeof(data[0]); ++i)
     if (data[i].permitted || data[i].effective || data[i].inheritable) return 0;
-  for (int cap = 0; cap <= CAP_LAST_CAP; ++cap)
+  for (int cap = 0; cap <= last_cap; ++cap)
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, 0, 0) != 0) return 0;
   return 1;
 }
@@ -299,14 +314,16 @@ int main(int argc, char **argv){
   }
   close(rs);
   if (role_switch){
-    int bounding_drop = drop_capability_bounding_set();
+    int last_cap = runtime_last_cap();
+    if (last_cap < 0) return role_refuse("uid switch could not read the kernel capability range");
+    int bounding_drop = drop_capability_bounding_set(last_cap);
     if (bounding_drop < 0) return role_refuse("uid switch could not clear the capability bounding set");
     if (setgroups(0, NULL) && !(errno == EPERM && getuid() == (uid_t)uid_value && getgid() == (gid_t)gid_value))
       return role_refuse("uid switch could not clear supplementary groups");
     if (setgid((gid_t)gid_value)) return role_refuse("uid switch setgid failed");
     if (setuid((uid_t)uid_value)) return role_refuse("uid switch setuid failed");
     if (clear_capabilities()) return role_refuse("uid switch could not clear capabilities");
-    if (bounding_drop > 0 && !unprivileged_state_verified())
+    if (bounding_drop > 0 && !unprivileged_state_verified(last_cap))
       return role_refuse("uid switch could not verify cleared capabilities after bounding-set EPERM");
   }
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);

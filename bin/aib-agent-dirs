@@ -35,6 +35,18 @@ def main(argv: list[str]) -> int:
     if len(argv) != 1 or UID_RE.fullmatch(argv[0]) is None:
         return 64
     uid = argv[0]
+    role_uid_raw = os.environ.get("AIB_ROLE_UID", "")
+    role_gid_raw = os.environ.get("AIB_ROLE_GID", "")
+    role_enabled = bool(role_uid_raw or role_gid_raw)
+    if role_enabled:
+        if not (role_uid_raw.isdecimal() and role_gid_raw.isdecimal()):
+            return 64
+        role_uid = int(role_uid_raw)
+        role_gid = int(role_gid_raw)
+        if role_uid < 1000 or role_gid == 0:
+            return 64
+    else:
+        role_uid = role_gid = -1
     state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
     standup = Path(os.environ.get("AIB_STANDUP_DIR", "/srv/aib/standup"))
     group = os.environ.get("AIB_OPS_GROUP", "aib-ops")
@@ -48,6 +60,26 @@ def main(argv: list[str]) -> int:
         return 78
     if not real_directory(state, 0o700) or not real_directory(transcripts):
         return 78
+    if role_enabled:
+        try:
+            os.chown(state, role_uid, role_gid)
+            for name in (".claude", ".codex"):
+                provider_dir = state / name
+                if not real_directory(provider_dir, 0o700):
+                    return 78
+                os.chown(provider_dir, role_uid, role_gid)
+            auth = state / ".codex" / "auth.json"
+            target = Path(os.environ.get("AIB_LOGIN_ROOT", "/var/lib/aib/login")) / "codex" / "auth.json"
+            if auth.is_symlink():
+                if os.readlink(auth) != str(target):
+                    return 78
+            elif auth.exists():
+                return 78
+            else:
+                auth.symlink_to(target)
+                os.lchown(auth, role_uid, role_gid)
+        except OSError:
+            return 78
     calls = [
         ["-m", f"g:{group}:--x", str(state)],
         ["-d", "-m", f"g:{group}:r-x", str(state)],

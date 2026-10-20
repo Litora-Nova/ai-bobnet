@@ -305,6 +305,10 @@ def login_command(argv: list[str]) -> int:
     log = Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
     if not caller.startswith(("human:", "gateway:")):
         return audit_rejection(log, "login-start", provider, caller, actor, "unauthorized")
+    unit = f"aib-login@{provider}.service"
+    already_active = False
+    if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
+        already_active = systemctl("is-active", unit).returncode == 0
     try:
         requested = append_record(
             log,
@@ -317,7 +321,16 @@ def login_command(argv: list[str]) -> int:
         )
     except (OSError, ValueError, json.JSONDecodeError):
         return 73
-    outcome = systemctl("start", f"aib-login@{provider}.service")
+    if already_active:
+        try:
+            append_record(
+                log, "login.rejected", req=requested["seq"], provider=provider,
+                caller=caller, reason="already_running",
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return 73
+        return 77
+    outcome = systemctl("start", unit)
     if outcome.returncode != 0:
         return 69
     request = int(requested["seq"])

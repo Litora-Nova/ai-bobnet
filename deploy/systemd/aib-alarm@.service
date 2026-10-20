@@ -1,7 +1,7 @@
 [Unit]
-Description=BobNet failure alarm for %I
+Description=BobNet failure alarm for %i
 
 [Service]
 Type=oneshot
 User=aib-broker
-ExecStart=/opt/aib/engine/bin/aib-unit-alarm %I
+ExecStart=/opt/aib/engine/bin/aib-unit-alarm %i
