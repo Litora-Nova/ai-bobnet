@@ -149,7 +149,7 @@ eq "T1: …each carries provider and caller; accepted/succeeded carry the vorgan
 eq "T1: socket and private config dir are gone" "$(test -f "$FP/cli.log" && echo ran)|$([ ! -e "$LSOCK/login-claude-code.sock" ] && echo gone)|$([ ! -e "$(sed 's/.* cfg=//' "$FP/cli.log" | head -1)" ] && echo gone)" "ran|gone|gone"
 eq "T1: the code is in NO capture: audit log, outbox, status, store, unit stdout/stderr, PTY capture file" "$URC|$(leaks "$CODE" "$CLOG" "$OUTBOX" "$LSTAT" "$LROOT" "$LSTATE" "$W/unit.out" "$W/unit.err")" "0|0"
 eq "T1: …nor does any token leak into the audit log, outbox, status or unit output" "$(test -s "$cr" && echo have)|$(leaks "$SENT" "$CLOG" "$OUTBOX" "$LSTAT" "$W/unit.out" "$W/unit.err")" "have|0"
-eq "T1: the PTY capture file (if kept) exists with no code in it" "$(test -f "$LSTATE/claude-code.pty.log" && grep -c "$CODE" "$LSTATE/claude-code.pty.log" || echo nofile)" 0
+eq "T1: the PTY capture file (if kept) exists with no code in it" "$(if test -f "$LSTATE/claude-code.pty.log"; then grep -c "$CODE" "$LSTATE/claude-code.pty.log" || true; else echo nofile; fi)" 0
 
 # --- T2 rejections leave the vorgang open ---------------------------------------------------------------------------------------------------------
 fresh; lreq claude-code human:operator >/dev/null; ustart claude-code
@@ -200,7 +200,9 @@ eq "T5: the CLI argv was exactly 'login --device-auth'" "$(grep -c '^argv=login 
 
 # --- T6 gateway start gating: due-only, 1/h ---------------------------------------------------------------------------------------------------------------
 gate() { # gate <state> -> the unit's rc for a gateway request
-  fresh; lreq claude-code gateway:gw gateway-peer:hub1 >/dev/null
+  local saved_rate=""; [ ! -f "$LSTATE/start-claude-code.json" ] || saved_rate="$(cat "$LSTATE/start-claude-code.json")"
+  fresh; [ -z "$saved_rate" ] || printf '%s' "$saved_rate" > "$LSTATE/start-claude-code.json"
+  lreq claude-code gateway:gw gateway-peer:hub1 >/dev/null
   [ "$1" = none ] || printf '{"provider":"claude-code","state":"%s","expires_at":null,"label":"","id_hint":"","checked_at":"x"}' "$1" > "$LSTAT/claude-code.json"
   ustart claude-code AIB_LOGIN_WINDOW_S=1 AIB_LOGIN_NOW="${2:-$LNOW}"; uwait 15
 }

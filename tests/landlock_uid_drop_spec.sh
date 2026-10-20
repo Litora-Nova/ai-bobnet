@@ -59,7 +59,7 @@ ll AIB_ROLE_UIDS="5000,5001" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";      
 has "T1: …stderr says why" "$ERR" "uid"
 ll -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";                                        eq "T1: AIB_ROLE_UIDS unset => nobody allowed (exit 3)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS= -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";                         eq "T1: AIB_ROLE_UIDS empty => nobody allowed (exit 3)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
-ll AIB_ROLE_UIDS="50,${ME}0" -- --uid "${ME}0" --gid "$MG" "${touch_cmd[@]}" 2>/dev/null; eq "T1: a uid that is only a textual prefix/suffix of a listed one is not listed" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="50,${ME}00" -- --uid "${ME}0" --gid "$MG" "${touch_cmd[@]}" 2>/dev/null; eq "T1: a uid that is only a textual prefix/suffix of a listed one is not listed" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="${ME}1,2${ME}" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";           eq "T1: …(whole-token match: $ME vs ${ME}1,2$ME)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" -- --uid "$ME" --uid "$ME" --gid "$MG" "${touch_cmd[@]}";        eq "T1: a repeated option => exit 2" "$RC|$(ran)" "2|not-run"
 

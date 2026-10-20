@@ -49,6 +49,7 @@ cat > "$STUB/landlock-exec" <<'STUB'
 { printf 'ARGV=%s\n' "$*"; printf 'HOME=%s\nLL_RO=%s\nLL_RW=%s\nAIB_ROLE_UIDS=%s\n' "${HOME-<unset>}" "${LL_RO-<unset>}" "${LL_RW-<unset>}" "${AIB_ROLE_UIDS-<unset>}"; echo '---'; } >> "$(cd "$(dirname "$0")" && cat log.path)"
 [ -z "${LL_STATUS_FD-}" ] || eval "exec ${LL_STATUS_FD}>&-"
 if [ "${1-}" = --uid ]; then shift 4; fi
+unset AIB_ROLE_UIDS
 exec "$@"
 STUB
 echo "$LOG" > "$STUB/log.path"
@@ -56,7 +57,7 @@ cat > "$STUB/provider" <<'STUB'
 #!/usr/bin/env bash
 priv="$(cd "$(dirname "$0")" && cat priv.path)"
 { env | grep -E '^(HOME|AIB_[A-Z_]+)=' | sort; echo '---'; } >> "$priv/env.log"
-fd="${AIB_CREDENTIAL_FD:-}"; if [ -n "$fd" ]; then eval "cat <&$fd" > "$priv/fd.content" 2>/dev/null; ls "/proc/$$/fd" | tr '\n' ' ' > "$priv/fds"; fi
+fd="${AIB_CREDENTIAL_FD:-}"; if [ -n "$fd" ]; then eval "cat <&$fd" > "$priv/fd.content" 2>/dev/null; python3 -I -c 'import os; xs=os.listdir("/proc/self/fd"); print(" ".join(sorted((x for x in xs if os.path.exists("/proc/self/fd/"+x)),key=int)),end=" ")' > "$priv/fds"; fi
 echo ran >> "$priv/ran"
 exit 0
 STUB
