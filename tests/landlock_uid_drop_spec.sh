@@ -11,7 +11,10 @@
 #     - the refusal is decided BEFORE any Landlock work (so it is the same on a kernel without Landlock) and goes to stderr and, when LL_STATUS_FD is open, to that fd as one line `confine: ...` mentioning the word `uid`
 #   Mechanics on success (order matters):
 #     1. the Landlock ruleset is installed (restrict_self) FIRST,  2. then setgroups(0), setgid, setuid to the requested ids,
-#     3. all capabilities (permitted, effective, inheritable, ambient, bounding) are cleared, no_new_privs stays set,  4. CMD is exec'd.
+#     3. capabilities are cleared (permitted, effective, inheritable, ambient; the bounding set too where the caller may drop it: root / CAP_SETPCAP),
+#        no_new_privs stays set,  4. CMD is exec'd.
+#        Design v3.3: without CAP_SETPCAP the bounding set cannot be dropped; the helper then continues ONLY IF after the switch no_new_privs=1 and
+#        CapPrm/CapEff/CapInh/CapAmb are all zero (a residual CapBnd is harmless then); otherwise it refuses with exit 3.
 #     The child sees neither AIB_ROLE_UIDS nor LL_*; the Landlock rules still bind it after the id switch.
 #   Specs that need the kernel's Landlock or real root skip with a stated reason; the pure policy refusals run everywhere.
 #
@@ -33,6 +36,8 @@ if [ -z "$CC" ] || ! "$CC" -O2 -o "$WORK/ll" "$SRC_ROOT/src/landlock-exec.c" 2>"
   printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]; exit
 fi
 ME="$(id -u)"; MG="$(id -g)"; SENT="$WORK/ran"; mkdir -p "$WORK/rw" "$WORK/outside"
+# DAC must not be the reason for a denial: the dirs are world-writable (sticky) and $WORK is traversable, so only Landlock can deny a write
+chmod o+x "$WORK"; chmod 1777 "$WORK/rw" "$WORK/outside"
 # ll [env...] -- args...  -> RC OUT ERR STATUS (fd 3 = status channel)
 ll() {
   local extra=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do extra+=("$1"); shift; done; shift
@@ -68,21 +73,37 @@ ll -- /bin/true
 if [ "$RC" -ne 0 ]; then
   skip "T2: Landlock is not usable on this host (plain 'landlock-exec /bin/true' => rc $RC: $(printf '%s' "$ERR" | head -c 120)) — behavioural switch cases"
 else
-  ll AIB_ROLE_UIDS="5000,$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c ": > '$SENT'; id -u; id -g; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|CapBnd|NoNewPrivs):' /proc/self/status; env | grep -cE '^(AIB_ROLE_UIDS|LL_)'"
-  eq "T2: a listed uid (our own: the no-op switch a non-root caller can make) runs CMD as that uid/gid" "$RC|$(printf '%s\n' "$OUT" | sed -n 1,2p | tr '\n' ' ')" "0|$ME $MG "
-  eq "T2: …with ALL capability sets empty (incl. bounding) and no_new_privs set" "$(printf '%s\n' "$OUT" | grep -E '^Cap(Eff|Prm|Inh|Amb|Bnd):' | awk '{print $2}' | sort -u | tr '\n' ' ')|$(printf '%s\n' "$OUT" | grep '^NoNewPrivs:' | awk '{print $2}')" "0000000000000000 |1"
+  ll AIB_ROLE_UIDS="5000,$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c "touch '$SENT'; id -u; id -g; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|NoNewPrivs):' /proc/self/status; env | grep -cE '^(AIB_ROLE_UIDS|LL_)'"
+  eq "T2: a listed uid (our own: the no-op switch a non-root caller can make) => rc 0, CMD runs as that uid/gid" "$RC|$(printf '%s\n' "$OUT" | sed -n 1,2p | tr '\n' ' ')|$(ran)" "0|$ME $MG |ran"
+  eq "T2: …CapPrm/CapEff/CapInh/CapAmb all empty and no_new_privs set (CapBnd not asserted: v3.3)" "$(printf '%s\n' "$OUT" | grep -E '^Cap(Eff|Prm|Inh|Amb):' | awk '{print $2}' | sort -u | tr '\n' ' ')|$(printf '%s\n' "$OUT" | grep -c '^Cap\(Eff\|Prm\|Inh\|Amb\):')|$(printf '%s\n' "$OUT" | grep '^NoNewPrivs:' | awk '{print $2}')" "0000000000000000 |4|1"
   eq "T2: …the child sees neither AIB_ROLE_UIDS nor LL_*" "$(printf '%s\n' "$OUT" | tail -1)" 0
-  ll AIB_ROLE_UIDS="$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c ": > '$WORK/outside/x' 2>/dev/null && echo wrote || echo denied; : > '$WORK/rw/x' && echo rw-ok"
+  rm -f "$WORK/outside/c" "$WORK/outside/x" "$WORK/rw/x"
+  touch "$WORK/outside/c" 2>/dev/null && echo wrote > "$WORK/ctl" || echo denied > "$WORK/ctl"
+  eq "T2: control: WITHOUT the helper the same write outside succeeds (DAC allows it, so a denial below is Landlock)" "$(cat "$WORK/ctl")" wrote
+  ll AIB_ROLE_UIDS="$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c "if touch '$WORK/outside/x' 2>/dev/null; then echo wrote; else echo denied; fi; if touch '$WORK/rw/x'; then echo rw-ok; else echo rw-denied; fi"
   eq "T2: Landlock still binds after the switch: write outside LL_RW denied, inside allowed" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "denied rw-ok "
   ll AIB_ROLE_UIDS="$ME" -- /bin/sh -c "echo plain-$ME"
   eq "T2: without --uid the helper behaves as before (CMD runs, nothing refused even with the list set)" "$RC|$OUT" "0|plain-$ME"
   if [ "$(id -u)" -ne 0 ]; then
     skip "T2: real privilege drop (setgroups + setgid + setuid to another account, caps cleared) needs root; run this spec as root on the dev VM"
   else
-    ll AIB_ROLE_UIDS="65534" -- --uid 65534 --gid 65534 /bin/sh -c "id -u; id -g; id -G; grep '^CapEff:' /proc/self/status | awk '{print \$2}'"
-    eq "T2 (root): drops to 65534:65534, supplementary groups emptied to the gid alone, CapEff empty" "$RC|$(printf '%s\n' "$OUT" | tr '\n' ' ')" "0|65534 65534 65534 0000000000000000 "
-    ll AIB_ROLE_UIDS="65534" -- --uid 65534 --gid 65534 /bin/sh -c ": > '$WORK/outside/y' 2>/dev/null && echo wrote || echo denied"
-    eq "T2 (root): …and Landlock was installed BEFORE the drop: the dropped child cannot write outside LL_RW" "$OUT" denied
+    ll AIB_ROLE_UIDS="65534" -- --uid 65534 --gid 65534 /bin/sh -c "id -u; id -g; id -G; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|CapBnd):' /proc/self/status | awk '{print \$2}' | sort -u | tr '\n' ' '; grep '^NoNewPrivs:' /proc/self/status | awk '{print \$2}'"
+    eq "T2 (root): drops to 65534:65534, supplementary groups emptied to the gid alone, ALL cap sets incl. CapBnd empty, no_new_privs 1" "$RC|$(printf '%s\n' "$OUT" | tr '\n' ' ')" "0|65534 65534 65534 0000000000000000  1 "
+    rm -f "$WORK/outside/y"
+    "$CC" -x c -O2 -o "$WORK/asuid" - <<'CEOF' 2>/dev/null
+#include <unistd.h>
+#include <grp.h>
+int main(int c,char**v){ if(setgroups(0,0)||setgid(65534)||setuid(65534)) return 99; execvp(v[1],v+1); return 98; }
+CEOF
+    if [ -x "$WORK/asuid" ]; then
+      RC=0; "$WORK/asuid" touch "$WORK/outside/y" 2>/dev/null || RC=$?
+      eq "T2 (root): control: as 65534 WITHOUT the helper the write outside succeeds (DAC allows it)" "$RC|$([ -e "$WORK/outside/y" ] && echo there)" "0|there"
+    else
+      no "T2 (root): control: could not build the uid-switch helper for the DAC control"
+    fi
+    rm -f "$WORK/outside/y"
+    ll AIB_ROLE_UIDS="65534" -- --uid 65534 --gid 65534 /bin/sh -c "if touch '$WORK/outside/y' 2>/dev/null; then echo wrote; else echo denied; fi"
+    eq "T2 (root): …and Landlock was installed BEFORE the drop: the dropped child cannot write outside LL_RW (DAC would allow it)" "$OUT" denied
     ll AIB_ROLE_UIDS="65534" -- --uid 65534 --gid 65534 /bin/sh -c 'kill -0 1 2>/dev/null; id -u'
     eq "T2 (root): a child cannot get uid 0 back (setuid(0) is denied)" "$(ll AIB_ROLE_UIDS=65534 -- --uid 65534 --gid 65534 /usr/bin/python3 -c 'import os
 try:
