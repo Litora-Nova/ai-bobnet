@@ -76,7 +76,7 @@ else
   if [ "$ME" -eq 0 ]; then
     skip "T2: the own-uid switch is the non-root path (uid 0 is refused by policy, T1); root runs the drop block below"
   else
-  ll AIB_ROLE_UIDS="5000,$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c "touch '$SENT'; id -u; id -g; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|NoNewPrivs):' /proc/self/status; env | grep -cE '^(AIB_ROLE_UIDS|LL_)'"
+  ll AIB_ROLE_UIDS="5000,$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c "touch '$SENT'; id -u; id -g; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|NoNewPrivs):' /proc/self/status; env | grep -cE '^(AIB_ROLE_UIDS|LL_)' || true"
   eq "T2: a listed uid (our own: the no-op switch a non-root caller can make) => rc 0, CMD runs as that uid/gid" "$RC|$(printf '%s\n' "$OUT" | sed -n 1,2p | tr '\n' ' ')|$(ran)" "0|$ME $MG |ran"
   eq "T2: …CapPrm/CapEff/CapInh/CapAmb all empty and no_new_privs set (CapBnd not asserted: v3.3)" "$(printf '%s\n' "$OUT" | grep -E '^Cap(Eff|Prm|Inh|Amb):' | awk '{print $2}' | sort -u | tr '\n' ' ')|$(printf '%s\n' "$OUT" | grep -c '^Cap\(Eff\|Prm\|Inh\|Amb\):')|$(printf '%s\n' "$OUT" | grep '^NoNewPrivs:' | awk '{print $2}')" "0000000000000000 |4|1"
   eq "T2: …the child sees neither AIB_ROLE_UIDS nor LL_*" "$(printf '%s\n' "$OUT" | tail -1)" 0
