@@ -18,7 +18,7 @@
 #         -m g:<grp>:--x <standup>/transcripts -d -m g:<grp>:r-x <standup>/transcripts
 #         -m g:<grp>:r-- <root>/<uid>/live.json      (only when that file exists)
 #     uid must match [a-z0-9]+(-[a-z0-9]+)+ else rc 64 and nothing is created or run. A failing setfacl => rc 69.
-#   bin/aib-unit-alarm <failed unit name>   (unit aib-alarm@.service: Type=oneshot, User=aib-broker, ExecStart=/…/bin/aib-unit-alarm %I)
+#   bin/aib-unit-alarm <failed unit name>   (unit aib-alarm@.service: Type=oneshot, User=aib-broker, ExecStart=/…/bin/aib-unit-alarm %i; v3.4 K1, was %I)
 #     aib-agent@<uid>.service           -> a line in the agent's TEAM outbox (from registry): from:aib-alarm | to:human:<team> | state:PERSISTED |
 #                                          alarm:unit_failed agent:<uid> unit:aib-agent@<uid>.service        (unknown agent -> the server outbox, to:human:ops)
 #     aib-login@<p>.service, aib-login-refresh@<p>.service
@@ -110,10 +110,61 @@ done
 AL="$SRC_ROOT/deploy/systemd/aib-alarm@.service"; AG="$SRC_ROOT/deploy/systemd/aib-agent@.service"
 sec() { awk -v s="[$2]" '/^\[/{on=($0==s)} on' "$1" 2>/dev/null | grep -v '^[[:space:]]*#' | grep -v '^\['; }
 eq "T4: aib-alarm@.service is oneshot, User=aib-broker" "$(sec "$AL" Service | grep -cx -e 'Type=oneshot' -e 'User=aib-broker')" 2
-case "$(sec "$AL" Service | grep '^ExecStart=' | head -1)" in ExecStart=/*/bin/aib-unit-alarm\ %I) ok "T4: ExecStart= absolute path to bin/aib-unit-alarm %I (unescaped instance)";; *) no "T4: ExecStart= absolute path to bin/aib-unit-alarm %I";; esac
+case "$(sec "$AL" Service | grep '^ExecStart=' | head -1)" in ExecStart=/*/bin/aib-unit-alarm\ %i) ok "T4: ExecStart= absolute path to bin/aib-unit-alarm %i (v3.4 K1: the RAW instance; %I would turn every '-' of the failed unit's name into '/')";; *) no "T4: ExecStart= absolute path to bin/aib-unit-alarm %i (v3.4 K1; was %I, which contradicts systemd)";; esac
+# T4b (K1) the specifier round trip. OnFailure=aib-alarm@%n.service puts the failed unit's name into the instance RAW; %i hands it back unchanged, %I
+# applies systemd's unescape ('-' -> '/'). Simulate the expansion of the shipped ExecStart with systemd-escape itself and require the name to arrive intact.
+if ! command -v systemd-escape >/dev/null 2>&1; then
+  printf 'ok   - (skipped: systemd-escape is not installed on this host - the specifier round trip needs it; the text pin above still holds)\n'
+else
+  arg="$(sec "$AL" Service | grep '^ExecStart=' | head -1 | awk '{print $NF}')"
+  for inst in 'aib-agent@foo-bar.service' 'aib-login-refresh@claude-code.service' 'aib-login-watch.service'; do
+    case "$arg" in %i) got="$inst";; %I) got="$(systemd-escape --unescape -- "$inst")";; *) got="?$arg";; esac
+    eq "T4b: ExecStart argument '$arg' delivers '$inst' to aib-unit-alarm unchanged" "$got" "$inst"
+  done
+  eq "T4b: the Description= does not use %I either (it would show a mangled name)" "$(sec "$AL" Unit | grep -c '%I')" 0
+fi
 eq "T4: aib-agent@.service: OnFailure=aib-alarm@%n.service in [Unit] (not [Service])" "$(sec "$AG" Unit | grep -c '^OnFailure=aib-alarm@%n.service$')|$(sec "$AG" Service | grep -c '^OnFailure=')" "1|0"
 es="$(sec "$AG" Service | grep '^ExecStartPre=' | head -1)"
 case "$es" in ExecStartPre=+/*/bin/aib-agent-dirs\ %i) ok "T4: ExecStartPre=+<abs>/bin/aib-agent-dirs %i in [Service]";; *) no "T4: ExecStartPre=+<abs>/bin/aib-agent-dirs %i (got '$es')";; esac
 eq "T4: the supervisor itself still has NoNewPrivileges and StateDirectoryMode=0700" "$(sec "$AG" Service | grep -cx -e 'NoNewPrivileges=yes' -e 'StateDirectoryMode=0700')" 2
+
+# --- T5 (K7) aib-agent-dirs prepares the ROLE account's home (S1c) -------------------------------------------------------------------------------
+# With AIB_ROLE_UID/AIB_ROLE_GID set (the same variables the broker uses; decimal, uid >= 1000) the helper also
+#   - chowns <root>/<uid> to that uid:gid (mode stays 0700),
+#   - creates <root>/<uid>/.claude and <root>/<uid>/.codex as real directories, 0700, owned by the role account (never through a symlink: rc 78),
+#   - creates the symlink <root>/<uid>/.codex/auth.json -> $AIB_LOGIN_ROOT/codex/auth.json (default /var/lib/aib/login; dangling is fine: the login
+#     may not exist yet; an existing correct link is left alone). Without AIB_ROLE_UID none of this happens (S1c off = today's behaviour).
+LR="$W/login-root"; RU="$(id -u)"; RG="$(id -g)"; [ "$RU" -ge 1000 ] || RU=""
+rdirs() { RC=0; : > "$W/setfacl.log"; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SR" AIB_STANDUP_DIR="$SD" AIB_OPS_GROUP="$GRP" AIB_SETFACL="$W/fakes/setfacl" AIB_LOGIN_ROOT="$LR" "$@" \
+    timeout 30 "$ENGINE/bin/aib-agent-dirs" acme-core 2>"$W/dirs.err")" || RC=$?; ERR="$(cat "$W/dirs.err")"; }
+rm -rf "$SR" "$SD" "$LR"; mkdir -p "$SR" "$SD" "$LR"
+rdirs
+eq "T5: without AIB_ROLE_UID nothing of the role setup happens (no .claude/.codex)" "$RC|$([ -e "$SR/acme-core/.claude" ] || [ -e "$SR/acme-core/.codex" ] && echo created || echo none)" "0|none"
+if [ -z "$RU" ]; then
+  printf 'ok   - (skipped: this test user has uid < 1000, so its own ids are not a valid AIB_ROLE_UID - the role-setup cases need a normal account)\n'
+else
+  rm -rf "$SR" "$SD"; mkdir -p "$SR" "$SD"
+  rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"
+  d="$SR/acme-core"
+  eq "T5: role setup: rc 0, state dir 0700 and owned by the role uid:gid" "$RC|$(stat -c '%a %u:%g' "$d")" "0|700 $RU:$RG"
+  eq "T5: ….claude and .codex are real 0700 dirs owned by the role account" "$(for x in .claude .codex; do [ -d "$d/$x" ] && [ ! -L "$d/$x" ] && stat -c '%a %u:%g' "$d/$x"; done | tr '\n' ',')" "700 $RU:$RG,700 $RU:$RG,"
+  eq "T5: ….codex/auth.json is a symlink to the shared store (dangling is fine)" "$([ -L "$d/.codex/auth.json" ] && readlink "$d/.codex/auth.json")" "$LR/codex/auth.json"
+  eq "T5: …the setfacl calls are unchanged (still exactly four)" "$(wc -l < "$W/setfacl.log" | tr -d ' ')" 4
+  rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"
+  eq "T5: idempotent (rc 0, link unchanged)" "$RC|$(readlink "$d/.codex/auth.json")" "0|$LR/codex/auth.json"
+  rm -rf "$d/.claude"; ln -s "$W" "$d/.claude"; rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"
+  eq "T5: a symlink where .claude belongs => rc 78 (nothing is created or chowned through it)" "$RC" 78
+  rm -f "$d/.claude"
+  for bad in 0 999 abc -1 '1000 1001'; do
+    rm -rf "$SR/acme-core"; rdirs AIB_ROLE_UID="$bad" AIB_ROLE_GID="$RG"
+    eq "T5: AIB_ROLE_UID='$bad' is not a valid role uid => rc 64, no state dir touched" "$RC|$([ -e "$SR/acme-core" ] && echo created || echo none)" "64|none"
+  done
+fi
+if [ "$(id -u)" -ne 0 ]; then
+  printf 'ok   - (skipped: not root - chowning to a DIFFERENT uid needs root; the own-uid cases above cover the logic, the VM run covers the cross-uid case)\n'
+else
+  rm -rf "$SR" "$SD"; mkdir -p "$SR" "$SD"; rdirs AIB_ROLE_UID=64211 AIB_ROLE_GID=64211
+  eq "T5 (root): the state dir, .claude and .codex belong to the role uid" "$RC|$(stat -c '%u:%g' "$SR/acme-core" "$SR/acme-core/.claude" "$SR/acme-core/.codex" | tr '\n' ' ')" "0|64211:64211 64211:64211 64211:64211 "
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

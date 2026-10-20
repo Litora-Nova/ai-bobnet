@@ -16,7 +16,14 @@
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/ctl_harness.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-suplogin.XXXXXX")"
-trap sup_cleanup EXIT
+# gate round 1 (Marvin 4./Riker): the supervisor can still be writing episodes/ when the plain cleanup removes the tree
+# ("rm: Directory not empty", ~3300 stale /tmp/aibobnet-* dirs). Reap the supervisor and the fakes first, then retry the removal until it is gone.
+login_cleanup() {
+  if [ -n "${SUP_PID:-}" ]; then kill -9 "$SUP_PID" 2>/dev/null; wait "$SUP_PID" 2>/dev/null; SUP_PID=""; fi
+  [ -z "${W:-}" ] || pkill -9 -f "$W/fakes/" 2>/dev/null
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do rm -rf "$WORK" 2>/dev/null; [ ! -e "$WORK" ] && break; sleep 0.2; done
+}
+trap login_cleanup EXIT
 OB() { cat "$OUTBOX/acme-engine/outbox.md" 2>/dev/null; }
 obn() { OB | grep -c "alarm:$1"; }
 ob_has() { [ "$(obn "$1")" -ge "$2" ]; }
@@ -58,6 +65,19 @@ start_sup acme-core "${CTLENV[@]}"
 wait_for 5 lj_is brake.consecutive 5
 eq "T2: guard — an ordinary rc 1 failure still counts toward the brake" "$(lj brake.consecutive)|$(obn infra_blocked)" "5|0"
 stop_sup
+
+# --- T2b (Riker M6) the hint only comes from the adapter, never from free agent output ---------------------------------------------------------------
+# An agent (or a test run it executes) can print anything. `hint:login` is the ADAPTER's marker and only counts on the adapter's own exit (78);
+# a bare `401` inside ordinary output never counts. Otherwise a failing test run skips the brake and is retried forever.
+for text in "hint:login" "FAILED: expected 401 got 200" "ran 401 tests, 3 failed" "GET /x -> 401"; do
+  ctl_world neg
+  default "1||E:$text"; for i in 1 2 3; do m_send m-$i x; done
+  start_sup acme-core "${CTLENV[@]}" AIB_SUP_BLOCKED_AFTER_S=0.4
+  wait_for 5 lj_is brake.consecutive 5
+  sleep 0.6
+  eq "T2b: rc 1 + free output '${text:0:34}' => ordinary provider failure: the brake counts (5), no infra_blocked alarm" "$(lj brake.consecutive)|$(obn infra_blocked)" "5|0"
+  stop_sup
+done
 
 # --- T3 the alarm is per EPISODE ---------------------------------------------------------------------------------------------------------------------------------
 ctl_world episodes

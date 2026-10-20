@@ -176,4 +176,65 @@ chmod 640 "$LROOT/claude-code/.credentials.json"; mv "$LROOT/claude-code/.creden
 lrun AIB_TURN_TIMEOUT_S=900 -- "$TOK" claude-code; eq "T4: a symlinked store file => 78" "$RC|$OUT" "78|"
 rm -f "$LROOT/claude-code/.credentials.json"; lrun AIB_TURN_TIMEOUT_S=900 -- "$TOK" claude-code; eq "T4: no credential => 66" "$RC|$OUT" "66|"
 
+# =====================================================================================================================================
+# Gate round 1 delta (v3.4): K5 (the fd is checked by stat, not by access()), Marvin G3 (stdio descriptors), Riker M8 (owner of the store file)
+# =====================================================================================================================================
+
+# --- T5 (K5) the descriptor, not the path, carries the right to read ---------------------------------------------------------------------------
+# The broker's buffer is a 0600 file owned by aib-broker; the role account has no access to the PATH, only the inherited descriptor. `-r` on
+# /proc/self/fd/N is access(R_OK) on the inode and refuses it. Mode 000 reproduces that for any non-root user.
+printf '%s' "$FD_TOKEN" > "$W/fd.nopath"
+rm -f "$W/fake.env" "$W/fake.tok"; RC=0
+( cd "$CWD" && exec 3< "$W/fd.nopath" && chmod 000 "$W/fd.nopath" && env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" \
+    AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TIMEOUT_S=900 \
+    "$SRC_ROOT/adapters/claude-code" exec -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "hi" ) >"$W/ad.out" 2>"$W/ad.err" || RC=$?
+if [ "$(id -u)" -eq 0 ]; then
+  printf 'ok   - (skipped: running as root - root passes access(R_OK) on a mode-000 file, so the mode-000 case cannot show the bug here; the cross-uid case below is the root-side proof)\n'
+else
+  eq "T5: fd mode with the buffer at mode 000 (path unreadable, descriptor open) => the CLI runs and reads the token from the fd" "$RC|$([ -f "$W/fake.env" ] && echo ran)|$(cat "$W/fake.tok" 2>/dev/null)" "0|ran|$FD_TOKEN"
+fi
+chmod 600 "$W/fd.nopath" 2>/dev/null
+
+# stdio descriptors are never a credential channel, even when they are open and non-empty (Marvin G3)
+ADARGS=(exec -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "hi")
+for stdio in 0 1 2; do
+  printf '%s' "$FD_TOKEN" > "$W/fd.stdio"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
+  AD=( env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD="$stdio" AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" "${ADARGS[@]}" )
+  case "$stdio" in
+    0) ( cd "$CWD" && "${AD[@]}" ) <"$W/fd.stdio" >"$W/ad.out" 2>"$W/ad.err" || RC=$?;;
+    1) ( cd "$CWD" && "${AD[@]}" ) 1<>"$W/fd.stdio" 2>"$W/ad.err" || RC=$?;;
+    2) ( cd "$CWD" && "${AD[@]}" ) >"$W/ad.out" 2<>"$W/fd.stdio" || RC=$?;;
+  esac
+  eq "T5: AIB_CREDENTIAL_FD=$stdio with that stdio descriptor open and NON-empty => 78, CLI not started" "$RC|$([ -f "$W/fake.env" ] && echo ran || echo not-started)" "78|not-started"
+done
+
+# VM-only cross-uid proof (needs root; skipped elsewhere): the role account cannot open the path, but inherits the descriptor
+if [ "$(id -u)" -ne 0 ] || ! command -v setpriv >/dev/null 2>&1; then
+  printf 'ok   - (skipped: needs root and setpriv - the cross-uid hand-off is proven on the VM, the mode-000 case above is the non-root proxy)\n'
+else
+  RU=64231; chmod -R a+rX "$W" "$WORK" 2>/dev/null; mkdir -p "$W/xhome/.claude"; chown -R $RU:$RU "$W/xhome"; chmod 700 "$W/xhome/.claude"
+  printf '%s' "$FD_TOKEN" > "$W/fd.x"; chown 0:0 "$W/fd.x"; chmod 600 "$W/fd.x"; chmod a+rx "$W/fakes" "$FAKE"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
+  ( cd "$CWD" && exec 3< "$W/fd.x" && exec setpriv --reuid=$RU --regid=$RU --clear-groups env -i HOME="$W/xhome" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" \
+      AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" exec -m "$MODEL" -s workspace-write -- "hi" ) >"$W/ad.out" 2>"$W/ad.err" || RC=$?
+  eq "T5 (VM, root): a different uid, root-owned 0600 buffer, only the inherited fd => the CLI runs and reads the token" "$RC|$([ -f "$W/fake.env" ] && echo ran)|$(cat "$W/fake.tok" 2>/dev/null)" "0|ran|$FD_TOKEN"
+fi
+
+# --- T6 (M8) the store file must belong to the account that owns the store ---------------------------------------------------------------------
+# The store directory is group-writable by the role accounts; whatever 0640 file is found there is handed to every agent. The token tool therefore
+# requires the file's owner (default: its own effective uid; seam AIB_LOGIN_STORE_OWNER, the same name the codex adapter uses) and, when
+# AIB_LOGIN_STORE_GROUP is given, its group.
+mk_claude $(( LNOW + FLOORC )); other_user="$(getent passwd 0 | cut -d: -f1)"; [ "$(id -u)" -ne 0 ] || other_user="nobody"
+lrun AIB_TURN_TIMEOUT_S=900 -- "$TOK" claude-code
+eq "T6: guard — the file owned by the tool's own uid is served" "$RC|$OUT" "0|at-$SENT"
+lrun AIB_TURN_TIMEOUT_S=900 AIB_LOGIN_STORE_OWNER="$other_user" -- "$TOK" claude-code
+eq "T6: a store file owned by someone else than the expected owner => 78, nothing on stdout" "$RC|$OUT" "78|"
+lrun AIB_TURN_TIMEOUT_S=900 AIB_LOGIN_STORE_OWNER="$(id -un)" AIB_LOGIN_STORE_GROUP="no-such-group-$$" -- "$TOK" claude-code
+eq "T6: …nor a store file in the wrong group" "$RC|$OUT" "78|"
+if [ "$(id -u)" -eq 0 ]; then
+  chown 64299:64299 "$LROOT/claude-code/.credentials.json"; lrun AIB_TURN_TIMEOUT_S=900 -- "$TOK" claude-code
+  eq "T6 (VM, root): a file owned by an arbitrary uid is refused by default (st_uid != geteuid())" "$RC|$OUT" "78|"
+else
+  printf 'ok   - (skipped: not root - the arbitrary-uid case needs chown; the seam-based cases above pin the same check)\n'
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

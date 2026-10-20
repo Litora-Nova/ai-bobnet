@@ -142,4 +142,12 @@ printf '{"claudeAiOauth":{"accessToken":"at-%s","refreshToken":"rt-x","expiresAt
 launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOGIN_ROOT="$LROOT"
 eq "T4: a token inside the preflight floor => the token tool refuses, provider NOT started, no token in the response" "$(provider_ran)|$(printf '%s' "$RESP" | grep -c "$SENT")" "not-run|0"
 
+# --- T5 (Riker M7) a token refusal reaches the supervisor as a LOGIN condition, not as a generic launch failure --------------------------------
+# aib-login-token exits 78 with `hint:login` on ITS stderr, which stays in the broker's journal. The terminal the client receives must carry the
+# marker and the 78 class, otherwise the supervisor sees "io-refused confine 126", counts a brake and never auto-heals after the re-login (F6).
+printf '{"claudeAiOauth":{"accessToken":"at-%s","refreshToken":"rt-x","expiresAt":%s000}}' "$SENT" "$(( $(date +%s) + 60 ))" > "$LROOT/claude-code/.credentials.json"
+launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOGIN_ROOT="$LROOT"
+eq "T5: an expired/near-expiry login: the response carries exit_code=78 and the hint:login marker, provider not started" "$(printf '%s' "$RESP" | grep -c '^exit_code=78$')|$(printf '%s' "$RESP" | grep -c 'hint:login')|$(provider_ran)" "1|1|not-run"
+eq "T5: …and still no token in the response" "$(printf '%s' "$RESP" | grep -c "$SENT")" 0
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

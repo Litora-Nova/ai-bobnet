@@ -67,6 +67,14 @@ ll AIB_ROLE_UIDS= -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";                 
 ll AIB_ROLE_UIDS="50,${ME}00" -- --uid "${ME}0" --gid "$MG" "${touch_cmd[@]}" 2>/dev/null; eq "T1: a uid that is only a textual prefix/suffix of a listed one is not listed" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="${ME}1,2${ME}" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";           eq "T1: …(whole-token match: $ME vs ${ME}1,2$ME)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" -- --uid "$ME" --uid "$ME" --gid "$MG" "${touch_cmd[@]}";        eq "T1: a repeated option => exit 2" "$RC|$(ran)" "2|not-run"
+# gate round 1 (Marvin G1/G2): the floor is numeric, and a neighbouring uid is not the listed one
+for low in 999 33 1; do
+  ll AIB_ROLE_UIDS="$low,$ME" -- --uid "$low" --gid "$low" "${touch_cmd[@]}";           eq "T1: uid $low (< 1000, system range) is refused even when listed => exit 3, CMD not run" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
+done
+ll AIB_ROLE_UIDS="$ME" -- --uid "$(( ME + 1 ))" --gid "$MG" "${touch_cmd[@]}";           eq "T1: uid ME+1 requested while only ME is listed => exit 3 (numeric, not textual, neighbour)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$(( ME + 1 ))" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";           eq "T1: …and the other way round (ME requested, ME+1 listed)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$(( ME / 10 * 10 ))" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}"
+[ "$(( ME / 10 * 10 ))" = "$ME" ] && skip "T1: decade neighbour is ME itself on this host" || eq "T1: …a uid in the same decade (ME/10 equal) is not the listed one" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 
 # --- T2 what a permitted switch does (needs Landlock; as non-root only the identity-preserving switch is possible) ----------------------------------
 ll -- /bin/true

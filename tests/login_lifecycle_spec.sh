@@ -11,7 +11,7 @@
 #     exists, vorgang. THE CODE IS NEVER IN ANY RECORD.
 #     Gate (only for a requester `gateway:*`; `human:*` is unrestricted): the status file state must be expiring|expired|absent, else
 #     login.rejected reason=not_due; and at most one gateway-started login per AIB_LOGIN_START_INTERVAL_S per provider (state in
-#     AIB_LOGIN_STATE_DIR; a rejected request does not consume the slot), else reason=rate_limited. A rejected run exits 77, starts no CLI.
+#     AIB_LOGIN_STATE_DIR; a rejected request does not consume the slot), else reason=rate_limited. A rejected run exits 0 (v3.4 K8; was 77: with OnFailure= a policy rejection must not page ops), starts no CLI.
 #     Claude (adapter argv `auth login`, CLAUDE_CONFIG_DIR = a private temp dir, the CLI runs on a PTY the unit holds; the unit turns the
 #     tty echo OFF and redacts anyway):
 #       - finds the first https URL the CLI prints; appends to the SERVER outbox
@@ -53,6 +53,7 @@ fp="$FP"; printf 'argv=%s cfg=%s\n' "\$*" "\${CLAUDE_CONFIG_DIR:-}" >> "\$fp/cli
 [ "\$*" = "auth login" ] || exit 64
 echo "Open this URL to sign in: https://claude.example.test/oauth/authorize?state=zz9&code_challenge=abc"
 printf 'Paste code here > '
+stty -a 2>/dev/null | tr ' ' '\\n' | grep -E '^-?echo\$' > "\$fp/echo.log"
 IFS= read -r line
 printf '%s\n' "\$line" >> "\$fp/typed.log"
 echo "got: \$line"                                               # a CLI that echoes what it read
@@ -206,10 +207,10 @@ gate() { # gate <state> -> the unit's rc for a gateway request
   [ "$1" = none ] || printf '{"provider":"claude-code","state":"%s","expires_at":null,"label":"","id_hint":"","checked_at":"x"}' "$1" > "$LSTAT/claude-code.json"
   ustart claude-code AIB_LOGIN_WINDOW_S=1 AIB_LOGIN_NOW="${2:-$LNOW}"; uwait 15
 }
-gate ok; eq "T6: a gateway request on a healthy login => login.rejected not_due, exit 77, CLI not called" "$URC|$(evf login.rejected reason)|$(evf login.rejected caller)|$(test -f "$FP/cli.log" && echo called || echo uncalled)" "77|not_due|gateway:gw|uncalled"
+gate ok; eq "T6: a gateway request on a healthy login => login.rejected not_due, exit 0 (v3.4 K8: a policy rejection is no unit failure), CLI not called" "$URC|$(evf login.rejected reason)|$(evf login.rejected caller)|$(test -f "$FP/cli.log" && echo called || echo uncalled)" "0|not_due|gateway:gw|uncalled"
 for s in expiring expired absent none; do rm -rf "${LSTATE:?}"/*; gate $s; eq "T6: …state '$s' is due: the login starts" "$(ev login.started)|$(ev login.rejected)" "1|0"; done
 rm -rf "${LSTATE:?}"/*; gate expiring "$LNOW"; gate expiring $(( LNOW + 100 ))
-eq "T6: a second gateway start within the hour => rate_limited (exit 77, no CLI call)" "$URC|$(evf login.rejected reason)" "77|rate_limited"
+eq "T6: a second gateway start within the hour => rate_limited (exit 0 per v3.4 K8, no CLI call)" "$URC|$(evf login.rejected reason)" "0|rate_limited"
 gate expiring $(( LNOW + 3600 )); eq "T6: …after AIB_LOGIN_START_INTERVAL_S it is allowed again" "$(ev login.started)" 1
 rm -rf "${LSTATE:?}"/*; gate ok; gate expiring; eq "T6: a not_due rejection does not consume the hourly slot" "$(ev login.started)" 1
 fresh; lreq claude-code human:operator >/dev/null; printf '{"provider":"claude-code","state":"ok","expires_at":null,"label":"","id_hint":"","checked_at":"x"}' > "$LSTAT/claude-code.json"
@@ -262,6 +263,98 @@ SVC="$SRC_ROOT/deploy/systemd/aib-login@.service"; sv() { grep -v '^[[:space:]]*
 eq "T9: aib-login@.service: Type=simple, User=aib-broker, OnFailure alarm" "$(sv | grep -cx -e 'Type=simple' -e 'User=aib-broker' -e 'OnFailure=aib-alarm@%n.service')" 3
 case "$(sv | grep '^ExecStart=' | head -1)" in ExecStart=/*/bin/aib-login\ %i) ok "T9: ExecStart= absolute path to bin/aib-login %i";; *) no "T9: ExecStart= absolute path to bin/aib-login %i";; esac
 eq "T9: StandardOutput/StandardError are not a TTY capture of the PTY (no StandardInput=tty)" "$([ -f "$SVC" ] && sv | grep -c '^StandardInput=tty')" 0
-eq "T9: RuntimeDirectory=aib gives the socket directory; no credential-looking Environment=" "$(sv | grep -c '^RuntimeDirectory=aib$')|$(sv | grep -ciE '^Environment=.*(TOKEN|KEY|SECRET|PASSWORD|CODE)')" "1|0"
+eq "T9: NO RuntimeDirectory= (v3.4 K3: systemd would delete the shared /run/aib on every stop; it was pinned =aib before); no credential-looking Environment=" "$([ -f "$SVC" ] && sv | grep -c '^RuntimeDirectory=')|$(sv | grep -ciE '^Environment=.*(TOKEN|KEY|SECRET|PASSWORD|CODE)')" "0|0"
+
+# =====================================================================================================================================
+# Gate round 1 delta (v3.4): K3 (units), K4 (device-auth streams), K8 (rc 0 for policy outcomes), M1 (accepted-connection timeout),
+# Dexter (PTY capture mode), Marvin G4 (tty echo off while the code is typed).
+# =====================================================================================================================================
+
+# --- T10 (K3) none of the login machinery's units may own /run/aib --------------------------------------------------------------------------
+for u in aib-login@.service aib-login-refresh@.service aib-login-watch.service; do
+  eq "T10: $u has no RuntimeDirectory= (systemd would remove the shared /run/aib on stop)" "$([ -f "$SRC_ROOT/deploy/systemd/$u" ] && grep -v '^[[:space:]]*#' "$SRC_ROOT/deploy/systemd/$u" | grep -c '^RuntimeDirectory')|$([ -f "$SRC_ROOT/deploy/systemd/$u" ] && echo present)" "0|present"
+done
+
+# --- T11 (K8) no request / policy rejections are exit 0 with an audit record -------------------------------------------------------------
+fresh; ustart claude-code AIB_LOGIN_WINDOW_S=1; uwait 15
+eq "T11: a start without any login.requested record => exit 0, no CLI call, ONE audit record login.rejected reason=no_request" "$URC|$(test -f "$FP/cli.log" && echo called || echo uncalled)|$(ev login.rejected)|$(evf login.rejected reason)" "0|uncalled|1|no_request"
+
+# --- T12 (M1) a silent connection cannot block the code socket ------------------------------------------------------------------------------
+fresh; lreq claude-code human:operator >/dev/null; ustart claude-code
+uwf 15 has_vorg claude-code; V="$(vorg claude-code)"; uwf 10 bash -c "[ -S '$LSOCK/login-claude-code.sock' ]"; as gateway:gw
+python3 -I - "$LSOCK/login-claude-code.sock" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); time.sleep(8)      # connects and sends nothing
+PY
+HOLD=$!; sleep 0.5
+t0=$(date +%s); R="$(sendcode claude-code "$V" "$CODE")"; t1=$(date +%s)
+eq "T12: …while a peer sits silent on the socket, the right code is still accepted within 8 s" "$(reply_ok "$R" && echo ok)|$([ $(( t1 - t0 )) -le 8 ] && echo prompt)" "ok|prompt"
+kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null; uwait 15
+
+# --- T13 (Dexter) PTY capture file: never world/group readable ---------------------------------------------------------------------------
+cap="$LSTATE/claude-code.pty.log"
+eq "T13: the PTY capture file (if kept) is mode 0600 (it holds a live authorize URL with state + challenge)" "$(if test -f "$cap"; then mode_of "$cap"; else echo nofile; fi | sed 's/^nofile$/600/')" 600
+
+# --- T14 (Marvin G4) the tty echo is OFF while the code is typed ---------------------------------------------------------------------------
+fresh; lreq claude-code human:operator >/dev/null; rm -f "$FP/echo.log"; ustart claude-code
+uwf 15 has_vorg claude-code; V="$(vorg claude-code)"; uwf 10 bash -c "[ -S '$LSOCK/login-claude-code.sock' ]"; as gateway:gw
+R="$(sendcode claude-code "$V" "$CODE")"; uwait 15
+eq "T14: the CLI's controlling tty had echo disabled when it read the code" "$(tr -d '\n' < "$FP/echo.log" 2>/dev/null)" "-echo"
+
+# --- T15 (K4) codex device-auth streams: the alarm exists WHILE the CLI runs; the window kills the process group -------------------------
+cat > "$W/fakes/codex-slow" <<FAKE
+#!/usr/bin/env bash
+fp="$FP"; echo \$\$ > "\$fp/slow.pid"
+printf '\033[1;36mhttps://auth.example.test/device\033[0m\n'
+printf 'Enter the code \033[1mABCD-EFGH\033[0m\n'
+sleep 300 &
+echo \$! > "\$fp/slow.child"
+wait
+FAKE
+chmod +x "$W/fakes/codex-slow"
+fresh; rm -f "$FP/slow.pid" "$FP/slow.child"; lreq codex human:operator >/dev/null
+ustart codex AIB_CODEX_BIN="$W/fakes/codex-slow" AIB_LOGIN_WINDOW_S=4
+uwf 3 bash -c "SO() { cat '$OUTBOX/_server/outbox.md' 2>/dev/null; }; SO | grep -q 'alarm:login_required provider:codex'"
+line="$(SO | grep 'alarm:login_required provider:codex' | tail -1)"
+alive=""; [ -s "$FP/slow.pid" ] && kill -0 "$(cat "$FP/slow.pid")" 2>/dev/null && alive=running
+eq "T15: the login_required alarm (ANSI-stripped URL + user code) was raised while the CLI was still running" "$alive|$(printf '%s' "$line" | grep -c 'url:https://auth.example.test/device user_code:ABCD-EFGH$')" "running|1"
+uwait 15
+sleep 0.3
+eq "T15: at the window end the unit exits 1 with login.failed reason=timeout" "$URC|$(evf login.failed reason)|$(son login_failed)" "1|timeout|1"
+eq "T15: …and the whole process group is gone (the CLI AND its child)" "$(kill -0 "$(cat "$FP/slow.pid" 2>/dev/null)" 2>/dev/null && echo cli-alive || echo cli-dead)|$(kill -0 "$(cat "$FP/slow.child" 2>/dev/null)" 2>/dev/null && echo child-alive || echo child-dead)" "cli-dead|child-dead"
+eq "T15: …store untouched" "$(ls -A "$LROOT/codex" | wc -l | tr -d ' ')" 0
+kill "$(cat "$FP/slow.child" 2>/dev/null)" "$(cat "$FP/slow.pid" 2>/dev/null)" 2>/dev/null; true     # a RED run must not leave the fake behind
+
+# --- T16 (K6) the code socket belongs to the gateway group, mode 0660 -----------------------------------------------------------------------
+# Socket group = AIB_LOGIN_SOCK_GROUP (a group name or a numeric gid), default `aib-gateway` (only gateway accounts, never a role account or a human).
+eq "T16: the unit's default socket group is named aib-gateway" "$(grep -c 'aib-gateway' "$UNIT_BIN" 2>/dev/null | awk '{print ($1>0)?"named":"absent"}')" named
+other_group=""; for g in $(id -G); do [ "$g" != "$(id -g)" ] && { other_group="$g"; break; }; done
+if [ -z "$other_group" ]; then
+  printf 'ok   - (skipped: the test user has no supplementary group, so a socket group different from its primary one cannot be shown here)\n'
+else
+  fresh; lreq claude-code human:operator >/dev/null; ustart claude-code AIB_LOGIN_SOCK_GROUP="$other_group"
+  uwf 15 has_vorg claude-code; uwf 10 bash -c "[ -S '$LSOCK/login-claude-code.sock' ]"
+  eq "T16: the socket is 0660 and its group is the configured one (not the unit's primary group)" "$(stat -c '%a %g' "$LSOCK/login-claude-code.sock" 2>/dev/null)" "660 $other_group"
+  ulife_stop
+fi
+if [ "$(id -u)" -ne 0 ] || ! command -v setpriv >/dev/null 2>&1; then
+  printf 'ok   - (skipped: needs root and setpriv - the two-uid socket reachability test runs on the VM)\n'
+else
+  # broker uid 64211, gateway group 64212 (member uid 64213), an unrelated uid 64214
+  fresh; chmod -R a+rwX "$WORK" 2>/dev/null; chmod a+x "$W/fakes/claude"; lreq claude-code human:operator >/dev/null
+  env -i PATH="$W/fakebin:$PATH" HOME="$W/home-login" LANG=C TZ=UTC "${LENV[@]}" AIBOBNET_REGISTRY="$ENGINE/registry.json" AIB_LOGIN_SOCK_GROUP=64212 \
+    setpriv --reuid=64211 --regid=64211 --clear-groups "$UNIT_BIN" claude-code >"$W/unit.out" 2>"$W/unit.err" & UPID=$!
+  uwf 15 bash -c "[ -S '$LSOCK/login-claude-code.sock' ]"
+  conn() { setpriv --reuid="$1" --regid="$2" --clear-groups python3 -I -c 'import socket,sys
+s=socket.socket(socket.AF_UNIX)
+try:
+    s.connect(sys.argv[1]); print("connected")
+except PermissionError:
+    print("denied")
+except Exception as e:
+    print(type(e).__name__)' "$LSOCK/login-claude-code.sock"; }
+  eq "T16 (VM, two uids): a member of the gateway group connects; an unrelated uid is denied" "$(conn 64213 64212)|$(conn 64214 64214)" "connected|denied"
+  ulife_stop
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]
