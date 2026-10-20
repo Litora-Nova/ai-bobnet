@@ -317,12 +317,15 @@ def claude_login(request: dict[str, Any], private: Path) -> int:
     status["checked_at"] = iso(now())
     atomic_json(status_path, status, 0o644)
     socket_path = Path(setting("AIB_LOGIN_SOCK_DIR", "/run/aib/login")) / f"login-{provider}.sock"
-    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_ready = False
+    socket_setup_failed = False
+    code = None
     try:
-        socket_path.unlink()
-    except FileNotFoundError:
-        pass
-    try:
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
         with socket.socket(socket.AF_UNIX) as server:
             server.bind(str(socket_path))
             target_gid = socket_group()
@@ -330,14 +333,19 @@ def claude_login(request: dict[str, Any], private: Path) -> int:
                 os.chown(socket_path, -1, target_gid)
             os.chmod(socket_path, 0o660)
             server.listen(8)
+            socket_ready = True
             code = serve_code(server, provider, vorgang, request, deadline)
-    except OSError:
-        code = None
+    except (OSError, KeyError):
+        socket_setup_failed = not socket_ready
     finally:
         try:
             socket_path.unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
+    if socket_setup_failed:
+        stop_group(process)
+        os.close(master)
+        return fail(request, provider, "socket_setup", vorgang)
     if code is None:
         stop_group(process)
         os.close(master)

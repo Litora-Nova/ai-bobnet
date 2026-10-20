@@ -254,13 +254,20 @@ Every agent role account on that server is intentionally able to read the shared
 `aib-login` group. Landlock keeps the store out of writable paths, but this subscription mode is not a
 "credential never reaches the agent" design.
 
-For `claude-code`, the broker extracts the access token into an unlinked mode-0600 buffer, opens it,
+For `claude-code`, the broker extracts the access token into an unlinked buffer, opens it,
 and hands the already-open descriptor to the role process; the adapter exposes only the descriptor
-number. For `codex`, the role-owned `$HOME/.codex/auth.json` is a pinned symlink to the shared
+number. The buffer is created as `aib-broker:aib-login 0640` inside a fresh broker-private `0700`
+directory so the role uid can re-open `/proc/self/fd/N`; the file is unlinked after opening and the
+empty directory is removed by the confined-run cleanup. For `codex`, the role-owned
+`$HOME/.codex/auth.json` is a pinned symlink to the shared
 `/var/lib/aib/login/codex/auth.json`, because that CLI consumes its complete authentication object.
 The broker-owned `login.meta.json` may retain the full provider account id for internal expiry
 tracking, but human-facing status exposes only its last four characters. Device authorization URLs
 and user codes are sent only to the human-ops server outbox.
+
+The login unit runs as `aib-broker` with supplementary groups `aib-login` and `aib-gateway`. The
+first grants access to the shared credential store; the second grants only the group membership
+needed to publish the mode-`0660` code socket in `/run/aib/login` for gateway clients.
 
 API-key mode is the path that restores the stronger "the agent never sees the shared credential"
 property. The deployment schema reserves `credential_mode=proxy` for that later mediation path; it

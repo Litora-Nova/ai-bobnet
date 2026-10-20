@@ -7,6 +7,7 @@ OnFailure=aib-alarm@%n.service
 [Service]
 Type=simple
 User=aib-broker
+SupplementaryGroups=aib-login aib-gateway
 ExecStart=/opt/aib/engine/bin/aib-login %i
 TimeoutStartSec=31min
 PrivateTmp=yes

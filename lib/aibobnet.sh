@@ -1559,7 +1559,8 @@ aib_enact_launch() {
   local adapter state_dir root cwd_req sandbox effort model timeout_s session provider resolved_root
   local _s1c_enabled=0 _engine_root _agent_uid="" _agent_home="" _credential_mode="file"
   local _credential_source="login" _login_root="/var/lib/aib/login" _login_store_path=""
-  local _credential_tmp="" _credential_error="" _credential_fd_open=0 _credential_refusal=0
+  local _credential_dir="" _credential_tmp="" _credential_error="" _credential_error_text=""
+  local _credential_fd_open=0 _credential_refusal=0
   local _role_uid="${AIB_ROLE_UID:-}" _role_gid="${AIB_ROLE_GID:-}"
 
   case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
@@ -1961,6 +1962,28 @@ aib_enact_launch__run_confined() {
   # reintroduce the same "am I already a leader" question one level down.
   _python_bin="$(command -v python3 2>/dev/null || true)"
 
+  _aib_enact_cleanup_credential_tmp() {
+    local _keep_dir="${1:-0}" _cleanup_rc=0
+    if [ -n "$_credential_tmp" ]; then
+      rm -f -- "$_credential_tmp" 2>/dev/null && _credential_tmp="" || _cleanup_rc=1
+    fi
+    if [ -n "$_credential_error" ]; then
+      rm -f -- "$_credential_error" 2>/dev/null && _credential_error="" || _cleanup_rc=1
+    fi
+    if [ "$_keep_dir" -eq 0 ] && [ -n "$_credential_dir" ]; then
+      rmdir -- "$_credential_dir" 2>/dev/null && _credential_dir="" || _cleanup_rc=1
+    fi
+    return "$_cleanup_rc"
+  }
+
+  _aib_enact_credential_die() {
+    local _die_status="$1"
+    shift
+    [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
+    _aib_enact_cleanup_credential_tmp || true
+    aib_die "$_die_status" "$@"
+  }
+
   # --- D-A / D-A2: pre-flight, before ANYTHING else runs -----------------------
   local _preflight_tmp _preflight_rc=1 state_path=""
   if [ "$_s1c_enabled" -eq 1 ]; then
@@ -1998,27 +2021,42 @@ aib_enact_launch__run_confined() {
       file|shared) ;;
       proxy) _preflight_rc=1 ;;
       fd)
-        _credential_tmp="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-credential.XXXXXX")" || aib_die 2 "cannot create credential buffer"
-        _credential_error="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-credential-error.XXXXXX")" || aib_die 2 "cannot create credential error buffer"
-        chmod 600 "$_credential_tmp" || aib_die 2 "cannot protect credential buffer"
-        chmod 600 "$_credential_error" || aib_die 2 "cannot protect credential error buffer"
-        local _token_args=("$_engine_root/bin/aib-login-token" "$provider")
-        [ "$_credential_source" = login ] || _token_args+=(--source "$_credential_source")
-        local _token_rc=0
-        AIB_TURN_TIMEOUT_S="$timeout_s" "${_token_args[@]}" >"$_credential_tmp" 2>"$_credential_error" || _token_rc=$?
-        if [ "$_token_rc" -ne 0 ]; then
+        _credential_dir="$("$_mktemp_bin" -d "${TMPDIR:-/tmp}/aibobnet-credential.XXXXXX")" ||
+          _aib_enact_credential_die 2 "cannot create credential directory"
+        _credential_tmp="$_credential_dir/token"
+        _credential_error="$_credential_dir/error"
+        local _credential_group="${AIB_LOGIN_STORE_GROUP:-aib-login}"
+        if [ "${AIB_TEST_SEAMS:-}" = 1 ] && [ ! -e "$_engine_root/.aib-installed" ] &&
+           [ -z "${AIB_LOGIN_STORE_GROUP:-}" ]; then
+          _credential_group=""
+        fi
+        if ! chmod 700 "$_credential_dir" ||
+           ! (umask 077; : >"$_credential_tmp" && : >"$_credential_error") ||
+           { [ -n "$_credential_group" ] && ! chgrp -- "$_credential_group" "$_credential_tmp"; } ||
+           ! chmod 640 "$_credential_tmp" || ! chmod 600 "$_credential_error"; then
           _preflight_rc=1
-          if [ "$_token_rc" -eq 78 ]; then
-            _credential_refusal=78
+        else
+          local _token_args=("$_engine_root/bin/aib-login-token" "$provider")
+          [ "$_credential_source" = login ] || _token_args+=(--source "$_credential_source")
+          local _token_rc=0
+          AIB_TURN_TIMEOUT_S="$timeout_s" "${_token_args[@]}" >"$_credential_tmp" 2>"$_credential_error" || _token_rc=$?
+          if [ "$_token_rc" -ne 0 ]; then
+            _preflight_rc=1
+            _credential_error_text="$("$_cat_bin" "$_credential_error" 2>/dev/null)"
+            if [ "$_token_rc" -eq 78 ]; then
+              _credential_refusal=78
+            fi
           fi
         fi
         if [ "$_preflight_rc" -eq 0 ]; then
           exec 3<"$_credential_tmp" || _preflight_rc=1
           if [ "$_preflight_rc" -eq 0 ]; then
             _credential_fd_open=1
-            rm -f -- "$_credential_tmp" 2>/dev/null || true
-            _credential_tmp=""
           fi
+        fi
+        if ! _aib_enact_cleanup_credential_tmp "$_credential_fd_open"; then
+          [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
+          _preflight_rc=1
         fi
         ;;
       *) _preflight_rc=1 ;;
@@ -2026,23 +2064,23 @@ aib_enact_launch__run_confined() {
   fi
   if [ "$_preflight_rc" -eq 0 ] && [ -n "${AIB_CONFINE_BIN:-}" ] && [ -x "$AIB_CONFINE_BIN" ]; then
     _preflight_rc=1
-    _preflight_tmp="$("$_mktemp_bin" -d "${TMPDIR:-/tmp}/aibobnet-preflight.XXXXXX")" || aib_die 2 "cannot create pre-flight tmp dir"
+    _preflight_tmp="$("$_mktemp_bin" -d "${TMPDIR:-/tmp}/aibobnet-preflight.XXXXXX")" ||
+      _aib_enact_credential_die 2 "cannot create pre-flight tmp dir"
     LL_RO=/ LL_RW="$_preflight_tmp" "$AIB_CONFINE_BIN" /bin/true >/dev/null 2>&1
     _preflight_rc=$?
     rm -rf "$_preflight_tmp" 2>/dev/null || true
   fi
   if [ "$_preflight_rc" -ne 0 ]; then
     [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
-    [ -z "$_credential_tmp" ] || rm -f -- "$_credential_tmp" 2>/dev/null || true
+    _aib_enact_cleanup_credential_tmp || true
     local _reported_refusal=126
     [ "$_credential_refusal" -ne 78 ] || _reported_refusal=78
     _aib_enact_commit_ended io-refused confine "$_reported_refusal"
-    if [ "$_credential_refusal" -eq 78 ] && [ -n "$_credential_error" ]; then
-      case "$("$_cat_bin" "$_credential_error" 2>/dev/null)" in
+    if [ "$_credential_refusal" -eq 78 ]; then
+      case "$_credential_error_text" in
         *hint:login*) AIB_ENACT_REASON="credential_unavailable:hint:login" ;;
       esac
     fi
-    [ -z "$_credential_error" ] || rm -f -- "$_credential_error" 2>/dev/null || true
     # R4 (gate delta 2, Ikarus MEDIUM): _aib_enact_commit_ended's own D8 incident
     # branch can fire right here too (event store gone/corrupt before the
     # provider ever ran, not just after) — it sets AIB_ENACT_INCIDENT and returns
@@ -2070,14 +2108,18 @@ aib_enact_launch__run_confined() {
 
   local _internal_fifo _status_file _cwd_fail_marker _provider_status_file _escalated_marker
   _internal_fifo="$("$_mktemp_bin" -u "${TMPDIR:-/tmp}/aibobnet-relay.XXXXXX")"
-  "$_mkfifo_bin" "$_internal_fifo" || aib_die 2 "cannot create relay fifo"
-  _status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-status.XXXXXX")" || aib_die 2 "cannot create status buffer"
-  _cwd_fail_marker="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-cwdfail.XXXXXX")" || aib_die 2 "cannot create cwd-check marker"
-  _provider_status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-provstatus.XXXXXX")" || aib_die 2 "cannot create provider status buffer"
+  "$_mkfifo_bin" "$_internal_fifo" || _aib_enact_credential_die 2 "cannot create relay fifo"
+  _status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-status.XXXXXX")" ||
+    _aib_enact_credential_die 2 "cannot create status buffer"
+  _cwd_fail_marker="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-cwdfail.XXXXXX")" ||
+    _aib_enact_credential_die 2 "cannot create cwd-check marker"
+  _provider_status_file="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-provstatus.XXXXXX")" ||
+    _aib_enact_credential_die 2 "cannot create provider status buffer"
   # Riker LOW (should-fix): which signal actually ended the child — TERM if it
   # obeyed the first one, KILL only if the 10s grace timer had to escalate.
   # Written by the killer job below ONLY when it finds the tree still alive.
-  _escalated_marker="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-escalated.XXXXXX")" || aib_die 2 "cannot create escalation marker"
+  _escalated_marker="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-escalated.XXXXXX")" ||
+    _aib_enact_credential_die 2 "cannot create escalation marker"
   : > "$_cwd_fail_marker"
 
   _aib_enact_cleanup_confined() {
@@ -2086,8 +2128,7 @@ aib_enact_launch__run_confined() {
     # forever, win or lose, escalated or not.
     [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
     rm -f -- "$_internal_fifo" "$_status_file" "$_cwd_fail_marker" "$_provider_status_file" "$_escalated_marker" 2>/dev/null || true
-    [ -z "$_credential_tmp" ] || rm -f -- "$_credential_tmp" 2>/dev/null || true
-    [ -z "$_credential_error" ] || rm -f -- "$_credential_error" 2>/dev/null || true
+    _aib_enact_cleanup_credential_tmp || true
   }
 
   _aib_enact_exec_child_confined() {

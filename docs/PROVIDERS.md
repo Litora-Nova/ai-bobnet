@@ -367,7 +367,8 @@ terminal mapping needed — identical to `codex`'s own table entry above.
 
 Each role process receives a private 0700 `.claude` history/config directory. The broker does not
 place `.credentials.json` there in shared subscription mode: it extracts the access token to an
-unlinked mode-0600 buffer and passes an already-open descriptor, named by
+unlinked `aib-broker:aib-login 0640` buffer inside a transient broker-private `0700` directory and
+passes an already-open descriptor, named by
 `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`. This isolates histories but not subscription authority;
 every server role may request the same shared token. API-key proxy mode is the later "never sees"
 path. See the dated divergence in `docs/CONFINEMENT.md`.
