@@ -168,22 +168,39 @@ static int role_refuse(const char *message){
 }
 
 static int drop_capability_bounding_set(void){
+  int saw_eperm = 0, saw_other_failure = 0;
   for (int cap = 0; cap <= CAP_LAST_CAP; ++cap){
-    if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) &&
-        !(errno == EPERM && prctl(PR_CAPBSET_READ, cap, 0, 0, 0) == 0))
-      return -1;
+    if (!prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)) continue;
+    if (errno == EPERM) saw_eperm = 1;
+    else saw_other_failure = 1;
   }
-  return 0;
+  if (saw_other_failure) return -1;
+  return saw_eperm;
 }
 
 static int clear_capabilities(void){
-  (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+  if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)) return -1;
   struct __user_cap_header_struct header = {
     .version = _LINUX_CAPABILITY_VERSION_3,
     .pid = 0,
   };
   struct __user_cap_data_struct data[2] = {{0}};
   return (int)syscall(SYS_capset, &header, data);
+}
+
+static int unprivileged_state_verified(void){
+  if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return 0;
+  struct __user_cap_header_struct header = {
+    .version = _LINUX_CAPABILITY_VERSION_3,
+    .pid = 0,
+  };
+  struct __user_cap_data_struct data[2] = {{0}};
+  if (syscall(SYS_capget, &header, data)) return 0;
+  for (size_t i = 0; i < sizeof(data) / sizeof(data[0]); ++i)
+    if (data[i].permitted || data[i].effective || data[i].inheritable) return 0;
+  for (int cap = 0; cap <= CAP_LAST_CAP; ++cap)
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, 0, 0) != 0) return 0;
+  return 1;
 }
 
 int main(int argc, char **argv){
@@ -214,6 +231,7 @@ int main(int argc, char **argv){
   role_switch = saw_uid && saw_gid;
   if (role_switch){
     if (uid_value == 0) return role_refuse("uid 0 is never an allowed role uid");
+    if (uid_value < 1000) return role_refuse("uid below 1000 is never an allowed role uid");
     if (gid_value == 0) return role_refuse("gid 0 is refused for a role uid");
     if (!uid_allowed((uid_t)uid_value)) return role_refuse("uid is not present in AIB_ROLE_UIDS");
   }
@@ -281,12 +299,15 @@ int main(int argc, char **argv){
   }
   close(rs);
   if (role_switch){
-    if (drop_capability_bounding_set()) return role_refuse("uid switch could not clear the capability bounding set");
+    int bounding_drop = drop_capability_bounding_set();
+    if (bounding_drop < 0) return role_refuse("uid switch could not clear the capability bounding set");
     if (setgroups(0, NULL) && !(errno == EPERM && getuid() == (uid_t)uid_value && getgid() == (gid_t)gid_value))
       return role_refuse("uid switch could not clear supplementary groups");
     if (setgid((gid_t)gid_value)) return role_refuse("uid switch setgid failed");
     if (setuid((uid_t)uid_value)) return role_refuse("uid switch setuid failed");
     if (clear_capabilities()) return role_refuse("uid switch could not clear capabilities");
+    if (bounding_drop > 0 && !unprivileged_state_verified())
+      return role_refuse("uid switch could not verify cleared capabilities after bounding-set EPERM");
   }
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);
   if (relay_fd >= 0 && dup2(relay_fd,2) < 0)
