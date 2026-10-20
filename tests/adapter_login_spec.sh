@@ -41,8 +41,10 @@ cat > "$FAKE" <<'STUB'
 w=$(cd -P "$(dirname "$0")/.." && pwd)
 { echo started; env; } > "$w/fake.env"
 tok=""; fd="${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR:-}"
-[ -z "$fd" ] || { eval "tok=\$(cat <&$fd)" 2>/dev/null; }
+# like the real CLI (measured 20.10.): RE-OPEN the descriptor by path, so the inode permission check applies to the calling uid
+[ -z "$fd" ] || { tok=$(cat "/proc/self/fd/$fd" 2>/dev/null); }
 printf '%s' "$tok" > "$w/fake.tok"
+[ -z "$fd" ] || [ -n "$tok" ] || { echo "fake claude: cannot read the token from fd $fd" >&2; exit 1; }
 ls -A "$HOME/.claude" > "$w/fake.claudedir" 2>/dev/null
 cat > /dev/null; echo FAKE_OK
 STUB
@@ -180,23 +182,27 @@ rm -f "$LROOT/claude-code/.credentials.json"; lrun AIB_TURN_TIMEOUT_S=900 -- "$T
 # Gate round 1 delta (v3.4): K5 (the fd is checked by stat, not by access()), Marvin G3 (stdio descriptors), Riker M8 (owner of the store file)
 # =====================================================================================================================================
 
-# --- T5 (K5) the descriptor, not the path, carries the right to read ---------------------------------------------------------------------------
-# The broker's buffer is a 0600 file owned by aib-broker; the role account has no access to the PATH, only the inherited descriptor. `-r` on
-# /proc/self/fd/N is access(R_OK) on the inode and refuses it. Mode 000 reproduces that for any non-root user.
-printf '%s' "$FD_TOKEN" > "$W/fd.nopath"
-rm -f "$W/fake.env" "$W/fake.tok"; RC=0
-( cd "$CWD" && exec 3< "$W/fd.nopath" && chmod 000 "$W/fd.nopath" && env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" \
-    AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TIMEOUT_S=900 \
-    "$SRC_ROOT/adapters/claude-code" exec -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "hi" ) >"$W/ad.out" 2>"$W/ad.err" || RC=$?
+# --- T5 (K5 measured) the CLI RE-OPENS /proc/self/fd/N; the inode permission check decides --------------------------------------------------
+# The real Claude CLI does openat("/proc/self/fd/N", O_RDONLY) (strace, 20.10.), so a broker-owned 0600 buffer fails for the role uid. The broker's
+# buffer is therefore 0640, owner = broker, group = AIB_LOGIN_STORE_GROUP (aib-login), made in a broker-private 0700 dir and unlinked after opening
+# (that part is pinned in run_confined_home_spec T4). The fake CLI above re-opens the descriptor like the real one and exits 1 when it cannot read it.
+# The adapter itself checks the fd by stat only (-e/-s), so an unreadable buffer is a clean CLI failure (rc 1) or a 78, never a hang.
+ADARGS=(exec -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "hi")
+fdrun() { # fdrun <buffer-mode> -> RC (never hangs: 20 s cap, 124 would be a hang)
+  printf '%s' "$FD_TOKEN" > "$W/fd.buf"; chmod 640 "$W/fd.buf"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
+  ( cd "$CWD" && exec 3< "$W/fd.buf" && chmod "$1" "$W/fd.buf" && exec timeout 20 env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" \
+      AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" "${ADARGS[@]}" ) >"$W/ad.out" 2>"$W/ad.err" || RC=$?
+}
+fdrun 640
+eq "T5: fd mode, 0640 buffer (own uid), the CLI re-opens /proc/self/fd/3 and reads the token" "$RC|$([ -f "$W/fake.env" ] && echo ran)|$(cat "$W/fake.tok" 2>/dev/null)" "0|ran|$FD_TOKEN"
 if [ "$(id -u)" -eq 0 ]; then
-  printf 'ok   - (skipped: running as root - root passes access(R_OK) on a mode-000 file, so the mode-000 case cannot show the bug here; the cross-uid case below is the root-side proof)\n'
+  printf 'ok   - (skipped: running as root - root passes the inode check on a mode-000 file; the cross-uid cases below are the root-side proof)\n'
 else
-  eq "T5: fd mode with the buffer at mode 000 (path unreadable, descriptor open) => the CLI runs and reads the token from the fd" "$RC|$([ -f "$W/fake.env" ] && echo ran)|$(cat "$W/fake.tok" 2>/dev/null)" "0|ran|$FD_TOKEN"
+  fdrun 000
+  eq "T5: fd mode, buffer at mode 000 (re-open denied) => a clean failure (rc 1 or 78), not a hang, no token read" "$([ "$RC" = 1 ] || [ "$RC" = 78 ] && echo clean-fail || echo "rc=$RC")|$(cat "$W/fake.tok" 2>/dev/null)" "clean-fail|"
 fi
-chmod 600 "$W/fd.nopath" 2>/dev/null
 
 # stdio descriptors are never a credential channel, even when they are open and non-empty (Marvin G3)
-ADARGS=(exec -m "$MODEL" -s workspace-write -c 'model_reasoning_effort="high"' -c 'approval_policy="never"' -- "hi")
 for stdio in 0 1 2; do
   printf '%s' "$FD_TOKEN" > "$W/fd.stdio"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
   AD=( env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD="$stdio" AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" "${ADARGS[@]}" )
@@ -208,15 +214,24 @@ for stdio in 0 1 2; do
   eq "T5: AIB_CREDENTIAL_FD=$stdio with that stdio descriptor open and NON-empty => 78, CLI not started" "$RC|$([ -f "$W/fake.env" ] && echo ran || echo not-started)" "78|not-started"
 done
 
-# VM-only cross-uid proof (needs root; skipped elsewhere): the role account cannot open the path, but inherits the descriptor
+# VM-only cross-uid proof (needs root; skipped elsewhere). Broker uid BU owns the buffer; the role uid RU is in the dedicated test group TG.
+# (rc 65 in the earlier pin was the adapter's "invalid adapter argv": that case passed 7 arguments instead of the frozen 11, so it never reached the credential check.)
 if [ "$(id -u)" -ne 0 ] || ! command -v setpriv >/dev/null 2>&1; then
   printf 'ok   - (skipped: needs root and setpriv - the cross-uid hand-off is proven on the VM, the mode-000 case above is the non-root proxy)\n'
 else
-  RU=64231; chmod -R a+rX "$W" "$WORK" 2>/dev/null; mkdir -p "$W/xhome/.claude"; chown -R $RU:$RU "$W/xhome"; chmod 700 "$W/xhome/.claude"
-  printf '%s' "$FD_TOKEN" > "$W/fd.x"; chown 0:0 "$W/fd.x"; chmod 600 "$W/fd.x"; chmod a+rx "$W/fakes" "$FAKE"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
-  ( cd "$CWD" && exec 3< "$W/fd.x" && exec setpriv --reuid=$RU --regid=$RU --clear-groups env -i HOME="$W/xhome" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" \
-      AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" exec -m "$MODEL" -s workspace-write -- "hi" ) >"$W/ad.out" 2>"$W/ad.err" || RC=$?
-  eq "T5 (VM, root): a different uid, root-owned 0600 buffer, only the inherited fd => the CLI runs and reads the token" "$RC|$([ -f "$W/fake.env" ] && echo ran)|$(cat "$W/fake.tok" 2>/dev/null)" "0|ran|$FD_TOKEN"
+  RU=64231; BU=64230; TG=64232
+  chmod -R a+rX "$W" "$WORK" 2>/dev/null; chmod a+rwx "$W"; mkdir -p "$W/xhome/.claude"; chown -R $RU:$RU "$W/xhome"; chmod 700 "$W/xhome/.claude"; chmod a+rx "$W/fakes" "$FAKE"
+  xrun() { # xrun <mode> <group> -> RC; buffer owned by the broker uid, opened on fd 3, only the descriptor reaches the role uid (in group TG)
+    printf '%s' "$FD_TOKEN" > "$W/fd.x"; chown $BU:$2 "$W/fd.x"; chmod "$1" "$W/fd.x"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
+    ( cd "$CWD" && exec 3< "$W/fd.x" && exec timeout 20 setpriv --reuid=$RU --regid=$RU --groups=$TG env -i HOME="$W/xhome" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 \
+        AIB_LOGIN_NOW="$LNOW" AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" "${ADARGS[@]}" ) >"$W/ad.out" 2>"$W/ad.err" || RC=$?
+  }
+  xrun 640 $TG
+  eq "T5 (VM, root): a different uid in the buffer's group, 0640 broker-owned buffer, only the inherited fd => the CLI runs and reads the token" "$RC|$([ -f "$W/fake.env" ] && echo ran)|$(cat "$W/fake.tok" 2>/dev/null)" "0|ran|$FD_TOKEN"
+  xrun 600 $TG
+  eq "T5 (VM, root): …the same buffer at 0600 (the old design) => clean failure (rc 1 or 78), not a hang, no token" "$([ "$RC" = 1 ] || [ "$RC" = 78 ] && echo clean-fail || echo "rc=$RC")|$(cat "$W/fake.tok" 2>/dev/null)" "clean-fail|"
+  xrun 640 0
+  eq "T5 (VM, root): …0640 but a group the role uid is not in => clean failure too" "$([ "$RC" = 1 ] || [ "$RC" = 78 ] && echo clean-fail || echo "rc=$RC")|$(cat "$W/fake.tok" 2>/dev/null)" "clean-fail|"
 fi
 
 # --- T6 (M8) the store file must belong to the account that owns the store ---------------------------------------------------------------------

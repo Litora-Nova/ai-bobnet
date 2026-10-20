@@ -340,10 +340,12 @@ fi
 if [ "$(id -u)" -ne 0 ] || ! command -v setpriv >/dev/null 2>&1; then
   printf 'ok   - (skipped: needs root and setpriv - the two-uid socket reachability test runs on the VM)\n'
 else
-  # broker uid 64211, gateway group 64212 (member uid 64213), an unrelated uid 64214
+  # broker uid 64211, gateway group 64212 (member uid 64213), an unrelated uid 64214.
+  # The unit must itself be a member of the gateway group (production: SupplementaryGroups=aib-gateway): chown(socket, -1, gid) by a non-root
+  # process only works for a group it is in. Without --groups the unit hit EPERM, which the bind block's `except OSError` turns into login.failed timeout.
   fresh; chmod -R a+rwX "$WORK" 2>/dev/null; chmod a+x "$W/fakes/claude"; lreq claude-code human:operator >/dev/null
   env -i PATH="$W/fakebin:$PATH" HOME="$W/home-login" LANG=C TZ=UTC "${LENV[@]}" AIBOBNET_REGISTRY="$ENGINE/registry.json" AIB_LOGIN_SOCK_GROUP=64212 \
-    setpriv --reuid=64211 --regid=64211 --clear-groups "$UNIT_BIN" claude-code >"$W/unit.out" 2>"$W/unit.err" & UPID=$!
+    setpriv --reuid=64211 --regid=64211 --groups=64212 "$UNIT_BIN" claude-code >"$W/unit.out" 2>"$W/unit.err" & UPID=$!
   uwf 15 bash -c "[ -S '$LSOCK/login-claude-code.sock' ]"
   conn() { setpriv --reuid="$1" --regid="$2" --clear-groups python3 -I -c 'import socket,sys
 s=socket.socket(socket.AF_UNIX)

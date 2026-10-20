@@ -58,6 +58,11 @@ cat > "$STUB/provider" <<'STUB'
 priv="$(cd "$(dirname "$0")" && cat priv.path)"
 { env | grep -E '^(HOME|AIB_[A-Z_]+)=' | sort; echo '---'; } >> "$priv/env.log"
 fd="${AIB_CREDENTIAL_FD:-}"; if [ -n "$fd" ]; then eval "cat <&$fd" > "$priv/fd.content" 2>/dev/null; python3 -I -c 'import os; xs=os.listdir("/proc/self/fd"); print(" ".join(sorted((x for x in xs if os.path.exists("/proc/self/fd/"+x)),key=int)),end=" ")' > "$priv/fds"; fi
+if [ -n "$fd" ]; then   # what the broker made of the buffer behind the descriptor (inode as seen through the fd, and where it lived)
+  t=$(readlink "/proc/self/fd/$fd"); d=$(dirname "${t% (deleted)}")
+  { printf 'inode=%s\n' "$(stat -L -c '%a %g %u' "/proc/self/fd/$fd" 2>/dev/null)"; printf 'target=%s\n' "$t"; printf 'parent=%s\n' "$d"
+    printf 'parentmode=%s\n' "$(stat -c '%a' "$d" 2>/dev/null || echo gone)"; } > "$priv/fdmeta"
+fi
 echo ran >> "$priv/ran"
 exit 0
 STUB
@@ -69,7 +74,7 @@ dep() { printf '{"deployment_id":"acme-dev-1","allow":{"customer_code":true,"com
 dep '{}'
 launch() { # launch <agent_uid> <record-extra-lines> [VAR=val...]  -> RESP
   local uid="$1" extra="$2"; shift 2
-  : > "$LOG"; rm -f "$PRIV/ran" "$PRIV/env.log" "$PRIV/fd.content" "$PRIV/fds"
+  : > "$LOG"; rm -f "$PRIV/ran" "$PRIV/env.log" "$PRIV/fd.content" "$PRIV/fds" "$PRIV/fdmeta"
   local kv decided payload rec
   kv="$(printf 'decision=allow\ncode=0\nreasons=\npid=%s\nprompt_len=1\nprompt_sha256=deadbeef' "$$")"
   payload="$(aib_event_compose_decided_payload "$kv")"
@@ -133,6 +138,25 @@ launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOG
 eq "T4: fd mode: AIB_CREDENTIAL_MODE=fd, AIB_CREDENTIAL_FD=3, and the provider reads the access token from fd 3" "$(penv AIB_CREDENTIAL_MODE)|$(penv AIB_CREDENTIAL_FD)|$(cat "$PRIV/fd.content" 2>/dev/null)" "fd|3|at-$SENT"
 eq "T4: …fd 3 is the only extra descriptor the provider chain holds (0,1,2 and 3)" "$(tr ' ' '\n' < "$PRIV/fds" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tr '\n' ' ')" "0 1 2 3 "
 eq "T4: the token is in neither the response nor the helper log nor the chain env" "$(printf '%s' "$RESP" | grep -c "$SENT")|$(grep -c "$SENT" "$LOG")|$(grep -c "$SENT" "$PRIV/env.log" 2>/dev/null)" "0|0|0"
+# K5 measured: the real CLI re-opens /proc/self/fd/N, so the inode check applies to the role uid. The broker's buffer is 0640 with the configured login
+# group (AIB_LOGIN_STORE_GROUP, default aib-login), made inside a broker-private 0700 directory (not directly in TMPDIR) and unlinked once it is open.
+fmeta() { grep -m1 "^$1=" "$PRIV/fdmeta" 2>/dev/null | cut -d= -f2-; }
+eq "T4: the buffer behind fd 3 is 0640 (owner = the broker's uid)" "$(fmeta inode | awk '{print $1" "$3}')" "640 $(id -u)"
+other_group=""; for g in $(id -G); do [ "$g" != "$(id -g)" ] && { other_group="$g"; break; }; done
+mkdir -p "$WORK/tmp"
+if [ -z "$other_group" ]; then
+  printf 'ok   - (skipped: the test user has no supplementary group, so a login group different from its primary one cannot be shown here)\n'
+else
+  chgrp "$other_group" "$LROOT/claude-code/.credentials.json"      # the token tool checks the store file against the same AIB_LOGIN_STORE_GROUP
+  launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOGIN_ROOT="$LROOT" AIB_LOGIN_MARGIN_S=300 AIB_LOGIN_SLACK_S=600 AIB_LOGIN_STORE_GROUP="$other_group" TMPDIR="$WORK/tmp"
+  eq "T4: …its group is AIB_LOGIN_STORE_GROUP (not the broker's primary group)" "$(fmeta inode | awk '{print $1" "$2}')" "640 $other_group"
+  eq "T4: …the provider still got the token through it" "$(cat "$PRIV/fd.content" 2>/dev/null)" "at-$SENT"
+  chgrp "$(id -g)" "$LROOT/claude-code/.credentials.json"
+fi
+launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOGIN_ROOT="$LROOT" AIB_LOGIN_MARGIN_S=300 AIB_LOGIN_SLACK_S=600 TMPDIR="$WORK/tmp"
+eq "T4: …it was unlinked once open (the fd target is '(deleted)')" "$(fmeta target | grep -c ' (deleted)$')" 1
+eq "T4: …it lived in a private subdirectory of TMPDIR (not directly in TMPDIR), mode 0700" "$([ "$(fmeta parent)" != "$WORK/tmp" ] && case "$(fmeta parent)" in "$WORK/tmp/"*) echo sub;; esac)|$(fmeta parentmode)" "sub|700"
+eq "T4: …and nothing of it is left behind in TMPDIR afterwards" "$(find "$WORK/tmp" -mindepth 1 | wc -l | tr -d ' ')" 0
 printf 'setup-%s' "$SENT" > "$LROOT/claude-code/setup-token"; chmod 640 "$LROOT/claude-code/setup-token"
 dep '{"claude-code":{"credential_mode":"fd","credential_source":"setup_token"}}'
 launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOGIN_ROOT="$LROOT"
