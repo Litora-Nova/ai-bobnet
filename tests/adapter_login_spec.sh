@@ -77,7 +77,7 @@ run_adapter claude-code 3 AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=3 AIB_TURN_TI
 eq "T1: fd mode with NO credential file in the agent dir runs the CLI" "$RC|$(ran)" "0|ran"
 eq "T1: …the CLI gets CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3 and can read the token from that fd" "$(envof CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR)|$(cat "$W/fake.tok" 2>/dev/null)" "3|$FD_TOKEN"
 eq "T1: …no CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY in its env, CLAUDE_CONFIG_DIR is the agent's history dir" "$(grep -cE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=' "$W/fake.env" 2>/dev/null)|$(envof CLAUDE_CONFIG_DIR)" "0|$CH/.claude"
-eq "T1: …and the adapter never created a credential file" "$(ls -A "$CH/.claude" | tr '\n' ' ')" ""
+eq "T1: …and the adapter never created a credential file" "$([ -z "$(ls -A "$CH/.claude")" ] && echo empty)" empty
 eq "T1: the token is not in the adapter's own output" "$(grep -c "$SENT" "$W/ad.out" "$W/ad.err" | grep -vc ':0$')" 0
 run_adapter claude-code 3 AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD=5 AIB_TURN_TIMEOUT_S=900
 eq "T1: AIB_CREDENTIAL_FD names a closed descriptor (5) => 78, CLI not started" "$RC|$(ran)" "78|not-started:tagged"
@@ -158,7 +158,7 @@ TOK="$ENGINE/bin/aib-login-token"
 FLOORC=$(( 900 + 300 + 600 ))
 mk_claude $(( LNOW + FLOORC )); lrun AIB_TURN_TIMEOUT_S=900 -- "$TOK" claude-code
 eq "T4: login source prints exactly the access token (floor reached)" "$RC|$OUT" "0|at-$SENT"
-eq "T4: …nothing on stderr" "$ERR" ""
+eq "T4: …nothing on stderr" "$([ -z "$ERR" ] && echo empty)" empty
 mk_claude $(( LNOW + FLOORC - 1 )); lrun AIB_TURN_TIMEOUT_S=900 -- "$TOK" claude-code
 eq "T4: a second short of the floor => 78, stdout empty, hint:login on stderr" "$RC|$OUT|$(printf '%s' "$ERR" | grep -c 'hint:login')" "78||1"
 mk_claude $(( LNOW + 100000 )); lrun -- "$TOK" claude-code
