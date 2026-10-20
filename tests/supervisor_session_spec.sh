@@ -55,6 +55,9 @@ plan "0|5|never finishes"
 start_sup
 m_send m-1 "will be interrupted"
 wait_for 6 lj_is state WORKING
+# S1c G8 (flake): state WORKING can be visible a moment before the fake launcher has logged its call; wait for the call itself
+has_call1() { [ -n "$(callf 1 session)" ]; }
+wait_for 6 has_call1
 sid="$(callf 1 session)"; sid="${sid#new:}"
 crash_sup; pkill -9 -f "$W/fakes/launch-agent" 2>/dev/null; rmdir "$W/turn.lock" 2>/dev/null; : > "$W/plan"
 start_sup
