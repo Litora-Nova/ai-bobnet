@@ -6,9 +6,12 @@ polkit.addRule(function(action, subject) {
     var unitFileAction = action.id === "org.freedesktop.systemd1.manage-unit-files" &&
         (verb === "enable" || verb === "disable");
 
-    if (subject.isInGroup("aib-ops") &&
-        /^aib-agent@[a-z0-9-]+\.service$/.test(unit) &&
-        (unitAction || unitFileAction)) {
+    var agentUnit = /^aib-agent@[a-z0-9-]+\.service$/.test(unit) &&
+        (unitAction || unitFileAction);
+    var loginUnit = /^aib-login(-refresh)?@[a-z0-9-]+\.service$/.test(unit) &&
+        unitAction;
+
+    if (subject.isInGroup("aib-ops") && (agentUnit || loginUnit)) {
         return polkit.Result.YES;
     }
 });

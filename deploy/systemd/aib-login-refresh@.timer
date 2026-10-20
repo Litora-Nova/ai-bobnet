@@ -1,0 +1,9 @@
+[Unit]
+Description=BobNet shared-login refresh timer for %i
+
+[Timer]
+OnUnitActiveSec=1799s
+Unit=aib-login-refresh@%i.service
+
+[Install]
+WantedBy=timers.target

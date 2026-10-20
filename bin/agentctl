@@ -25,15 +25,19 @@ if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists()
         "AIB_SYSTEMCTL",
         "AIB_SUP_STATE_ROOT",
         "AIB_OUTBOX_ROOT",
+        "AIB_LOGIN_STATUS_DIR",
+        "AIB_DEPLOYMENT_CONFIG",
     ):
         os.environ.pop(name, None)
 sys.path.insert(0, str(ROOT / "lib"))
 from aib_control import append_record, identity_for, terminal_record, utc_now  # noqa: E402
+from aib_deployment import load_deployment  # noqa: E402
 
-USAGE = "usage: agentctl <status|neustart|feierabend|standup|abschalten|start|reset-brake|say|attach> <uid>"
+USAGE = "usage: agentctl <status|neustart|feierabend|standup|abschalten|start|reset-brake|say|attach> <uid> | login <status|start> [provider]"
 QUEUED = {"neustart", "feierabend", "standup", "abschalten", "reset-brake"}
 ALL_VERBS = QUEUED | {"status", "start", "say", "attach"}
 UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
+LOGIN_PROVIDERS = ("claude-code", "codex")
 
 
 def die(code: int, text: str = "") -> int:
@@ -229,7 +233,111 @@ def attach(registry: dict, uid: str, caller: str) -> int:
     return 0
 
 
+def deployment_label(provider: str) -> str:
+    path = Path(os.environ.get("AIB_DEPLOYMENT_CONFIG", "/etc/aib/deployment.json"))
+    value = load_deployment(path, ROOT)
+    account = value.get("accounts", {}).get(provider) if value else None
+    label = account.get("label", "") if isinstance(account, dict) else ""
+    return label if isinstance(label, str) else ""
+
+
+def login_status(provider: str) -> dict[str, object]:
+    path = Path(os.environ.get("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status")) / f"{provider}.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        value = {}
+    state = value.get("state", "absent")
+    expires_at = value.get("expires_at")
+    hint = value.get("id_hint", "")
+    return {
+        "provider": provider,
+        "state": state if isinstance(state, str) else "absent",
+        "expires_at": expires_at if isinstance(expires_at, str) else None,
+        "account_label": deployment_label(provider),
+        "account_id_hint": hint if isinstance(hint, str) else "",
+    }
+
+
+def login_terminal(log: Path, request: int) -> dict[str, object] | None:
+    terminal = None
+    try:
+        with log.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("req") == request and record.get("event") in (
+                    "login.started",
+                    "login.rejected",
+                    "login.failed",
+                ):
+                    terminal = record
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return terminal
+
+
+def login_command(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[1] == "status":
+        if len(argv) == 3:
+            if argv[2] not in LOGIN_PROVIDERS:
+                return 64
+            providers = [argv[2]]
+        elif len(argv) == 2:
+            status_dir = Path(os.environ.get("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status"))
+            try:
+                providers = sorted(path.stem for path in status_dir.glob("*.json") if path.stem in LOGIN_PROVIDERS)
+            except OSError:
+                providers = []
+        else:
+            return 64
+        for provider in providers:
+            print(json.dumps(login_status(provider), separators=(",", ":")))
+        return 0
+    if len(argv) != 3 or argv[1] != "start" or argv[2] not in LOGIN_PROVIDERS:
+        return 64
+    provider = argv[2]
+    caller = identity_for(os.geteuid())
+    actor = os.environ.get("AIBOBNET_ACTOR", "")
+    log = Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
+    if not caller.startswith(("human:", "gateway:")):
+        return audit_rejection(log, "login-start", provider, caller, actor, "unauthorized")
+    try:
+        requested = append_record(
+            log,
+            "login.requested",
+            verb="login-start",
+            target=provider,
+            provider=provider,
+            caller=caller,
+            actor=actor,
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 73
+    outcome = systemctl("start", f"aib-login@{provider}.service")
+    if outcome.returncode != 0:
+        return 69
+    request = int(requested["seq"])
+    deadline = time.monotonic() + float(os.environ.get("AIB_CTL_WAIT_S", "30"))
+    while time.monotonic() < deadline:
+        terminal = login_terminal(log, request)
+        if terminal is not None:
+            event = terminal.get("event")
+            if event == "login.started":
+                return 0
+            if event == "login.rejected":
+                return 77
+            return 69
+        time.sleep(0.05)
+    return 124
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "login":
+        return login_command(argv)
     parsed = parse(argv)
     if parsed is None:
         return die(64, USAGE)

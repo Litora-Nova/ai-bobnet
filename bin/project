@@ -31,10 +31,18 @@ while IFS= read -r protected_uid; do
 done <<< "$projects"
 
 _project_one() (
-  local uid="$1" standup home agent owner mode scratch='' temp='' output_fd
+  local uid="$1" standup home provider account_label account_present agent owner mode scratch='' temp='' output_fd
   aib_validate_token "$uid" project_uid
   standup="$(_aib_snapshot_query projects field "$uid" standup_dir)" || aib_die 2 "cannot resolve standup_dir for $uid"
   home="$(_aib_snapshot_query projects field "$uid" home)" || aib_die 2 "cannot resolve home for $uid"
+  provider="$(_aib_snapshot_query projects field "$uid" provider)" || aib_die 2 "cannot resolve provider for $uid"
+  account_label="$(aib_deployment_account "$provider" label 2>/dev/null)" || account_label=''
+  account_present=0; _aib_deployment_account_present "$provider" 2>/dev/null && account_present=1
+  if [ "$account_present" -eq 0 ] && [ -e "${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" ] && ! aib_deployment_valid; then
+    # Invalid policy is still a known (but unreadable) account source. Expose an
+    # empty label rather than making the projection disappear or copying data.
+    account_present=1
+  fi
   [ -d "$standup" ] && [ -r "$standup" ] && [ -x "$standup" ] || aib_die 2 "standup_dir unavailable for $uid"
   [ -d "$home" ] || aib_die 2 "home unavailable for $uid"
   trap 'rm -rf -- "$scratch"; [ -z "$temp" ] || rm -f -- "$temp"' EXIT
@@ -52,7 +60,7 @@ _project_one() (
     printf '%s\t%s\n' "$agent" "$mode" >> "$scratch/agent-modes" || aib_die 2 'cannot buffer agent modes'
   done <<< "$agents"
   aib_attempts_fold "$AIB_EVENT_ROOT/$uid/main.events" > "$scratch/fold" || aib_die 2 "fold failed for $uid"
-  python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" > "$scratch/result" <<'PY'
+  python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" "$provider" "$account_label" "$account_present" > "$scratch/result" <<'PY'
 import datetime as dt
 import errno
 import json
@@ -65,7 +73,7 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
-lib, uid, standup, eventroot, scratch, minutes, limit = sys.argv[1:]
+lib, uid, standup, eventroot, scratch, minutes, limit, provider, account_label, account_present = sys.argv[1:]
 scratch = Path(scratch)
 zone = ZoneInfo(os.environ.get('TZ') or 'UTC')
 now = time.time()
@@ -313,8 +321,18 @@ def supervisor_projection(agent):
                     restarts += 1
             except ValueError:
                 pass
+    status_dir = Path(os.environ.get('AIB_LOGIN_STATUS_DIR', '/run/aib/login-status'))
+    login = read_json_file(status_dir/(provider+'.json'))
+    account = None
+    if account_present == '1' or login is not None:
+        state = login.get('state', 'absent') if login is not None else 'absent'
+        hint = login.get('id_hint', '') if login is not None else ''
+        account = dict(provider=provider,
+                       state=state if isinstance(state, str) else 'absent',
+                       label=account_label,
+                       id_hint=hint if isinstance(hint, str) else '')
     return dict(
-        mode='supervised', account=None,
+        mode='supervised', account=account,
         unit_state=unit.get('ActiveState', 'unknown'),
         disabled=unit.get('UnitFileState') == 'disabled',
         session_state=session_state, state_reason=state_reason, health=health,

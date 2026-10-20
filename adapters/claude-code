@@ -39,17 +39,36 @@ case "$effort_setting" in
   *) refuse 65 'invalid effort setting' ;;
 esac
 
+credential_mode=${AIB_CREDENTIAL_MODE:-file}
+case "$credential_mode" in
+  file|fd) ;;
+  proxy) refuse 78 'credential mode proxy: not built' ;;
+  *) refuse 78 "credential mode $credential_mode: unsupported" ;;
+esac
+
 [[ -n ${HOME:-} ]] || refuse 78 'credential unavailable or unsafe'
 claude_home="$HOME/.claude"
 auth="$claude_home/.credentials.json"
-[[ -d $claude_home && ! -L $claude_home && -f $auth && ! -L $auth ]] ||
-  refuse 78 'credential unavailable or unsafe'
-dir_mode=$(stat -c '%a' -- "$claude_home" 2>/dev/null) ||
-  refuse 78 'credential unavailable or unsafe'
-auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
-  refuse 78 'credential unavailable or unsafe'
-[[ $dir_mode == 700 && $auth_meta == "$EUID:600" ]] ||
-  refuse 78 'credential unavailable or unsafe'
+case "$credential_mode" in
+  file)
+    [[ -d $claude_home && ! -L $claude_home && -f $auth && ! -L $auth ]] ||
+      refuse 78 'credential unavailable or unsafe'
+    dir_mode=$(stat -c '%a' -- "$claude_home" 2>/dev/null) ||
+      refuse 78 'credential unavailable or unsafe'
+    auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
+      refuse 78 'credential unavailable or unsafe'
+    [[ $dir_mode == 700 && $auth_meta == "$EUID:600" ]] ||
+      refuse 78 'credential unavailable or unsafe'
+    ;;
+  fd)
+    [[ -d $claude_home && ! -L $claude_home ]] ||
+      refuse 78 'credential mode fd: history directory unavailable or unsafe'
+    credential_fd=${AIB_CREDENTIAL_FD:-}
+    [[ $credential_fd =~ ^[3-9]$ && -r /proc/self/fd/$credential_fd && -s /proc/self/fd/$credential_fd ]] ||
+      refuse 78 'credential mode fd: descriptor unavailable or empty'
+    export CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="$credential_fd"
+    ;;
+esac
 
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 export SHELL=/bin/bash TERM=dumb CLAUDE_CONFIG_DIR="$claude_home" DISABLE_AUTOUPDATER=1 \

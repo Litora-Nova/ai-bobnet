@@ -1,0 +1,14 @@
+[Unit]
+Description=BobNet shared-login refresher for %i
+# %n is intentionally retained: systemd escapes the complete failed unit name
+# when it becomes the aib-alarm@ instance, including its existing @ character;
+# %N would remove the failed unit's type suffix.
+OnFailure=aib-alarm@%n.service
+
+[Service]
+Type=oneshot
+User=aib-broker
+ExecStart=/opt/aib/engine/bin/aib-login-refresh %i
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aib/login /var/lib/aib/login-state

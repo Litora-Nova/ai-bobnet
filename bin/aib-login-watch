@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Publish sanitized login status and server-wide expiry alarms."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_deployment import load_deployment  # noqa: E402
+from aib_login import (PROVIDERS, atomic_json, credential_path, integer, iso, login_root, now,
+                       read_object, setting, write_alarm)  # noqa: E402
+
+
+def label_for(provider: str) -> str:
+    path = Path(setting("AIB_DEPLOYMENT_CONFIG", "/etc/aib/deployment.json"))
+    value = load_deployment(path, ROOT)
+    account = value.get("accounts", {}).get(provider, {}) if value else {}
+    label = account.get("label", "") if isinstance(account, dict) else ""
+    return label if isinstance(label, str) else ""
+
+
+def inspect(provider: str) -> tuple[str, int | None, str]:
+    cred = credential_path(provider)
+    data = read_object(cred)
+    if data is None:
+        return "absent", None, ""
+    meta = read_object(cred.parent / "login.meta.json") or {}
+    account = meta.get("account_id", "")
+    if provider == "claude-code":
+        oauth = data.get("claudeAiOauth", {})
+        own_end = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
+        end = own_end // 1000 if type(own_end) is int else meta.get("login_expires_at")
+    else:
+        end = meta.get("login_expires_at")
+        tokens = data.get("tokens", {})
+        if not account and isinstance(tokens, dict):
+            account = tokens.get("account_id", "")
+    if type(end) is not int:
+        end = None
+    if end is not None and end <= now():
+        state = "expired"
+    elif end is not None and end - now() <= integer("AIB_LOGIN_EXPIRING_S", 259200):
+        state = "expiring"
+    else:
+        state = "ok"
+    hint = account[-4:] if isinstance(account, str) else ""
+    return state, end, hint
+
+
+def process(provider: str) -> None:
+    state, end, hint = inspect(provider)
+    status_dir = Path(setting("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status"))
+    atomic_json(status_dir / f"{provider}.json", {
+        "provider": provider, "state": state, "expires_at": iso(end) if end is not None else None,
+        "label": label_for(provider), "id_hint": hint, "checked_at": iso(now()),
+    }, 0o644)
+
+    state_dir = Path(setting("AIB_LOGIN_STATE_DIR", "/var/lib/aib/login-state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / f"watch-{provider}.json"
+    previous = read_object(state_file) or {}
+    last_state = previous.get("state")
+    last_emit = previous.get("last_emit") if type(previous.get("last_emit")) is int else None
+    alert = state in ("expiring", "expired")
+    changed = state != last_state
+    due = last_emit is None or now() - last_emit >= integer("AIB_LOGIN_REEMIT_S", 86400)
+    emitted = False
+    if alert and (changed or due):
+        kind = f"login_{state}"
+        body = f"alarm:{kind} provider:{provider} expires_at:{iso(end) if end is not None else 'unknown'}"
+        emitted = write_alarm(Path(setting("AIB_OUTBOX_ROOT", "/srv/aib/outbox")), "aib-login-watch", body)
+    atomic_json(state_file, {"state": state, "last_emit": now() if emitted else last_emit}, 0o640)
+
+
+def main(argv: list[str]) -> int:
+    providers = argv
+    if not providers:
+        try:
+            providers = sorted(item.name for item in login_root().iterdir() if item.is_dir())
+        except OSError:
+            providers = []
+    if any(provider not in PROVIDERS for provider in providers):
+        return 64
+    try:
+        for provider in providers:
+            process(provider)
+    except OSError:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

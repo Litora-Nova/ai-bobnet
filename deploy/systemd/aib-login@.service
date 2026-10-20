@@ -1,0 +1,14 @@
+[Unit]
+Description=BobNet shared provider login for %i
+# %n is deliberate: the alarm instance receives the complete failed unit name;
+# %N would remove the type suffix needed by aib-unit-alarm's strict parser.
+OnFailure=aib-alarm@%n.service
+
+[Service]
+Type=simple
+User=aib-broker
+RuntimeDirectory=aib
+ExecStart=/opt/aib/engine/bin/aib-login %i
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aib/login /var/lib/aib/login-state /run/aib /srv/aib/outbox/_server /srv/aib/standup

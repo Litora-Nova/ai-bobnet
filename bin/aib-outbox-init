@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Create safe team and server outbox directories from the registry."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
+    os.environ.pop("AIBOBNET_REGISTRY", None)
+    os.environ.pop("AIB_OUTBOX_ROOT", None)
+
+NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
+
+
+def ensure_dir(path: Path, mode: int) -> bool:
+    try:
+        if path.is_symlink():
+            return False
+        path.mkdir(parents=False, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            return False
+        os.chmod(path, mode)
+        return True
+    except OSError:
+        return False
+
+
+def main() -> int:
+    registry_path = Path(os.environ.get("AIBOBNET_REGISTRY", ROOT / "registry.json"))
+    outbox_root = Path(os.environ.get("AIB_OUTBOX_ROOT", "/srv/aib/outbox"))
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        agents = registry["agents"]
+        if not isinstance(agents, dict):
+            raise ValueError
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return 66
+    try:
+        outbox_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 78
+    result = 0
+    if not ensure_dir(outbox_root / "_server", 0o750):
+        result = 78
+    teams: set[str] = set()
+    for agent in agents.values():
+        if not isinstance(agent, dict) or agent.get("mode") != "supervised":
+            continue
+        team = agent.get("team_uid")
+        if not isinstance(team, str) or NAME_RE.fullmatch(team) is None:
+            if result < 65:
+                result = 65
+            continue
+        teams.add(team)
+    for team in sorted(teams):
+        if not ensure_dir(outbox_root / team, 0o770):
+            result = 78
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

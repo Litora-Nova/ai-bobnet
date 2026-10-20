@@ -954,6 +954,24 @@ aib_deployment_allow() {
   _aib_deployment_query "${1-}"
 }
 
+aib_deployment_account() {
+  [ "$#" -eq 2 ] || return 2
+  local path="${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" root="${REPO_ROOT:-}"
+  if [ -z "$root" ]; then
+    root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || return 1
+  fi
+  python3 -I "$root/lib/aib_deployment.py" "$root" "$path" --account "$1" "$2"
+}
+
+_aib_deployment_account_present() {
+  [ "$#" -eq 1 ] || return 2
+  local path="${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" root="${REPO_ROOT:-}"
+  if [ -z "$root" ]; then
+    root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || return 1
+  fi
+  python3 -I "$root/lib/aib_deployment.py" "$root" "$path" --account-present "$1"
+}
+
 # _aib_record_field <record> <key> -> value on stdout; rc 0 present, rc 1 absent.
 # Newline-delimited key=value; the FIRST '=' splits (a value may contain '='). Pure
 # parameter expansion: no here-string, no subshell, no temp file — deterministic over
@@ -1036,7 +1054,7 @@ aib_authorize_launch() {
   if _aib_record_field "$snapshot" data_class >/dev/null; then
     data_class="$(_aib_record_field "$snapshot" data_class)"
   else
-    data_class="internal"
+    data_class="customer"
   fi
   deploy_customer_code="$(_aib_record_field "$snapshot" deploy_customer_code)" || deploy_customer_code=""
 
@@ -1538,7 +1556,10 @@ aib_event_compose_ended_payload() {
 aib_enact_launch() {
   local enact_record="${1-}" prompt="${2-}" events_path="${3-}" lock_path="${4-}"
   local envelope_kv="${5-}" decided_id="${6-}" mode="${7:-confined}"
-  local adapter state_dir root cwd_req sandbox effort model timeout_s session resolved_root
+  local adapter state_dir root cwd_req sandbox effort model timeout_s session provider resolved_root
+  local _s1c_enabled=0 _engine_root _agent_uid="" _agent_home="" _credential_mode="file"
+  local _credential_source="login" _login_root="/var/lib/aib/login" _login_store_path=""
+  local _credential_tmp="" _credential_fd_open=0 _role_uid="${AIB_ROLE_UID:-}" _role_gid="${AIB_ROLE_GID:-}"
 
   case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
   [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$decided_id" ] ||
@@ -1556,6 +1577,7 @@ aib_enact_launch() {
   model="$(_aib_record_field "$enact_record" model)" || aib_die 2 "enact record requires model"
   timeout_s="$(_aib_record_field "$enact_record" timeout)" || aib_die 2 "enact record requires timeout"
   session="$(_aib_record_field "$enact_record" session)" || session=""
+  provider="$(_aib_record_field "$enact_record" provider)" || provider=""
   case "$timeout_s" in ''|*[!0-9]*) aib_die 2 "enact record timeout must be digits (got '$timeout_s')";; esac
   [ "$timeout_s" -gt 0 ] 2>/dev/null || aib_die 2 "enact record timeout must be > 0"
 
@@ -1582,15 +1604,49 @@ aib_enact_launch() {
       aib_die 2 "enact record root does not exist: $root"
   fi
 
+  _engine_root="${REPO_ROOT:-}"
+  if [ -z "$_engine_root" ]; then
+    _engine_root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || aib_die 2 "cannot resolve engine root"
+  fi
+  # S1c is enabled by the broker unit's state-root setting. On installed
+  # engines an attempted environment override is ignored in favour of the
+  # production path, matching the other test seams.
+  if [ "$mode" = confined ] && [ -n "${AIB_SUP_STATE_ROOT+x}" ]; then
+    _s1c_enabled=1
+    local _state_root="/var/lib/aib-sup"
+    if [ "${AIB_TEST_SEAMS:-}" = 1 ] && [ ! -e "$_engine_root/.aib-installed" ]; then
+      _state_root="$AIB_SUP_STATE_ROOT"
+      _login_root="${AIB_LOGIN_ROOT:-/var/lib/aib/login}"
+    fi
+    _agent_uid="$(_aib_record_field "$envelope_kv" agent_uid)" || _agent_uid=""
+    _agent_home="${_state_root%/}/$_agent_uid"
+    if [ -n "$provider" ]; then
+      _credential_mode="$(aib_deployment_account "$provider" credential_mode 2>/dev/null)" || _credential_mode=file
+      _credential_source="$(aib_deployment_account "$provider" credential_source 2>/dev/null)" || _credential_source=login
+      case "$provider" in
+        claude-code) _login_store_path="$_login_root/$provider/.credentials.json" ;;
+        codex) _login_store_path="$_login_root/$provider/auth.json" ;;
+      esac
+    fi
+  fi
+
   # --- child env: allow-list (ambient, from the PDP this caller already ran)
   # plus whatever the caller pre-populated, plus ATTEMPT_ID (always, always last).
   local _child_env=() _n
   for _n in ${AIB_VERDICT_ENV_ALLOW:-}; do
+    [ "$_s1c_enabled" -eq 0 ] || [ "$_n" != HOME ] || continue
     [ -n "${!_n+x}" ] && _child_env+=("$_n=${!_n}")
   done
   if declare -p AIB_ENACT_CHILD_ENV_EXTRA >/dev/null 2>&1; then
     local -n _extra_ref=AIB_ENACT_CHILD_ENV_EXTRA
     [ "${#_extra_ref[@]}" -eq 0 ] || _child_env+=("${_extra_ref[@]}")
+  fi
+  if [ "$_s1c_enabled" -eq 1 ]; then
+    _child_env+=("HOME=$_agent_home" "AIB_TURN_TIMEOUT_S=$timeout_s" "AIB_CREDENTIAL_MODE=$_credential_mode")
+    case "$_credential_mode" in
+      shared) _child_env+=("AIB_LOGIN_STORE_PATH=$_login_store_path") ;;
+      fd) _child_env+=("AIB_CREDENTIAL_FD=3") ;;
+    esac
   fi
   _child_env+=("AIBOBNET_ATTEMPT_ID=$decided_id")
 
@@ -1906,11 +1962,53 @@ aib_enact_launch__run_confined() {
 
   # --- D-A / D-A2: pre-flight, before ANYTHING else runs -----------------------
   local _preflight_tmp _preflight_rc=1 state_path=""
-  if [ -z "$state_dir" ]; then
+  if [ "$_s1c_enabled" -eq 1 ]; then
+    if [[ "$_agent_uid" =~ ^[a-z0-9]+(-[a-z0-9]+)+$ ]] &&
+       [ -d "$_agent_home" ] && [ ! -L "$_agent_home" ]; then
+      if [ -z "$state_dir" ]; then
+        _preflight_rc=0
+      else
+        state_path="$_agent_home/$state_dir"
+        [ -d "$state_path" ] && [ ! -L "$state_path" ] && _preflight_rc=0
+      fi
+    fi
+  elif [ -z "$state_dir" ]; then
     _preflight_rc=0
   elif [ -n "${HOME:-}" ]; then
     state_path="$HOME/$state_dir"
     [ -d "$state_path" ] && [ ! -L "$state_path" ] && _preflight_rc=0
+  fi
+  if [ "$_preflight_rc" -eq 0 ]; then
+    case "$_role_uid:$_role_gid" in
+      :) ;;
+      *:)
+        _preflight_rc=1
+        ;;
+      :*)
+        _preflight_rc=1
+        ;;
+      *)
+        [[ "$_role_uid" =~ ^[0-9]+$ && "$_role_gid" =~ ^[0-9]+$ ]] || _preflight_rc=1
+        ;;
+    esac
+  fi
+  if [ "$_preflight_rc" -eq 0 ] && [ "$_s1c_enabled" -eq 1 ]; then
+    case "$_credential_mode" in
+      file|shared) ;;
+      proxy) _preflight_rc=1 ;;
+      fd)
+        _credential_tmp="$("$_mktemp_bin" "${TMPDIR:-/tmp}/aibobnet-credential.XXXXXX")" || aib_die 2 "cannot create credential buffer"
+        chmod 600 "$_credential_tmp" || aib_die 2 "cannot protect credential buffer"
+        local _token_args=("$_engine_root/bin/aib-login-token" "$provider")
+        [ "$_credential_source" = login ] || _token_args+=(--source "$_credential_source")
+        AIB_TURN_TIMEOUT_S="$timeout_s" "${_token_args[@]}" >"$_credential_tmp" || _preflight_rc=1
+        if [ "$_preflight_rc" -eq 0 ]; then
+          exec 3<"$_credential_tmp" || _preflight_rc=1
+          [ "$_preflight_rc" -ne 0 ] || _credential_fd_open=1
+        fi
+        ;;
+      *) _preflight_rc=1 ;;
+    esac
   fi
   if [ "$_preflight_rc" -eq 0 ] && [ -n "${AIB_CONFINE_BIN:-}" ] && [ -x "$AIB_CONFINE_BIN" ]; then
     _preflight_rc=1
@@ -1920,6 +2018,8 @@ aib_enact_launch__run_confined() {
     rm -rf "$_preflight_tmp" 2>/dev/null || true
   fi
   if [ "$_preflight_rc" -ne 0 ]; then
+    [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
+    [ -z "$_credential_tmp" ] || rm -f -- "$_credential_tmp" 2>/dev/null || true
     _aib_enact_commit_ended io-refused confine 126
     # R4 (gate delta 2, Ikarus MEDIUM): _aib_enact_commit_ended's own D8 incident
     # branch can fire right here too (event store gone/corrupt before the
@@ -1962,7 +2062,9 @@ aib_enact_launch__run_confined() {
     # LOW (gate delta 2, Ikarus): the escalation marker was created above but
     # never listed here — every confined run leaked one file into TMPDIR
     # forever, win or lose, escalated or not.
+    [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
     rm -f -- "$_internal_fifo" "$_status_file" "$_cwd_fail_marker" "$_provider_status_file" "$_escalated_marker" 2>/dev/null || true
+    [ -z "$_credential_tmp" ] || rm -f -- "$_credential_tmp" 2>/dev/null || true
   }
 
   _aib_enact_exec_child_confined() {
@@ -1975,7 +2077,10 @@ aib_enact_launch__run_confined() {
     fi
     for _fd in /proc/self/fd/[0-9]*; do
       _fd="${_fd##*/}"
-      case "$_fd" in 0|1|2|9) continue;; esac
+      case "$_fd" in
+        0|1|2|9) continue;;
+        3) [ "$_credential_fd_open" -eq 1 ] && continue;;
+      esac
       exec {_fd}>&-
     done
     # S1a: no setsid here — the manager's own `set -m` (below) already put THIS
@@ -1991,9 +2096,15 @@ aib_enact_launch__run_confined() {
     # because the dup2 happens strictly after them.
     local adapter_mode=(exec)
     [ -z "$session" ] || adapter_mode=(session-turn "$session")
-    exec "$_env_bin" -i "${_child_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
+    local _role_args=()
+    if [ -n "$_role_uid" ] && [ -n "$_role_gid" ]; then
+      _role_args=(--uid "$_role_uid" --gid "$_role_gid")
+    fi
+    local _role_env=()
+    [ "${#_role_args[@]}" -eq 0 ] || _role_env+=("AIB_ROLE_UIDS=${AIB_ROLE_UIDS:-}")
+    exec "$_env_bin" -i "${_child_env[@]}" "${_role_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
       "LL_STATUS_FD=9" "LL_STDERR_FD=1" \
-      "$AIB_CONFINE_BIN" "$adapter" "${adapter_mode[@]}" \
+      "$AIB_CONFINE_BIN" "${_role_args[@]}" "$adapter" "${adapter_mode[@]}" \
       -m "$model" -s "$sandbox" \
       -c "model_reasoning_effort=\"$effort\"" \
       -c 'approval_policy="never"' \

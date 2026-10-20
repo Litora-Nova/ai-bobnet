@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Print one preflighted Claude credential for broker fd hand-off."""
+
+from __future__ import annotations
+
+import stat
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_login import access_expiry, credential_path, integer, now, read_object  # noqa: E402
+
+
+def regular_0640(path: Path) -> int:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return 66
+    except OSError:
+        return 78
+    return 0 if stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o640 else 78
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] != "claude-code":
+        return 64
+    source = "login"
+    if len(argv) == 3 and argv[1] == "--source":
+        source = argv[2]
+    elif len(argv) != 1:
+        return 64
+    if source not in ("login", "setup_token"):
+        return 64
+    path = credential_path("claude-code") if source == "login" else credential_path("claude-code").parent / "setup-token"
+    valid = regular_0640(path)
+    if valid:
+        return valid
+    if source == "setup_token":
+        try:
+            token = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return 78
+        if not token:
+            return 78
+        sys.stdout.write(token)
+        return 0
+    data = read_object(path)
+    oauth = data.get("claudeAiOauth") if data else None
+    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    expiry = access_expiry("claude-code", data or {})
+    timeout = integer("AIB_TURN_TIMEOUT_S", -1)
+    if not isinstance(token, str) or not token or expiry is None or timeout < 0:
+        print("claude-code login token unavailable hint:login", file=sys.stderr)
+        return 78
+    floor = now() + timeout + integer("AIB_LOGIN_MARGIN_S", 300) + integer("AIB_LOGIN_SLACK_S", 600)
+    if expiry < floor:
+        print("claude-code login token inside refresh margin hint:login", file=sys.stderr)
+        return 78
+    sys.stdout.write(token)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,9 @@
+[Unit]
+Description=BobNet shared-login expiry watch timer
+
+[Timer]
+OnUnitActiveSec=1h
+Unit=aib-login-watch.service
+
+[Install]
+WantedBy=timers.target

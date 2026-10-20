@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Perform one audited provider login and publish its credential atomically."""
+
+from __future__ import annotations
+
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_control import append_record, identity_for  # noqa: E402
+from aib_deployment import load_deployment  # noqa: E402
+from aib_login import (PROVIDERS, atomic_json, credential_path, integer, iso, now, read_object,
+                       setting, write_alarm)  # noqa: E402
+
+URL_RE = re.compile(r"https://[^\s]+")
+DEVICE_CODE_RE = re.compile(r"[A-Z0-9]{4}-[A-Z0-9]{4}")
+LOGIN_CODE_RE = re.compile(r"[A-Za-z0-9#_-]{1,256}\Z", re.ASCII)
+TERMINAL_EVENTS = {"login.rejected", "login.succeeded", "login.failed"}
+
+
+def control_log() -> Path:
+    return Path(setting("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
+
+
+def request_for(provider: str) -> dict[str, Any] | None:
+    try:
+        records = [json.loads(line) for line in control_log().read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return None
+    terminal = {record.get("req") for record in records if record.get("event") in TERMINAL_EVENTS}
+    requests = [
+        record for record in records
+        if record.get("event") == "login.requested"
+        and record.get("provider", record.get("target")) == provider
+        and record.get("seq") not in terminal
+    ]
+    return requests[-1] if requests else None
+
+
+def audit(event: str, request: dict[str, Any], provider: str, **fields: Any) -> None:
+    append_record(
+        control_log(),
+        event,
+        req=request["seq"],
+        provider=provider,
+        caller=request.get("caller", ""),
+        **fields,
+    )
+
+
+def label_for(provider: str) -> str:
+    value = load_deployment(Path(setting("AIB_DEPLOYMENT_CONFIG", "/etc/aib/deployment.json")), ROOT)
+    account = value.get("accounts", {}).get(provider) if value else None
+    label = account.get("label", "") if isinstance(account, dict) else ""
+    return label if isinstance(label, str) else ""
+
+
+def gateway_gate(provider: str, request: dict[str, Any]) -> str | None:
+    caller = request.get("caller", "")
+    if not isinstance(caller, str) or not caller.startswith("gateway:"):
+        return None
+    status = read_object(Path(setting("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status")) / f"{provider}.json") or {}
+    if status.get("state", "absent") not in ("expiring", "expired", "absent"):
+        return "not_due"
+    state_file = Path(setting("AIB_LOGIN_STATE_DIR", "/var/lib/aib/login-state")) / f"start-{provider}.json"
+    state = read_object(state_file) or {}
+    last = state.get("last_start")
+    if type(last) is int and now() - last < integer("AIB_LOGIN_START_INTERVAL_S", 3600):
+        return "rate_limited"
+    atomic_json(state_file, {"last_start": now()}, 0o640)
+    return None
+
+
+def publish(provider: str, private: Path) -> tuple[int, str]:
+    source = private / PROVIDERS[provider]
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return 1, ""
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return 1, ""
+    target = credential_path(provider)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(raw)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(source.read_bytes())
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    account = ""
+    if provider == "claude-code":
+        profile = read_object(private / ".claude.json") or {}
+        oauth_account = profile.get("oauthAccount")
+        if isinstance(oauth_account, dict) and isinstance(oauth_account.get("accountUuid"), str):
+            account = oauth_account["accountUuid"]
+    else:
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict) and isinstance(tokens.get("account_id"), str):
+            account = tokens["account_id"]
+    end = now() + integer("AIB_LOGIN_LIFETIME_S", 4_838_400)
+    atomic_json(target.parent / "login.meta.json", {
+        "logged_in_at": now(), "login_expires_at": end, "account_id": account,
+    }, 0o640)
+    atomic_json(Path(setting("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status")) / f"{provider}.json", {
+        "provider": provider, "state": "ok", "expires_at": iso(end), "label": label_for(provider),
+        "id_hint": account[-4:], "checked_at": iso(now()),
+    }, 0o644)
+    return 0, account
+
+
+def alarm(body: str) -> None:
+    write_alarm(Path(setting("AIB_OUTBOX_ROOT", "/srv/aib/outbox")), "aib-login", body)
+
+
+def fail(request: dict[str, Any], provider: str, reason: str, vorgang: str | None = None) -> int:
+    fields: dict[str, Any] = {"reason": reason}
+    if vorgang is not None:
+        fields["vorgang"] = vorgang
+    audit("login.failed", request, provider, **fields)
+    alarm(f"alarm:login_failed provider:{provider} reason:{reason}")
+    return 1
+
+
+def read_pty(master: int, process: subprocess.Popen[bytes], deadline: float, *, retain: bool) -> str:
+    chunks: list[bytes] = []
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.05)
+        if ready:
+            try:
+                part = os.read(master, 4096)
+            except OSError:
+                part = b""
+            if part and retain:
+                chunks.append(part)
+            if not part and process.poll() is not None:
+                break
+        elif process.poll() is not None:
+            break
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def peer_identity(connection: socket.socket) -> str:
+    raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return identity_for(uid)
+
+
+def serve_code(
+    server: socket.socket,
+    provider: str,
+    vorgang: str,
+    request: dict[str, Any],
+    deadline: float,
+) -> str | None:
+    fresh_s = integer("AIB_LOGIN_CODE_FRESH_S", 60)
+    while time.monotonic() < deadline:
+        server.settimeout(min(0.2, max(0.01, deadline - time.monotonic())))
+        try:
+            connection, _ = server.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            return None
+        with connection:
+            caller = peer_identity(connection)
+            reason = ""
+            try:
+                raw = connection.makefile("rb").readline(4097)
+                message = json.loads(raw)
+                code = message.get("code")
+                received = message.get("received_at")
+                if not caller.startswith("gateway:"):
+                    reason = "unauthorized"
+                elif message.get("provider") != provider or message.get("vorgang") != vorgang:
+                    reason = "vorgang_unknown"
+                elif not isinstance(code, str) or LOGIN_CODE_RE.fullmatch(code) is None or len(code.encode("ascii")) > 256:
+                    reason = "bad_code"
+                elif isinstance(received, bool) or not isinstance(received, (int, float)) or time.time() - received > fresh_s:
+                    reason = "stale"
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, UnicodeEncodeError):
+                code = None
+                reason = "bad_code"
+            if reason:
+                append_record(
+                    control_log(), "login.code_rejected", req=request["seq"], provider=provider,
+                    caller=caller, vorgang=vorgang, reason=reason,
+                )
+                connection.sendall((json.dumps({"ok": False, "reason": reason}) + "\n").encode())
+                continue
+            append_record(
+                control_log(), "login.code_accepted", req=request["seq"], provider=provider,
+                caller=caller, vorgang=vorgang,
+            )
+            connection.sendall(b'{"ok":true}\n')
+            return code
+    return None
+
+
+def claude_login(request: dict[str, Any], private: Path) -> int:
+    provider = "claude-code"
+    vorgang = os.urandom(16).hex()
+    audit("login.started", request, provider, vorgang=vorgang)
+    master, slave = pty.openpty()
+    attributes = termios.tcgetattr(slave)
+    attributes[3] &= ~termios.ECHO
+    termios.tcsetattr(slave, termios.TCSANOW, attributes)
+    environment = os.environ.copy()
+    environment["CLAUDE_CONFIG_DIR"] = str(private)
+    process = subprocess.Popen(
+        [setting("AIB_CLAUDE_BIN", "claude"), "auth", "login"],
+        stdin=slave, stdout=slave, stderr=slave, env=environment, start_new_session=True,
+    )
+    os.close(slave)
+    window = integer("AIB_LOGIN_WINDOW_S", 1800)
+    deadline = time.monotonic() + window
+    prefix = ""
+    while time.monotonic() < deadline and URL_RE.search(prefix) is None and process.poll() is None:
+        prefix += read_pty(master, process, min(deadline, time.monotonic() + 0.1), retain=True)
+    capture = Path(setting("AIB_LOGIN_STATE_DIR", "/var/lib/aib/login-state")) / f"{provider}.pty.log"
+    capture.parent.mkdir(parents=True, exist_ok=True)
+    capture.write_text(prefix, encoding="utf-8")
+    url_match = URL_RE.search(prefix)
+    if url_match is None:
+        os.close(master)
+        process.wait(timeout=5)
+        return fail(request, provider, "cli_failed", vorgang)
+    expires_at = iso(int(time.time()) + window)
+    alarm(f"alarm:login_required provider:{provider} vorgang:{vorgang} url:{url_match.group(0)} expires_at:{expires_at}")
+    status_path = Path(setting("AIB_LOGIN_STATUS_DIR", "/run/aib/login-status")) / f"{provider}.json"
+    status = read_object(status_path) or {"provider": provider, "expires_at": None, "label": label_for(provider), "id_hint": ""}
+    status["state"] = "pending"
+    status["checked_at"] = iso(now())
+    atomic_json(status_path, status, 0o644)
+    socket_path = Path(setting("AIB_LOGIN_SOCK_DIR", "/run/aib")) / f"login-{provider}.sock"
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o660)
+            server.listen(8)
+            code = serve_code(server, provider, vorgang, request, deadline)
+    except OSError:
+        code = None
+    finally:
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
+    if code is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            process.wait()
+        os.close(master)
+        return fail(request, provider, "timeout", vorgang)
+    os.write(master, code.encode("ascii") + b"\n")
+    read_pty(master, process, deadline, retain=False)
+    os.close(master)
+    try:
+        rc = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        return fail(request, provider, "timeout", vorgang)
+    if rc != 0:
+        return fail(request, provider, "cli_failed", vorgang)
+    published, _account = publish(provider, private)
+    if published:
+        return fail(request, provider, "cli_failed", vorgang)
+    audit("login.succeeded", request, provider, vorgang=vorgang)
+    return 0
+
+
+def codex_login(request: dict[str, Any], private: Path) -> int:
+    provider = "codex"
+    audit("login.started", request, provider)
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(private)
+    try:
+        result = subprocess.run(
+            [setting("AIB_CODEX_BIN", "codex"), "login", "--device-auth"], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=integer("AIB_LOGIN_WINDOW_S", 1800), check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return fail(request, provider, "timeout")
+    url = URL_RE.search(result.stdout)
+    user_code = DEVICE_CODE_RE.search(result.stdout)
+    if url is not None and user_code is not None:
+        alarm(f"alarm:login_required provider:{provider} url:{url.group(0)} user_code:{user_code.group(0)}")
+    if result.returncode != 0 or publish(provider, private)[0] != 0:
+        return fail(request, provider, "cli_failed")
+    audit("login.succeeded", request, provider)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or argv[0] not in PROVIDERS:
+        return 64
+    provider = argv[0]
+    request = request_for(provider)
+    if request is None:
+        return 77
+    rejection = gateway_gate(provider, request)
+    if rejection is not None:
+        audit("login.rejected", request, provider, reason=rejection)
+        return 77
+    private = Path(tempfile.mkdtemp(prefix=f"aib-login-{provider}."))
+    os.chmod(private, 0o700)
+    try:
+        return claude_login(request, private) if provider == "claude-code" else codex_login(request, private)
+    finally:
+        shutil.rmtree(private, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
