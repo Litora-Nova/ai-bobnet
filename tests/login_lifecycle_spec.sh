@@ -117,7 +117,7 @@ vorg() { SO | grep "alarm:login_required provider:$1" | tail -1 | grep -o 'vorga
 has_vorg() { [ -n "$(vorg "$1")" ]; }
 ev() { python3 -I "$SJ" count "$CLOG" "$1"; }
 evf() { cf "$1" "${3:--1}" "$2"; }
-fresh() { lw_clean; rm -f "$LROOT/claude-code/".* "$LROOT/codex/"* 2>/dev/null; : > "$CLOG"; : > "$FP/typed.log"; rm -f "$FP/cli.log" "$FP/cli.pid"; as human:operator; }
+fresh() { lw_clean; rm -f "$LROOT/claude-code/".* "$LROOT/claude-code/"* "$LROOT/codex/"* 2>/dev/null; : > "$CLOG"; : > "$FP/typed.log"; rm -f "$FP/cli.log" "$FP/cli.pid"; as human:operator; }
 
 # --- T1 claude happy path -------------------------------------------------------------------------------------------------------------------------
 fresh; lreq claude-code human:operator >/dev/null

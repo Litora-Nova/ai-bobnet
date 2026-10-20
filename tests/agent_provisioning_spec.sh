@@ -52,7 +52,7 @@ init() { RC=0; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" "${CTLENV[@]}" AIBO
 
 # --- T1 outbox dirs -------------------------------------------------------------------------------------------------------------------------------------
 rm -rf "${OUTBOX:?}"; mkdir -p "$OUTBOX"; init
-eq "T1: supervised teams + _server are created; oneshot-only team and the unsafe name are not; the unsafe name makes rc 65" "$RC|$(ls "$OUTBOX" | tr '\n' ' ')" "65|_server acme-engine acme-ops "
+eq "T1: supervised teams + _server are created; oneshot-only team and the unsafe name are not; the unsafe name makes rc 65" "$RC|$(LC_ALL=C ls "$OUTBOX" | tr '\n' ' ')" "65|_server acme-engine acme-ops "
 eq "T1: team dirs are group-writable and not world-writable" "$(for d in acme-engine acme-ops; do m=$(stat -c %a "$OUTBOX/$d"); echo $(( (8#$m & 8#020) != 0 )) $(( (8#$m & 8#002) != 0 )); done | tr '\n' ' ')" "1 0 1 0 "
 eq "T1: _server is neither group- nor world-writable" "$(m=$(stat -c %a "$OUTBOX/_server" 2>/dev/null); echo $(( (8#${m:-777} & 8#022) != 0 )))" 0
 printf 'keep me\n' > "$OUTBOX/acme-engine/outbox.md"; init
