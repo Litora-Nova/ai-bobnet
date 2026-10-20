@@ -596,7 +596,7 @@ fi
 #     _projection.json symlink name) — the mechanical form of CONTRACT-visibility.md SS4/SS5 and
 #     docs/decisions/0008-dashboard.md SSD's "import-level, not repo-level" separation.
 # =========================================================================
-ALLOWLIST='^(docs/CONTRACT-visibility\.md|docs/decisions/0007-visibility-projection\.md|docs/decisions/0008-dashboard\.md|docs/CONFINEMENT\.md|docs/CONTRACT-execution-binding\.md|deploy/systemd/aib-projection\.(service|timer)|deploy/systemd/aib-dashboard\.service|bin/project|bin/dashboard|tests/projection_spec\.sh|tests/dashboard_spec\.sh|tests/visibility_delta_spec\.sh|tests/visibility_mutation_spec\.sh|tests/projection_supervisor_spec\.sh|tests/fixtures/projection_jget\.py|tests/fixtures/projection_bulk_stream\.py)$'
+ALLOWLIST='^(docs/CONTRACT-visibility\.md|docs/decisions/0007-visibility-projection\.md|docs/decisions/0008-dashboard\.md|docs/CONFINEMENT\.md|docs/CONTRACT-execution-binding\.md|deploy/systemd/aib-projection\.(service|timer)|deploy/systemd/aib-dashboard\.service|bin/project|bin/dashboard|tests/projection_spec\.sh|tests/projection_[^/]*_spec\.sh|tests/dashboard_spec\.sh|tests/visibility_delta_spec\.sh|tests/visibility_mutation_spec\.sh|tests/fixtures/projection_jget\.py|tests/fixtures/projection_bulk_stream\.py)$'
 hits="$(cd "$SRC_ROOT" && grep -rlE 'AIB_PROJECTION_ROOT|_projection\.json' --exclude-dir=.git . 2>/dev/null | sed 's#^\./##' | grep -vE "$ALLOWLIST" || true)"
 eq "non-consumption: nothing outside bin/project + bin/dashboard + their own fixtures + docs references the projection" "$hits" ""
 

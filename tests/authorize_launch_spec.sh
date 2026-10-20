@@ -179,7 +179,8 @@ adapter=/opt/acme/adapters/codex
 cap_sandbox=workspace-write
 cap_tier=t3
 cap_effort=high
-cap_timeout=900'
+cap_timeout=900
+data_class=internal'
 pure_out="$(env -i "$(command -v bash)" -c '
   . "'"$SRC_ROOT"'/lib/aibobnet.sh"
   aib_authorize_launch "$1" "$2" && printf "%s\n" "$AIB_VERDICT_DECISION"
