@@ -52,10 +52,12 @@ l="$(line /run/aib/login)"; m="$(fld "$l" 3)"
 eq "T2: /run/aib/login: aib-broker:aib-gateway, group may traverse, others get nothing" "$(fld "$l" 4):$(fld "$l" 5)|$([ -n "$m" ] && echo $(( (8#$m & 8#010) != 0 )) $(( (8#$m & 8#007) != 0 )))" "aib-broker:aib-gateway|1 0"
 
 # --- T3 (K7) broker drop-in example ---------------------------------------------------------------------------------------------------------------
-DI="$(grep -l 'AIB_SUP_STATE_ROOT' "$U"/aib-broker@.service.d/*.example 2>/dev/null | grep -v 'site.conf.example' | head -1)"
+DI="$(grep -l 'CAP_SETUID' "$U"/aib-broker@.service.d/*.example 2>/dev/null | grep -v 'site.conf.example' | head -1)"
 eq "T3: a broker drop-in example for S1c is shipped (next to site.conf.example)" "$([ -n "$DI" ] && echo present)" present
 dt="$(body "${DI:-/nonexistent}")"
-for k in AIB_SUP_STATE_ROOT= AIB_ROLE_UID= AIB_ROLE_GID= AIB_ROLE_UIDS=; do has "T3: sets $k" "$dt" "$k"; done
+# FLIPPED in v3.5 (L2/N2, Garfield): the role ids are no longer set by Environment= lines of this drop-in (aib-agent-dirs, run by another unit, never saw
+# them); they live in ONE /etc/aib/role.env that the drop-in and the aib-agent@ unit both read via EnvironmentFile= (pinned in T7 below).
+eq "T3: (v3.5 flip) the drop-in sets none of the role keys itself, it reads them from role.env" "$(printf '%s\n' "$dt" | grep -Ec '^Environment=.*(AIB_SUP_STATE_ROOT|AIB_ROLE_UID|AIB_ROLE_GID|AIB_ROLE_UIDS|AIB_ROLE_GROUPS)=')|$(printf '%s\n' "$dt" | grep -c '^EnvironmentFile=')" "0|1"
 for k in AmbientCapabilities CapabilityBoundingSet; do
   v="$(printf '%s\n' "$dt" | grep "^$k=" | tr '\n' ' ')"
   eq "T3: $k= names CAP_SETUID and CAP_SETGID" "$(printf '%s' "$v" | grep -c CAP_SETUID)|$(printf '%s' "$v" | grep -c CAP_SETGID)" "1|1"
@@ -100,5 +102,49 @@ has "T6: …says where the store lives and its mode" "$DOC" "/var/lib/aib/login"
 has "T6: …says every agent of the server can read the shared login" "$(printf '%s' "$DOC" | tr 'A-Z' 'a-z')" "every agent"
 has "T6: …names API-key mode as what restores 'never sees'" "$DOC" "API-key"
 eq "T6: …and no longer claims the role-uid switch is unbuilt ('does not build the switch' / 'pending slice')" "$(printf '%s' "$DOC" | grep -c -e 'does not build the switch' -e 'the role-uid switch is a pending slice')" 0
+
+# --- T7 (design v3.5 L2/N2) ONE role EnvironmentFile ---------------------------------------------------------------------------------------------------
+# /etc/aib/role.env (root:root 0644) carries AIB_ROLE_UID, AIB_ROLE_GID, AIB_ROLE_UIDS, AIB_ROLE_GROUPS, AIB_SUP_STATE_ROOT. It is read via EnvironmentFile=
+# by BOTH the broker drop-in and the unit that runs aib-agent-dirs (aib-agent@), so the chown of the per-agent dirs and the broker's switch use the same ids.
+# Shipped as deploy/role.env.example (the installer, prox-init, writes the real one). The broker reference is mandatory (no `-`: a missing file must stop
+# the broker, not silently run it without the switch); the agent unit may take it optionally.
+RE="$D/role.env.example"
+eq "T7: deploy/role.env.example is shipped" "$([ -f "$RE" ] && echo present)" present
+rbody() { body "$RE" | sed '/^[[:space:]]*$/d'; }
+rkey() { rbody | grep "^$1=" | head -1 | cut -d= -f2-; }
+eq "T7: every non-comment line is KEY=value (EnvironmentFile syntax: no 'Environment=', no 'export')" "$(rbody | grep -vc '^[A-Z][A-Z0-9_]*=[^[:space:]]*$')|$(rbody | wc -l | tr -d ' ')" "0|5"
+eq "T7: …exactly the five keys, once each" "$(rbody | cut -d= -f1 | LC_ALL=C sort | tr '\n' ' ')" "AIB_ROLE_GID AIB_ROLE_GROUPS AIB_ROLE_UID AIB_ROLE_UIDS AIB_SUP_STATE_ROOT "
+isid() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1000 ]; }
+islist() { local x; [ -n "$1" ] || return 1; for x in $(printf '%s' "$1" | tr ',' ' '); do isid "$x" || return 1; done; case "$1" in ,*|*,|*,,*) return 1;; esac; }
+isid "$(rkey AIB_ROLE_UID)" && ok "T7: AIB_ROLE_UID is a decimal uid >= 1000" || no "T7: AIB_ROLE_UID is a decimal uid >= 1000 (got '$(rkey AIB_ROLE_UID)')"
+isid "$(rkey AIB_ROLE_GID)" && ok "T7: AIB_ROLE_GID is a decimal gid >= 1000" || no "T7: AIB_ROLE_GID is a decimal gid >= 1000 (got '$(rkey AIB_ROLE_GID)')"
+islist "$(rkey AIB_ROLE_UIDS)" && ok "T7: AIB_ROLE_UIDS is a strict decimal comma list, each >= 1000" || no "T7: AIB_ROLE_UIDS is a strict decimal comma list (got '$(rkey AIB_ROLE_UIDS)')"
+islist "$(rkey AIB_ROLE_GROUPS)" && ok "T7: AIB_ROLE_GROUPS is a strict decimal comma list, each >= 1000" || no "T7: AIB_ROLE_GROUPS is a strict decimal comma list (got '$(rkey AIB_ROLE_GROUPS)')"
+case ",$(rkey AIB_ROLE_UIDS)," in *",$(rkey AIB_ROLE_UID),"*) ok "T7: AIB_ROLE_UID is one of AIB_ROLE_UIDS (the helper's allow-list)";; *) no "T7: AIB_ROLE_UID is one of AIB_ROLE_UIDS";; esac
+case "$(rkey AIB_SUP_STATE_ROOT)" in /?*) ok "T7: AIB_SUP_STATE_ROOT is an absolute path";; *) no "T7: AIB_SUP_STATE_ROOT is an absolute path (got '$(rkey AIB_SUP_STATE_ROOT)')";; esac
+RTXT="$([ -f "$RE" ] && tr "\n" " " < "$RE" | tr -s " ")"
+has "T7: the example's comments name the install path /etc/aib/role.env" "$RTXT" "/etc/aib/role.env"
+has "T7: …and its ownership root:root and mode 0644" "$RTXT" "root:root"
+has "T7: …(mode)" "$RTXT" "0644"
+eq "T7: the broker drop-in reads it with EnvironmentFile=/etc/aib/role.env (mandatory, no '-')" "$(printf '%s\n' "$dt" | grep -c '^EnvironmentFile=/etc/aib/role.env$')" 1
+eq "T7: the aib-agent@ unit (it runs aib-agent-dirs) reads the same file" "$(body "$U/aib-agent@.service" | grep -Ec '^EnvironmentFile=-?/etc/aib/role.env$')" 1
+eq "T7: …in its [Service] section, so ExecStartPre sees it" "$(awk '/^\[/{s=$0} /^EnvironmentFile=/{print s}' "$U/aib-agent@.service" 2>/dev/null | sort -u)" "[Service]"
+eq "T7: …and aib-agent@ does not set the role keys by Environment= (one source)" "$(body "$U/aib-agent@.service" | grep -Ec '^Environment=.*(AIB_SUP_STATE_ROOT|AIB_ROLE_UID|AIB_ROLE_GID|AIB_ROLE_UIDS|AIB_ROLE_GROUPS)=')" 0
+
+# --- T8 (design v3.5 L3/N3) login/refresh units outlive their own CLI calls --------------------------------------------------------------------------------
+# TimeoutStartSec >= 2 x AIB_LOGIN_CLI_TIMEOUT_S + 60 s (the Codex refresh can run two CLIs, features list + app-server, each bounded by the CLI timeout).
+# The CLI timeout is DERIVED: an Environment=AIB_LOGIN_CLI_TIMEOUT_S= of the unit, else the default in bin/aib-login-refresh.
+dur_s() { awk -v v="$1" 'BEGIN{ if (match(v,/^[0-9]+/)==0) {print "x"; exit} n=substr(v,1,RLENGTH); u=substr(v,RLENGTH+1); gsub(/ /,"",u);
+  if (u==""||u=="s"||u=="sec"||u=="second"||u=="seconds") m=1; else if (u=="m"||u=="min"||u=="minute"||u=="minutes") m=60; else if (u=="h"||u=="hr"||u=="hour"||u=="hours") m=3600; else {print "x"; exit}
+  print n*m }'; }
+DEF="$(grep -o 'integer("AIB_LOGIN_CLI_TIMEOUT_S", *[0-9]*' "$SRC_ROOT/bin/aib-login-refresh" 2>/dev/null | grep -o '[0-9]*$' | head -1)"
+case "$DEF" in ''|*[!0-9]*) no "T8: could not derive the default AIB_LOGIN_CLI_TIMEOUT_S from bin/aib-login-refresh (got '$DEF')";; *) ok "T8: derived default AIB_LOGIN_CLI_TIMEOUT_S=$DEF from bin/aib-login-refresh";; esac
+for u in aib-login@.service aib-login-refresh@.service; do
+  cli="$(body "$U/$u" | sed -n 's/^Environment=.*AIB_LOGIN_CLI_TIMEOUT_S=\([0-9]*\).*/\1/p' | head -1)"; cli="${cli:-$DEF}"
+  ts="$(dur_s "$(body "$U/$u" | grep '^TimeoutStartSec=' | tail -1 | cut -d= -f2-)")"
+  need=$(( 2 * ${cli:-0} + 60 ))
+  case "$ts$cli" in *x*|'') no "T8: $u: TimeoutStartSec / CLI timeout not derivable (ts '$ts', cli '$cli')";;
+    *) if [ "$ts" -ge "$need" ]; then ok "T8: $u: TimeoutStartSec ${ts}s >= 2 x ${cli}s + 60 = ${need}s"; else no "T8: $u: TimeoutStartSec ${ts}s must be >= 2 x ${cli}s + 60 = ${need}s"; fi;; esac
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

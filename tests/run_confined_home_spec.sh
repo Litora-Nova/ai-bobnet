@@ -45,11 +45,11 @@ chmod 700 "$BROKER_HOME/.codex" "$STATE_ROOT/acme-core/.codex" "$STATE_ROOT/acme
 LOG="$WORK/ll.log"; PRIV="$WORK/provider-private"; mkdir -p "$PRIV"
 cat > "$STUB/landlock-exec" <<'STUB'
 #!/usr/bin/env bash
-# logs how it is called, drops --uid/--gid like the real helper (without switching), execs the rest
-{ printf 'ARGV=%s\n' "$*"; printf 'HOME=%s\nLL_RO=%s\nLL_RW=%s\nAIB_ROLE_UIDS=%s\n' "${HOME-<unset>}" "${LL_RO-<unset>}" "${LL_RW-<unset>}" "${AIB_ROLE_UIDS-<unset>}"; echo '---'; } >> "$(cd "$(dirname "$0")" && cat log.path)"
+# logs how it is called, drops --uid/--gid[/--groups] like the real helper (without switching), execs the rest
+{ printf 'ARGV=%s\n' "$*"; printf 'HOME=%s\nLL_RO=%s\nLL_RW=%s\nAIB_ROLE_UIDS=%s\nAIB_ROLE_GROUPS=%s\n' "${HOME-<unset>}" "${LL_RO-<unset>}" "${LL_RW-<unset>}" "${AIB_ROLE_UIDS-<unset>}" "${AIB_ROLE_GROUPS-<unset>}"; echo '---'; } >> "$(cd "$(dirname "$0")" && cat log.path)"
 [ -z "${LL_STATUS_FD-}" ] || eval "exec ${LL_STATUS_FD}>&-"
-if [ "${1-}" = --uid ]; then shift 4; fi
-unset AIB_ROLE_UIDS
+if [ "${1-}" = --uid ]; then shift 4; [ "${1-}" != --groups ] || shift 2; fi
+unset AIB_ROLE_UIDS AIB_ROLE_GROUPS
 exec "$@"
 STUB
 echo "$LOG" > "$STUB/log.path"
@@ -115,6 +115,24 @@ eq "T2: the unit's allow-list reaches the helper's env" "$(ll_field AIB_ROLE_UID
 eq "T2: …but not the provider chain" "$(penv AIB_ROLE_UIDS)|$(provider_ran)" "|ran"
 launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT"
 case "$(ll_field ARGV)" in "$STUB/provider exec "*) ok "T2: without AIB_ROLE_UID/GID the argv has no role options";; *) no "T2: without AIB_ROLE_UID/GID the argv has no role options (got '$(ll_field ARGV)')";; esac
+# v3.5 L1: the role's supplementary groups come from the broker unit's protected env (AIB_ROLE_GROUPS: the role.env file / drop-in), as
+#   <confine-bin> --uid U --gid G --groups <AIB_ROLE_GROUPS> <adapter> ...     — never from the request, and the list is also the helper's allow-list env.
+launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=5001 AIB_ROLE_GID=5002 AIB_ROLE_UIDS=5001,5003 AIB_ROLE_GROUPS=5004,5005
+case "$(ll_field ARGV)" in "--uid 5001 --gid 5002 --groups 5004,5005 $STUB/provider exec "*) ok "T2g: helper argv is --uid 5001 --gid 5002 --groups 5004,5005, then the adapter and its normal ABI";; *) no "T2g: helper argv carries --groups from the unit env (got '$(ll_field ARGV)')";; esac
+eq "T2g: …the allow-list AIB_ROLE_GROUPS reaches the helper's env" "$(ll_field AIB_ROLE_GROUPS)" "5004,5005"
+eq "T2g: …but not the provider chain" "$(penv AIB_ROLE_GROUPS)|$(provider_ran)" "|ran"
+launch acme-core "groups=6000
+AIB_ROLE_GROUPS=6000
+role_groups=6000
+gids=6000" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=5001 AIB_ROLE_GID=5002 AIB_ROLE_UIDS=5001 AIB_ROLE_GROUPS=5004
+case "$(ll_field ARGV)" in "--uid 5001 --gid 5002 --groups 5004 $STUB/provider exec "*) ok "T2g: groups/AIB_ROLE_GROUPS/role_groups keys in the enact record cannot choose the groups (the unit's 5004 wins)";; *) no "T2g: request keys cannot choose the groups (got '$(ll_field ARGV)')";; esac
+launch acme-core "groups=6000
+AIB_ROLE_GROUPS=6000" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=5001 AIB_ROLE_GID=5002 AIB_ROLE_UIDS=5001
+case "$(ll_field ARGV)" in "--uid 5001 --gid 5002 $STUB/provider exec "*) ok "T2g: no AIB_ROLE_GROUPS in the unit => no --groups, whatever the request says";; *) no "T2g: no unit groups => no --groups option (got '$(ll_field ARGV)')";; esac
+case "$(ll_field ARGV)" in *--groups*) no "T2g: …--groups appears nowhere in the argv";; *) ok "T2g: …--groups appears nowhere in the argv";; esac
+launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_GROUPS=5004
+case "$(ll_field ARGV)" in "$STUB/provider exec "*) ok "T2g: AIB_ROLE_GROUPS without AIB_ROLE_UID/GID => no role options at all, no --groups";; *) no "T2g: groups alone switch nothing (got '$(ll_field ARGV)')";; esac
+eq "T2g: …and the allow-list is not passed to the helper" "$(ll_field AIB_ROLE_GROUPS)" "<unset>"
 launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=5001
 eq "T2: AIB_ROLE_UID without AIB_ROLE_GID => refused (half a switch is none), provider not started" "$(provider_ran)" not-run
 launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=abc AIB_ROLE_GID=5002 AIB_ROLE_UIDS=abc

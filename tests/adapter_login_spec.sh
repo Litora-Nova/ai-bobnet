@@ -205,7 +205,8 @@ fi
 # stdio descriptors are never a credential channel, even when they are open and non-empty (Marvin G3)
 for stdio in 0 1 2; do
   printf '%s' "$FD_TOKEN" > "$W/fd.stdio"; rm -f "$W/fake.env" "$W/fake.tok"; RC=0
-  AD=( env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD="$stdio" AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" "${ADARGS[@]}" )
+  # Marvin N1 (hardening): a regression that lets the CLI start with a stdio descriptor as the credential must fail this check, not hang the suite
+  AD=( timeout -k 2 20 env -i HOME="$CH" PATH="$PATH" AIB_CLAUDE_BIN="$FAKE" AIB_TEST_SEAMS=1 AIB_LOGIN_NOW="$LNOW" AIB_CREDENTIAL_MODE=fd AIB_CREDENTIAL_FD="$stdio" AIB_TURN_TIMEOUT_S=900 "$SRC_ROOT/adapters/claude-code" "${ADARGS[@]}" )
   case "$stdio" in
     0) ( cd "$CWD" && "${AD[@]}" ) <"$W/fd.stdio" >"$W/ad.out" 2>"$W/ad.err" || RC=$?;;
     1) ( cd "$CWD" && "${AD[@]}" ) 1<>"$W/fd.stdio" 2>"$W/ad.err" || RC=$?;;

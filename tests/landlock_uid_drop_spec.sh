@@ -76,6 +76,34 @@ ll AIB_ROLE_UIDS="$(( ME + 1 ))" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}";  
 ll AIB_ROLE_UIDS="$(( ME / 10 * 10 ))" -- --uid "$ME" --gid "$MG" "${touch_cmd[@]}"
 [ "$(( ME / 10 * 10 ))" = "$ME" ] && skip "T1: decade neighbour is ME itself on this host" || eq "T1: …a uid in the same decade (ME/10 equal) is not the listed one" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
 
+# --- T1g (design v3.5 L1) `--groups <gid,...>`: strict, allow-listed by the unit env AIB_ROLE_GROUPS, decided before any Landlock work --------------------
+# Invocation: landlock-exec --uid U --gid G [--groups g1,g2,...] CMD...   (--groups only together with --uid/--gid; at most once)
+#   malformed list (not strict decimal, empty element, spaces, sign, hex, overflow, empty list)   => exit 2 (usage), CMD not run
+#   gid 0, gid < 1000, a gid not in AIB_ROLE_GROUPS (whole-token match), AIB_ROLE_GROUPS unset/empty => exit 3, CMD not run, message names `group`
+groupmsg() { printf '%s\n%s' "$STATUS" "$ERR" | grep -ci 'group' | awk '{print ($1>0)?1:0}'; }
+UG=(--uid "$ME" --gid "$MG")
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- --groups 5000 "${touch_cmd[@]}";           eq "T1g: --groups without --uid/--gid => exit 2, CMD not run" "$RC|$(ran)" "2|not-run"
+for bad in '' abc -1 +5000 1e3 0x3e8 ' 5000' '5000 ' '5000,' ',5000' '5000,,5001' '5000 5001' '5000;5001' '5000.5' 99999999999999999999 '5000,abc'; do
+  ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups "$bad" "${touch_cmd[@]}"; eq "T1g: --groups '$bad' (not a strict decimal comma list) => exit 2, CMD not run" "$RC|$(ran)" "2|not-run"
+done
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5000 --groups 5001 "${touch_cmd[@]}"; eq "T1g: a repeated --groups => exit 2, CMD not run" "$RC|$(ran)" "2|not-run"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5002 "${touch_cmd[@]}";    eq "T1g: a gid outside AIB_ROLE_GROUPS => exit 3, CMD not run, the refusal names the group" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+has "T1g: …the refusal reaches the status fd as one confine: line" "$STATUS" "confine:"
+has "T1g: …and that line says group" "$STATUS" "group"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5000,5002 "${touch_cmd[@]}"; eq "T1g: one listed + one unlisted gid => exit 3 (all-or-nothing), CMD not run" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";                                 eq "T1g: AIB_ROLE_GROUPS unset => nobody allowed (exit 3)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS= -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";                 eq "T1g: AIB_ROLE_GROUPS empty => nobody allowed (exit 3)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="0,5000" -- "${UG[@]}" --groups 0 "${touch_cmd[@]}";           eq "T1g: gid 0 is refused even when listed => exit 3" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,0" -- "${UG[@]}" --groups 5000,0 "${touch_cmd[@]}";       eq "T1g: …also as the second element of the list" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+for low in 999 33 1; do
+  ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="$low,5000" -- "${UG[@]}" --groups "$low" "${touch_cmd[@]}";  eq "T1g: gid $low (< 1000, system range) is refused even when listed => exit 3" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+done
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="50000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";         eq "T1g: whole-token match: 5000 is not in '50000'" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 50000 "${touch_cmd[@]}";         eq "T1g: …nor 50000 in '5000'" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="15000,25000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";    eq "T1g: …nor 5000 in '15000,25000' (suffix)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5001" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";           eq "T1g: …nor a numeric neighbour (5000 requested, 5001 listed)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="5000" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";           eq "T1g: a good group list does not rescue an unlisted uid (the uid policy still refuses, exit 3)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
+
 # --- T2 what a permitted switch does (needs Landlock; as non-root only the identity-preserving switch is possible) ----------------------------------
 ll -- /bin/true
 if [ "$RC" -ne 0 ]; then
@@ -121,6 +149,84 @@ CEOF
 try:
     os.setuid(0); print("regained")
 except PermissionError: print("denied")'; printf '%s' "$OUT")" denied
+  fi
+fi
+
+# --- T3 (design v3.5 L1) supplementary groups: setgroups(list) -> setgid -> setuid after restrict_self; without --groups they stay empty ---------------
+# Needs real root and a Landlock kernel (skips cleanly otherwise). The group ids need not exist on the host; the probe reads getgroups(2) in the child.
+GRP='import os; print(" ".join(map(str, sorted(os.getgroups()))))'
+if [ "$ME" -ne 0 ]; then
+  skip "T3: the supplementary-group switch needs root; run this spec as root on the dev VM"
+else
+  ll -- /bin/true
+  if [ "$RC" -ne 0 ]; then
+    skip "T3: Landlock is not usable on this host (rc $RC) — behavioural group cases"
+  else
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001,60002,60003" -- --uid 65534 --gid 65534 /usr/bin/python3 -I -c "$GRP"
+    eq "T3 (root): WITHOUT --groups the supplementary list stays empty, even with AIB_ROLE_GROUPS set in the env" "$RC|$OUT" "0|"
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001,60002,60003" -- --uid 65534 --gid 65534 --groups 60001,60002 /usr/bin/python3 -I -c "$GRP"
+    eq "T3 (root): --groups 60001,60002 => the child's supplementary groups are exactly those two" "$RC|$OUT" "0|60001 60002"
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001,60002,60003" -- --uid 65534 --gid 65534 --groups 60003 /usr/bin/python3 -I -c "$GRP"
+    eq "T3 (root): a single group" "$RC|$OUT" "0|60003"
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001,60002,60003" -- --uid 65534 --gid 65534 --groups 60002,60001 /usr/bin/python3 -I -c "$GRP"
+    eq "T3 (root): the order of the list does not matter" "$RC|$OUT" "0|60001 60002"
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001,60002" -- --uid 65534 --gid 65534 --groups 60001 /usr/bin/python3 -I -c 'import os
+for g in ([0], [60001, 60002]):
+    try:
+        os.setgroups(g); print("changed")
+    except PermissionError: print("denied")'
+    eq "T3 (root): after the switch the child cannot change its groups (setgroups denied, caps cleared)" "$OUT" "$(printf 'denied\ndenied')"
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001" -- --uid 65534 --gid 65534 --groups 60001 /bin/sh -c 'env | grep -cE "^(AIB_ROLE_UIDS|AIB_ROLE_GROUPS|LL_)" || true'
+    eq "T3 (root): the child sees none of AIB_ROLE_UIDS / AIB_ROLE_GROUPS / LL_*" "$OUT" 0
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001" -- --uid 65534 --gid 65534 --groups 60001 /bin/sh -c "if touch '$WORK/outside/g' 2>/dev/null; then echo wrote; else echo denied; fi"
+    eq "T3 (root): Landlock still binds the child that carries supplementary groups (restrict_self came first)" "$OUT" denied
+    ll AIB_ROLE_UIDS=65534 AIB_ROLE_GROUPS="60001" -- --uid 65534 --gid 65534 --groups 60001,60009 /bin/sh -c ": > '$SENT'"
+    eq "T3 (root): an unlisted gid in the list refuses BEFORE anything is switched: exit 3, CMD not run" "$RC|$(ran)" "3|not-run"
+  fi
+fi
+
+# --- T4 (design v3.5 L1) VM cross-uid acceptance ------------------------------------------------------------------------------------------------------
+# Env-gated like the other VM cases: AIB_VM_ROLE_USER=<the real role account>, run as root on the VM where the groups aib-shared and aib-login exist.
+# As that account, through the helper with --groups "<aib-shared>,<aib-login>": read a token buffer and a codex store (group aib-login), append to
+# _control.jsonl and to the team outbox (group aib-shared). The fixtures are fakes made here (no real credentials).
+RU="${AIB_VM_ROLE_USER:-}"
+if [ -z "$RU" ]; then
+  skip "T4: the VM cross-uid acceptance needs AIB_VM_ROLE_USER=<role account> (root, on the VM with groups aib-shared and aib-login)"
+elif [ "$ME" -ne 0 ]; then
+  no "T4: AIB_VM_ROLE_USER is set but the spec does not run as root"
+else
+  RUID="$(id -u "$RU" 2>/dev/null)"; RGID="$(id -g "$RU" 2>/dev/null)"
+  SG="$(getent group aib-shared | cut -d: -f3)"; LG="$(getent group aib-login | cut -d: -f3)"
+  if [ -z "$RUID" ] || [ -z "$SG" ] || [ -z "$LG" ] || [ "$RUID" -lt 1000 ]; then
+    no "T4: AIB_VM_ROLE_USER='$RU' needs a uid >= 1000 and the groups aib-shared / aib-login to exist (uid '$RUID', shared '$SG', login '$LG')"
+  else
+    VMD="$WORK/vm"; mkdir -p "$VMD/login/codex" "$VMD/shared/outbox"; chmod o+x "$WORK" "$VMD"
+    chown root:aib-login "$VMD/login" "$VMD/login/codex"; chmod 2770 "$VMD/login" "$VMD/login/codex"
+    printf 'fake-claude-token-buffer' > "$VMD/login/claude.buf"; printf '{"fake":"codex-store"}' > "$VMD/login/codex/auth.json"
+    chown root:aib-login "$VMD/login/claude.buf" "$VMD/login/codex/auth.json"; chmod 640 "$VMD/login/claude.buf" "$VMD/login/codex/auth.json"
+    chown root:aib-shared "$VMD/shared" "$VMD/shared/outbox"; chmod 2770 "$VMD/shared" "$VMD/shared/outbox"
+    : > "$VMD/shared/_control.jsonl"; : > "$VMD/shared/outbox/team.md"
+    chown root:aib-shared "$VMD/shared/_control.jsonl" "$VMD/shared/outbox/team.md"; chmod 660 "$VMD/shared/_control.jsonl" "$VMD/shared/outbox/team.md"
+    cat > "$VMD/probe.sh" <<PROBE
+#!/bin/sh
+b=\$(cat '$VMD/login/claude.buf' 2>/dev/null); c=\$(cat '$VMD/login/codex/auth.json' 2>/dev/null)
+[ "\$b" = fake-claude-token-buffer ] && echo buffer-read || echo buffer-denied
+[ -n "\$c" ] && echo codex-read || echo codex-denied
+echo '{"k":1}' >> '$VMD/shared/_control.jsonl' 2>/dev/null && echo control-append || echo control-denied
+echo 'line' >> '$VMD/shared/outbox/team.md' 2>/dev/null && echo outbox-append || echo outbox-denied
+PROBE
+    chmod 755 "$VMD/probe.sh"
+    run_role() { # run_role [--groups list]   (the full list is always in the unit allow-list)
+      local gl=(); [ $# -eq 0 ] || gl=(--groups "$2")
+      ll AIB_ROLE_UIDS="$RUID" AIB_ROLE_GROUPS="$SG,$LG" LL_RW="$WORK/rw:/tmp:$VMD/shared" -- --uid "$RUID" --gid "$RGID" "${gl[@]}" "$VMD/probe.sh"
+    }
+    run_role
+    eq "T4 (VM): control: as '$RU' WITHOUT --groups none of the four resources is reachable (DAC says no)" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "buffer-denied codex-denied control-denied outbox-denied "
+    run_role --groups "$LG"
+    eq "T4 (VM): …with only the aib-login group the stores are readable but the shared files are not appendable" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "buffer-read codex-read control-denied outbox-denied "
+    run_role --groups "$SG,$LG"
+    eq "T4 (VM): with --groups aib-shared,aib-login '$RU' reads the claude fd buffer and the codex store and appends to _control.jsonl and the team outbox" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "buffer-read codex-read control-append outbox-append "
+    eq "T4 (VM): …and the appended bytes really are in the files" "$(grep -c '"k":1' "$VMD/shared/_control.jsonl")|$(grep -c '^line$' "$VMD/shared/outbox/team.md")" "1|1"
   fi
 fi
 

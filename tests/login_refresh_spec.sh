@@ -49,10 +49,10 @@ if [ "$mode" = racing ]; then
   printf '{"claudeAiOauth":{"accessToken":"at-HUMAN","refreshToken":"rt-HUMAN","expiresAt":%s000}}' "$(( now + 28800 ))" > "$s.h"; chmod 640 "$s.h"; mv "$s.h" "$s"
 fi
 [ "$exp_in" -le 300 ] || exit 0                                    # not inside the refresh window: the ping succeeds and changes nothing
-python3 -I - "$c" "$now" <<'PY'
+python3 -I - "$c" "$now" "$(cat "$w/cli.life" 2>/dev/null || echo 3600)" <<'PY'
 import json, os, sys
-p, now = sys.argv[1], int(sys.argv[2]); d = json.load(open(p)); o = d["claudeAiOauth"]
-o["accessToken"] = "at-NEW-" + str(now); o["refreshToken"] = "rt-NEW-" + str(now); o["expiresAt"] = (now + 3600) * 1000
+p, now, life = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); d = json.load(open(p)); o = d["claudeAiOauth"]
+o["accessToken"] = "at-NEW-" + str(now); o["refreshToken"] = "rt-NEW-" + str(now); o["expiresAt"] = (now + life) * 1000
 t = p + ".tmp"; open(t, "w").write(json.dumps(d)); os.chmod(t, 0o600); os.rename(t, p)      # tmp + rename, 0600, like the CLI
 PY
 FAKE
@@ -75,11 +75,11 @@ if [ "$mode" = racing ]; then
   s="$w/login/codex/auth.json"; printf '{"tokens":{"access_token":"jwt-HUMAN","refresh_token":"rt-HUMAN","account_id":"acct-human"}}' > "$s.h"; chmod 640 "$s.h"; mv "$s.h" "$s"
 fi
 [ "$exp_in" -le 300 ] || exit 0
-python3 -I - "$a" "$now" <<'PY'
+python3 -I - "$a" "$now" "$(cat "$w/cli.life" 2>/dev/null || echo 3600)" <<'PY'
 import base64, json, sys
-p, now = sys.argv[1], int(sys.argv[2]); d = json.load(open(p))
+p, now, life = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); d = json.load(open(p))
 b = lambda x: base64.urlsafe_b64encode(json.dumps(x).encode()).rstrip(b"=").decode()
-d["tokens"]["access_token"] = b({"alg": "none"}) + "." + b({"exp": now + 3600}) + ".sigNEW"; d["tokens"]["refresh_token"] = "rt-NEW"
+d["tokens"]["access_token"] = b({"alg": "none"}) + "." + b({"exp": now + life}) + ".sigNEW"; d["tokens"]["refresh_token"] = "rt-NEW"
 open(p, "w").write(json.dumps(d))                                                           # IN PLACE (truncate + write), like the CLI
 PY
 FAKE
@@ -87,7 +87,7 @@ chmod +x "$W/fakes/claude" "$W/fakes/codex"
 echo "$LNOW" > "$W/cli.now"
 LENV+=(AIB_CLAUDE_BIN="$W/fakes/claude" AIB_CODEX_BIN="$W/fakes/codex")
 clog() { cat "$W/cli.log" 2>/dev/null; }
-reset() { : > "$W/cli.log"; rm -f "$W/cli.mode"; }
+reset() { : > "$W/cli.log"; rm -f "$W/cli.mode" "$W/cli.life"; }
 
 # --- T1 cadence is a parameter and stays under half the access-token lifetime ----------------------------------------------------
 lrun -- "$REF" --cadence claude-code; C="$OUT"
@@ -143,9 +143,12 @@ eq "T4: a codex token far from expiry is not refreshed" "$RC|$(clog | wc -l | tr
 
 # --- T5 failures leave the store byte-identical ---------------------------------------------------------------------------------------
 for mode in fail noop; do
-  reset; mk_claude $(( LNOW + 100 )); before="$(cat "$LROOT/claude-code/.credentials.json")"; echo "$mode" > "$W/cli.mode"
+  reset; mk_claude $(( LNOW + THR )); before="$(cat "$LROOT/claude-code/.credentials.json")"; echo "$mode" > "$W/cli.mode"
   lrun -- "$REF" claude-code
-  want=1; [ "$mode" != noop ] || want=0                                                        # v3.4 K2/K8: "no change" is not a failure
+  # FLIPPED in v3.5 (L4/N4): this case used to start at LNOW+100, where "the CLI changed nothing" (noop) still exited 0. The token is now AT THE THRESHOLD
+  # (comfortably above the broker floor) so the v3.4 K2/K8 meaning stays pinned here: "no change, still valid" is not a failure. The below-floor
+  # noop is the L4 case in T13 and exits non-zero.
+  want=1; [ "$mode" != noop ] || want=0
   eq "T5: CLI '$mode' => rc $want, store byte-identical, private dir removed" "$RC|$([ "$before" = "$(cat "$LROOT/claude-code/.credentials.json")" ] && echo same)|$([ ! -e "$(clog | sed 's/.* cfg=//' | head -1)" ] && echo clean)" "$want|same|clean"
 done
 reset; rm -f "$LROOT/codex/auth.json"
@@ -260,5 +263,76 @@ lrun AIB_LOGIN_STORE_OWNER="$other_user" -- "$REF" codex
 eq "T12: codex: the same" "$RC|$(clog | wc -l | tr -d ' ')" "78|0"
 reset; mk_codex $(( LNOW + 100 )); lrun AIB_LOGIN_STORE_OWNER="$(id -un)" -- "$REF" codex
 eq "T12: guard — with the matching owner the refresh runs" "$RC|$(clog | wc -l | tr -d ' ')" "0|1"
+
+# --- T13 (design v3.5 L4/N4) the refresher RAN, yet the store is still below the broker floor => non-zero (OnFailure alarm) --------------------------------
+# Broker floor = AIB_LOGIN_MAX_TURN_S + MARGIN + SLACK (= what aib-login-token / the adapters refuse below). "Ran" = it was due and called the CLI.
+# Exactly at the floor is fine (the broker accepts remaining == floor, see adapter_login), one second less is not. "Unchanged and comfortably valid" stays rc 0 (T8).
+FLOOR=$(( 900 + 300 + 600 ))
+for prov in claude-code codex; do
+  mk() { if [ "$prov" = codex ]; then mk_codex "$1"; else mk_claude "$1"; fi; }
+  sf="$LROOT/claude-code/.credentials.json"; [ "$prov" != codex ] || sf="$LROOT/codex/auth.json"
+  for rem in 100 $(( FLOOR - 1 )); do
+    reset; mk $(( LNOW + rem )); echo noop > "$W/cli.mode"; before="$(cat "$sf")"
+    lrun -- "$REF" "$prov"
+    eq "T13: $prov: ran, CLI changed nothing, ${rem}s left (< floor ${FLOOR}s) => non-zero exit, store byte-identical, a message" "$([ "$RC" -ne 0 ] && echo nonzero)|$([ "$(clog | wc -l)" -ge 1 ] && echo called)|$([ "$before" = "$(cat "$sf")" ] && echo same)|$([ -n "$OUT$ERR" ] && echo said)" "nonzero|called|same|said"
+  done
+  reset; mk $(( LNOW + FLOOR )); echo noop > "$W/cli.mode"
+  lrun -- "$REF" "$prov"
+  eq "T13: $prov: ran, unchanged, exactly the floor (${FLOOR}s) left => rc 0 (the broker still accepts it)" "$RC|$([ "$(clog | wc -l)" -ge 1 ] && echo called)" "0|called"
+  reset; mk $(( LNOW + THR )); echo noop > "$W/cli.mode"
+  lrun -- "$REF" "$prov"
+  eq "T13: $prov: ran, unchanged, comfortably valid (threshold ${THR}s left) => rc 0" "$RC|$([ "$(clog | wc -l)" -ge 1 ] && echo called)" "0|called"
+  reset; mk $(( LNOW + 100 )); echo 600 > "$W/cli.life"
+  lrun -- "$REF" "$prov"
+  eq "T13: $prov: the CLI refreshed but the NEW token lives only 600 s (< floor) => non-zero exit" "$([ "$RC" -ne 0 ] && echo nonzero)|$([ "$(clog | wc -l)" -ge 1 ] && echo called)" "nonzero|called"
+  reset; mk $(( LNOW + 100 )); echo $(( FLOOR + 600 )) > "$W/cli.life"
+  lrun -- "$REF" "$prov"
+  eq "T13: $prov: guard — a refresh that leaves the new token above the floor => rc 0" "$RC" 0
+done
+reset
+
+# --- T14 (Marvin N2, hardening: green on the current implementation) store_lock really serializes publishers ----------------------------------------------
+# Two processes do a read-modify-write on a counter under aib_login.store_lock(), with a pause between read and write. With the lock the final count is exact;
+# the CONTROL (same probe, no lock) must lose updates, which proves the probe can see a missing lock. Removing the lock from store_lock() fails the first check.
+cat > "$W/lockprobe.py" <<'PY'
+import os, sys, time
+sys.path.insert(0, sys.argv[1] + "/lib")
+import aib_login
+counter, use_lock, rounds = sys.argv[2], sys.argv[3] == "lock", int(sys.argv[4])
+def bump():
+    n = int(open(counter).read() or 0); time.sleep(0.02); open(counter, "w").write(str(n + 1))
+for _ in range(rounds):
+    if use_lock:
+        with aib_login.store_lock():
+            bump()
+    else:
+        bump()
+PY
+for variant in lock nolock; do
+  rm -rf "$W/lockroot"; mkdir -p "$W/lockroot"; echo 0 > "$W/counter"
+  for w in 1 2; do env -i PATH="$PATH" AIB_TEST_SEAMS=1 AIB_LOGIN_ROOT="$W/lockroot" python3 -I "$W/lockprobe.py" "$ENGINE" "$W/counter" "$variant" 8 & done; wait
+  got="$(cat "$W/counter")"
+  if [ "$variant" = lock ]; then eq "T14: two writers under store_lock() lose no update (16 of 16)" "$got" 16
+  else if [ "$got" -lt 16 ]; then ok "T14: control: the same probe WITHOUT the lock loses updates ($got of 16) - the probe can see a missing lock"; else no "T14: control: without the lock the probe must lose updates (got $got of 16)"; fi; fi
+done
+
+# --- T15 (Marvin N3, hardening: green on the current implementation) the store GROUP is checked, not only the owner -----------------------------------------
+# trusted_store_file() compares gid with AIB_LOGIN_STORE_GROUP (default: the caller's egid in the test seam). The test user's own primary group is the expected
+# one; a store file in ANOTHER group the user belongs to must be refused (T12 covers the owner). Needs a second group, like the other group cases.
+other_group=""; for g in $(id -G); do [ "$g" != "$(id -g)" ] && { other_group="$g"; break; }; done
+if [ -z "$other_group" ]; then
+  printf 'ok   - (skipped: the test user has no supplementary group, so a wrong store group cannot be presented here)\n'
+else
+  reset; mk_claude $(( LNOW + 100 )); sf="$LROOT/claude-code/.credentials.json"; chgrp "$other_group" "$sf"; before="$(cat "$sf")"
+  lrun -- "$REF" claude-code
+  eq "T15: claude: a credential file in the wrong group => rc 78, no CLI call, store untouched" "$RC|$(clog | wc -l | tr -d ' ')|$([ "$before" = "$(cat "$sf")" ] && echo same)" "78|0|same"
+  reset; mk_codex $(( LNOW + 100 )); chgrp "$other_group" "$LROOT/codex/auth.json"
+  lrun -- "$REF" codex
+  eq "T15: codex: the same" "$RC|$(clog | wc -l | tr -d ' ')" "78|0"
+  reset; mk_claude $(( LNOW + 100 )); chgrp "$other_group" "$sf"
+  lrun AIB_LOGIN_STORE_GROUP="$other_group" -- "$REF" claude-code
+  eq "T15: guard — when that group IS the configured AIB_LOGIN_STORE_GROUP the refresh runs" "$RC|$(clog | wc -l | tr -d ' ')" "0|1"
+  chgrp "$(id -g)" "$sf" "$LROOT/codex/auth.json" 2>/dev/null
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

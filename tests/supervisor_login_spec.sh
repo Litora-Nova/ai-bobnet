@@ -3,16 +3,17 @@
 # (Supervisor slice S1c; design v3 G5, v3.1 H6, v3.2 J1 "Expiry during a turn -> 401 -> class (c) retry, never a child refresh").
 #
 # WHAT THIS PINS
-#   - Login-shaped failures are the INFRA class (no brake, backoff, heartbeat blocked after AIB_SUP_BLOCKED_AFTER_S, auto-heal), exactly like
-#     adapter exit 78, even when the launcher exits 1: stderr containing `Not logged in` or an HTTP `401`, or the adapter marker `hint:login`.
+#   - Login-shaped failures are the INFRA class (no brake, backoff, heartbeat blocked after AIB_SUP_BLOCKED_AFTER_S, auto-heal) when the adapter says
+#     so: exit 78 (with the marker `hint:login` for the login hint). v3.5 L5: free text such as `Not logged in` or `401` in agent output never does it
+#     (T2/T2b: it is an ordinary failure that counts toward the brake).
 #   - The infra_blocked alarm now carries WHERE it comes from, so a hub can collapse N agents of one expired login into one message:
 #         alarm:infra_blocked agent:<uid> provider:<registry provider of the agent's project> [hint:login]
-#     `hint:login` is present exactly when the failing attempt's stderr said `hint:login`, `Not logged in` or `401`; absent otherwise (a plain 78).
+#     `hint:login` is present exactly when the failing attempt exited 78 AND its stderr carried the adapter marker `hint:login`; absent otherwise.
 #   - write_alarm dedupe is keyed on the EPISODE, not on the kind for the journal's lifetime: one infra outage = one alarm; after the loop heals
 #     (a turn succeeds) a LATER outage alarms again (brake_tripped already does this per tripped_at; pinned again as a guard).
 #   - A failed attempt never makes the supervisor touch a credential: the fake launcher is the only thing called (no refresher, no login command).
 #
-#   Expected on the unbuilt tree: infra_blocked has no provider/hint, a rc-1 `Not logged in` counts toward the brake, and a second outage is silent.
+#   (v3.5 L5, T2/T2b: free-text login phrases at rc 1 count toward the brake; they are RED against the v3.4 implementation.)
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/ctl_harness.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-suplogin.XXXXXX")"
@@ -46,19 +47,30 @@ has "T1: a plain 78 still carries the provider" "$line" "| alarm:infra_blocked a
 hasnt "T1: …but no login hint (the attempt did not say so)" "$line" "hint:login"
 stop_sup
 
-# --- T2 login-shaped failures with rc 1 are infra, not brake -------------------------------------------------------------------------------------------
-for text in "Not logged in · Please run /login" "Failed to authenticate. API Error: 401 Invalid authentication credentials"; do
+# --- T2 (FLIPPED in v3.5 L5/N5) login-shaped FREE TEXT at rc 1 is NOT infra ---------------------------------------------------------------------------------
+# v3.2 pinned: rc 1 + `Not logged in` / `Failed to authenticate. API Error: 401` => infra class (no brake, alarm with hint:login). Flipped by design v3.5 L5
+# (Riker N5): the login hint comes ONLY from the adapter's structured marker (rc 78 + `hint:login`). Free-text "not logged in" in agent output (a test run, a
+# doc the agent printed, a tool it ran) never turns a provider failure into the infra class: it counts toward the brake like any other rc 1.
+# The adapter now emits the marker itself for every login-shaped refusal (adapter_login_spec, run_confined_home_spec T5), so nothing is lost.
+for text in "Not logged in · Please run /login" "Failed to authenticate. API Error: 401 Invalid authentication credentials" "not logged in" "NOT LOGGED IN to the staging site" "ERROR: user is not logged in"; do
   ctl_world rc1
   default "1||E:$text"; for i in 1 2 3 4 5 6; do m_send m-$i x; done
-  start_sup acme-core "${CTLENV[@]}" AIB_SUP_BLOCKED_AFTER_S=0.6
-  wait_for 5 ob_has infra_blocked 1
-  sleep 0.5
-  eq "T2: rc 1 + '${text:0:30}…' => infra: alarm raised, brake counter stays 0, no brake alarm" "$(obn infra_blocked)|$(lj brake.consecutive)|$(obn brake_tripped)|$(lj state_reason)" "1|0|0|infra"
-  has "T2: …with hint:login" "$(OB | grep alarm:infra_blocked | head -1)" "provider:acme hint:login"
-  default "0||healed"; wait_for 1 state_is m-1 PROCESSED
-  eq "T2: …and it heals when the login is back (no restart needed)" "$(m_state m-1)" PROCESSED
+  start_sup acme-core "${CTLENV[@]}" AIB_SUP_BLOCKED_AFTER_S=0.4
+  wait_for 5 lj_is brake.consecutive 5
+  sleep 0.6
+  eq "T2: rc 1 + free text '${text:0:34}' => ordinary provider failure: the brake counts (5), no infra_blocked alarm, no hint" "$(lj brake.consecutive)|$(obn infra_blocked)|$(lj state_reason)" "5|0|brake"
   stop_sup
 done
+# rc 78 is the adapter's own class: infra, with or without the marker; the HINT, however, is only the marker (here: absent, free text ignored)
+ctl_world rc78text
+default "78||E:Not logged in · Please run /login"; m_send m-1 x
+start_sup acme-core "${CTLENV[@]}" AIB_SUP_BLOCKED_AFTER_S=0.6
+wait_for 5 ob_has infra_blocked 1
+line="$(OB | grep 'alarm:infra_blocked' | head -1)"
+has "T2: rc 78 stays infra even without the marker (the provider is named)" "$line" "| alarm:infra_blocked agent:acme-core provider:acme"
+hasnt "T2: …but free-text 'Not logged in' does not add the login hint" "$line" "hint:login"
+eq "T2: …no brake" "$(lj brake.consecutive)" 0
+stop_sup
 ctl_world plain1
 default "1||E:boom"; for i in 1 2 3; do m_send m-$i x; done
 start_sup acme-core "${CTLENV[@]}"
