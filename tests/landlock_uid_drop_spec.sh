@@ -73,6 +73,9 @@ ll -- /bin/true
 if [ "$RC" -ne 0 ]; then
   skip "T2: Landlock is not usable on this host (plain 'landlock-exec /bin/true' => rc $RC: $(printf '%s' "$ERR" | head -c 120)) — behavioural switch cases"
 else
+  if [ "$ME" -eq 0 ]; then
+    skip "T2: the own-uid switch is the non-root path (uid 0 is refused by policy, T1); root runs the drop block below"
+  else
   ll AIB_ROLE_UIDS="5000,$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c "touch '$SENT'; id -u; id -g; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|NoNewPrivs):' /proc/self/status; env | grep -cE '^(AIB_ROLE_UIDS|LL_)'"
   eq "T2: a listed uid (our own: the no-op switch a non-root caller can make) => rc 0, CMD runs as that uid/gid" "$RC|$(printf '%s\n' "$OUT" | sed -n 1,2p | tr '\n' ' ')|$(ran)" "0|$ME $MG |ran"
   eq "T2: …CapPrm/CapEff/CapInh/CapAmb all empty and no_new_privs set (CapBnd not asserted: v3.3)" "$(printf '%s\n' "$OUT" | grep -E '^Cap(Eff|Prm|Inh|Amb):' | awk '{print $2}' | sort -u | tr '\n' ' ')|$(printf '%s\n' "$OUT" | grep -c '^Cap\(Eff\|Prm\|Inh\|Amb\):')|$(printf '%s\n' "$OUT" | grep '^NoNewPrivs:' | awk '{print $2}')" "0000000000000000 |4|1"
@@ -82,13 +85,14 @@ else
   eq "T2: control: WITHOUT the helper the same write outside succeeds (DAC allows it, so a denial below is Landlock)" "$(cat "$WORK/ctl")" wrote
   ll AIB_ROLE_UIDS="$ME" -- --uid "$ME" --gid "$MG" /bin/sh -c "if touch '$WORK/outside/x' 2>/dev/null; then echo wrote; else echo denied; fi; if touch '$WORK/rw/x'; then echo rw-ok; else echo rw-denied; fi"
   eq "T2: Landlock still binds after the switch: write outside LL_RW denied, inside allowed" "$(printf '%s\n' "$OUT" | tr '\n' ' ')" "denied rw-ok "
+  fi
   ll AIB_ROLE_UIDS="$ME" -- /bin/sh -c "echo plain-$ME"
   eq "T2: without --uid the helper behaves as before (CMD runs, nothing refused even with the list set)" "$RC|$OUT" "0|plain-$ME"
   if [ "$(id -u)" -ne 0 ]; then
     skip "T2: real privilege drop (setgroups + setgid + setuid to another account, caps cleared) needs root; run this spec as root on the dev VM"
   else
     ll AIB_ROLE_UIDS="65534" -- --uid 65534 --gid 65534 /bin/sh -c "id -u; id -g; id -G; grep -E '^(CapEff|CapPrm|CapInh|CapAmb|CapBnd):' /proc/self/status | awk '{print \$2}' | sort -u | tr '\n' ' '; grep '^NoNewPrivs:' /proc/self/status | awk '{print \$2}'"
-    eq "T2 (root): drops to 65534:65534, supplementary groups emptied to the gid alone, ALL cap sets incl. CapBnd empty, no_new_privs 1" "$RC|$(printf '%s\n' "$OUT" | tr '\n' ' ')" "0|65534 65534 65534 0000000000000000  1 "
+    eq "T2 (root): drops to 65534:65534, supplementary groups emptied to the gid alone, ALL cap sets incl. CapBnd empty, no_new_privs 1" "$RC|$(printf '%s\n' "$OUT" | tr '\n' ' ')" "0|65534 65534 65534 0000000000000000 1 "
     rm -f "$WORK/outside/y"
     "$CC" -x c -O2 -o "$WORK/asuid" - <<'CEOF' 2>/dev/null
 #include <unistd.h>
