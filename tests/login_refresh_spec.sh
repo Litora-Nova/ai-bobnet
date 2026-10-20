@@ -112,7 +112,7 @@ has "T4: the store holds the new refresh token" "$(cat "$f")" "rt-NEW"
 eq "T4: new inode, mode 0640, no stray files" "$([ "$(stat -c %i "$f")" != "$ino" ] && echo new)|$(mode_of "$f")|$(ls -A "$LROOT/codex" | tr '\n' ' ')" "new|640|auth.json "
 log="$(clog)"
 has "T4: the trigger is exactly 'features list' (one token call, no model turn)" "$log" "argv=features list cfg="
-eq "T4: one call, private CODEX_HOME" "$(printf '%s' "$log" | wc -l | tr -d ' ')|$(printf '%s' "$log" | sed 's/.* cfg=//' | grep -vc "^$LROOT")" "1|1"
+eq "T4: one call, private CODEX_HOME" "$(printf '%s\n' "$log" | wc -l | tr -d ' ')|$(printf '%s' "$log" | sed 's/.* cfg=//' | grep -vc "^$LROOT")" "1|1"
 mk_codex $(( LNOW + THR + 1 )); reset
 lrun -- "$REF" codex
 eq "T4: a codex token far from expiry is not refreshed" "$RC|$(clog | wc -l | tr -d ' ')" "0|0"
