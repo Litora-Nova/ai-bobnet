@@ -283,9 +283,11 @@ Landlock, DAC alone would let the role create, rename or remove entries in the s
 (mode `2770`); only the owner and mode checks the refresher and broker apply to every store file would
 then stand in the way, turning a tampered file into a refusal and an alarm rather than a silent use.
 
-Second, `_control.jsonl` and the team outbox are mode `0660` for `aib-shared`. A confined turn
-cannot write them, because the standup and outbox trees are not in its `LL_RW`, but every other
-process in `aib-shared` can append arbitrary lines. Both files are report streams. One consumer is a
+Second, `_control.jsonl` and the team outbox are group-writable for `aib-shared` as provisioned;
+the engine itself does not fix their mode. A confined turn cannot write them while the standup and
+outbox trees lie outside the agent's project root (as in the shipped `/srv/aib/standup` and
+`/srv/aib/outbox` layout), because only the project root, the provider state directory and the
+temporary trees are in its `LL_RW`. Every other process in `aib-shared` can append arbitrary lines. Both files are report streams. One consumer is a
 known exception: `bin/aib-login` reads the latest `login.requested` record and its `caller` from
 `_control.jsonl` to apply the "due" and rate-limit gate. A forged record from an `aib-shared` member
 could therefore bypass that gate or mask a real request. The reach is bounded: starting the login unit
