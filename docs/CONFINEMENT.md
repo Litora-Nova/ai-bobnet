@@ -239,9 +239,15 @@ processes.
 
 **Role-account execution (2026-10-20).** The broker still accepts and audits requests as
 `aib-broker`, but the confined exec path now passes the provisioned `AIB_ROLE_UID` and
-`AIB_ROLE_GID` to `landlock-exec`. The helper applies Landlock first, clears supplementary groups,
-switches gid and uid, clears all remaining capability sets and the ambient set, and then executes the
-adapter. `bin/aib-agent-dirs` prepares the role-owned private home beneath `/var/lib/aib-sup` before
+`AIB_ROLE_GID` to `landlock-exec`, plus `--groups` from `AIB_ROLE_GROUPS` when that is configured.
+The helper applies Landlock first, sets exactly the allow-listed supplementary groups (or clears them
+when no `--groups` is given), switches gid and uid, clears all remaining capability sets and the
+ambient set, and then executes the adapter. Every `--groups` gid must be strict decimal, not 0, and
+listed in `AIB_ROLE_GROUPS`; there is no numeric floor, because provisioning creates the shared and
+login groups as system groups. The role, gid and group list come from the root-owned
+`/etc/aib/role.env` (template `deploy/role.env.example`) read by the broker drop-in, never from a
+request. Groups the role account has outside this list, such as the control group, do not reach the
+confined turn. `bin/aib-agent-dirs` prepares the role-owned private home beneath `/var/lib/aib-sup` before
 the unit starts. The broker unit therefore needs only `CAP_SETUID` and `CAP_SETGID`, bounded as shown
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
@@ -268,6 +274,16 @@ and user codes are sent only to the human-ops server outbox.
 The login unit runs as `aib-broker` with supplementary groups `aib-login` and `aib-gateway`. The
 first grants access to the shared credential store; the second grants only the group membership
 needed to publish the mode-`0660` code socket in `/run/aib/login` for gateway clients.
+
+Two further residuals follow from the group grants and are accepted for the shared subscription
+mode. The role account is not a member of `aib-login` itself; it holds the group only inside the
+confined turn, where Landlock keeps the store out of `LL_RW`. On a path without Landlock (the
+mount-namespace fallback), DAC alone would let it create, rename or remove entries in the setgid
+store directory (mode `2770`); there only the owner and mode checks the refresher and broker apply to
+every store file stand in the way, and they turn a tampered file into a refusal and an alarm rather
+than a silent use. A role in `aib-shared` can append arbitrary lines to
+`_control.jsonl` and the team outbox. Both are report streams, so no component may authorize or act on
+a line from them without its own check.
 
 API-key mode is the path that restores the stronger "the agent never sees the shared credential"
 property. The deployment schema reserves `credential_mode=proxy` for that later mediation path; it
