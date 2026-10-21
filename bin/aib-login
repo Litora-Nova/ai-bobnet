@@ -286,10 +286,17 @@ def claude_login(request: dict[str, Any], private: Path) -> int:
     termios.tcsetattr(slave, termios.TCSANOW, attributes)
     environment = os.environ.copy()
     environment["CLAUDE_CONFIG_DIR"] = str(private)
-    process = subprocess.Popen(
-        [setting("AIB_CLAUDE_BIN", CLAUDE_BIN), "auth", "login"],
-        stdin=slave, stdout=slave, stderr=slave, env=environment, start_new_session=True,
-    )
+    binary = setting("AIB_CLAUDE_BIN", CLAUDE_BIN)
+    try:
+        process = subprocess.Popen(
+            [binary, "auth", "login"],
+            stdin=slave, stdout=slave, stderr=slave, env=environment, start_new_session=True,
+        )
+    except OSError as error:
+        os.close(slave)
+        os.close(master)
+        print(f"aib-login: cannot run {binary}: {error.strerror or type(error).__name__}", file=sys.stderr)
+        return fail(request, provider, "cli_missing", vorgang)
     os.close(slave)
     window = integer("AIB_LOGIN_WINDOW_S", 1800)
     deadline = time.monotonic() + window
@@ -372,13 +379,15 @@ def codex_login(request: dict[str, Any], private: Path) -> int:
     audit("login.started", request, provider)
     environment = os.environ.copy()
     environment["CODEX_HOME"] = str(private)
+    binary = setting("AIB_CODEX_BIN", CODEX_BIN)
     try:
         process = subprocess.Popen(
-            [setting("AIB_CODEX_BIN", CODEX_BIN), "login", "--device-auth"], env=environment,
+            [binary, "login", "--device-auth"], env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
         )
-    except OSError:
-        return fail(request, provider, "timeout")
+    except OSError as error:
+        print(f"aib-login: cannot run {binary}: {error.strerror or type(error).__name__}", file=sys.stderr)
+        return fail(request, provider, "cli_missing")
     deadline = time.monotonic() + integer("AIB_LOGIN_WINDOW_S", 1800)
     output = ""
     announced = False
