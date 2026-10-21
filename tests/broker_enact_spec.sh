@@ -165,13 +165,15 @@ count_real_terminal_end_lines() {
 # Fixtures
 # =============================================================================
 
-# Registry layout: standup_dir INSIDE home (D-B/ADR-0005's exact hazard shape),
+# Registry layout (design v3.7 P5: standup_dir is now a SIBLING of home, no longer inside it - the hazard shape of D-B/ADR-0005 is kept by the
+# event-root checks below, which only need the event root to be outside LL_RW),
 # AIB_EVENT_ROOT a sibling tree entirely OUTSIDE home (the broker-owned location
 # ADR-0005 moves the stream to). <standup_dir>/events is the reader symlink ADR-0005
 # says provisioning maintains — created here so a stub adapter can prove "decided
 # committed before I started" by reading through the SAME path a real reader would.
 FIXTURE_HOME="$WORK/home-acme"
-FIXTURE_STANDUP="$FIXTURE_HOME/standup"
+# design v3.7 P5 layout rule: the standup dir lies OUTSIDE the project root (the confined launch refuses a root that contains it)
+FIXTURE_STANDUP="$WORK/standup-acme"
 FIXTURE_WS="$FIXTURE_HOME/ws"
 mkdir -p "$FIXTURE_WS" "$FIXTURE_STANDUP"
 EVENT_ROOT="$WORK/event-root"
@@ -677,7 +679,7 @@ has "…/dev" "$ll_rw_a" "/dev"
 
 # --- 4d. LL_RW excludes AIB_EVENT_ROOT even though standup_dir sits INSIDE
 #     home (D-B / ADR-0005's exact hazard) -------------------------------------
-hasnt "LL_RW never contains the broker's event root, even though standup_dir is under home" \
+hasnt "LL_RW never contains the broker's event root" \
   "$ll_rw_a" "$EVENT_ROOT"
 # SPEC-FIXTURE CORRECTION (found while building; addition, nothing weakened —
 # same class as the two documented at the top of this file): `has` is a plain
@@ -690,8 +692,9 @@ hasnt "LL_RW never contains the broker's event root, even though standup_dir is 
 # actually needs: standup_dir is reachable BECAUSE home, its parent, is
 # granted — the same hierarchical-grant property Landlock itself provides and
 # a substring search cannot express.
-reachable_under "…while standup_dir itself (a real agent-writable subtree of home) IS reachable" \
-  "$ll_rw_a" "$FIXTURE_STANDUP"
+# v3.7 P5: standup_dir moved out of home, so the hierarchical-grant property is shown on the project workspace (a real agent-writable subtree of home) instead.
+reachable_under "…while a real agent-writable subtree of home (the workspace) IS reachable" \
+  "$ll_rw_a" "$FIXTURE_WS"
 
 # --- 4e. cwd re-check: a symlink swapped in AFTER authorize, BEFORE exec -----
 # (SPEC-wire-format "Order is part of the requirement" / gate delta D2 obligation)

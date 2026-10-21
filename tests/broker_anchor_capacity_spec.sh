@@ -95,7 +95,8 @@ hasnt(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then no "$1 (unexpected '$3')
 # Fixtures
 # =============================================================================
 FIXTURE_HOME="$WORK/home-acme"
-FIXTURE_STANDUP="$FIXTURE_HOME/standup"
+# design v3.7 P5 layout rule: the standup dir lies OUTSIDE the project root (the confined launch refuses a root that contains it)
+FIXTURE_STANDUP="$WORK/standup-acme"
 FIXTURE_WS="$FIXTURE_HOME/ws"
 mkdir -p "$FIXTURE_WS" "$FIXTURE_STANDUP"
 EVENT_ROOT="$WORK/event-root"
