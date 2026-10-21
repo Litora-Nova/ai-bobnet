@@ -376,8 +376,11 @@ for pv in claude-code:CLAUDE:/opt/aib/claude-code/current/claude codex:CODEX:/op
   lrun "AIB_${key}_BIN=" -- "$REF" "$p"
   has "T17: with no $key override the refresher runs the installed default ($def)" "$ERR" "cannot run $def"
 done
-grep -q 'setting("AIB_CLAUDE_BIN", CLAUDE_BIN)' "$ENGINE/bin/aib-login" && grep -q 'setting("AIB_CODEX_BIN", CODEX_BIN)' "$ENGINE/bin/aib-login" \
-  && ok "T17: bin/aib-login starts its CLIs from the shared defaults" || no "T17: bin/aib-login starts its CLIs from the shared defaults"
+for tool in aib-login aib-login-refresh; do
+  grep -q 'setting("AIB_CLAUDE_BIN", CLAUDE_BIN)' "$ENGINE/bin/$tool" && grep -q 'setting("AIB_CODEX_BIN", CODEX_BIN)' "$ENGINE/bin/$tool" \
+    && ok "T17: bin/$tool starts its CLIs from the shared defaults (holds also where the no-override run is skipped)" \
+    || no "T17: bin/$tool starts its CLIs from the shared defaults"
+done
 reset; mk_claude $(( LNOW + 100 )); before="$(cat "$LROOT/claude-code/.credentials.json")"
 lrun AIB_CLAUDE_BIN="$W/no-such-claude" -- "$REF" claude-code
 eq "T17: a missing CLI binary => rc 1, store untouched" "$RC|$([ "$before" = "$(cat "$LROOT/claude-code/.credentials.json")" ] && echo same)" "1|same"
