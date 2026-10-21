@@ -78,7 +78,7 @@ eq "T2: an invalid deployment config => label \"\" (fail closed), the projection
 ex() { python3 -I -c 'import json,sys;a=json.load(open(sys.argv[1]))["agents"]["acme-core"]["supervisor"]["account"];print("null" if a is None else json.dumps([a.get("expires_at","MISSING"),a.get("checked_at","MISSING")]))' "$OUT" 2>/dev/null; }
 printf '{"provider":"claude-code","state":"ok","expires_at":"2026-12-01T09:30:00Z","label":"x","id_hint":"c0de","checked_at":"2026-10-21T08:15:42Z"}' > "$LSTAT/claude-code.json"; proj "$DEP"
 eq "T5: valid ISO UTC expires_at and checked_at pass through verbatim" "$(ex)" '["2026-12-01T09:30:00Z", "2026-10-21T08:15:42Z"]'
-for bad in '"x"' '12345' '""' '"2026-12-01"' '"2026-13-45T99:00:00Z"' '"tomorrow at noon"' 'true' '["2026-12-01T00:00:00Z"]'; do
+for bad in '"x"' '12345' '""' '"2026-12-01"' '"2026-13-45T99:00:00Z"' '"tomorrow at noon"' 'true' '["2026-12-01T00:00:00Z"]' '"2026-12-01T00:00:00Zjunk"' '"2026-12-01T00:00:00.5Zjunk"'; do
   printf '{"provider":"claude-code","state":"ok","expires_at":%s,"label":"x","id_hint":"c0de","checked_at":%s}' "$bad" "$bad" > "$LSTAT/claude-code.json"; proj "$DEP"
   eq "T5: garbage $bad => expires_at and checked_at null (and the run succeeds)" "$RC|$(ex)" '0|[null, null]'
 done
