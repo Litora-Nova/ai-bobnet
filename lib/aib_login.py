@@ -31,6 +31,11 @@ def test_seams_enabled() -> bool:
     return os.environ.get("AIB_TEST_SEAMS") == "1" and not (root / ".aib-installed").exists()
 
 
+# The same installed CLI locations the provider adapters default to (adapters/claude-code, adapters/codex).
+CLAUDE_BIN = "/opt/aib/claude-code/current/claude"
+CODEX_BIN = "/opt/aib/codex/current/codex"
+
+
 def setting(name: str, default: str) -> str:
     if test_seams_enabled() and name in os.environ and os.environ[name] != "":
         return os.environ[name]
