@@ -7,3 +7,7 @@ node_modules/
 
 # agent worktrees / local tooling state
 .claude/
+
+# python bytecode
+__pycache__/
+*.pyc

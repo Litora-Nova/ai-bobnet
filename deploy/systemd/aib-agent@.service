@@ -10,7 +10,7 @@ OnFailure=aib-alarm@%n.service
 [Service]
 Type=notify
 NotifyAccess=all
-EnvironmentFile=/etc/aib/role.env
+EnvironmentFile=-/etc/aib/role.env
 ExecStartPre=+/opt/aib/engine/bin/aib-agent-dirs %i
 ExecStart=/opt/aib/engine/bin/aib-supervisor %i
 Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
