@@ -360,4 +360,21 @@ touch "$W/lock.release"; wait "$holder" 2>/dev/null
 for _ in $(seq 1 200); do [ -e "$W/lock.rc" ] && break; sleep 0.05; done; wait "$refr" 2>/dev/null
 eq "T16: after release the refresher proceeds: rc 0, CLI called once, store refreshed" "$(cat "$W/lock.rc" 2>/dev/null)|$(clog | wc -l | tr -d ' ')|$([ "$before" != "$(cat "$sf")" ] && echo refreshed)" "0|1|refreshed"
 
+# --- T17 the CLI defaults are the installed paths the adapters use, and a failed CLI start is reported, never silent ----------------
+for pv in claude:CLAUDE codex:CODEX; do
+  ad="${pv%%:*}"; key="${pv##*:}"
+  adef="$(grep -o "AIB_${key}_BIN:-[^}]*" "$ENGINE/adapters/$([ "$ad" = claude ] && echo claude-code || echo codex)" | head -1 | cut -d- -f2-)"
+  ldef="$(python3 -I -c 'import sys;sys.path.insert(0,sys.argv[1]);import aib_login;print(getattr(aib_login,sys.argv[2]))' "$ENGINE/lib" "${key}_BIN" 2>/dev/null)"
+  eq "T17: the refresher's default $ad binary is the adapter default" "$ldef" "${adef:-adapter-default-missing}"
+done
+reset; mk_claude $(( LNOW + 100 )); before="$(cat "$LROOT/claude-code/.credentials.json")"
+lrun AIB_CLAUDE_BIN="$W/no-such-claude" -- "$REF" claude-code
+eq "T17: a missing CLI binary => rc 1, store untouched" "$RC|$([ "$before" = "$(cat "$LROOT/claude-code/.credentials.json")" ] && echo same)" "1|same"
+has "T17: …and stderr names the binary that could not run" "$ERR" "cannot run $W/no-such-claude"
+eq "T17: …without echoing any token" "$(printf '%s' "$ERR" | grep -c 'at-\|rt-')" "0"
+reset; mk_claude $(( LNOW + 100 )); echo fail > "$W/cli.mode"
+lrun -- "$REF" claude-code
+eq "T17: a CLI that exits non-zero => rc 1 and its status on stderr, not its output" "$RC|$(printf '%s' "$ERR" | grep -c 'exited with status 1')|$(printf '%s' "$ERR" | grep -c 'refresh failed')" "1|1|0"
+rm -f "$W/cli.mode"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]
