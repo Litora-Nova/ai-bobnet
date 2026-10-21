@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_login import (PROVIDERS, access_expiry, credential_path, integer, now, read_object,
+from aib_login import (CLAUDE_BIN, CODEX_BIN, PROVIDERS, access_expiry, credential_path, integer, now, read_object,
                        setting, store_lock, trusted_store_file)  # noqa: E402
 
 
@@ -63,14 +63,20 @@ def force_private_expiry(provider: str, path: Path) -> bytes:
 
 
 def run_cli(command: list[str], environment: dict[str, str]) -> int:
-    process = subprocess.Popen(
-        command,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    # Diagnostics name the binary and the outcome only; the CLI's own output may carry
+    # account data and is never echoed.
+    try:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        print(f"aib-login-refresh: cannot run {command[0]}: {error.strerror or type(error).__name__}", file=sys.stderr)
+        return 1
     try:
         process.communicate(timeout=integer("AIB_LOGIN_CLI_TIMEOUT_S", 120))
     except subprocess.TimeoutExpired:
@@ -79,7 +85,10 @@ def run_cli(command: list[str], environment: dict[str, str]) -> int:
         except ProcessLookupError:
             pass
         process.communicate()
+        print(f"aib-login-refresh: {command[0]} timed out", file=sys.stderr)
         return 1
+    if process.returncode != 0:
+        print(f"aib-login-refresh: {command[0]} exited with status {process.returncode}", file=sys.stderr)
     return process.returncode
 
 
@@ -121,10 +130,10 @@ def main(argv: list[str]) -> int:
                 env = os.environ.copy()
                 if provider == "claude-code":
                     env["CLAUDE_CONFIG_DIR"] = str(private)
-                    command = [setting("AIB_CLAUDE_BIN", "claude"), "-p", "ok"]
+                    command = [setting("AIB_CLAUDE_BIN", CLAUDE_BIN), "-p", "ok"]
                 else:
                     env["CODEX_HOME"] = str(private)
-                    command = [setting("AIB_CODEX_BIN", "codex"), "features", "list"]
+                    command = [setting("AIB_CODEX_BIN", CODEX_BIN), "features", "list"]
                 if run_cli(command, env) != 0:
                     return 1
                 updated = local.read_bytes()
@@ -133,7 +142,7 @@ def main(argv: list[str]) -> int:
                     # app-server initializes the auth manager and exits cleanly on our closed
                     # stdin without starting a model turn. Older/fake CLIs may already have
                     # refreshed above, so retain the cheap compatibility trigger first.
-                    if run_cli([setting("AIB_CODEX_BIN", "codex"), "app-server"], env) != 0:
+                    if run_cli([setting("AIB_CODEX_BIN", CODEX_BIN), "app-server"], env) != 0:
                         return 1
                     updated = local.read_bytes()
                 if updated == forced:
@@ -157,7 +166,8 @@ def main(argv: list[str]) -> int:
                 return 0 if store_meets_broker_floor(provider, path) else 1
             finally:
                 shutil.rmtree(private, ignore_errors=True)
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        print(f"aib-login-refresh: {provider} refresh failed ({type(error).__name__})", file=sys.stderr)
         return 1
 
 

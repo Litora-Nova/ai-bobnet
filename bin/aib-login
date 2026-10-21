@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from aib_control import append_record, identity_for  # noqa: E402
 from aib_deployment import load_deployment  # noqa: E402
-from aib_login import (PROVIDERS, atomic_json, credential_path, integer, iso, now, read_object,
+from aib_login import (CLAUDE_BIN, CODEX_BIN, PROVIDERS, atomic_json, credential_path, integer, iso, now, read_object,
                        setting, store_lock, test_seams_enabled, write_alarm)  # noqa: E402
 
 URL_RE = re.compile(r"https://[^\s\x1b]+(?=\s)")
@@ -287,7 +287,7 @@ def claude_login(request: dict[str, Any], private: Path) -> int:
     environment = os.environ.copy()
     environment["CLAUDE_CONFIG_DIR"] = str(private)
     process = subprocess.Popen(
-        [setting("AIB_CLAUDE_BIN", "claude"), "auth", "login"],
+        [setting("AIB_CLAUDE_BIN", CLAUDE_BIN), "auth", "login"],
         stdin=slave, stdout=slave, stderr=slave, env=environment, start_new_session=True,
     )
     os.close(slave)
@@ -374,7 +374,7 @@ def codex_login(request: dict[str, Any], private: Path) -> int:
     environment["CODEX_HOME"] = str(private)
     try:
         process = subprocess.Popen(
-            [setting("AIB_CODEX_BIN", "codex"), "login", "--device-auth"], env=environment,
+            [setting("AIB_CODEX_BIN", CODEX_BIN), "login", "--device-auth"], env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
         )
     except OSError:
