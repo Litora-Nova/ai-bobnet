@@ -310,7 +310,6 @@ int main(int argc, char **argv){
     if (!uid_allowed((uid_t)uid_value)) return role_refuse("uid is not present in AIB_ROLE_UIDS");
     for (size_t i = 0; i < group_count; ++i){
       if (groups[i] == 0) return role_refuse("supplementary group 0 is never allowed");
-      if (groups[i] < 1000) return role_refuse("supplementary group below 1000 is never allowed");
       if (!group_allowed(groups[i])) return role_refuse("supplementary group is not present in AIB_ROLE_GROUPS");
     }
   }
