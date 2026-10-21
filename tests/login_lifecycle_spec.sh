@@ -73,7 +73,8 @@ mkdir -p "\$CODEX_HOME"; printf '{"tokens":{"access_token":"jwt-$SENT","refresh_
 echo "Logged in"
 FAKE
 chmod +x "$W/fakes/claude" "$W/fakes/codex"
-LENV+=(AIB_CLAUDE_BIN="$W/fakes/claude" AIB_CODEX_BIN="$W/fakes/codex" AIB_LOGIN_WINDOW_S=30 AIB_LOGIN_CODE_FRESH_S=60 AIB_LOGIN_START_INTERVAL_S=3600)
+LENV+=(AIB_CLAUDE_BIN="$W/fakes/claude" AIB_CODEX_BIN="$W/fakes/codex" AIB_LOGIN_WINDOW_S=30 AIB_LOGIN_CODE_FRESH_S=60 AIB_LOGIN_START_INTERVAL_S=3600
+      AIB_LOGIN_REQ_MAX_AGE_S=999999999)   # v3.7.1 Q3: the gate cases pass AIB_LOGIN_NOW far from the real clock; request expiry is pinned in login_spool_spec, not here
 
 # a request, as agentctl writes it (design v3.7 P1): the audit record in the log AND the spool file <provider>.<seq>.req; lreq <provider> <caller> [actor] -> echoes the seq
 # FLIPPED in v3.7 (P2/P3): the unit used to take the request AND its caller from the log record (`caller` field), so this helper only appended that record. The

@@ -173,4 +173,15 @@ l="$(line /run/aib/login-requests)"
 eq "T10: tmpfiles: d /run/aib/login-requests 1733 aib-broker aib-broker -" "$(fld "$l" 1) $(fld "$l" 2) $(fld "$l" 3) $(fld "$l" 4) $(fld "$l" 5) $(fld "$l" 6)" "d /run/aib/login-requests 1733 aib-broker aib-broker -"
 eq "T10: aib-login@.service may write the spool (ReadWritePaths has -/run/aib/login-requests, '-' prefixed)" "$(body "$U/aib-login@.service" | grep -E '^ReadWritePaths=' | cut -d= -f2- | tr ' ' '\n' | grep -Fxc -e '-/run/aib/login-requests')" 1
 
+# --- T11 (design v3.7.1 Q4/Q5) role uids by uid, docs tell the residuals ---------------------------------------------------------------------------------
+# Q4: the login unit reads the same role.env as the broker (optional `-`: a host without role accounts has none), so AIB_ROLE_UIDS reaches bin/aib-login.
+eq "T11: aib-login@.service reads EnvironmentFile=-/etc/aib/role.env" "$(body "$U/aib-login@.service" | grep -c '^EnvironmentFile=-/etc/aib/role.env$')" 1
+eq "T11: …in its [Service] section, and without setting the role keys by Environment=" "$(awk '/^\[/{s=$0} /^EnvironmentFile=/{print s}' "$U/aib-login@.service" 2>/dev/null | sort -u)|$(body "$U/aib-login@.service" | grep -Ec '^Environment=.*AIB_ROLE_')" "[Service]|0"
+# Q5: CONFINEMENT.md states the availability residual of the spool and the scope of the project-root guard (wording is the design's; case-insensitive)
+DOCL="$(printf '%s' "$DOC" | tr 'A-Z' 'a-z')"
+has "T11: CONFINEMENT.md states the spool residual: local accounts can delay a login" "$DOCL" "delay a login"
+has "T11: …but never start or authorize one" "$DOCL" "never start or authorize"
+has "T11: …and that the project-root guard (P5) covers configured and resolvable directories only" "$DOCL" "configured and resolvable"
+has "T11: …naming the spool directory" "$DOC" "/run/aib/login-requests"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

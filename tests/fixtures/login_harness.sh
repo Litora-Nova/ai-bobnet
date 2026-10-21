@@ -15,8 +15,9 @@
 #   AIB_LOGIN_STATE_DIR     watch dedupe + gateway rate-limit state     (default /var/lib/aib/login-state)
 #   AIB_LOGIN_SOCK_DIR      login-<provider>.sock lives here            (default /run/aib)
 #   AIB_LOGIN_REQ_DIR       request spool (design v3.7 P1/P2)           (default /run/aib/login-requests; dir mode 1733, owned by the broker)
-#                           `agentctl login start` creates <provider>.<seq>.req there (O_EXCL|O_NOFOLLOW, 0644, {"seq","provider"}); bin/aib-login
+#                           `agentctl login start` creates <provider>.<seq>.<8 hex>.req there (O_EXCL|O_NOFOLLOW, 0644, {"seq","provider"}); bin/aib-login
 #                           takes the request and the CALLER (= identity_for(st_uid of the file)) ONLY from here, never from _control.jsonl.
+#   AIB_LOGIN_REQ_MAX_AGE_S requests older than this (mtime) are removed unused (default 600; design v3.7.1 Q3)
 #   AIB_LOGIN_NOW           epoch seconds replacing the clock of the ONE-SHOT tools (watch, refresher, token tool, adapter preflight)
 #   AIB_DEPLOYMENT_CONFIG / AIB_OUTBOX_ROOT / AIB_CONTROL_LOG / AIB_IDENTITY_CMD / AIB_SYSTEMCTL: as in ctl_harness.sh
 #   AIB_CLAUDE_BIN / AIB_CODEX_BIN   the wrapped CLI (fakes here)
@@ -92,12 +93,15 @@ leaks() { local n="$1"; shift; grep -rlF -- "$n" "$@" 2>/dev/null | wc -l | tr -
 # setmode <path> <octal> — an exact mode (plain chmod keeps setgid on a directory for 4-digit numeric modes)
 setmode() { python3 -I -c 'import os,sys; os.chmod(sys.argv[1], int(sys.argv[2], 8))' "$1" "$2"; }
 lw_clean() { rm -rf "${OUTBOX:?}"/* "${LSTATE:?}"/* "${LSTAT:?}"/* "${LREQ:?}"/* "$LREQ"/.[!.]*; mkdir -p "$OUTBOX" "$LREQ"; setmode "$LREQ" 1733; }
-# spool_put <provider> <seq> [json-content] [file-mode] — one request file, created like agentctl does (O_CREAT|O_EXCL|O_NOFOLLOW, owner = us, default 0644)
-spool_put() { python3 -I - "$LREQ" "$1" "$2" "${3:-}" "${4:-644}" <<'PY'
-import json, os, sys
-d, prov, seq, content, mode = sys.argv[1:6]
+# spool_put <provider> <seq> [json-content] [file-mode] [rand] — one request file named <provider>.<seq>.<8 hex>.req (design v3.7.1 Q1), created like agentctl does
+# (O_CREAT|O_EXCL|O_NOFOLLOW, owner = us, default 0644); rand defaults to 8 random hex chars; content defaults to {"seq":<seq>,"provider":"<provider>"}
+spool_put() { python3 -I - "$LREQ" "$1" "$2" "${3:-}" "${4:-644}" "${5:-}" <<'PY'
+import json, os, secrets, sys
+d, prov, seq, content, mode, rand = sys.argv[1:7]
 if not content: content = json.dumps({"seq": int(seq), "provider": prov})
-fd = os.open(os.path.join(d, "%s.%s.req" % (prov, seq)), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+if not rand: rand = secrets.token_hex(4)
+fd = os.open(os.path.join(d, "%s.%s.%s.req" % (prov, seq, rand)), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 os.fchmod(fd, int(mode, 8)); os.write(fd, content.encode()); os.close(fd)
 PY
-}   # reset outbox + watch state + status files
+}
+   # reset outbox + watch state + status files
