@@ -2,6 +2,8 @@
 Description=BobNet shared-login refresh timer for %i
 
 [Timer]
+OnBootSec=5min
+OnActiveSec=5min
 OnUnitActiveSec=1799s
 AccuracySec=1s
 Unit=aib-login-refresh@%i.service
