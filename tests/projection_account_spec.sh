@@ -21,6 +21,10 @@
 #   the two extra keys (the old fixtures carry checked_at "x" => null). Nothing else of the status file leaks (unchanged).
 #
 #   Expected on the unbuilt tree: account stays null for everybody; the S2a block (T5) is RED because the keys do not exist yet.
+#
+#   S2a round 2 (design v2): R1 the status file's times may carry a fraction (the writer emits whole seconds today, other writers may not):
+#   YYYY-MM-DDTHH:MM:SS[.f+]Z passes as whole seconds, "…SS.Z" (fraction without digits) is garbage => null. R5 `id_hint` is clamped to its
+#   LAST 4 characters (shorter values unchanged). A `state` string outside absent|ok|expiring|expired|pending becomes "absent" (projection-layer whitelist).
 set -uo pipefail
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 PROJECT_BIN="$SRC_ROOT/bin/project"; JGET="$SRC_ROOT/tests/fixtures/projection_jget.py"
@@ -86,5 +90,26 @@ rm -f "$LSTAT/claude-code.json"; proj "$DEP"
 eq "T5: missing status file (accounts entry only) => state absent, expires_at/checked_at null" "$(jg agents.acme-core.supervisor.account.state)|$(ex)" 'absent|[null, null]'
 printf 'not json at all' > "$LSTAT/claude-code.json"; proj "$DEP"
 eq "T5: an unparsable status file never crashes the projection" "$RC" 0
+
+# T6 (S2a v2 R1): fractions are accepted and emitted as whole seconds
+for pair in '"2026-12-01T09:30:00.250Z"|"2026-12-01T09:30:00Z"' '"2026-12-01T09:30:00.5Z"|"2026-12-01T09:30:00Z"' '"2026-12-01T09:30:00.123456Z"|"2026-12-01T09:30:00Z"' '"2026-12-01T09:30:00.Z"|null'; do
+  in="${pair%%|*}"; want="${pair#*|}"
+  printf '{"provider":"claude-code","state":"ok","expires_at":%s,"label":"x","id_hint":"c0de","checked_at":%s}' "$in" "$in" > "$LSTAT/claude-code.json"; proj "$DEP"
+  eq "T6: time $in => $want (both fields)" "$RC|$(ex)" "0|[$want, $want]" ; done
+# T7 (S2a v2 R5): id_hint clamped to its last 4 characters
+hint() { printf '{"provider":"claude-code","state":"ok","expires_at":null,"label":"x","id_hint":%s}' "$1" > "$LSTAT/claude-code.json"; proj "$DEP"; jg agents.acme-core.supervisor.account.id_hint; }
+eq "T7: a 12-char id_hint is clamped to its last 4 characters" "$(hint '"0123456789ab"')" "89ab"
+eq "T7: a 5-char id_hint is clamped to its last 4 characters" "$(hint '"abcde"')" "bcde"
+eq "T7: a 4-char id_hint is unchanged" "$(hint '"c0de"')" "c0de"
+eq "T7: a 3-char id_hint is unchanged" "$(hint '"c0d"')" "c0d"
+eq "T7: an empty id_hint stays empty" "$(hint '""')" ""
+eq "T7: a non-string id_hint becomes empty" "$(hint '12345')" ""
+# T8 (S2a v2 R7): the state whitelist lives in the projection
+st() { printf '{"provider":"claude-code","state":%s,"expires_at":null,"label":"x","id_hint":"c0de"}' "$1" > "$LSTAT/claude-code.json"; proj "$DEP"; jg agents.acme-core.supervisor.account.state; }
+for s in ok expiring expired pending absent; do eq "T8: state $s passes" "$(st "\"$s\"")" "$s"; done
+eq "T8: an unknown state string becomes absent" "$(st '"weird"')" absent
+eq "T8: a state with a different case becomes absent" "$(st '"OK"')" absent
+eq "T8: a non-string state becomes absent" "$(st '7')" absent
+rm -f "$LSTAT/claude-code.json"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

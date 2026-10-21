@@ -45,6 +45,18 @@
 #                   limit; order = `at` descending, newest first; caller/args/text payload fields never appear anywhere in the output.
 #     attention     kind "brake" (brake.tripped_at set), "login" (supervised agent with an account whose state is expiring|expired|absent;
 #                   NOT for account null, ok or pending), "unit" (unit_state failed); each item names the agent in `agent`.
+#
+#   S2a round 2 (design v2, R1-R7) — section "S2a v2" at the end of this file, on its own registry/state root (agents r-*):
+#     R1  timestamps: journal `ts`, live.json `brake.tripped_at` and the account times accept YYYY-MM-DDTHH:MM:SS[.f+]Z (the real writers
+#         emit milliseconds) and are emitted as whole seconds YYYY-MM-DDTHH:MM:SSZ. A fraction with no digits ("05.Z") is not a timestamp.
+#     R2  a torn / non-JSON / non-object / non-UTF-8 journal line is skipped; the other records still feed last_control, restarts_24h, journal_seq.
+#     R3  only the LAST 262144 bytes of journal.jsonl are read; the first (partial) line of the window is dropped even when its tail is valid JSON.
+#     R4  `brake` is rebuilt from the known keys only: consecutive int >= 0 (bool/str/negative => 0), tripped_at instant or null (garbage => null);
+#         no other live.json brake key reaches the projection.
+#     R6  `state_reason` and the control `reason` are machine words ^[a-z][a-z0-9_]{0,39}$ (matched as a FULL string: a trailing newline fails),
+#         otherwise "other". DECISION (not in the design): the EMPTY string stays "" (no reason is not "other"); the existing T1 check needs it.
+#     R7  last_control: equal `at` => higher req first; order is by `at` (not journal position); same req + same priority + same `at` => the LATER
+#         journal line wins (DECISION: determinism pin); reason non-empty only for rejected; req must be an int >= 1 (0, -1, true, "5", 5.0, null dropped).
 set -uo pipefail
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 PROJECT_BIN="$SRC_ROOT/bin/project"
@@ -234,6 +246,181 @@ rm -f "$LST2/acme.json"; live2 s-brk ',"off_duty":false' "$NOBRAKE"; printf 'Act
 eq "A4: no tripped brake and an active unit => none of the three kinds" "$(kinds)" ""
 printf 'ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\n' > "$WORK/unit.s-brk"; proj2
 eq "A4: an inactive (not failed) unit is not a unit item" "$(kinds)" ""
+
+# =========================================================================
+# S2a v2 — R1 millisecond timestamps, R2 torn lines, R3 bounded read, R4 brake rebuild, R6 machine words, R7 ordering rules
+# =========================================================================
+SUP3="$WORK/sup3"; EVR3="$WORK/events3"; STD3="$WORK/standup3"
+mkdir -p "$SUP3" "$EVR3/attempts" "$STD3/inbox"
+for u in r-ms r-torn r-big r-tie r-rules r-var; do mkdir -p "$SUP3/$u"; done
+REG3="$WORK/registry3.json"
+cat > "$REG3" <<JSON
+{ "schema_version": 5,
+  "providers": { "acme": { "adapter": "/bin/true", "cap_sandbox": "workspace-write", "cap_tier": "t2", "cap_effort": "high", "cap_timeout": "900" } },
+  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STD3", "mux_session": "acme", "provider": "acme", "model": "m", "effort": "low" } },
+  "agents": {
+    "r-ms":    { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "r-torn":  { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "r-big":   { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "r-tie":   { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "r-rules": { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "r-var":   { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" }
+  } }
+JSON
+proj3() { RC=0; env -i PATH="$WORK/fakebin:$PATH" TZ=UTC AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$(id -u)" AIB_DEPLOYMENT_CONFIG="$WORK/none.json" AIB_LOGIN_STATUS_DIR="$WORK/lstat3" \
+    AIBOBNET_REGISTRY="$REG3" AIB_PROJECTION_ROOT="$WORK/proj3" AIB_EVENT_ROOT="$EVR3" AIB_SUP_STATE_ROOT="$SUP3" "$PROJECT_BIN" acme --stdout > "$OUT" 2>"$WORK/err3" || RC=$?; }
+msiso() { date -u -d "$1" +%Y-%m-%dT%H:%M:%S."$2"Z; }   # msiso '10 minutes ago' 123
+seciso() { date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ; }
+lv() { # lv <uid> <ts> <state_reason JSON literal> <brake JSON literal>
+  printf '{"seq":5,"ts":"%s","interval_s":30,"pid":9,"state":"WORKING","state_reason":%s,"turn":null,"brake":%s,"session_id":null,"turns_in_session":0}\n' "$2" "$3" "$4" > "$SUP3/$1/live.json"; }
+NB='{"consecutive":0,"tripped_at":null}'
+for u in r-torn r-big r-tie r-rules r-var; do lv "$u" "$(msiso 'now' 456)" '""' "$NB"; done
+lv r-ms "$(msiso 'now' 789)" '""' "$NB"
+lc3() { python3 -I -c 'import json,sys;l=json.load(open(sys.argv[1]))["agents"][sys.argv[2]]["supervisor"]["last_control"];print(sys.argv[3].join(str(e[sys.argv[4]]) for e in l))' "$OUT" "$1" "$2" "$3" 2>/dev/null; }
+# --- R1: the real writer's millisecond format, plus a second-precision control ---
+Ta="$(seciso '10 minutes ago')"; Tb="$(seciso '20 minutes ago')"; Tc="$(seciso '30 minutes ago')"; Td="$(seciso '40 minutes ago')"
+cat > "$SUP3/r-ms/journal.jsonl" <<JSON
+{"seq":1,"ts":"$(msiso '48 hours ago' 100)","event":"supervisor.started","pid":1,"reexec":false}
+{"seq":2,"ts":"$(msiso '2 hours ago' 200)","event":"supervisor.started","pid":2,"reexec":false}
+{"seq":3,"ts":"$(seciso '1 hour ago')","event":"supervisor.started","pid":3,"reexec":false}
+{"seq":4,"ts":"${Td%Z}.123Z","event":"ctl.done","req":1,"verb":"neustart","target":"r-ms","result":"ok"}
+{"seq":5,"ts":"${Tc%Z}.5Z","event":"ctl.accepted","req":2,"verb":"standup","target":"r-ms","result":"accepted"}
+{"seq":6,"ts":"${Tb%Z}.123456Z","event":"ctl.rejected","req":3,"verb":"abschalten","target":"r-ms","reason":"busy"}
+{"seq":7,"ts":"$Ta","event":"ctl.done","req":4,"verb":"reset-brake","target":"r-ms","result":"ok"}
+{"seq":8,"ts":"$(seciso '5 minutes ago' | sed 's/Z$/.Z/')","event":"ctl.done","req":5,"verb":"neustart","target":"r-ms","result":"ok"}
+JSON
+proj3
+eq "R1: bin/project runs on the v2 fixtures" "$RC" 0
+eq "R1: millisecond journal timestamps (1, 3 and 6 fraction digits) and a second-precision one: all four controls survive, newest first; '05.Z' dropped" "$(lc3 r-ms , req)" "4,3,2,1"
+eq "R1: ...and every 'at' is emitted as whole seconds" "$(lc3 r-ms , at)" "$Ta,$Tb,$Tc,$Td"
+eq "R1: restarts_24h counts millisecond and second precision records alike (2 in 24 h)" "$(jg agents.r-ms.supervisor.restarts_24h)" 2
+eq "R1: a millisecond live.json ts keeps the agent healthy" "$(jg agents.r-ms.supervisor.health)" healthy
+# --- R2: torn / garbage lines never empty the journal ---
+python3 -I - "$SUP3/r-torn/journal.jsonl" "$(msiso '2 hours ago' 321)" "$(msiso '1 hour ago' 654)" "$(seciso '30 minutes ago')" <<'PYEOF'
+import sys
+path, t_a, t_b, t_c = sys.argv[1:]
+lines = [
+  b'{"seq":1,"ts":"%s","event":"supervisor.started","pid":1,"reexec":false}' % t_a.encode(),
+  b'{"seq":2,"ts":"%s","event":"ctl.done","req":1,"verb":"neustart"' % t_c.encode(),
+  b'this is not json at all',
+  b'[1,2,3]',
+  b'"just a string"',
+  b'\xff\xfe broken \x80 utf8',
+  b'{"seq":7,"ts":"%s","event":"ctl.done","req":2,"verb":"standup","target":"r-torn","result":"ok"}' % t_c.encode(),
+  b'{"seq":8,"ts":"%s","event":"supervisor.started","pid":2,"reexec":false}' % t_b.encode(),
+  b'',
+]
+tail = b'{"seq":99,"ts":"%s","event":"ctl.done","req":3,"ver' % t_c.encode()
+open(path, 'wb').write(b'\n'.join(lines) + b'\n' + tail)
+PYEOF
+proj3
+eq "R2: a journal with torn, non-JSON, non-object, non-UTF-8 lines and a torn tail still projects (rc 0)" "$RC" 0
+eq "R2: ...the valid control still feeds last_control" "$(lc3 r-torn , req)" "2"
+eq "R2: ...restarts_24h still counts the valid starts (2)" "$(jg agents.r-torn.supervisor.restarts_24h)" 2
+eq "R2: ...journal_seq is the highest VALID seq (8; the torn tail's 99 is ignored)" "$(jg agents.r-torn.supervisor.journal_seq)" 8
+# --- R3: bounded read of the last 262144 bytes, first partial line dropped even when its tail is valid JSON ---
+python3 -I - "$SUP3/r-big/journal.jsonl" "$(msiso '90 minutes ago' 111)" "$(msiso '80 minutes ago' 222)" "$(msiso '70 minutes ago' 333)" "$(msiso '20 minutes ago' 444)" "$(msiso '10 minutes ago' 555)" "$(seciso '15 minutes ago')" <<'PYEOF'
+import sys, json
+path, t_head1, t_head2, t_strag, t_s1, t_s2, t_c = sys.argv[1:]
+rec = lambda **k: (json.dumps(k, separators=(',', ':')) + '\n').encode()
+head = rec(seq=999999, ts=t_head1, event='supervisor.started', pid=1, reexec=False) + \
+       rec(seq=5, ts=t_head2, event='ctl.done', req=50, verb='neustart', target='r-big', result='ok')
+inner = json.dumps(dict(seq=777, ts=t_strag, event='supervisor.started', pid=3, reexec=False), separators=(',', ':'))
+straggler = b'x' * 3000 + inner.encode() + b'\n'
+tail_fixed = rec(seq=1001, ts=t_s1, event='supervisor.started', pid=4, reexec=False) + \
+             rec(seq=1002, ts=t_c, event='ctl.done', req=60, verb='standup', target='r-big', result='ok') + \
+             rec(seq=1003, ts=t_s2, event='supervisor.started', pid=5, reexec=False)
+# the 262144-byte window must start exactly at the '{' of a valid JSON object that is the tail of a longer, invalid line (x-run prefix)
+fill_len = 262144 - (len(inner) + 1) - len(tail_fixed)
+base = len(rec(seq=1000, ts=t_head2, event='filler', pad=''))
+filler = rec(seq=1000, ts=t_head2, event='filler', pad='y' * (fill_len - base))
+assert len(filler) == fill_len
+open(path, 'wb').write(head + straggler + filler + tail_fixed)
+PYEOF
+sz="$(wc -c < "$SUP3/r-big/journal.jsonl")"
+if [ "$sz" -gt 262144 ]; then ok "R3: fixture journal is larger than the 262144-byte window ($sz bytes)"; else no "R3: fixture journal is larger than the window (got $sz)"; fi
+proj3
+eq "R3: bin/project runs on the large journal" "$RC" 0
+eq "R3: restarts_24h counts only the window (2): not the head record, not the partial first line's valid-looking tail" "$(jg agents.r-big.supervisor.restarts_24h)" 2
+eq "R3: last_control sees only the window (req 60), not req 50 from the head" "$(lc3 r-big , req)" "60"
+eq "R3: journal_seq is the highest seq inside the window (not 999999 from the head)" "$(jg agents.r-big.supervisor.journal_seq)" 1003
+# --- R7: ordering and rules ---
+Tt="$(seciso '5 minutes ago')"; Tn="$(seciso '20 minutes ago')"; To="$(seciso '40 minutes ago')"; Tz="$(seciso '60 minutes ago')"
+cat > "$SUP3/r-tie/journal.jsonl" <<JSON
+{"seq":1,"ts":"$Tn","event":"ctl.done","req":30,"verb":"neustart","target":"r-tie","result":"ok"}
+{"seq":2,"ts":"$To","event":"ctl.done","req":31,"verb":"standup","target":"r-tie","result":"ok"}
+{"seq":3,"ts":"$Tt","event":"ctl.done","req":10,"verb":"neustart","target":"r-tie","result":"ok"}
+{"seq":4,"ts":"$Tt","event":"ctl.done","req":11,"verb":"standup","target":"r-tie","result":"ok"}
+{"seq":5,"ts":"$Tz","event":"ctl.rejected","req":20,"verb":"abschalten","target":"r-tie","reason":"first_one"}
+{"seq":6,"ts":"$Tz","event":"ctl.rejected","req":20,"verb":"abschalten","target":"r-tie","reason":"second_one"}
+JSON
+cat > "$SUP3/r-rules/journal.jsonl" <<JSON
+{"seq":1,"ts":"$(seciso '1 minute ago')","event":"ctl.done","req":0,"verb":"neustart","target":"r-rules","result":"ok"}
+{"seq":2,"ts":"$(seciso '1 minute ago')","event":"ctl.done","req":-1,"verb":"neustart","target":"r-rules","result":"ok"}
+{"seq":3,"ts":"$(seciso '1 minute ago')","event":"ctl.done","req":true,"verb":"neustart","target":"r-rules","result":"ok"}
+{"seq":4,"ts":"$(seciso '1 minute ago')","event":"ctl.done","req":"5","verb":"neustart","target":"r-rules","result":"ok"}
+{"seq":5,"ts":"$(seciso '1 minute ago')","event":"ctl.done","req":5.0,"verb":"neustart","target":"r-rules","result":"ok"}
+{"seq":6,"ts":"$(seciso '1 minute ago')","event":"ctl.done","req":null,"verb":"neustart","target":"r-rules","result":"ok"}
+{"seq":7,"ts":"$(seciso '3 minutes ago')","event":"ctl.done","req":7,"verb":"neustart","target":"r-rules","result":"ok","reason":"leak_done"}
+{"seq":8,"ts":"$(seciso '4 minutes ago')","event":"ctl.accepted","req":8,"verb":"standup","target":"r-rules","result":"accepted","reason":"leak_acc"}
+JSON
+proj3
+eq "R7: order is by 'at' descending (not journal position, not req); equal 'at' => higher req first; duplicates of one req collapse" "$(lc3 r-tie , req)" "11,10,30,31,20"
+eq "R7: same req, same priority, same 'at' => the LATER journal line wins (reason second_one)" "$(python3 -I -c 'import json,sys;l=json.load(open(sys.argv[1]))["agents"]["r-tie"]["supervisor"]["last_control"];print([e["reason"] for e in l if e["req"]==20][0])' "$OUT" 2>/dev/null)" "second_one"
+eq "R7: req must be an int >= 1: 0, -1, true, \"5\", 5.0 and null are dropped (only 7 and 8 remain)" "$(lc3 r-rules , req)" "7,8"
+eq "R7: reason is non-empty only for rejected: a done and an accepted record carrying a reason give \"\"" "$(lc3 r-rules , reason)" ","
+# --- R4 / R6 on live.json (agent r-var) ---
+bk() { python3 -I -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1]))["agents"]["r-var"]["supervisor"]["brake"],sort_keys=True))' "$OUT" 2>/dev/null; }
+sr() { python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["agents"]["r-var"]["supervisor"]["state_reason"])' "$OUT" 2>/dev/null; }
+mw40="b$(printf 'a%.0s' $(seq 1 39))"; mw41="b$(printf 'a%.0s' $(seq 1 40))"; long300="$(printf 'a%.0s' $(seq 1 300))"
+rv() { # rv <state_reason JSON literal> <expected>
+  lv r-var "$(msiso 'now' 1)" "$1" "$NB"; proj3; eq "R6: state_reason ${1:0:40} ($((${#1}-2)) chars) => '${2:0:40}'" "$RC|$(sr)" "0|$2"; }
+rv '"quota_backoff"' quota_backoff
+rv "\"$mw40\"" "$mw40"
+rv "\"$mw41\"" other
+rv "\"$long300\"" other
+rv '"Quota_backoff"' other
+rv '"quota backoff"' other
+rv '"quota-backoff"' other
+rv '"1st_try"' other
+rv '"_lead"' other
+rv '"abc\n"' other
+rv '"<script>x</script>"' other
+rv '"größe"' other
+rv '""' ""
+while IFS='|' read -r brake want; do
+  lv r-var "$(msiso 'now' 1)" '"ok_word"' "$brake"; proj3
+  eq "R4: brake $brake => $want (other fields untouched)" "$RC|$(bk)|$(jg agents.r-var.supervisor.session_state)|$(sr)" "0|$want|WORKING|ok_word"
+done <<'LIST'
+{"consecutive":2,"tripped_at":null,"extra":"EVIL-BRAKE-KEY","nested":{"EVIL":1}}|{"consecutive": 2, "tripped_at": null}
+{"consecutive":"3","tripped_at":"garbage"}|{"consecutive": 0, "tripped_at": null}
+{"consecutive":-1,"tripped_at":12345}|{"consecutive": 0, "tripped_at": null}
+{"consecutive":true,"tripped_at":null}|{"consecutive": 0, "tripped_at": null}
+{"consecutive":4,"tripped_at":"2026-10-21T08:15:42.789Z"}|{"consecutive": 4, "tripped_at": "2026-10-21T08:15:42Z"}
+{"consecutive":1,"tripped_at":"2026-10-21T08:15:42Z"}|{"consecutive": 1, "tripped_at": "2026-10-21T08:15:42Z"}
+"not-a-dict"|{"consecutive": 0, "tripped_at": null}
+LIST
+lv r-var "$(msiso 'now' 1)" '"ok_word"' '{"consecutive":1,"tripped_at":"2026-10-21T08:15:42.789Z","extra":"EVIL-BRAKE-KEY"}'; proj3
+eq "R4: no unknown live.json brake key reaches the projection" "$(grep -c EVIL-BRAKE-KEY "$OUT")" 0
+eq "R1: the brake attention item carries the whole-second tripped_at" "$(python3 -I -c 'import json,sys;print([i["since"] for i in json.load(open(sys.argv[1]))["attention"] if i["kind"]=="brake" and i["agent"]=="r-var"])' "$OUT" 2>/dev/null)" "['2026-10-21T08:15:42Z']"
+lv r-var "$(msiso 'now' 1)" '"ok_word"' "$NB"
+# --- R6 on the control reason ---
+rr() { # rr <reason JSON literal, or NONE> <expected>
+  if [ "$1" = NONE ]; then printf '{"seq":1,"ts":"%s","event":"ctl.rejected","req":1,"verb":"neustart","target":"r-var"}\n' "$(seciso '1 minute ago')" > "$SUP3/r-var/journal.jsonl"
+  else printf '{"seq":1,"ts":"%s","event":"ctl.rejected","req":1,"verb":"neustart","target":"r-var","reason":%s}\n' "$(seciso '1 minute ago')" "$1" > "$SUP3/r-var/journal.jsonl"; fi
+  proj3; eq "R6: control reason ${1:0:40} ($((${#1}-2)) chars) => '${2:0:40}'" "$RC|$(lc3 r-var , reason)" "0|$2"; }
+rr '"not_authorized"' not_authorized
+rr "\"$mw40\"" "$mw40"
+rr "\"$mw41\"" other
+rr "\"$long300\"" other
+rr '"Not_authorized"' other
+rr '"not authorized"' other
+rr '"not-authorized"' other
+rr '"busy\n"' other
+rr '"<b>x</b>"' other
+rr '"größe"' other
+rr '""' ""
+rr NONE ""
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

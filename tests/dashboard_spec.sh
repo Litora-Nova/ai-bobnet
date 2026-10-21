@@ -49,6 +49,14 @@
 #                (login-attention = supervised agents whose account state is expiring|expired|absent; N = 0 for a project without supervisors).
 #   All projected strings stay inert (HTML-escaped). Expected on the unbuilt renderer: every S2a assertion except the no-500 and the
 #   no-card-for-unsupervised ones is RED.
+#
+#   S2a round 2 (design v2): R5 the reader accepts an account id_hint of at most 4 characters; R7 each whitelist is pinned in its own layer
+#   (reader: control keys exactly req/verb/outcome/reason/at, verb outside agentctl's set, outcome outside done|rejected|accepted, account state
+#   outside the enum; each => the invalid markers above, with no value of the block rendered); the relative expiry hint is exactly ONE
+#   floored unit (`in 2 d`, `in 23 h`, `in 5 min`, `in 0 min`, `expired 3 d ago`, `expired 0 min ago`; d >= 1 day, h >= 1 hour, else min);
+#   the fleet counts treat `absent` as login-attention and count an invalid supervisor block as supervised but never as braked or
+#   login-attention; a null session id renders as the em dash U+2014 (never `<code>null</code>`). The reader keeps its 200-char bound for
+#   state_reason/reason (hand-built projections): the R6 machine-word rule lives in bin/project only. Fixtures are written by $WORK/supfix.py.
 set -uo pipefail
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
@@ -426,9 +434,9 @@ printf '{}' > "$DROOT/bad name.json"                # invalid token (space): mus
 
 # --- S2a fixtures (hand-built; no real data) ---
 if [ -n "$PY" ]; then
-"$PY" - "$DROOT" <<'PYEOF'
+cat > "$WORK/supfix.py" <<'PYEOF'
 import datetime as dt, json, sys
-root = sys.argv[1]
+root = sys.argv[1]; mode = sys.argv[2]
 now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 iso = lambda d: d.strftime('%Y-%m-%dT%H:%M:%SZ')
 def base(uid, gen, agents):
@@ -448,6 +456,16 @@ def sup(gen=now, **kw):
 def lc(req, verb, outcome, reason, at): return {"req": req, "verb": verb, "outcome": outcome, "reason": reason, "at": iso(at)}
 def put(uid, value):
     open(f"{root}/{uid}.json", "w").write(json.dumps(value))
+
+if mode == 'rel':
+    cases = {"d1": 216000, "d2": 90000, "h1": 84600, "h2": 5400, "m1": 340, "m2": 3570, "z1": 40,
+             "p0": -20, "pm": -310, "ph": -5400, "pd": -(3 * 86400 + 12 * 3600), "pd2": -(25 * 3600), "n1": None}
+    agents = {}
+    for name, off in cases.items():
+        exp = None if off is None else iso(now + dt.timedelta(seconds=off))
+        agents["rel-" + name] = agent(sup(account=acct("expired" if off is not None and off < 0 else "ok", "rel-label", "ab12", exp, iso(now))))
+    put("acme-suprel", base("acme-suprel", now, agents))
+    sys.exit(0)
 
 run = sup(session_state="WORKING", state_reason="quota backoff", unit_state="active", health="healthy", tick_age_s=12,
     current_turn={"msg_id": "m-77", "started_at": iso(now), "attempt_id": "att-9"}, session_id_short="3f2b8c1e", turns_in_session=7, restarts_24h=2,
@@ -470,12 +488,27 @@ bad = {
   "bad-acct":    sup(state_reason="fine-reason-ok", account=acct("ok", "LEAKLABEL", "LEAKHINT123456", None, None)),
   "bad-type":    "oops-LEAKMARK4",
   "good":        sup(state_reason="still-fine"),
+  "bad-hint5":   sup(state_reason="hint5_card", account=acct("ok", "LEAKFIVE", "abcde", None, None)),
+  "ok-hint4":    sup(state_reason="hint4_card", account=acct("ok", "hint4-label", "ab12", None, None)),
+  "bad-ctl-verb":    sup(state_reason="LEAKCTLV", last_control=[lc(1, "frobnicate", "done", "", now)]),
+  "bad-ctl-extra":   sup(state_reason="LEAKCTLX", last_control=[dict(lc(1, "neustart", "done", "", now), caller="LEAKCALLER")]),
+  "bad-ctl-outcome": sup(state_reason="LEAKCTLO", last_control=[lc(1, "neustart", "weird", "", now)]),
+  "bad-acct-state":  sup(state_reason="acct_state_ok", account=acct("weird", "LEAKSTATE", "ab12", None, None)),
 }
 put("acme-supbad", base("acme-supbad", now, {k: agent(v) for k, v in bad.items()}))
 
 old = now - dt.timedelta(days=1)
 put("acme-supold", base("acme-supold", old, {"sup-old": agent(sup(gen=old, state_reason="old news"), old)}))
+
+cnt = {
+  "cnt-absent":  sup(account=acct("absent", "cnt-label", "", None, None)),
+  "cnt-brk":     sup(brake={"consecutive": 2, "tripped_at": iso(now - dt.timedelta(minutes=10))}, account=acct("ok", "cnt-label", "ab12", None, None)),
+  "cnt-invalid": sup(session_state="EXPLODING", brake={"consecutive": 9, "tripped_at": iso(now)}, account=acct("expired", "cnt-label", "ab12", None, None)),
+  "cnt-solo":    None,
+}
+put("acme-supcnt", base("acme-supcnt", now, {k: agent(v) for k, v in cnt.items()}))
 PYEOF
+"$PY" "$WORK/supfix.py" "$DROOT" static
 fi
 
 start_dashboard() {
@@ -680,6 +713,62 @@ has "C4: a stale projection keeps the existing 'stale since' banner" "$page_old"
 has "C4: its supervised card is greyed via class 'sup-card sup-stale'" "$(open_of "$(card_of "$page_old" sup-old)")" 'class="sup-card sup-stale"'
 has "C4: stale card still shows its data" "$(card_of "$page_old" sup-old)" "old news"
 hasnt "C4: a fresh card is not marked sup-stale" "$o_run" "sup-stale"
+
+
+# =========================================================================
+# S2a v2 — R5 hint length, R7 reader whitelists, relative-hint units, fleet-count rules, null session id
+# =========================================================================
+c="$(card_of "$page_bad" bad-hint5)"
+has "R5: an id_hint of 5 characters is invalid in the reader ('account data invalid')" "$c" "account data invalid"
+hasnt "R5: ...and the account label does not leak" "$page_bad" "LEAKFIVE"
+c="$(card_of "$page_bad" ok-hint4)"
+has "R5: an id_hint of 4 characters is accepted" "$c" "hint4-label"
+has "R5: ...and shown" "$c" "ab12"
+has "R5: ...with its login state attribute" "$(open_of "$c")" 'data-login-state="ok"'
+for u in bad-ctl-verb bad-ctl-extra bad-ctl-outcome; do
+  c="$(card_of "$page_bad" "$u")"
+  has "R7: reader whitelist: $u => the supervisor block is invalid" "$(open_of "$c")" 'data-supervisor="invalid"'
+done
+for leak in LEAKCTLV LEAKCTLX LEAKCTLO LEAKCALLER; do hasnt "R7: reader whitelist: $leak never reaches the page" "$page_bad" "$leak"; done
+c="$(card_of "$page_bad" bad-acct-state)"
+has "R7: reader whitelist: an account state outside the enum => 'account data invalid'" "$c" "account data invalid"
+has "R7: ...while the valid supervisor part still renders" "$c" "acct_state_ok"
+hasnt "R7: ...and the account label does not leak" "$page_bad" "LEAKSTATE"
+
+# relative expiry hints: regenerate with a fresh clock right before reading
+"$PY" "$WORK/supfix.py" "$DROOT" rel
+page_rel="$(get /p/acme-suprel)"
+eq "R7: GET /p/acme-suprel is 200" "$(code_of /p/acme-suprel)" 200
+hint_of() { printf '%s' "$1" | "$PY" -I -c 'import re,sys;print(";".join(re.findall(r"in \d+ (?:d|h|min)\b|expired \d+ (?:d|h|min) ago",sys.stdin.read())))'; }
+while IFS='|' read -r who want; do
+  eq "R7: relative hint of $who is exactly '$want'" "$(hint_of "$(card_of "$page_rel" "rel-$who")")" "$want"
+done <<'LIST'
+d1|in 2 d
+d2|in 1 d
+h1|in 23 h
+h2|in 1 h
+m1|in 5 min
+m2|in 59 min
+z1|in 0 min
+p0|expired 0 min ago
+pm|expired 5 min ago
+ph|expired 1 h ago
+pd|expired 3 d ago
+pd2|expired 1 d ago
+n1|
+LIST
+
+# fleet-count rules
+fleet_html="$(get /)"
+row_cnt="$(row_of "$fleet_html" acme-supcnt)"
+has "R7: fleet: absent counts as login-attention; an invalid block counts as supervised only" "$row_cnt" 'data-supervised="3"'
+has "R7: fleet: an invalid block is never braked (only cnt-brk is)" "$row_cnt" 'data-braked="1"'
+has "R7: fleet: login-attention counts absent but not the invalid block's expired account, nor an ok one" "$row_cnt" 'data-login-attention="1"'
+
+# null session id
+c_brk="$(card_of "$page_sup" sup-brk)"
+has "cosmetic: a null session id renders as an em dash" "$c_brk" "—"
+hasnt "cosmetic: ...never as <code>null</code>" "$c_brk" "<code>null</code>"
 
 eq "POST / is a 405" "$(code_of / -X POST)" 405
 eq "POST /api/fleet is a 405" "$(code_of /api/fleet -X POST)" 405
