@@ -10,6 +10,10 @@ TOKEN = r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?'
 UID = re.compile(TOKEN + r'\Z')
 FILE = re.compile('(' + TOKEN + r')\.json\Z')
 STATES = ('busy', 'idle', 'blocked', 'done', 'unknown')
+SESSION_STATES = ('READY', 'WORKING', 'WAITING', 'STOPPING', 'ORPHANED', 'FAILED', 'OFFLINE')
+ACCOUNT_STATES = ('absent', 'ok', 'expiring', 'expired', 'pending')
+CONTROL_VERBS = ('status', 'neustart', 'feierabend', 'standup', 'abschalten',
+                 'start', 'reset-brake', 'say', 'attach')
 
 
 def instant(value):
@@ -36,12 +40,20 @@ def text(value):
     return isinstance(value, str)
 
 
+def bounded_text(value):
+    return isinstance(value, str) and len(value) <= 200
+
+
 def count(value):
     return type(value) is int and value >= 0
 
 
 def fields(value, shape):
     return isinstance(value, dict) and all(key in value and check(value[key]) for key, check in shape.items())
+
+
+def exact_fields(value, shape):
+    return fields(value, shape) and value.keys() == shape.keys()
 
 
 def binding(value):
@@ -58,6 +70,48 @@ def attempt(value):
     return fields(value, dict(id=text, decided_at=is_instant, decision=lambda v: v in ('allow', 'deny'),
         open=lambda v: type(v) is bool,
         last=lambda v: fields(v, {'class': nullable(text), 'stage': nullable(text), 'ended_at': nullable(is_instant)})))
+
+
+def account(value):
+    return fields(value, dict(
+        provider=bounded_text,
+        state=lambda v: v in ACCOUNT_STATES,
+        label=bounded_text,
+        id_hint=lambda v: isinstance(v, str) and len(v) <= 8,
+        expires_at=nullable(is_instant),
+        checked_at=nullable(is_instant)))
+
+
+def control(value):
+    return exact_fields(value, dict(
+        req=count,
+        verb=lambda v: v in CONTROL_VERBS,
+        outcome=lambda v: v in ('done', 'rejected', 'accepted'),
+        reason=bounded_text,
+        at=is_instant))
+
+
+def supervisor(value):
+    return fields(value, dict(
+        mode=lambda v: v == 'supervised',
+        account=lambda _v: True,
+        unit_state=bounded_text,
+        disabled=lambda v: type(v) is bool,
+        session_state=lambda v: v in SESSION_STATES,
+        state_reason=bounded_text,
+        health=lambda v: v in ('healthy', 'unhealthy'),
+        tick_seq=nullable(count),
+        tick_age_s=nullable(count),
+        current_turn=nullable(lambda v: fields(v, dict(
+            msg_id=bounded_text, started_at=is_instant, attempt_id=bounded_text))),
+        session_id_short=nullable(bounded_text),
+        turns_in_session=count,
+        restarts_24h=count,
+        brake=lambda v: fields(v, dict(consecutive=count, tripped_at=nullable(is_instant))),
+        off_duty=lambda v: type(v) is bool,
+        inbox_open=count,
+        last_control=lambda v: isinstance(v, list) and len(v) <= 5 and all(control(item) for item in v),
+        journal_seq=count))
 
 
 def agent(value):
@@ -78,6 +132,18 @@ def projection(value, uid):
         attention=lambda v: isinstance(v, list) and all(fields(item, dict(kind=text, agent=nullable(text), reason=text, since=is_instant, attested=lambda b: type(b) is bool)) for item in v),
         agents=lambda v: isinstance(v, dict) and all(agent(a) for a in v.values()),
         anomalies=lambda v: fields(v, {key: count for key in ('unregistered_logs', 'unparsable_lines', 'uid_mismatches', 'undecodable_records', 'launch_malformed')})))
+
+
+def sanitize_supervisors(value):
+    for item in value['agents'].values():
+        if 'supervisor' not in item or item['supervisor'] is None:
+            continue
+        if not supervisor(item['supervisor']):
+            item['supervisor'] = False
+            continue
+        account_value = item['supervisor']['account']
+        if account_value is not None and not account(account_value):
+            item['supervisor']['account'] = False
 
 
 def unique_keys(pairs):
@@ -120,6 +186,7 @@ class ProjectionRoot:
             json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8')
             if not projection(value, uid):
                 return None, 'schema'
+            sanitize_supervisors(value)
             return value, None
         except (ValueError, TypeError, RecursionError, OverflowError):
             return None, 'unparsable'
@@ -154,13 +221,22 @@ class ProjectionRoot:
                 value, reason = self.read_at(fd, uid)
                 row = dict(project_uid=uid, present=value is not None, reason=reason,
                            generated_at=None, age_seconds=None, stale=None, stream_status=None,
-                           capacity=None, attention_count=None, agents_by_state=None)
+                           capacity=None, attention_count=None, agents_by_state=None,
+                           supervised_count=0, braked_count=0, login_attention_count=0)
                 if value is not None:
                     elapsed = now - instant(value['generated_at'])
                     age = math.floor(elapsed)
+                    supervisors = [a.get('supervisor') for a in value['agents'].values()
+                                   if a.get('supervisor') is not None]
+                    valid_supervisors = [s for s in supervisors if isinstance(s, dict)]
                     row.update(generated_at=value['generated_at'], age_seconds=age, stale=elapsed > threshold,
                         stream_status=value['stream']['status'], capacity=value['capacity'], attention_count=len(value['attention']),
-                        agents_by_state={state: sum(a['state'] == state for a in value['agents'].values()) for state in STATES})
+                        agents_by_state={state: sum(a['state'] == state for a in value['agents'].values()) for state in STATES},
+                        supervised_count=len(supervisors),
+                        braked_count=sum(s['brake']['tripped_at'] is not None for s in valid_supervisors),
+                        login_attention_count=sum(isinstance(s['account'], dict) and
+                                                  s['account']['state'] in ('expiring', 'expired', 'absent')
+                                                  for s in valid_supervisors))
                 result['projects'].append(row)
             result.update(root_status='ok', files_seen=len(names))
         except OSError:
