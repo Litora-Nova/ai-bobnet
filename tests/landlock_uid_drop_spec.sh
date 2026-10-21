@@ -82,6 +82,9 @@ ll AIB_ROLE_UIDS="$(( ME / 10 * 10 ))" -- --uid "$ME" --gid "$MG" "${touch_cmd[@
 #   gid 0, a gid not in AIB_ROLE_GROUPS (whole-token match), AIB_ROLE_GROUPS unset/empty => exit 3, CMD not run, message names `group`
 #   v3.6 M1: NO numeric floor for groups (system groups such as aib-shared have gids < 1000): a listed gid 1..999 passes the group policy.
 groupmsg() { printf '%s\n%s' "$STATUS" "$ERR" | grep -ci 'group' | awk '{print ($1>0)?1:0}'; }
+# The policy checks use the caller as the role uid; as root that is uid 0, which the uid policy refuses first. Root runs cover
+# the real switch in T3/T4, so T1g runs as non-root only.
+if [ "$ME" -ne 0 ]; then
 UG=(--uid "$ME" --gid "$MG")
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- --groups 5000 "${touch_cmd[@]}";           eq "T1g: --groups without --uid/--gid => exit 2, CMD not run" "$RC|$(ran)" "2|not-run"
 for bad in '' abc -1 +5000 1e3 0x3e8 ' 5000' '5000 ' '5000,' ',5000' '5000,,5001' '5000 5001' '5000;5001' '5000.5' 99999999999999999999 '5000,abc'; do
@@ -113,6 +116,9 @@ ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 50000 "${to
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="15000,25000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";    eq "T1g: …nor 5000 in '15000,25000' (suffix)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5001" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";           eq "T1g: …nor a numeric neighbour (5000 requested, 5001 listed)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="5000" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";           eq "T1g: a good group list does not rescue an unlisted uid (the uid policy still refuses, exit 3)" "$RC|$(ran)|$(uidmsg)" "3|not-run|1"
+else
+  skip "T1g: the group policy checks use the caller as the role uid and run as non-root only (root: see T3/T4)"
+fi
 
 # --- T2 what a permitted switch does (needs Landlock; as non-root only the identity-preserving switch is possible) ----------------------------------
 ll -- /bin/true
