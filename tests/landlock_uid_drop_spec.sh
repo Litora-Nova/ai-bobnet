@@ -104,8 +104,11 @@ ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,0" -- "${UG[@]}" --groups 5000,0 "$
 # `group` refusal. (Without Landlock on this host the helper then stops later with "unavailable"; with Landlock the CMD runs.)
 for low in 999 989 33 1; do
   ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="$low,5000" -- "${UG[@]}" --groups "$low" "${touch_cmd[@]}"
-  case "$RC" in 0) post="ran:$(ran)";; 3) post="landlock:$(printf '%s' "$ERR" | grep -c 'unavailable')";; *) post="other:$RC";; esac
-  eq "T1g: (v3.6) a listed gid $low (< 1000) passes the group policy: not exit 2, no group refusal" "$(groupmsg)|$post" "0|$(case "$RC" in 0) echo ran:ran;; *) echo landlock:1;; esac)"
+  # After the policy the helper may still stop: no Landlock on this host ("unavailable"), or, as non-root on a Landlock host, setgroups is
+  # EPERM ("could not set supplementary groups", fail closed). Neither is a policy refusal, which names AIB_ROLE_GROUPS or "never allowed".
+  case "$RC" in 0) post="ran:$(ran)";; 3) post="later:$(printf '%s\n%s' "$STATUS" "$ERR" | grep -cE 'unavailable|could not set supplementary groups' | awk '{print ($1>0)?1:0}')";; *) post="other:$RC";; esac
+  pol="$(printf '%s\n%s' "$STATUS" "$ERR" | grep -cE 'AIB_ROLE_GROUPS|never allowed' | awk '{print ($1>0)?1:0}')"
+  eq "T1g: (v3.6) a listed gid $low (< 1000) passes the group policy: not exit 2, no group refusal" "$pol|$post" "0|$(case "$RC" in 0) echo ran:ran;; *) echo later:1;; esac)"
 done
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 989 "${touch_cmd[@]}"
 eq "T1g: …while the same low gid UNLISTED is still refused (exit 3, group message)" "$RC|$(groupmsg)" "3|1"
