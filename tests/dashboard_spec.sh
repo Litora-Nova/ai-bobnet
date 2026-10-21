@@ -29,6 +29,34 @@
 #   invariant-style checks (the deploy-unit text, the non-consumption ALLOWLIST in
 #   `tests/projection_spec.sh`, and the untouched `bin/attempts`/`frame_parity_spec` baselines) are
 #   expected to PASS already and must keep passing once `bin/dashboard` and schema 2 exist.
+#
+#   S2a (agent view, design B1/B2/C1-C4): section "S2a" below, hand-built projections acme-sup / acme-supxss / acme-supbad / acme-supold.
+#   The HTML markers the builder must emit (chosen here; assertions target these, never CSS):
+#     /p/<uid>   a section whose heading text is `Agents (supervised)`, placed BEFORE the existing agents table, present only when at least
+#                one agent has a non-null `supervisor`. One `<article class="sup-card" data-agent="<uid>" ...>` per supervised agent
+#                (class is exactly `sup-card`; `sup-card sup-stale` when the projection is older than AIB_PROJECTION_STALE_SECONDS, which also
+#                keeps the existing `stale since` banner; `sup-card sup-invalid` for an invalid supervisor block). Oneshot agents get no card.
+#       valid card attributes: data-session-state=<enum> data-health=<healthy|unhealthy> data-unit-state=<text> data-off-duty=<true|false>
+#                data-braked=<true iff brake.tripped_at is set> data-login-state=<account.state | none (account null) | invalid>
+#       valid card text: state_reason, label, `c0de`-style id_hint, absolute expiry date (YYYY-MM-DD of expires_at), relative hint as ONE unit,
+#                floor, units `d` `h` `min` (`in 6 d`, `expired 2 h ago`), `braked since` when braked, the words `off duty` iff off_duty is true,
+#                up to 5 last_control lines containing verb, outcome and reason, restarts, current turn msg_id, session_id_short.
+#       invalid supervisor block (bad enum, string > 200 chars, > 5 last_control entries, non-object): the card carries data-supervisor="invalid"
+#                and the text `supervisor data invalid`, and NO value of the block appears anywhere in the page. An invalid account inside a
+#                valid supervisor block: the card still renders the supervisor part, shows the text `account data invalid` in place of the
+#                account, data-login-state="invalid", and no account value appears. Never a 500.
+#     /          the project row contains `<td class="sup-counts" data-supervised="N" data-braked="N" data-login-attention="N">`
+#                (login-attention = supervised agents whose account state is expiring|expired|absent; N = 0 for a project without supervisors).
+#   All projected strings stay inert (HTML-escaped). Expected on the unbuilt renderer: every S2a assertion except the no-500 and the
+#   no-card-for-unsupervised ones is RED.
+#
+#   S2a round 2 (design v2): R5 the reader accepts an account id_hint of at most 4 characters; R7 each whitelist is pinned in its own layer
+#   (reader: control keys exactly req/verb/outcome/reason/at, verb outside agentctl's set, outcome outside done|rejected|accepted, account state
+#   outside the enum; each => the invalid markers above, with no value of the block rendered); the relative expiry hint is exactly ONE
+#   floored unit (`in 2 d`, `in 23 h`, `in 5 min`, `in 0 min`, `expired 3 d ago`, `expired 0 min ago`; d >= 1 day, h >= 1 hour, else min);
+#   the fleet counts treat `absent` as login-attention and count an invalid supervisor block as supervised but never as braked or
+#   login-attention; a null session id renders as the em dash U+2014 (never `<code>null</code>`). The reader keeps its 200-char bound for
+#   state_reason/reason (hand-built projections): the R6 machine-word rule lives in bin/project only. Fixtures are written by $WORK/supfix.py.
 set -uo pipefail
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
@@ -404,6 +432,85 @@ JSON
 ln -sfn "/etc/hostname" "$DROOT/evil.json" 2>/dev/null   # symlink: must be ignored, never followed
 printf '{}' > "$DROOT/bad name.json"                # invalid token (space): must be ignored
 
+# --- S2a fixtures (hand-built; no real data) ---
+if [ -n "$PY" ]; then
+cat > "$WORK/supfix.py" <<'PYEOF'
+import datetime as dt, json, sys
+root = sys.argv[1]; mode = sys.argv[2]
+now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+iso = lambda d: d.strftime('%Y-%m-%dT%H:%M:%SZ')
+def base(uid, gen, agents):
+    return {"schema": 2, "generated_at": iso(gen), "project_uid": uid, "attested_sources": ["stream", "capacity", "launch"],
+        "stream": {"status": "ok", "last_seq": 1, "anchor": {"value": 1, "relationship": "ok"}, "torn_tail": False, "undecodable_records": []},
+        "capacity": {"limit": 12, "live": 0, "as_of": iso(gen)}, "attention": [], "agents": agents,
+        "anomalies": {"unregistered_logs": 0, "unparsable_lines": 0, "uid_mismatches": 0, "undecodable_records": 0, "launch_malformed": 0}}
+def agent(sup, gen=now):
+    return {"state": "idle", "since": iso(gen), "message": "plain heartbeat", "stale": False, "attested": False, "attempt": None, "launch": None, "supervisor": sup}
+def acct(state, label, hint, exp, chk):
+    return {"provider": "claude-code", "state": state, "label": label, "id_hint": hint, "expires_at": exp, "checked_at": chk}
+def sup(gen=now, **kw):
+    v = {"mode": "supervised", "account": None, "unit_state": "active", "disabled": False, "session_state": "WORKING", "state_reason": "",
+         "health": "healthy", "tick_seq": 10, "tick_age_s": 12, "current_turn": None, "session_id_short": None, "turns_in_session": 0,
+         "restarts_24h": 0, "brake": {"consecutive": 0, "tripped_at": None}, "off_duty": False, "inbox_open": 0, "last_control": [], "journal_seq": 4}
+    v.update(kw); return v
+def lc(req, verb, outcome, reason, at): return {"req": req, "verb": verb, "outcome": outcome, "reason": reason, "at": iso(at)}
+def put(uid, value):
+    open(f"{root}/{uid}.json", "w").write(json.dumps(value))
+
+if mode == 'rel':
+    cases = {"d1": 216000, "d2": 90000, "h1": 84600, "h2": 5400, "m1": 340, "m2": 3570, "z1": 40,
+             "p0": -20, "pm": -310, "ph": -5400, "pd": -(3 * 86400 + 12 * 3600), "pd2": -(25 * 3600), "n1": None}
+    agents = {}
+    for name, off in cases.items():
+        exp = None if off is None else iso(now + dt.timedelta(seconds=off))
+        agents["rel-" + name] = agent(sup(account=acct("expired" if off is not None and off < 0 else "ok", "rel-label", "ab12", exp, iso(now))))
+    put("acme-suprel", base("acme-suprel", now, agents))
+    sys.exit(0)
+
+run = sup(session_state="WORKING", state_reason="quota backoff", unit_state="active", health="healthy", tick_age_s=12,
+    current_turn={"msg_id": "m-77", "started_at": iso(now), "attempt_id": "att-9"}, session_id_short="3f2b8c1e", turns_in_session=7, restarts_24h=2,
+    account=acct("ok", "Interim: PO account", "c0de", iso(now + dt.timedelta(days=6, hours=2)), iso(now)),
+    last_control=[lc(7, "neustart", "done", "", now), lc(2, "feierabend", "rejected", "not_authorized", now - dt.timedelta(hours=1))])
+brk = sup(session_state="FAILED", state_reason="brake tripped", unit_state="failed", health="unhealthy", tick_age_s=4000, off_duty=True,
+    brake={"consecutive": 3, "tripped_at": iso(now - dt.timedelta(minutes=10))},
+    account=acct("expired", "Backup login", "beef", iso(now - dt.timedelta(hours=2, minutes=10)), iso(now)))
+put("acme-sup", base("acme-sup", now, {"sup-run": agent(run), "sup-brk": agent(brk), "sup-solo": agent(None)}))
+
+xss = sup(state_reason="<script>SUPXSS</script>",
+    account=acct("ok", "<img src=x onerror=SUPXSS>", "ab12", iso(now + dt.timedelta(days=3)), iso(now)),
+    last_control=[lc(1, "neustart", "rejected", "<b onmouseover=SUPXSS>x</b>", now)])
+put("acme-supxss", base("acme-supxss", now, {"sup-xss": agent(xss)}))
+
+bad = {
+  "bad-session": sup(session_state="EXPLODING", state_reason="LEAKMARK1"),
+  "bad-long":    sup(state_reason="LEAKLONG" + "A" * 300),
+  "bad-control": sup(state_reason="LEAKMARK3", last_control=[lc(i, "neustart", "done", "LEAKMARK2", now) for i in range(1, 8)]),
+  "bad-acct":    sup(state_reason="fine-reason-ok", account=acct("ok", "LEAKLABEL", "LEAKHINT123456", None, None)),
+  "bad-type":    "oops-LEAKMARK4",
+  "good":        sup(state_reason="still-fine"),
+  "bad-hint5":   sup(state_reason="hint5_card", account=acct("ok", "LEAKFIVE", "abcde", None, None)),
+  "ok-hint4":    sup(state_reason="hint4_card", account=acct("ok", "hint4-label", "ab12", None, None)),
+  "bad-ctl-verb":    sup(state_reason="LEAKCTLV", last_control=[lc(1, "frobnicate", "done", "", now)]),
+  "bad-ctl-extra":   sup(state_reason="LEAKCTLX", last_control=[dict(lc(1, "neustart", "done", "", now), caller="LEAKCALLER")]),
+  "bad-ctl-outcome": sup(state_reason="LEAKCTLO", last_control=[lc(1, "neustart", "weird", "", now)]),
+  "bad-acct-state":  sup(state_reason="acct_state_ok", account=acct("weird", "LEAKSTATE", "ab12", None, None)),
+}
+put("acme-supbad", base("acme-supbad", now, {k: agent(v) for k, v in bad.items()}))
+
+old = now - dt.timedelta(days=1)
+put("acme-supold", base("acme-supold", old, {"sup-old": agent(sup(gen=old, state_reason="old news"), old)}))
+
+cnt = {
+  "cnt-absent":  sup(account=acct("absent", "cnt-label", "", None, None)),
+  "cnt-brk":     sup(brake={"consecutive": 2, "tripped_at": iso(now - dt.timedelta(minutes=10))}, account=acct("ok", "cnt-label", "ab12", None, None)),
+  "cnt-invalid": sup(session_state="EXPLODING", brake={"consecutive": 9, "tripped_at": iso(now)}, account=acct("expired", "cnt-label", "ab12", None, None)),
+  "cnt-solo":    None,
+}
+put("acme-supcnt", base("acme-supcnt", now, {k: agent(v) for k, v in cnt.items()}))
+PYEOF
+"$PY" "$WORK/supfix.py" "$DROOT" static
+fi
+
 start_dashboard() {
   DASH_PID=""; DASH_PORT=""
   [ -x "$DASHBOARD_BIN" ] || return 1
@@ -502,6 +609,166 @@ has "SS19: a day-old generated_at renders stale" "$html_stale" "stale"
 lower_stale="$(printf '%s' "$html_stale" | tr 'A-Z' 'a-z')"
 hasnt "SS19: an aging/unregistered file is never rendered as an alarm" "$lower_stale" "alarm"
 hasnt "SS19: an aging/unregistered file is never rendered as an error" "$lower_stale" "error"
+
+
+# =========================================================================
+# S2a — agent view: B1/B2 validation, C1 contents, C2 fleet counts, C3 escaping, C4 stale greying
+# =========================================================================
+card_of() { printf '%s' "$1" | "$PY" -I -c 'import re,sys;h=sys.stdin.read();m=re.search(r"<article[^>]*data-agent=\""+re.escape(sys.argv[1])+r"\"[^>]*>.*?</article>",h,re.S);print(m.group(0) if m else "")' "$2"; }
+open_of() { printf '%s' "$1" | "$PY" -I -c 'import re,sys;m=re.match(r"<article[^>]*>",sys.stdin.read());print(m.group(0) if m else "")'; }
+row_of() { printf '%s' "$1" | "$PY" -I -c 'import re,sys;h=sys.stdin.read()
+for m in re.finditer(r"<tr>.*?</tr>",h,re.S):
+    if "href=\"/p/"+sys.argv[1]+"\"" in m.group(0): print(m.group(0)); break' "$2"; }
+lowercase() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+
+page_sup="$(get /p/acme-sup)"
+eq "C1: GET /p/acme-sup is 200" "$(code_of /p/acme-sup)" 200
+has "C1: the section heading 'Agents (supervised)' is present" "$page_sup" "Agents (supervised)"
+order="$(printf '%s' "$page_sup" | "$PY" -I -c 'import sys;h=sys.stdin.read();a=h.find("Agents (supervised)");b=h.find("Agent state and effective launch bindings");print("ok" if 0<=a<b else "bad %d %d"%(a,b))')"
+eq "C1: the supervised section sits above the existing agents table" "$order" ok
+eq "C1: one sup-card per supervised agent, none for the oneshot (supervisor null)" "$(printf '%s' "$page_sup" | grep -o '<article class="sup-card' | wc -l | tr -d ' ')|$(card_of "$page_sup" sup-solo | wc -c | tr -d ' ')" "2|1"
+c_run="$(card_of "$page_sup" sup-run)"; o_run="$(open_of "$c_run")"
+has "C1: running card: class sup-card (fresh, not stale)" "$o_run" 'class="sup-card"'
+has "C1: running card: data-session-state" "$o_run" 'data-session-state="WORKING"'
+has "C1: running card: data-health" "$o_run" 'data-health="healthy"'
+has "C1: running card: data-unit-state" "$o_run" 'data-unit-state="active"'
+has "C1: running card: data-off-duty false" "$o_run" 'data-off-duty="false"'
+has "C1: running card: data-braked false" "$o_run" 'data-braked="false"'
+has "C1: running card: data-login-state" "$o_run" 'data-login-state="ok"'
+has "C1: running card shows the reason" "$c_run" "quota backoff"
+has "C1: running card shows the account label" "$c_run" "Interim: PO account"
+has "C1: running card shows the id_hint" "$c_run" "c0de"
+has "C1: running card shows the absolute expiry date" "$c_run" "$(date -u -d '6 days 2 hours' +%Y-%m-%d)"
+has "C1: running card shows the relative expiry hint (one unit, floor)" "$c_run" "in 6 d"
+has "C1: running card shows the current turn" "$c_run" "m-77"
+has "C1: running card shows the short session id" "$c_run" "3f2b8c1e"
+has "C1: running card lists a done control (verb)" "$c_run" "neustart"
+has "C1: running card lists a rejected control with its reason" "$c_run" "not_authorized"
+has "C1: running card shows the outcome words" "$(lowercase "$c_run")" "rejected"
+hasnt "C1: running card does not say 'off duty'" "$(lowercase "$c_run")" "off duty"
+hasnt "C1: running card does not say 'braked since'" "$(lowercase "$c_run")" "braked since"
+c_brk="$(card_of "$page_sup" sup-brk)"; o_brk="$(open_of "$c_brk")"
+has "C1: braked card: data-session-state FAILED" "$o_brk" 'data-session-state="FAILED"'
+has "C1: braked card: data-health unhealthy" "$o_brk" 'data-health="unhealthy"'
+has "C1: braked card: data-unit-state failed" "$o_brk" 'data-unit-state="failed"'
+has "C1: braked card: data-off-duty true" "$o_brk" 'data-off-duty="true"'
+has "C1: braked card: data-braked true" "$o_brk" 'data-braked="true"'
+has "C1: braked card: data-login-state expired" "$o_brk" 'data-login-state="expired"'
+has "C1: braked card says 'braked since'" "$(lowercase "$c_brk")" "braked since"
+has "C1: off-duty card says 'off duty'" "$(lowercase "$c_brk")" "off duty"
+has "C1: expired login shows the relative hint 'expired 2 h ago'" "$c_brk" "expired 2 h ago"
+has "C1: braked card shows its account label" "$c_brk" "Backup login"
+page_plain="$(get /p/acme)"
+hasnt "C1: a project without supervised agents has no supervised section" "$page_plain" "Agents (supervised)"
+hasnt "C1: ...and no sup-card" "$page_plain" '<article class="sup-card'
+
+# C2 fleet counts
+fleet_html="$(get /)"
+row_sup="$(row_of "$fleet_html" acme-sup)"
+has "C2: fleet row acme-sup: 2 supervised" "$row_sup" 'data-supervised="2"'
+has "C2: fleet row acme-sup: 1 braked" "$row_sup" 'data-braked="1"'
+has "C2: fleet row acme-sup: 1 login-attention (expired; the ok one does not count)" "$row_sup" 'data-login-attention="1"'
+has "C2: the counts live in a td.sup-counts" "$row_sup" 'class="sup-counts"'
+row_plain="$(row_of "$fleet_html" acme)"
+has "C2: fleet row acme (no supervisors): data-supervised 0" "$row_plain" 'data-supervised="0"'
+has "C2: ...data-braked 0" "$row_plain" 'data-braked="0"'
+has "C2: ...data-login-attention 0" "$row_plain" 'data-login-attention="0"'
+
+# C3 escaping
+page_xss="$(get /p/acme-supxss)"
+eq "C3: GET /p/acme-supxss is 200" "$(code_of /p/acme-supxss)" 200
+has "C3: the card exists" "$(card_of "$page_xss" sup-xss)" "data-agent"
+hasnt "C3: no raw <script> from a state_reason" "$page_xss" "<script>SUPXSS"
+hasnt "C3: no raw <img> from an account label" "$page_xss" "<img src=x"
+hasnt "C3: no raw <b onmouseover> from a control reason" "$page_xss" "<b onmouseover"
+has "C3: the script text is shown inert (escaped)" "$page_xss" "&lt;script&gt;SUPXSS"
+has "C3: the label is shown inert (escaped)" "$page_xss" "&lt;img src=x"
+
+# B1/B2 invalid blocks
+page_bad="$(get /p/acme-supbad)"
+eq "B1: GET /p/acme-supbad (invalid blocks) is 200, never 500" "$(code_of /p/acme-supbad)" 200
+eq "B1: the fleet page still renders with an invalid project" "$(code_of /)" 200
+eq "B1: /api/fleet still renders with an invalid project" "$(code_of /api/fleet)" 200
+for u in bad-session bad-long bad-control bad-type; do
+  c="$(card_of "$page_bad" "$u")"
+  has "B1: $u renders the invalid marker attribute" "$(open_of "$c")" 'data-supervisor="invalid"'
+  has "B1: $u says 'supervisor data invalid'" "$c" "supervisor data invalid"
+done
+for leak in LEAKMARK1 LEAKLONG LEAKMARK2 LEAKMARK3 LEAKMARK4 AAAAAAAAAA EXPLODING; do
+  hasnt "B1: invalid block value $leak never reaches the page (no partial data)" "$page_bad" "$leak"
+done
+c="$(card_of "$page_bad" bad-acct)"
+has "B2: an invalid account (id_hint > 8) shows 'account data invalid'" "$c" "account data invalid"
+has "B2: ...login state attribute is invalid" "$(open_of "$c")" 'data-login-state="invalid"'
+has "B2: ...while the valid supervisor part still renders" "$c" "fine-reason-ok"
+hasnt "B2: ...and the account label does not leak" "$page_bad" "LEAKLABEL"
+hasnt "B2: ...nor the id_hint" "$page_bad" "LEAKHINT"
+c="$(card_of "$page_bad" good)"
+has "B1: a valid sibling in the same projection renders normally" "$c" "still-fine"
+hasnt "B1: ...and is not marked invalid" "$c" 'data-supervisor="invalid"'
+
+# C4 stale greying
+page_old="$(get /p/acme-supold)"
+has "C4: a stale projection keeps the existing 'stale since' banner" "$page_old" "stale since"
+has "C4: its supervised card is greyed via class 'sup-card sup-stale'" "$(open_of "$(card_of "$page_old" sup-old)")" 'class="sup-card sup-stale"'
+has "C4: stale card still shows its data" "$(card_of "$page_old" sup-old)" "old news"
+hasnt "C4: a fresh card is not marked sup-stale" "$o_run" "sup-stale"
+
+
+# =========================================================================
+# S2a v2 — R5 hint length, R7 reader whitelists, relative-hint units, fleet-count rules, null session id
+# =========================================================================
+c="$(card_of "$page_bad" bad-hint5)"
+has "R5: an id_hint of 5 characters is invalid in the reader ('account data invalid')" "$c" "account data invalid"
+hasnt "R5: ...and the account label does not leak" "$page_bad" "LEAKFIVE"
+c="$(card_of "$page_bad" ok-hint4)"
+has "R5: an id_hint of 4 characters is accepted" "$c" "hint4-label"
+has "R5: ...and shown" "$c" "ab12"
+has "R5: ...with its login state attribute" "$(open_of "$c")" 'data-login-state="ok"'
+for u in bad-ctl-verb bad-ctl-extra bad-ctl-outcome; do
+  c="$(card_of "$page_bad" "$u")"
+  has "R7: reader whitelist: $u => the supervisor block is invalid" "$(open_of "$c")" 'data-supervisor="invalid"'
+done
+for leak in LEAKCTLV LEAKCTLX LEAKCTLO LEAKCALLER; do hasnt "R7: reader whitelist: $leak never reaches the page" "$page_bad" "$leak"; done
+c="$(card_of "$page_bad" bad-acct-state)"
+has "R7: reader whitelist: an account state outside the enum => 'account data invalid'" "$c" "account data invalid"
+has "R7: ...while the valid supervisor part still renders" "$c" "acct_state_ok"
+hasnt "R7: ...and the account label does not leak" "$page_bad" "LEAKSTATE"
+
+# relative expiry hints: regenerate with a fresh clock right before reading
+"$PY" "$WORK/supfix.py" "$DROOT" rel
+page_rel="$(get /p/acme-suprel)"
+eq "R7: GET /p/acme-suprel is 200" "$(code_of /p/acme-suprel)" 200
+hint_of() { printf '%s' "$1" | "$PY" -I -c 'import re,sys;print(";".join(re.findall(r"in \d+ (?:d|h|min)\b|expired \d+ (?:d|h|min) ago",sys.stdin.read())))'; }
+while IFS='|' read -r who want; do
+  eq "R7: relative hint of $who is exactly '$want'" "$(hint_of "$(card_of "$page_rel" "rel-$who")")" "$want"
+done <<'LIST'
+d1|in 2 d
+d2|in 1 d
+h1|in 23 h
+h2|in 1 h
+m1|in 5 min
+m2|in 59 min
+z1|in 0 min
+p0|expired 0 min ago
+pm|expired 5 min ago
+ph|expired 1 h ago
+pd|expired 3 d ago
+pd2|expired 1 d ago
+n1|
+LIST
+
+# fleet-count rules
+fleet_html="$(get /)"
+row_cnt="$(row_of "$fleet_html" acme-supcnt)"
+has "R7: fleet: absent counts as login-attention; an invalid block counts as supervised only" "$row_cnt" 'data-supervised="3"'
+has "R7: fleet: an invalid block is never braked (only cnt-brk is)" "$row_cnt" 'data-braked="1"'
+has "R7: fleet: login-attention counts absent but not the invalid block's expired account, nor an ok one" "$row_cnt" 'data-login-attention="1"'
+
+# null session id
+c_brk="$(card_of "$page_sup" sup-brk)"
+has "cosmetic: a null session id renders as an em dash" "$c_brk" "—"
+hasnt "cosmetic: ...never as <code>null</code>" "$c_brk" "<code>null</code>"
 
 eq "POST / is a 405" "$(code_of / -X POST)" 405
 eq "POST /api/fleet is a 405" "$(code_of /api/fleet -X POST)" 405
