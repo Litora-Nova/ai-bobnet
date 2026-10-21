@@ -237,17 +237,48 @@ and privileged observers remain outside that protection. Nothing in this reposit
 paths (the projection is file-based, never a `/proc` scan) depends on seeing another account's
 processes.
 
-**Documented divergence: the confined child runs as the broker account.** `deploy/systemd/
-aib-broker@.service` sets `User=aib-broker`, and nothing in the confined enactment path switches uid
-before `exec`ing the confinement helper — every agent's provider process, whatever the request names
-as `agent_uid`, runs under that one shared broker account today, so `CODEX_HOME` resolves to
-`/var/lib/aib/.codex` for every agent alike. Role accounts are the RM-3 target; this slice does not
-build the switch. It is recorded here, as a dated divergence rather than left implicit, for the same
-reason `LL_RO=/` is above: **the role-uid switch is a pending slice**, not a defect of this one. Until
-it lands, `docs/CONTRACT-execution-binding.md` §8.6's existing caution — "the `agent_uid` in these
-records is an assertion the launcher accepts rather than a fact it verifies" — extends to the OS-level
-identity the confined child actually runs as: it is always `aib-broker`, never a per-agent account,
-regardless of which `agent_uid` the request named.
+**Role-account execution (2026-10-20).** The broker still accepts and audits requests as
+`aib-broker`, but the confined exec path now passes the provisioned `AIB_ROLE_UID` and
+`AIB_ROLE_GID` to `landlock-exec`. The helper applies Landlock first, clears supplementary groups,
+switches gid and uid, clears all remaining capability sets and the ambient set, and then executes the
+adapter. `bin/aib-agent-dirs` prepares the role-owned private home beneath `/var/lib/aib-sup` before
+the unit starts. The broker unit therefore needs only `CAP_SETUID` and `CAP_SETGID`, bounded as shown
+in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
+the configured gid is broker-controlled and is not an independent user input.
+
+### Documented divergence: shared subscription login (2026-10-20)
+
+Subscription credentials are shared server-wide under `/var/lib/aib/login/<provider>/`. Credential
+files are regular `aib-broker:aib-login` files with mode `0640`, inside the setgid login directory.
+Every agent role account on that server is intentionally able to read the shared login through the
+`aib-login` group. Landlock keeps the store out of writable paths, but this subscription mode is not a
+"credential never reaches the agent" design.
+
+For `claude-code`, the broker extracts the access token into an unlinked buffer, opens it,
+and hands the already-open descriptor to the role process; the adapter exposes only the descriptor
+number. The buffer is created as `aib-broker:aib-login 0640` inside a fresh broker-private `0700`
+directory so the role uid can re-open `/proc/self/fd/N`; the file is unlinked after opening and the
+empty directory is removed by the confined-run cleanup. For `codex`, the role-owned
+`$HOME/.codex/auth.json` is a pinned symlink to the shared
+`/var/lib/aib/login/codex/auth.json`, because that CLI consumes its complete authentication object.
+The broker-owned `login.meta.json` may retain the full provider account id for internal expiry
+tracking, but human-facing status exposes only its last four characters. Device authorization URLs
+and user codes are sent only to the human-ops server outbox.
+
+The login unit runs as `aib-broker` with supplementary groups `aib-login` and `aib-gateway`. The
+first grants access to the shared credential store; the second grants only the group membership
+needed to publish the mode-`0660` code socket in `/run/aib/login` for gateway clients.
+
+API-key mode is the path that restores the stronger "the agent never sees the shared credential"
+property. The deployment schema reserves `credential_mode=proxy` for that later mediation path; it
+fails closed until built. Operators must not describe the current shared subscription mode as API-key
+isolation.
+
+The role gid is selected only by the broker's protected unit configuration. `landlock-exec --gid`
+does not carry a second allow-list: the uid must be present in `AIB_ROLE_UIDS`, uid/gid must be passed
+together, role uids below 1000 and gid 0 are refused, and provisioning receives the uid/gid pair only
+from the protected broker unit configuration. Treat write access to the broker drop-in as equivalent
+to control of the role identity.
 
 **A11 — the measurement that feeds `LL_RO` narrowing, not the narrowing itself.** `LL_RO=/` above
 stays exactly as dated and unbuilt as before this amendment; this slice's real `codex` launch is the

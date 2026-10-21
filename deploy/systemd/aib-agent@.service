@@ -3,10 +3,15 @@ Description=BobNet supervised agent %i
 Documentation=file:/opt/aib/engine/docs/DOMAIN.md
 StartLimitIntervalSec=900
 StartLimitBurst=5
+# %n is deliberate: the alarm instance must receive the complete failed unit
+# name including its type suffix; %N would remove that suffix.
+OnFailure=aib-alarm@%n.service
 
 [Service]
 Type=notify
 NotifyAccess=all
+EnvironmentFile=-/etc/aib/role.env
+ExecStartPre=+/opt/aib/engine/bin/aib-agent-dirs %i
 ExecStart=/opt/aib/engine/bin/aib-supervisor %i
 Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
 WatchdogSec=90

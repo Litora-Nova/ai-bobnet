@@ -1,0 +1,6 @@
+[Service]
+EnvironmentFile=/etc/aib/role.env
+Environment=AIB_LOGIN_MAX_TURN_S=900
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+SupplementaryGroups=aib-login

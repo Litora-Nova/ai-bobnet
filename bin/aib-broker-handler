@@ -442,9 +442,9 @@ AIB_ENACT_CHILD_ENV_EXTRA=(
 # adapter argv identical to the PEP's (D-F): -m/-s/effort/prompt come from the
 # VERDICT's effective values, never the request. root is AIB_HOME — the
 # registry-derived Landlock boundary aib_enact_launch re-checks cwd against.
-_enact_record="$(printf 'adapter=%s\nstate_dir=%s\nroot=%s\ncwd=%s\nsandbox=%s\neffort=%s\nmodel=%s\ntimeout=%s\nsession=%s' \
+_enact_record="$(printf 'adapter=%s\nstate_dir=%s\nroot=%s\ncwd=%s\nsandbox=%s\neffort=%s\nmodel=%s\ntimeout=%s\nsession=%s\nprovider=%s' \
   "$AIB_VERDICT_ADAPTER_PATH" "$AIB_STATE_DIR" "$AIB_HOME" "$AIB_CWD_RESOLVED" "$AIB_VERDICT_EFFECTIVE_SANDBOX" \
-  "$AIB_VERDICT_EFFECTIVE_EFFORT" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_TIMEOUT" "${AIB_REQ_SESSION:-}")"
+  "$AIB_VERDICT_EFFECTIVE_EFFORT" "$AIB_MODEL" "$AIB_VERDICT_EFFECTIVE_TIMEOUT" "${AIB_REQ_SESSION:-}" "$AIB_PROVIDER")"
 
 aib_enact_launch "$_enact_record" "${AIB_REQ_PROMPT:-}" "$AIB_EVENT_FILE" "$AIB_EVENT_LOCK" \
   "$_broker_envelope" "$_decided_event_id"

@@ -245,7 +245,7 @@ has "T10: a typed line becomes a say from the human's own identity" "$(grep -F '
 exec 7>&-
 WAIT_DEAD_OK=1 wait_for 10 test -s "$W/attach.rc"
 eq "T10: EOF on stdin ends the session cleanly (rc 0)" "$(cat "$W/attach.rc" 2>/dev/null)" 0
-eq "T10: …no follower process is left behind" "$(cat "$W/attach.rc" 2>/dev/null)|$(pgrep -f "tail.*$TRANSCRIPT" | wc -l | tr -d ' ')" "0|0"
+eq "T10: …no follower process is left behind" "$(cat "$W/attach.rc" 2>/dev/null)|$(pgrep -f "[t]ail.*$TRANSCRIPT" | wc -l | tr -d ' ')" "0|0"
 wait "$APID" 2>/dev/null
 as role:aib-agent
 ctl -- attach acme-core < /dev/null

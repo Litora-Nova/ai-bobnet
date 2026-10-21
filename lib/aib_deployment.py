@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sys
 from pathlib import Path
 from typing import Any
 
 ALLOW_KEYS = ("customer_code", "comms_secrets")
+ACCOUNT_FIELDS = ("label", "credential_mode", "credential_source")
+PROVIDER_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 
 def test_seams_enabled(root: Path) -> bool:
@@ -69,6 +72,23 @@ def load_deployment(path: Path, root: Path) -> dict[str, Any] | None:
             not isinstance(key, str) or not isinstance(item, str) for key, item in role_map.items()
         ):
             return None
+    if "accounts" in value:
+        accounts = value["accounts"]
+        if not isinstance(accounts, dict):
+            return None
+        for provider, account in accounts.items():
+            if not isinstance(provider, str) or not PROVIDER_RE.fullmatch(provider):
+                return None
+            if not isinstance(account, dict) or any(key not in ACCOUNT_FIELDS for key in account):
+                return None
+            if "label" in account:
+                label = account["label"]
+                if not isinstance(label, str) or len(label) > 64 or not label.isprintable():
+                    return None
+            if account.get("credential_mode", "file") not in ("file", "fd", "shared", "proxy"):
+                return None
+            if account.get("credential_source", "login") not in ("login", "setup_token"):
+                return None
     return value
 
 
@@ -78,6 +98,20 @@ def deployment_allows(path: Path, key: str, root: Path) -> bool:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 5 and argv[2] == "--account":
+        root, path, provider, field = Path(argv[0]), Path(argv[1]), argv[3], argv[4]
+        if field not in ACCOUNT_FIELDS:
+            return 2
+        value = load_deployment(path, root)
+        account = value.get("accounts", {}).get(provider) if value is not None else None
+        if not isinstance(account, dict) or field not in account:
+            return 1
+        print(account[field])
+        return 0
+    if len(argv) == 4 and argv[2] == "--account-present":
+        root, path, provider = Path(argv[0]), Path(argv[1]), argv[3]
+        value = load_deployment(path, root)
+        return 0 if value is not None and provider in value.get("accounts", {}) else 1
     if len(argv) != 3 or argv[2] not in ("", *ALLOW_KEYS):
         return 2
     root, path, key = Path(argv[0]), Path(argv[1]), argv[2]

@@ -133,7 +133,8 @@ adapter=/opt/aib/adapters/acme
 cap_sandbox=workspace-write
 cap_tier=t2
 cap_effort=high
-cap_timeout=900"
+cap_timeout=900
+data_class=internal"
 aib_authorize_launch "$req" "$snap" >/dev/null 2>&1
 eq "an over-long timeout is capped to the declared cap" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "900"
 req_short="${req/timeout=999999/timeout=60}"
@@ -474,7 +475,8 @@ effort=medium
 adapter=/opt/aib/adapters/acme
 cap_sandbox=workspace-write
 cap_tier=t2
-cap_effort=high"
+cap_effort=high
+data_class=internal"
 aib_authorize_launch "$boundary_req" "$snap_no_captimeout" >/dev/null 2>&1
 eq "an absent cap_timeout denies config (2)" "${AIB_VERDICT_CODE:-}" "2"
 snap_bad_captimeout="${snap_no_captimeout}

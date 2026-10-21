@@ -14,6 +14,8 @@
 #       other units (sshd.service, the bare template aib-agent@.service, aib-broker@x.service, aib-agent@A.service, drop-in names,
 #       trailing junk), other actions (reboot), and any subject outside aib-ops (an agent role account is never in aib-ops;
 #       provisioning asserts it, and the rule names NO account at all).
+#   S1c (design v3.1 H7): the same group may also start|stop (only) units matching ^aib-login(-refresh)?@[a-z0-9-]+\.service$ — never enable/disable/restart,
+#   never the watch, the alarm unit or the bare templates. Still ONE polkit.Result.YES (a single guarded grant).
 #   Text pins: the rule uses action.lookup("unit") and action.lookup("verb") and subject.isInGroup("aib-ops"), contains the
 #   literal regex, never returns polkit.Result.YES outside a branch that checks all three, and no role-account name appears.
 #   Repo pins: nothing under deploy/ mentions NOPASSWD or ships a sudoers file.
@@ -36,6 +38,7 @@ has "text: reads the unit via action.lookup" "$TEXT" 'action.lookup("unit")'
 has "text: reads the verb via action.lookup" "$TEXT" 'action.lookup("verb")'
 has "text: group check" "$TEXT" 'subject.isInGroup("aib-ops")'
 has "text: the anchored unit regex" "$TEXT" '^aib-agent@[a-z0-9-]+\.service$'
+has "text (S1c): the login units regex" "$TEXT" '^aib-login(-refresh)?@[a-z0-9-]+\.service$'
 for v in start stop enable disable; do has "text: names the verb $v" "$TEXT" "\"$v\""; done
 for bad in aib-dev aib-broker NOPASSWD; do
   hasnt "text: does not mention '$bad'" "$TEXT" "$bad"
@@ -64,6 +67,18 @@ else
   for u in sshd.service aib-agent@.service aib-broker@x.service aib-agent@A.service aib-agent@a_b.service xaib-agent@a.service \
            aib-agent@a.service.d aib-agent@a.socket 'aib-agent@a.service ' ''; do
     eq "eval: unit '$u' is NOT granted" "$(ev $P "$u" start aib-ops)" null
+  done
+  # S1c (v3.1 H7): `agentctl login start` is `systemctl start aib-login@<p>.service` by a human; the refresher may be kicked/stopped by the same group
+  for u in aib-login@claude-code.service aib-login@codex.service aib-login-refresh@claude-code.service aib-login-refresh@codex.service; do
+    eq "eval (S1c): ops member may start $u" "$(ev $P $u start aib-ops)" yes
+    eq "eval (S1c): …stop" "$(ev $P $u stop aib-ops)" yes
+    eq "eval (S1c): …but not restart/kill" "$(ev $P $u restart aib-ops)|$(ev $P $u kill aib-ops)" "null|null"
+    eq "eval (S1c): …nor enable/disable (unit files: the login machinery is not toggled by humans)" "$(ev $F $u enable aib-ops)|$(ev $F $u disable aib-ops)" "null|null"
+    eq "eval (S1c): a non-member is not granted ($u)" "$(ev $P $u start users)" null
+  done
+  for u in aib-login@.service aib-login-refresh@.service aib-login-watch.service aib-login@A.service aib-loginx@a.service aib-login-refreshx@a.service \
+           aib-login-refresh-refresh@a.service aib-login@a.service.d aib-login@a_b.service aib-alarm@aib-agent.service; do
+    eq "eval (S1c): unit '$u' is NOT granted" "$(ev $P "$u" start aib-ops)" null
   done
   eq "eval: a newline-suffixed unit name is NOT granted (anchoring)" "$(ev $P "aib-agent@a.service
 x" start aib-ops)" null

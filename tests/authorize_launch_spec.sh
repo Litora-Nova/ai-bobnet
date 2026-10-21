@@ -41,7 +41,8 @@ req() {
 # clearance/effort caps, not the timeout cap, which broker_authorize_spec.sh owns —
 # the default keeps every existing call site here well-formed without restating it.
 snap() {
-  printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
+  # S1c G8: an absent data_class now means CUSTOMER (fail closed), so this spec's snapshots say what they are.
+  printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s\ndata_class=internal' \
     "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-900}"
 }
 # Serialise the resolver's globals into a snapshot record — documents, for Lane B,
@@ -178,7 +179,8 @@ adapter=/opt/acme/adapters/codex
 cap_sandbox=workspace-write
 cap_tier=t3
 cap_effort=high
-cap_timeout=900'
+cap_timeout=900
+data_class=internal'
 pure_out="$(env -i "$(command -v bash)" -c '
   . "'"$SRC_ROOT"'/lib/aibobnet.sh"
   aib_authorize_launch "$1" "$2" && printf "%s\n" "$AIB_VERDICT_DECISION"

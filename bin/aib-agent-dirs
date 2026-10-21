@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Prepare one supervised agent's state and transcript ACLs."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
+    for name in ("AIB_SUP_STATE_ROOT", "AIB_STANDUP_DIR", "AIB_OPS_GROUP", "AIB_SETFACL"):
+        os.environ.pop(name, None)
+
+UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
+
+
+def real_directory(path: Path, mode: int | None = None) -> bool:
+    try:
+        if path.is_symlink():
+            return False
+        path.mkdir(parents=False, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            return False
+        if mode is not None:
+            os.chmod(path, mode)
+        return True
+    except OSError:
+        return False
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or UID_RE.fullmatch(argv[0]) is None:
+        return 64
+    uid = argv[0]
+    role_uid_raw = os.environ.get("AIB_ROLE_UID", "")
+    role_gid_raw = os.environ.get("AIB_ROLE_GID", "")
+    role_enabled = bool(role_uid_raw or role_gid_raw)
+    if role_enabled:
+        if not (role_uid_raw.isdecimal() and role_gid_raw.isdecimal()):
+            return 64
+        role_uid = int(role_uid_raw)
+        role_gid = int(role_gid_raw)
+        if role_uid < 1000 or role_gid == 0:
+            return 64
+    else:
+        role_uid = role_gid = -1
+    state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
+    standup = Path(os.environ.get("AIB_STANDUP_DIR", "/srv/aib/standup"))
+    group = os.environ.get("AIB_OPS_GROUP", "aib-ops")
+    setfacl = os.environ.get("AIB_SETFACL", "setfacl")
+    state = state_root / uid
+    transcripts = standup / "transcripts"
+    try:
+        state_root.mkdir(parents=True, exist_ok=True)
+        standup.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 78
+    if not real_directory(state, 0o700) or not real_directory(transcripts):
+        return 78
+    if role_enabled:
+        try:
+            os.chown(state, role_uid, role_gid)
+            for name in (".claude", ".codex"):
+                provider_dir = state / name
+                if not real_directory(provider_dir, 0o700):
+                    return 78
+                os.chown(provider_dir, role_uid, role_gid)
+            auth = state / ".codex" / "auth.json"
+            target = Path(os.environ.get("AIB_LOGIN_ROOT", "/var/lib/aib/login")) / "codex" / "auth.json"
+            if auth.is_symlink():
+                if os.readlink(auth) != str(target):
+                    return 78
+            elif auth.exists():
+                return 78
+            else:
+                auth.symlink_to(target)
+                os.lchown(auth, role_uid, role_gid)
+        except OSError:
+            return 78
+    calls = [
+        ["-m", f"g:{group}:--x", str(state)],
+        ["-d", "-m", f"g:{group}:r-x", str(state)],
+        ["-m", f"g:{group}:--x", str(transcripts)],
+        ["-d", "-m", f"g:{group}:r-x", str(transcripts)],
+    ]
+    live = state / "live.json"
+    if live.exists() and not live.is_symlink():
+        calls.append(["-m", f"g:{group}:r--", str(live)])
+    try:
+        for args in calls:
+            if subprocess.run([setfacl, *args], check=False).returncode != 0:
+                return 69
+    except OSError:
+        return 69
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

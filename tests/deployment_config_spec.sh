@@ -14,8 +14,8 @@
 #   customer) only says what a project IS; the deployment says what the host MAY run.
 #   Enforcement points:
 #     - PDP (aib_authorize_launch): snapshot fields `data_class` and `deploy_customer_code`; a non-internal project with
-#       deploy_customer_code != true => deny with reason containing `deployment_denied`. An absent data_class means internal
-#       (old snapshots keep working). aib_build_pdp_snapshot_record takes OPTIONAL 9th/10th args (data_class, deploy_customer_code)
+#       deploy_customer_code != true => deny with reason containing `deployment_denied`. An absent data_class means CUSTOMER
+#       (S1c G8: fail closed; it used to mean internal). aib_build_pdp_snapshot_record takes OPTIONAL 9th/10th args (data_class, deploy_customer_code)
 #       and then emits `data_class=` / `deploy_customer_code=` lines; with 8 args the output is byte-identical to today.
 #     - the broker handler answers `end=denied` naming deployment_denied for such a launch, whatever the request says.
 #     - bin/aib-supervisor refuses to start (exit 78 = "a restart cannot help", journal supervisor.refused reason
@@ -98,7 +98,11 @@ snapx() { # snapx <extra lines...>
   local l; for l in "$@"; do printf '\n%s' "$l"; done
 }
 pdp() { aib_authorize_launch "$(req)" "$(snapx "$@")" >/dev/null 2>&1; PDP_RC=$?; }
-pdp; eq "T3: a snapshot WITHOUT data_class is unchanged: allow" "$AIB_VERDICT_DECISION" allow
+# S1c G8 (gate finding, Dexter): an ABSENT data_class is CUSTOMER, never internal — a snapshot that forgot the field must not slip past the deployment gate.
+pdp; eq "T3: a snapshot WITHOUT data_class (and without deploy_customer_code) is customer: deny (S1c G8; was: allow)" "$AIB_VERDICT_DECISION" deny
+has "T3: …reason deployment_denied" "$AIB_VERDICT_REASONS" deployment_denied
+pdp deploy_customer_code=true; eq "T3: …without data_class but customer_code allowed on the host: allow" "$AIB_VERDICT_DECISION" allow
+pdp deploy_customer_code=false; eq "T3: …without data_class and customer_code=false: deny" "$AIB_VERDICT_DECISION" deny
 pdp data_class=internal deploy_customer_code=false; eq "T3: internal project, customer_code=false: allow" "$AIB_VERDICT_DECISION" allow
 pdp data_class=customer deploy_customer_code=true;  eq "T3: customer project, customer_code=true: allow" "$AIB_VERDICT_DECISION" allow
 pdp data_class=customer deploy_customer_code=false

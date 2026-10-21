@@ -84,12 +84,13 @@ after `--` is never inspected as anything but bytes. The transient adapter/feede
 still expose those bytes before completion; only the wrapped binary's argv is prompt-free.
 Process visibility restrictions do not isolate attempts sharing the same broker uid.
 
-### E. Broker-account divergence, recorded rather than fixed here
+### E. Role-account execution supersedes the original broker-account divergence
 
-Every agent's provider process runs as `aib-broker` today, regardless of the request's own
-`agent_uid` — role accounts (the RM-3 target) are not switched to before `exec`. This slice does not
-build that switch; `docs/CONFINEMENT.md` records it as a dated divergence, the same posture already
-used for `LL_RO=/`, rather than silently shipping it undocumented.
+This ADR originally recorded that every provider process ran as `aib-broker`. S1c superseded that
+runtime fact on 2026-10-20: the broker now enters Landlock and then switches to the configured role
+uid/gid before executing the adapter. Subscription authentication remains deliberately shared and is
+documented separately in `docs/CONFINEMENT.md`; Codex receives it through the pinned per-role-home
+symlink rather than through a shared writable `CODEX_HOME`.
 
 ## Alternatives Considered
 

@@ -40,17 +40,69 @@ case "$effort_setting" in
   *) refuse 65 'invalid effort setting' ;;
 esac
 
+credential_mode=${AIB_CREDENTIAL_MODE:-file}
+case "$credential_mode" in
+  file|shared) ;;
+  proxy) refuse 78 'credential mode proxy: not built' ;;
+  *) refuse 78 "credential mode $credential_mode: unsupported" ;;
+esac
+
 [[ -n ${HOME:-} ]] || refuse 78 'credential unavailable or unsafe'
 codex_home="$HOME/.codex"
 auth="$codex_home/auth.json"
-[[ -d $codex_home && ! -L $codex_home && -f $auth && ! -L $auth ]] ||
-  refuse 78 'credential unavailable or unsafe'
-dir_mode=$(stat -c '%a' -- "$codex_home" 2>/dev/null) ||
-  refuse 78 'credential unavailable or unsafe'
-auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
-  refuse 78 'credential unavailable or unsafe'
-[[ $dir_mode == 700 && $auth_meta == "$EUID:600" ]] ||
-  refuse 78 'credential unavailable or unsafe'
+case "$credential_mode" in
+  file)
+    [[ -d $codex_home && ! -L $codex_home && -f $auth && ! -L $auth ]] ||
+      refuse 78 'credential unavailable or unsafe'
+    dir_mode=$(stat -c '%a' -- "$codex_home" 2>/dev/null) ||
+      refuse 78 'credential unavailable or unsafe'
+    auth_meta=$(stat -c '%u:%a' -- "$auth" 2>/dev/null) ||
+      refuse 78 'credential unavailable or unsafe'
+    [[ $dir_mode == 700 && $auth_meta == "$EUID:600" ]] ||
+      refuse 78 'credential unavailable or unsafe'
+    ;;
+  shared)
+    shared_refuse() { refuse 78 "credential mode shared: $1"; }
+    [[ -d $codex_home && ! -L $codex_home ]] || shared_refuse 'history directory unavailable or unsafe hint:login'
+    [[ $(stat -c '%a' -- "$codex_home" 2>/dev/null) == 700 ]] || shared_refuse 'history directory mode is not 0700 hint:login'
+    store=${AIB_LOGIN_STORE_PATH:-}
+    [[ -n $store && -L $auth && -f $store && ! -L $store ]] || shared_refuse 'store link unavailable or unsafe hint:login'
+    auth_real=$(realpath -e -- "$auth" 2>/dev/null) || shared_refuse 'store link unavailable or unsafe hint:login'
+    store_real=$(realpath -e -- "$store" 2>/dev/null) || shared_refuse 'store unavailable hint:login'
+    [[ $auth_real == "$store_real" ]] || shared_refuse 'store link target mismatch hint:login'
+    store_meta=$(stat -c '%U:%G:%a' -- "$store" 2>/dev/null) || shared_refuse 'store unavailable hint:login'
+    [[ $store_meta == "${AIB_LOGIN_STORE_OWNER:-aib-broker}:${AIB_LOGIN_STORE_GROUP:-aib-login}:640" ]] ||
+      shared_refuse 'store ownership or mode is unsafe hint:login'
+    [[ ${AIB_TURN_TIMEOUT_S:-} =~ ^[0-9]+$ ]] || shared_refuse 'turn timeout unavailable hint:login'
+    engine_root=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd) || shared_refuse 'engine root unavailable hint:login'
+    login_now=$(date +%s)
+    login_margin=300 login_slack=600
+    if [[ ${AIB_TEST_SEAMS:-} == 1 && ! -e $engine_root/.aib-installed ]]; then
+      [[ ${AIB_LOGIN_NOW:-} =~ ^[0-9]+$ ]] && login_now=$AIB_LOGIN_NOW
+      [[ ${AIB_LOGIN_MARGIN_S:-} =~ ^[0-9]+$ ]] && login_margin=$AIB_LOGIN_MARGIN_S
+      [[ ${AIB_LOGIN_SLACK_S:-} =~ ^[0-9]+$ ]] && login_slack=$AIB_LOGIN_SLACK_S
+    fi
+    expiry=$(python3 -I - "$store" <<'PY'
+import base64, json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    token = value["tokens"]["access_token"]
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError
+    raw = parts[1] + "=" * (-len(parts[1]) % 4)
+    exp = json.loads(base64.urlsafe_b64decode(raw).decode("utf-8"))["exp"]
+    if type(exp) is not int:
+        raise ValueError
+    print(exp)
+except Exception:
+    raise SystemExit(1)
+PY
+    ) || shared_refuse 'access token is malformed hint:login'
+    floor=$((login_now + AIB_TURN_TIMEOUT_S + login_margin + login_slack))
+    [[ $expiry -ge $floor ]] || shared_refuse 'access token inside the refresh margin hint:login'
+    ;;
+esac
 
 export SHELL=/bin/bash TERM=dumb
 case "$mode:$session_kind" in

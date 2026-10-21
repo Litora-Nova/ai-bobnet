@@ -100,6 +100,7 @@ class Supervisor:
         self.registry: dict[str, Any] = {}
         self.agent: dict[str, Any] = {}
         self.project_uid = ""
+        self.provider_uid = ""
         self.team_uid = ""
         self.data_class = "customer"
         self.protected = ""
@@ -128,6 +129,8 @@ class Supervisor:
         self.work: dict[str, Any] | None = None
         self.retry_at = 0.0
         self.infra_since: float | None = None
+        self.infra_episode: str | None = None
+        self.infra_login_hint = False
         self.last_heartbeat: str | None = None
         self.stop_requested = False
         self.reexec_requested = False
@@ -296,6 +299,7 @@ class Supervisor:
             self.project_home = project["home"]
             self.standup = Path(project["standup_dir"])
             self.project_uid = project_uid
+            self.provider_uid = provider_uid
             self.team_uid = agent["team_uid"]
             self.data_class = project.get("data_class", "customer")
             self.protected = agent.get("protected", "")
@@ -348,7 +352,18 @@ class Supervisor:
                 msg_id = record.get("msg_id")
                 if record.get("class") == "provider_failure" and isinstance(msg_id, str):
                     self.message_failures[msg_id] = self.message_failures.get(msg_id, 0) + 1
+                    self.infra_episode = None
+                    self.infra_login_hint = False
+                elif record.get("class") == "infra":
+                    if self.infra_episode is None:
+                        attempt_id = record.get("attempt_id")
+                        if isinstance(attempt_id, str):
+                            self.infra_episode = attempt_id
+                    if record.get("login_hint") is True:
+                        self.infra_login_hint = True
                 elif record.get("class") == "ok":
+                    self.infra_episode = None
+                    self.infra_login_hint = False
                     if record.get("sid") == self.session_id:
                         self.turns_in_session += 1
                     if isinstance(msg_id, str):
@@ -374,10 +389,12 @@ class Supervisor:
 
     def write_alarm(self, kind: str, **details: Any) -> None:
         tripped_at = self.brake_tripped_at if kind == "brake_tripped" else None
+        episode = self.infra_episode if kind == "infra_blocked" else None
         if any(
             record.get("event") == "alarm.sent"
             and record.get("kind") == kind
             and (kind != "brake_tripped" or record.get("tripped_at") == tripped_at)
+            and (kind != "infra_blocked" or record.get("episode") == episode)
             for record in self.records
         ):
             return
@@ -397,6 +414,8 @@ class Supervisor:
             fields = {"kind": kind}
             if tripped_at is not None:
                 fields["tripped_at"] = tripped_at
+            if episode is not None:
+                fields["episode"] = episode
             self.journal("alarm.sent", **fields)
         except OSError:
             self.journal("alarm.failed", kind=kind)
@@ -750,7 +769,7 @@ class Supervisor:
         attempt_id = str(uuid.uuid4())
         started_at = utc_now()
         self.current_turn = {"msg_id": work["id"], "started_at": started_at, "attempt_id": attempt_id}
-        self.set_state("WORKING")
+        self.set_state("WORKING", "infra" if self.infra_since is not None else "")
         if self.last_heartbeat != "blocked":
             self.heartbeat("busy", f"supervised turn {work['id']}")
         self.journal("turn.started", msg_id=work["id"], sid=self.session_id, attempt_id=attempt_id)
@@ -816,19 +835,29 @@ class Supervisor:
                 stream.write("\n")
         self.transcript.chmod(0o640)
 
-    def end_turn(self, work: dict[str, Any], attempt_id: str, result_class: str, rc: int) -> None:
+    def end_turn(
+        self,
+        work: dict[str, Any],
+        attempt_id: str,
+        result_class: str,
+        rc: int,
+        *,
+        login_hint: bool = False,
+    ) -> None:
         self.journal(
             "turn.ended",
             msg_id=work["id"],
             sid=self.session_id,
             attempt_id=attempt_id,
             **{"class": result_class, "rc": rc, "brake": self.brake_consecutive, "tripped_at": self.brake_tripped_at},
+            **({"login_hint": True} if login_hint else {}),
         )
 
     def _finish_result(self, rc: int, output: str, work: dict[str, Any], session_arg: str, attempt_id: str) -> None:
         self.append_transcript(output)
         self.current_turn = None
         lowered = output.lower()
+        login_hint = rc == 78 and "hint:login" in lowered
         if rc != 0 and session_arg.startswith("new:") and "already in use" in lowered:
             self.end_turn(work, attempt_id, "session_in_use", rc)
             self.retry_at = time.monotonic()
@@ -842,7 +871,7 @@ class Supervisor:
 
         if rc == 0 and output:
             result_class = "ok"
-        elif rc in (75, 78, 69) or (rc == 0 and not output):
+        elif rc in (75, 78, 69) or (rc == 0 and not output) or login_hint:
             result_class = "infra"
         else:
             result_class = "provider_failure"
@@ -852,6 +881,8 @@ class Supervisor:
             self.brake_consecutive = 0
             self.brake_tripped_at = None
             self.infra_since = None
+            self.infra_episode = None
+            self.infra_login_hint = False
             self.turns_in_session += 1
             self.end_turn(work, attempt_id, result_class, rc)
             control_action = work.get("control_action")
@@ -887,16 +918,24 @@ class Supervisor:
         if result_class == "infra":
             if self.infra_since is None:
                 self.infra_since = now
-            self.end_turn(work, attempt_id, result_class, rc)
+            if self.infra_episode is None:
+                self.infra_episode = attempt_id
+            self.infra_login_hint = self.infra_login_hint or login_hint
+            self.end_turn(work, attempt_id, result_class, rc, login_hint=login_hint)
             reason = "capacity" if rc == 75 else "infra"
             self.set_state("WAITING", reason)
             if now - self.infra_since >= self.blocked_after:
                 self.heartbeat("blocked", f"supervisor waiting on {reason}")
-                self.write_alarm("infra_blocked")
+                alarm_details: dict[str, str] = {"provider": self.provider_uid}
+                if self.infra_login_hint:
+                    alarm_details["hint"] = "login"
+                self.write_alarm("infra_blocked", **alarm_details)
             self.retry_at = now + random.uniform(self.infra_min, self.infra_max)
             return
 
         self.infra_since = None
+        self.infra_episode = None
+        self.infra_login_hint = False
         self.brake_consecutive += 1
         failures = self.message_failures.get(work["id"], 0) + 1
         self.message_failures[work["id"]] = failures

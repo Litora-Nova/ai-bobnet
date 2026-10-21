@@ -62,9 +62,13 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
+#include <linux/capability.h>
 #include <linux/types.h>
 
 struct rs_attr { __u64 handled_access_fs; __u64 handled_access_net; __u64 scoped; };
@@ -129,12 +133,185 @@ static void status_fail(const char *reason){
   (void)write(status_fd, "\n", 1);
 }
 
+static int decimal_id(const char *text, unsigned long *value){
+  if (!text || !*text) return -1;
+  for (const unsigned char *p = (const unsigned char *)text; *p; ++p)
+    if (*p < '0' || *p > '9') return -1;
+  errno = 0;
+  char *end = NULL;
+  unsigned long parsed = strtoul(text, &end, 10);
+  if (errno || !end || *end || parsed > UINT_MAX) return -1;
+  *value = parsed;
+  return 0;
+}
+
+static int group_list(const char *text, gid_t **groups, size_t *count){
+  if (!text || !*text) return -1;
+  size_t n = 1;
+  for (const char *p = text; *p; ++p) if (*p == ',') ++n;
+  gid_t *parsed = calloc(n, sizeof(*parsed));
+  if (!parsed) return -1;
+  const char *p = text;
+  for (size_t i = 0; i < n; ++i){
+    unsigned long value = 0;
+    const char *start = p;
+    while (*p >= '0' && *p <= '9'){
+      unsigned int digit = (unsigned int)(*p - '0');
+      if (value > (UINT_MAX - digit) / 10){ free(parsed); return -1; }
+      value = value * 10 + digit;
+      ++p;
+    }
+    if (p == start || (*p && *p != ',') || (unsigned long)(gid_t)value != value){
+      free(parsed);
+      return -1;
+    }
+    parsed[i] = (gid_t)value;
+    if (!*p){
+      if (i + 1 != n){ free(parsed); return -1; }
+      break;
+    }
+    ++p;
+    if (!*p){ free(parsed); return -1; }
+  }
+  *groups = parsed;
+  *count = n;
+  return 0;
+}
+
+static int uid_allowed(uid_t uid){
+  const char *raw = getenv("AIB_ROLE_UIDS");
+  if (!raw || !*raw) return 0;
+  char *copy = strdup(raw), *save = NULL;
+  if (!copy) return 0;
+  int allowed = 0;
+  for (char *part = strtok_r(copy, ",", &save); part; part = strtok_r(NULL, ",", &save)){
+    unsigned long value = 0;
+    if (!decimal_id(part, &value) && (uid_t)value == uid){ allowed = 1; break; }
+  }
+  free(copy);
+  return allowed;
+}
+
+static int group_allowed(gid_t gid){
+  gid_t *allowed_groups = NULL;
+  size_t allowed_count = 0;
+  if (group_list(getenv("AIB_ROLE_GROUPS"), &allowed_groups, &allowed_count)) return 0;
+  int allowed = 0;
+  for (size_t i = 0; i < allowed_count; ++i){
+    if (allowed_groups[i] == gid){ allowed = 1; break; }
+  }
+  free(allowed_groups);
+  return allowed;
+}
+
+static int role_refuse(const char *message){
+  fprintf(stderr, "landlock-exec: %s\n", message);
+  char status[256];
+  snprintf(status, sizeof(status), "confine: %s", message);
+  status_fail(status);
+  return 3;
+}
+
+static int runtime_last_cap(void){
+  int fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  char raw[32] = {0};
+  ssize_t length = read(fd, raw, sizeof(raw) - 1);
+  close(fd);
+  if (length <= 0) return -1;
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(raw, &end, 10);
+  while (end && (*end == '\n' || *end == '\r')) ++end;
+  if (errno || !end || *end || value < 0 || value > INT_MAX) return -1;
+  return (int)value;
+}
+
+static int drop_capability_bounding_set(int last_cap){
+  int saw_eperm = 0, saw_other_failure = 0;
+  for (int cap = 0; cap <= last_cap; ++cap){
+    if (!prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)) continue;
+    if (errno == EPERM) saw_eperm = 1;
+    else saw_other_failure = 1;
+  }
+  if (saw_other_failure) return -1;
+  return saw_eperm;
+}
+
+static int clear_capabilities(void){
+  if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)) return -1;
+  struct __user_cap_header_struct header = {
+    .version = _LINUX_CAPABILITY_VERSION_3,
+    .pid = 0,
+  };
+  struct __user_cap_data_struct data[2] = {{0}};
+  return (int)syscall(SYS_capset, &header, data);
+}
+
+static int unprivileged_state_verified(int last_cap){
+  if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return 0;
+  struct __user_cap_header_struct header = {
+    .version = _LINUX_CAPABILITY_VERSION_3,
+    .pid = 0,
+  };
+  struct __user_cap_data_struct data[2] = {{0}};
+  if (syscall(SYS_capget, &header, data)) return 0;
+  for (size_t i = 0; i < sizeof(data) / sizeof(data[0]); ++i)
+    if (data[i].permitted || data[i].effective || data[i].inheritable) return 0;
+  for (int cap = 0; cap <= last_cap; ++cap)
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, 0, 0) != 0) return 0;
+  return 1;
+}
+
 int main(int argc, char **argv){
   status_init();
   if (argc < 2){
     fprintf(stderr,"usage: landlock-exec CMD [ARGS...]\n");
     status_fail("confine: usage: landlock-exec CMD [ARGS...]");
     return 2;
+  }
+  int argi = 1, saw_uid = 0, saw_gid = 0, saw_groups = 0, role_switch = 0;
+  unsigned long uid_value = 0, gid_value = 0;
+  gid_t *groups = NULL;
+  size_t group_count = 0;
+  while (argi < argc && (!strcmp(argv[argi], "--uid") || !strcmp(argv[argi], "--gid") ||
+                         !strcmp(argv[argi], "--groups"))){
+    if (!strcmp(argv[argi], "--groups")){
+      if (argi + 1 >= argc || saw_groups || !saw_uid || !saw_gid ||
+          group_list(argv[argi + 1], &groups, &group_count)){
+        fprintf(stderr, "usage: landlock-exec [--uid N --gid N [--groups G,...]] CMD [ARGS...]\n");
+        status_fail("confine: usage: invalid supplementary group switch");
+        return 2;
+      }
+      saw_groups = 1;
+      argi += 2;
+      continue;
+    }
+    int is_uid = !strcmp(argv[argi], "--uid");
+    if (argi + 1 >= argc || saw_groups || (is_uid ? saw_uid : saw_gid) ||
+        decimal_id(argv[argi + 1], is_uid ? &uid_value : &gid_value)){
+      fprintf(stderr, "usage: landlock-exec [--uid N --gid N [--groups G,...]] CMD [ARGS...]\n");
+      status_fail("confine: usage: invalid uid/gid switch");
+      return 2;
+    }
+    if (is_uid) saw_uid = 1; else saw_gid = 1;
+    argi += 2;
+  }
+  if (saw_uid != saw_gid || argi >= argc){
+    fprintf(stderr, "usage: landlock-exec [--uid N --gid N [--groups G,...]] CMD [ARGS...]\n");
+    status_fail("confine: usage: uid and gid must be supplied together");
+    return 2;
+  }
+  role_switch = saw_uid && saw_gid;
+  if (role_switch){
+    if (uid_value == 0) return role_refuse("uid 0 is never an allowed role uid");
+    if (uid_value < 1000) return role_refuse("uid below 1000 is never an allowed role uid");
+    if (gid_value == 0) return role_refuse("gid 0 is refused for a role uid");
+    if (!uid_allowed((uid_t)uid_value)) return role_refuse("uid is not present in AIB_ROLE_UIDS");
+    for (size_t i = 0; i < group_count; ++i){
+      if (groups[i] == 0) return role_refuse("supplementary group 0 is never allowed");
+      if (!group_allowed(groups[i])) return role_refuse("supplementary group is not present in AIB_ROLE_GROUPS");
+    }
   }
   /* Reserve the journal channel before Landlock work. Descriptor failures
    * remain distinguishable even when this host cannot install a ruleset.
@@ -199,6 +376,20 @@ int main(int argc, char **argv){
     return 3;
   }
   close(rs);
+  if (role_switch){
+    int last_cap = runtime_last_cap();
+    if (last_cap < 0) return role_refuse("uid switch could not read the kernel capability range");
+    int bounding_drop = drop_capability_bounding_set(last_cap);
+    if (bounding_drop < 0) return role_refuse("uid switch could not clear the capability bounding set");
+    if (setgroups(group_count, groups) &&
+        !(group_count == 0 && errno == EPERM && getuid() == (uid_t)uid_value && getgid() == (gid_t)gid_value))
+      return role_refuse("uid switch could not set supplementary groups");
+    if (setgid((gid_t)gid_value)) return role_refuse("uid switch setgid failed");
+    if (setuid((uid_t)uid_value)) return role_refuse("uid switch setuid failed");
+    if (clear_capabilities()) return role_refuse("uid switch could not clear capabilities");
+    if (bounding_drop > 0 && !unprivileged_state_verified(last_cap))
+      return role_refuse("uid switch could not verify cleared capabilities after bounding-set EPERM");
+  }
   fprintf(stderr,"landlock-exec: confined (ABI %d)\n",abi);
   if (relay_fd >= 0 && dup2(relay_fd,2) < 0)
     fprintf(stderr,"landlock-exec: dup2 LL_STDERR_FD: %s\n",strerror(errno));
@@ -207,13 +398,14 @@ int main(int argc, char **argv){
    * closed by CLOEXEC on a successful exec below regardless, but unsetting all four
    * is cheap and removes any dependence on that being the only backstop. */
   unsetenv("LL_RO"); unsetenv("LL_RW"); unsetenv("LL_STATUS_FD"); unsetenv("LL_STDERR_FD");
-  execvp(argv[1],&argv[1]);
+  unsetenv("AIB_ROLE_UIDS"); unsetenv("AIB_ROLE_GROUPS");
+  execvp(argv[argi],&argv[argi]);
   /* execvp failed: fd 2 may already be the PROVIDER's relay (LL_STDERR_FD above) —
    * this diagnostic goes to journal_fd (the saved original stderr when that
    * happened, plain fd 2 otherwise), never to fd 2 itself, so it can never land on
    * the caller's wire. LL_STATUS_FD (status_fail below) is still the caller's
    * primary signal; this is the journal's copy of the same failure. */
-  dprintf(journal_fd,"landlock-exec: exec %s: %s\n",argv[1],strerror(errno));
+  dprintf(journal_fd,"landlock-exec: exec %s: %s\n",argv[argi],strerror(errno));
   status_fail("exec: execvp failed");
   return 127;
 }
