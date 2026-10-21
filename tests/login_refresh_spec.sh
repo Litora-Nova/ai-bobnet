@@ -335,4 +335,29 @@ else
   chgrp "$(id -g)" "$sf" "$LROOT/codex/auth.json" 2>/dev/null
 fi
 
+# --- T16 (Marvin D02, hardening: green on the current implementation) the refresher really TAKES store_lock -------------------------------------------------
+# T14 proves the primitive serializes; this proves bin/aib-login-refresh uses it. A holder process owns the lock; a due refresh is started meanwhile.
+# While the lock is held the refresher must not call the CLI nor touch the store; once released it must proceed (rc 0, CLI called, store refreshed).
+# Removing `with store_lock():` from the refresher makes the "while held" checks fail (the CLI is called at once).
+cat > "$W/lockholder.py" <<'PY'
+import os, sys, time
+sys.path.insert(0, sys.argv[1] + "/lib")
+import aib_login
+with aib_login.store_lock():
+    open(sys.argv[2], "w").close()
+    end = time.time() + 40
+    while not os.path.exists(sys.argv[3]) and time.time() < end:
+        time.sleep(0.05)
+PY
+reset; mk_claude $(( LNOW + 100 )); sf="$LROOT/claude-code/.credentials.json"; before="$(cat "$sf")"; rm -f "$W/lock.ready" "$W/lock.release" "$W/lock.rc"
+env -i PATH="$PATH" AIB_TEST_SEAMS=1 AIB_LOGIN_ROOT="$LROOT" python3 -I "$W/lockholder.py" "$ENGINE" "$W/lock.ready" "$W/lock.release" & holder=$!
+for _ in $(seq 1 100); do [ -e "$W/lock.ready" ] && break; sleep 0.05; done
+eq "T16: probe: the holder owns the lock before the refresher starts" "$([ -e "$W/lock.ready" ] && echo held)" held
+( env -i PATH="$W/fakebin:$PATH" HOME="$W/home-login" LANG=C TZ=UTC "${LENV[@]}" AIBOBNET_REGISTRY="$ENGINE/registry.json" timeout 60 "$REF" claude-code >"$W/lock.out" 2>&1; echo $? > "$W/lock.rc" ) & refr=$!
+sleep 1.5
+eq "T16: while the lock is held the refresher has not called the CLI, not finished, and the store is untouched" "$(clog | wc -l | tr -d ' ')|$([ -e "$W/lock.rc" ] && echo finished || echo waiting)|$([ "$before" = "$(cat "$sf")" ] && echo same)" "0|waiting|same"
+touch "$W/lock.release"; wait "$holder" 2>/dev/null
+for _ in $(seq 1 200); do [ -e "$W/lock.rc" ] && break; sleep 0.05; done; wait "$refr" 2>/dev/null
+eq "T16: after release the refresher proceeds: rc 0, CLI called once, store refreshed" "$(cat "$W/lock.rc" 2>/dev/null)|$(clog | wc -l | tr -d ' ')|$([ "$before" != "$(cat "$sf")" ] && echo refreshed)" "0|1|refreshed"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

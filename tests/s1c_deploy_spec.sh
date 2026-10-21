@@ -119,7 +119,10 @@ islist() { local x; [ -n "$1" ] || return 1; for x in $(printf '%s' "$1" | tr ',
 isid "$(rkey AIB_ROLE_UID)" && ok "T7: AIB_ROLE_UID is a decimal uid >= 1000" || no "T7: AIB_ROLE_UID is a decimal uid >= 1000 (got '$(rkey AIB_ROLE_UID)')"
 isid "$(rkey AIB_ROLE_GID)" && ok "T7: AIB_ROLE_GID is a decimal gid >= 1000" || no "T7: AIB_ROLE_GID is a decimal gid >= 1000 (got '$(rkey AIB_ROLE_GID)')"
 islist "$(rkey AIB_ROLE_UIDS)" && ok "T7: AIB_ROLE_UIDS is a strict decimal comma list, each >= 1000" || no "T7: AIB_ROLE_UIDS is a strict decimal comma list (got '$(rkey AIB_ROLE_UIDS)')"
-islist "$(rkey AIB_ROLE_GROUPS)" && ok "T7: AIB_ROLE_GROUPS is a strict decimal comma list, each >= 1000" || no "T7: AIB_ROLE_GROUPS is a strict decimal comma list (got '$(rkey AIB_ROLE_GROUPS)')"
+# FLIPPED in v3.6 (M1): groups had ">= 1000" (v3.5 L1); the shared groups are system groups (gid < 1000), the control is the allow-list. Now: strict decimal, != 0.
+isgid() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ne 0 ]; }
+glist() { local x; [ -n "$1" ] || return 1; for x in $(printf '%s' "$1" | tr ',' ' '); do isgid "$x" || return 1; done; case "$1" in ,*|*,|*,,*) return 1;; esac; }
+glist "$(rkey AIB_ROLE_GROUPS)" && ok "T7: AIB_ROLE_GROUPS is a strict decimal comma list, each != 0" || no "T7: AIB_ROLE_GROUPS is a strict decimal comma list, each != 0 (got '$(rkey AIB_ROLE_GROUPS)')"
 case ",$(rkey AIB_ROLE_UIDS)," in *",$(rkey AIB_ROLE_UID),"*) ok "T7: AIB_ROLE_UID is one of AIB_ROLE_UIDS (the helper's allow-list)";; *) no "T7: AIB_ROLE_UID is one of AIB_ROLE_UIDS";; esac
 case "$(rkey AIB_SUP_STATE_ROOT)" in /?*) ok "T7: AIB_SUP_STATE_ROOT is an absolute path";; *) no "T7: AIB_SUP_STATE_ROOT is an absolute path (got '$(rkey AIB_SUP_STATE_ROOT)')";; esac
 RTXT="$([ -f "$RE" ] && tr "\n" " " < "$RE" | tr -s " ")"
@@ -145,6 +148,21 @@ for u in aib-login@.service aib-login-refresh@.service; do
   need=$(( 2 * ${cli:-0} + 60 ))
   case "$ts$cli" in *x*|'') no "T8: $u: TimeoutStartSec / CLI timeout not derivable (ts '$ts', cli '$cli')";;
     *) if [ "$ts" -ge "$need" ]; then ok "T8: $u: TimeoutStartSec ${ts}s >= 2 x ${cli}s + 60 = ${need}s"; else no "T8: $u: TimeoutStartSec ${ts}s must be >= 2 x ${cli}s + 60 = ${need}s"; fi;; esac
+done
+
+# --- T9 (Remote Bob finding) timers must also start on their own ---------------------------------------------------------------------------------------
+# OnUnitActiveSec= alone never fires if the service never ran (fresh boot / fresh enable). Both timers need OnBootSec= and OnActiveSec=, each a positive
+# value at most the OnUnitActiveSec interval, and the interval itself stays unchanged (refresh 1799 s = the tool's cadence, watch 1 h).
+for spec in "aib-login-refresh@.timer:1799" "aib-login-watch.timer:3600"; do
+  tn="${spec%%:*}"; want="${spec##*:}"; tb="$(body "$U/$tn")"
+  val() { printf '%s\n' "$tb" | grep "^$1=" | head -1 | cut -d= -f2-; }
+  iv="$(dur_s "$(val OnUnitActiveSec)")"; bs="$(dur_s "$(val OnBootSec)")"; as="$(dur_s "$(val OnActiveSec)")"
+  eq "$tn: OnUnitActiveSec stays ${want}s" "$iv" "$want"
+  for k in "OnBootSec:$bs" "OnActiveSec:$as"; do
+    kv="${k#*:}"
+    case "$kv" in ''|x|*[!0-9]*) no "T9: $tn carries ${k%%:*}= with a parseable value (got '$kv')";;
+      *) if [ "$kv" -gt 0 ] && [ "$kv" -le "$want" ]; then ok "T9: $tn: ${k%%:*}=${kv}s is positive and <= ${want}s"; else no "T9: $tn: ${k%%:*}=${kv}s must be in 1..${want}s"; fi;; esac
+  done
 done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]
