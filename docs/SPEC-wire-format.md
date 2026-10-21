@@ -266,6 +266,7 @@ For ordinary cleanup, when `stage` is anything other than `provider`, a `reason=
 reason for that stage, so a client can act on it without knowing the stage enum by heart.
 
 ```
+stage=policy   -> reason=shared_tree_in_project
 stage=confine  -> reason=confinement_unavailable
 stage=cwd      -> reason=cwd_moved
 stage=exec     -> reason=exec_failed

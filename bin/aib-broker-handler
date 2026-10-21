@@ -15,9 +15,9 @@
 # confinement on allow (`aib_enact_launch`, lib/aibobnet.sh — the same function
 # bin/launch-agent's in-process path uses, in "confined" mode here), and
 # `commit(attempt.ended)`. The durable stream lives at `$AIB_EVENT_ROOT/<project_uid>`
-# (ADR-0005), never under the project's `standup_dir` — the confined child's `LL_RW`
-# may safely include `home` (and therefore `standup_dir`) only because the stream
-# and the high-water anchor live OUTSIDE it. `AIB_EVENT_ROOT` is unit-environment-only,
+# (ADR-0005), never under the project's `standup_dir` — the project-root guard rejects
+# configured, resolvable shared report trees that overlap `home`, while the stream and
+# the high-water anchor live OUTSIDE it. `AIB_EVENT_ROOT` is unit-environment-only,
 # exactly like `AIB_CONFINE_BIN` (docs/CONFINEMENT.md) — never request- or
 # registry-supplied — and this handler fails closed if it is unset or unwritable:
 # an attempt this handler cannot durably record is an incident, not a launch.

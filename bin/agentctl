@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -25,6 +26,7 @@ if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists()
         "AIB_SYSTEMCTL",
         "AIB_SUP_STATE_ROOT",
         "AIB_OUTBOX_ROOT",
+        "AIB_LOGIN_REQ_DIR",
         "AIB_LOGIN_STATUS_DIR",
         "AIB_DEPLOYMENT_CONFIG",
     ):
@@ -280,6 +282,35 @@ def login_terminal(log: Path, request: int) -> dict[str, object] | None:
     return terminal
 
 
+def create_login_request(provider: str, sequence: int) -> Path:
+    directory = Path(os.environ.get("AIB_LOGIN_REQ_DIR", "/run/aib/login-requests"))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    collision: FileExistsError | None = None
+    for _attempt in range(6):
+        path = directory / f"{provider}.{sequence}.{secrets.token_hex(4)}.req"
+        try:
+            descriptor = os.open(path, flags, 0o644)
+            break
+        except FileExistsError as error:
+            collision = error
+    else:
+        assert collision is not None
+        raise collision
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o644)
+            stream.write(json.dumps({"seq": sequence, "provider": provider}, separators=(",", ":")))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def login_command(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[1] == "status":
         if len(argv) == 3:
@@ -330,8 +361,16 @@ def login_command(argv: list[str]) -> int:
         except (OSError, ValueError, json.JSONDecodeError):
             return 73
         return 77
+    try:
+        request_path = create_login_request(provider, int(requested["seq"]))
+    except (OSError, TypeError, ValueError):
+        return 73
     outcome = systemctl("start", unit)
     if outcome.returncode != 0:
+        try:
+            request_path.unlink()
+        except OSError:
+            pass
         return 69
     request = int(requested["seq"])
     deadline = time.monotonic() + float(os.environ.get("AIB_CTL_WAIT_S", "30"))

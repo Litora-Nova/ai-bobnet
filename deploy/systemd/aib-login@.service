@@ -7,9 +7,10 @@ OnFailure=aib-alarm@%n.service
 [Service]
 Type=simple
 User=aib-broker
+EnvironmentFile=-/etc/aib/role.env
 SupplementaryGroups=aib-login aib-gateway
 ExecStart=/opt/aib/engine/bin/aib-login %i
 TimeoutStartSec=31min
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=-/var/lib/aib/login -/var/lib/aib/login-state -/run/aib/login -/run/aib/login-status -/srv/aib/outbox/_server -/srv/aib/standup
+ReadWritePaths=-/var/lib/aib/login -/var/lib/aib/login-state -/run/aib/login -/run/aib/login-status -/run/aib/login-requests -/srv/aib/outbox/_server -/srv/aib/standup

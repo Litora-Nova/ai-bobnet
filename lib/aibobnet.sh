@@ -1347,7 +1347,7 @@ aib_inbox_path() {
 #     payload value (§B7): it is exclusively a reader-side fold classification of an
 #     open decided(allow) whose recorded PID has vanished. The composer rejects it
 #     fail-closed. `stage` (RM-3 slice 3, schema version 2, CONTRACT-execution-binding
-#     §8.1, D-K) ∈ confine|cwd|exec|provider|transport|null — which phase of enactment the
+#     §8.1, D-K) ∈ policy|confine|cwd|exec|provider|transport|null — which phase of enactment the
 #     terminal status belongs to, so a helper-side refusal is never misread as the
 #     provider's own outcome. Always supplied by every real writer; `null` only on a
 #     record composed under schema version 1 (pre-slice-3), which a reader folds the
@@ -1480,10 +1480,10 @@ aib_event_compose_ended_payload() {
   # TRANSPORT failed before enactment started. Schema version 2 is unreleased
   # (no bump needed to extend its enum — docs/CONTRACT-execution-binding.md
   # §8.1), so this composer accepts it starting now.
-  stage="$(_aib_record_field "$kv" stage)" || aib_die 2 "ended payload requires stage (confine|cwd|exec|provider|transport)"
+  stage="$(_aib_record_field "$kv" stage)" || aib_die 2 "ended payload requires stage (policy|confine|cwd|exec|provider|transport)"
   case "$stage" in
-    confine|cwd|exec|provider|transport) ;;
-    *) aib_die 2 "invalid stage '$stage' (confine|cwd|exec|provider|transport)";;
+    policy|confine|cwd|exec|provider|transport) ;;
+    *) aib_die 2 "invalid stage '$stage' (policy|confine|cwd|exec|provider|transport)";;
   esac
   # Ordinary writers, including paths that never started a provider, default to
   # true. Only the confined manager can report exhausted group cleanup.
@@ -1541,13 +1541,14 @@ aib_event_compose_ended_payload() {
 #
 # On return, publishes (house AIB_VERDICT_*-style globals):
 #   AIB_ENACT_EXIT_CLASS  ok | provider-failure | timeout | io-refused | aborted
-#   AIB_ENACT_STAGE       confine | cwd | exec | provider
+#   AIB_ENACT_STAGE       policy | confine | cwd | exec | provider
 #   AIB_ENACT_EXIT_CODE   the provider/helper's numeric status (may be empty)
 #   AIB_ENACT_SIGNAL      the forwarded signal name (may be empty; exactly one of
 #                         AIB_ENACT_EXIT_CODE / AIB_ENACT_SIGNAL is ever non-empty)
 #   AIB_ENACT_ENDED_EVENT_ID  the committed attempt.ended event_id
 #   AIB_ENACT_GROUP_EMPTY    false only when confined group cleanup was exhausted
-#   AIB_ENACT_REASON      fixed refusal reason (confine -> confinement_unavailable,
+#   AIB_ENACT_REASON      fixed refusal reason (policy -> shared_tree_in_project,
+#     confine -> confinement_unavailable,
 #     cwd -> cwd_moved, exec -> exec_failed), or escalation_exhausted when group
 #     cleanup could not be confirmed; otherwise empty
 #     (docs/SPEC-wire-format.md, "Terminal lines").
@@ -1710,6 +1711,7 @@ aib_enact_launch() {
     # know the enum by heart. provider needs none: exit_class/exit_code/signal
     # already say what happened (docs/SPEC-wire-format.md, "Terminal lines").
     case "$stage" in
+      policy) AIB_ENACT_REASON=shared_tree_in_project;;
       confine) AIB_ENACT_REASON=confinement_unavailable;;
       cwd) AIB_ENACT_REASON=cwd_moved;;
       exec) AIB_ENACT_REASON=exec_failed;;
@@ -1961,6 +1963,36 @@ aib_enact_launch__run_confined() {
   # exec chain entirely: a second, redundant group-creation attempt there would only
   # reintroduce the same "am I already a leader" question one level down.
   _python_bin="$(command -v python3 2>/dev/null || true)"
+
+  _aib_enact_paths_overlap() {
+    local _left="${1%/}" _right="${2%/}"
+    [ -n "$_left" ] || _left=/
+    [ -n "$_right" ] || _right=/
+    [ "$_left" != / ] && [ "$_right" != / ] || return 0
+    [ "$_left" = "$_right" ] || [[ "$_left" == "$_right/"* ]] || [[ "$_right" == "$_left/"* ]]
+  }
+
+  local _control_log="${AIB_CONTROL_LOG:-/srv/aib/standup/_control.jsonl}" _control_dir
+  case "$_control_log" in
+    */*) _control_dir="${_control_log%/*}"; [ -n "$_control_dir" ] || _control_dir=/ ;;
+    *) _control_dir=. ;;
+  esac
+  local _shared_tree _resolved_shared
+  for _shared_tree in "${AIB_STANDUP_DIR:-}" "${AIB_OUTBOX_ROOT:-/srv/aib/outbox}" "$_control_dir"; do
+    [ -n "$_shared_tree" ] || continue
+    _resolved_shared="$("$_realpath_bin" -e -- "$_shared_tree" 2>/dev/null)" || continue
+    if _aib_enact_paths_overlap "$resolved_root" "$_resolved_shared"; then
+      _aib_enact_commit_ended io-refused policy 126
+      printf 'chunk_bytes=0\n\n'
+      if [ -n "$AIB_ENACT_INCIDENT" ]; then
+        printf 'reason=event_store_unavailable\n'
+        printf 'end=error\n'
+      else
+        aib_enact_launch__write_terminal
+      fi
+      return 0
+    fi
+  done
 
   _aib_enact_cleanup_credential_tmp() {
     local _keep_dir="${1:-0}" _cleanup_rc=0
