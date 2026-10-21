@@ -371,9 +371,10 @@ reader as **`presumed-dead`**. That is a reader-side classification only: there 
 before the provider ever runs — the pre-flight, the post-`cd` `pwd -P` re-check
 (`docs/SPEC-wire-format.md`, "Order is part of the requirement") — and a bare `exit.class` of
 `io-refused` cannot distinguish "we refused to run the child" from "the child ran and refused to do
-its job". The `attempt.ended` payload therefore gains `exit.stage`, always present, one of
-`confine | cwd | exec | provider`: `confine` — the pre-flight or the helper's own before-`exec`
-failure (§2.1, `LL_STATUS_FD` non-empty); `cwd` — the post-`cd` re-check found the resolved path had
+its job". The `attempt.ended` payload therefore gains `exit.stage`, always present. Its enactment
+values are `policy | confine | cwd | exec | provider`: `policy` — a broker policy guard refused the
+launch before confinement (currently `shared_tree_in_project`); `confine` — the pre-flight or the
+helper's own before-`exec` failure (§2.1, `LL_STATUS_FD` non-empty); `cwd` — the post-`cd` re-check found the resolved path had
 moved; `exec` — the helper installed confinement but `execvp` itself failed (helper exit 127); `provider`
 — confinement and exec both succeeded and the recorded exit class is the provider's own. This is a
 **deliberate payload change**: `AIB_EVENT_SCHEMA_VERSION` (`lib/aibobnet.sh`) bumps from `1` to `2`.
@@ -389,7 +390,8 @@ enactment step this path never reached). `transport` names it directly: the atte
 connection itself failed before enactment started. Schema version 2 is still unreleased at the time
 this value is added, so the enum extends to `confine | cwd | exec | provider | transport` in place,
 without a version bump — the same reason D-K's original four values needed one (an already-released
-schema cannot silently redefine what a field means), and the reason this one doesn't. An abort that
+schema cannot silently redefine what a field means), and the reason this one doesn't. The complete
+enum is therefore `policy | confine | cwd | exec | provider | transport`. An abort that
 happens DURING a provider run (client gone while the provider is running or silent) is unaffected and
 stays `stage=provider`, same as before.
 

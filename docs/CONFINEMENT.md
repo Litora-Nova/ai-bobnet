@@ -287,12 +287,18 @@ Second, `_control.jsonl` and the team outbox are group-writable for `aib-shared`
 the engine itself does not fix their mode. A confined turn cannot write them while the standup and
 outbox trees lie outside the agent's project root (as in the shipped `/srv/aib/standup` and
 `/srv/aib/outbox` layout), because only the project root, the provider state directory and the
-temporary trees are in its `LL_RW`. Every other process in `aib-shared` can append arbitrary lines. Both files are report streams. One consumer is a
-known exception: `bin/aib-login` reads the latest `login.requested` record and its `caller` from
-`_control.jsonl` to apply the "due" and rate-limit gate. A forged record from an `aib-shared` member
-could therefore bypass that gate or mask a real request. The reach is bounded: starting the login unit
-still needs the gateway's polkit grant, and the code channel still checks the peer over
-`SO_PEERCRED`. Moving login requests to a source only the gateway can write is a planned follow-up.
+temporary trees are in its `LL_RW`. Every other process in `aib-shared` can append arbitrary lines.
+Both files are report streams. `bin/aib-login` is no longer an exception: it never reads
+`_control.jsonl`. `agentctl login start`
+keeps its `login.requested` audit record, but also creates a mode-`0644` request in the broker-owned,
+sticky mode-`1733` `/run/aib/login-requests` spool. The login unit opens only regular request files
+without following symlinks and derives the caller from the file's kernel-attested owner uid; a
+`caller` field in the content has no authority. Role and unknown owners are rejected, while a
+gateway-owned request still passes through the due and rate-limit gate.
+
+The accepted residual is reporting-only: `agentctl` learns a request's outcome by polling
+`_control.jsonl` for a terminal record. An `aib-shared` member can therefore fake the outcome reported
+to that waiting caller, but cannot start a login or skip its authorization, due, or rate checks.
 
 API-key mode is the path that restores the stronger "the agent never sees the shared credential"
 property. The deployment schema reserves `credential_mode=proxy` for that later mediation path; it
