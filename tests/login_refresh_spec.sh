@@ -367,6 +367,17 @@ for pv in claude:CLAUDE codex:CODEX; do
   ldef="$(python3 -I -c 'import sys;sys.path.insert(0,sys.argv[1]);import aib_login;print(getattr(aib_login,sys.argv[2]))' "$ENGINE/lib" "${key}_BIN" 2>/dev/null)"
   eq "T17: the refresher's default $ad binary is the adapter default" "$ldef" "${adef:-adapter-default-missing}"
 done
+# Without an override the tools must reach the installed default (an empty override counts as unset). Skipped where the default exists,
+# so the real CLI is never started against a fixture.
+for pv in claude-code:CLAUDE:/opt/aib/claude-code/current/claude codex:CODEX:/opt/aib/codex/current/codex; do
+  p="${pv%%:*}"; rest="${pv#*:}"; key="${rest%%:*}"; def="${rest#*:}"
+  if [ -e "$def" ]; then skip "T17: $p default binary exists on this host; the no-override run is not attempted"; continue; fi
+  reset; [ "$p" = codex ] && mk_codex $(( LNOW + 100 )) || mk_claude $(( LNOW + 100 ))
+  lrun "AIB_${key}_BIN=" -- "$REF" "$p"
+  has "T17: with no $key override the refresher runs the installed default ($def)" "$ERR" "cannot run $def"
+done
+grep -q 'setting("AIB_CLAUDE_BIN", CLAUDE_BIN)' "$ENGINE/bin/aib-login" && grep -q 'setting("AIB_CODEX_BIN", CODEX_BIN)' "$ENGINE/bin/aib-login" \
+  && ok "T17: bin/aib-login starts its CLIs from the shared defaults" || no "T17: bin/aib-login starts its CLIs from the shared defaults"
 reset; mk_claude $(( LNOW + 100 )); before="$(cat "$LROOT/claude-code/.credentials.json")"
 lrun AIB_CLAUDE_BIN="$W/no-such-claude" -- "$REF" claude-code
 eq "T17: a missing CLI binary => rc 1, store untouched" "$RC|$([ "$before" = "$(cat "$LROOT/claude-code/.credentials.json")" ] && echo same)" "1|same"

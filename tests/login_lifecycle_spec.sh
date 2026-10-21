@@ -184,6 +184,15 @@ fresh; lreq claude-code human:operator >/dev/null; ustart claude-code AIB_LOGIN_
 uwait 15
 eq "T4: no code within the window => exit 1, login.failed reason=timeout" "$URC|$(evf login.failed reason)" "1|timeout"
 eq "T4: …a login_failed alarm with reason:timeout, the CLI process is gone, the store is untouched, no socket left" "$(SO | grep -c 'alarm:login_failed provider:claude-code reason:timeout')|$(kill -0 "$(cat "$FP/cli.pid" 2>/dev/null)" 2>/dev/null && echo alive || echo dead)|$(ls "$LROOT/claude-code" | wc -l | tr -d ' ')|$([ ! -e "$LSOCK/login-claude-code.sock" ] && echo gone)" "1|dead|0|gone"
+
+# --- T4b a login CLI that cannot start: a terminal login.failed reason=cli_missing with an alarm, never a traceback or "timeout" ----------------------
+for pv in claude-code:AIB_CLAUDE_BIN codex:AIB_CODEX_BIN; do
+  p="${pv%%:*}"; var="${pv##*:}"
+  fresh; lreq "$p" human:operator >/dev/null; ustart "$p" "$var=$W/no-such-cli"; uwait 15
+  eq "T4b: $p with a missing CLI => exit 1, login.failed reason=cli_missing, a matching alarm, store untouched" "$URC|$(evf login.failed reason)|$(SO | grep -c "alarm:login_failed provider:$p reason:cli_missing")|$(ls "$LROOT/$p" 2>/dev/null | wc -l | tr -d ' ')" "1|cli_missing|1|0"
+  has "T4b: …stderr names the binary that could not run" "$(cat "$W/unit.err" 2>/dev/null)" "cannot run $W/no-such-cli"
+  hasnt "T4b: …and carries no traceback" "$(cat "$W/unit.err" 2>/dev/null)" "Traceback"
+done
 fresh; lreq claude-code human:operator >/dev/null; ustart claude-code AIB_LOGIN_WINDOW_S=1800
 uwf 15 has_vorg claude-code
 eq "T4: the default window is 30 min (alarm expires_at ~1800 s ahead)" "$(SO | grep -o 'expires_at:[^ ]*' | head -1 | cut -d: -f2- | xargs -I{} date -u -d {} +%s | awk -v n="$(date +%s)" '{d=$1-n; print (d>1700 && d<=1800)?"ok":"bad:" d}')" ok
