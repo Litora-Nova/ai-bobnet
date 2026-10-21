@@ -79,7 +79,8 @@ ll AIB_ROLE_UIDS="$(( ME / 10 * 10 ))" -- --uid "$ME" --gid "$MG" "${touch_cmd[@
 # --- T1g (design v3.5 L1) `--groups <gid,...>`: strict, allow-listed by the unit env AIB_ROLE_GROUPS, decided before any Landlock work --------------------
 # Invocation: landlock-exec --uid U --gid G [--groups g1,g2,...] CMD...   (--groups only together with --uid/--gid; at most once)
 #   malformed list (not strict decimal, empty element, spaces, sign, hex, overflow, empty list)   => exit 2 (usage), CMD not run
-#   gid 0, gid < 1000, a gid not in AIB_ROLE_GROUPS (whole-token match), AIB_ROLE_GROUPS unset/empty => exit 3, CMD not run, message names `group`
+#   gid 0, a gid not in AIB_ROLE_GROUPS (whole-token match), AIB_ROLE_GROUPS unset/empty => exit 3, CMD not run, message names `group`
+#   v3.6 M1: NO numeric floor for groups (system groups such as aib-shared have gids < 1000): a listed gid 1..999 passes the group policy.
 groupmsg() { printf '%s\n%s' "$STATUS" "$ERR" | grep -ci 'group' | awk '{print ($1>0)?1:0}'; }
 UG=(--uid "$ME" --gid "$MG")
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- --groups 5000 "${touch_cmd[@]}";           eq "T1g: --groups without --uid/--gid => exit 2, CMD not run" "$RC|$(ran)" "2|not-run"
@@ -95,9 +96,18 @@ ll AIB_ROLE_UIDS="$ME" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";           
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS= -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";                 eq "T1g: AIB_ROLE_GROUPS empty => nobody allowed (exit 3)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="0,5000" -- "${UG[@]}" --groups 0 "${touch_cmd[@]}";           eq "T1g: gid 0 is refused even when listed => exit 3" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,0" -- "${UG[@]}" --groups 5000,0 "${touch_cmd[@]}";       eq "T1g: …also as the second element of the list" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
-for low in 999 33 1; do
-  ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="$low,5000" -- "${UG[@]}" --groups "$low" "${touch_cmd[@]}";  eq "T1g: gid $low (< 1000, system range) is refused even when listed => exit 3" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+# FLIPPED in v3.6 (M1): v3.5 L1 refused a listed gid < 1000. On the VM aib-shared / aib-login / aib-gateway are system groups (gid < GID_MIN), so the floor
+# would refuse exactly the groups the role needs; the control is the allow-list. A listed low gid is NOT refused by the group policy: no usage error, no
+# `group` refusal. (Without Landlock on this host the helper then stops later with "unavailable"; with Landlock the CMD runs.)
+for low in 999 989 33 1; do
+  ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="$low,5000" -- "${UG[@]}" --groups "$low" "${touch_cmd[@]}"
+  case "$RC" in 0) post="ran:$(ran)";; 3) post="landlock:$(printf '%s' "$ERR" | grep -c 'unavailable')";; *) post="other:$RC";; esac
+  eq "T1g: (v3.6) a listed gid $low (< 1000) passes the group policy: not exit 2, no group refusal" "$(groupmsg)|$post" "0|$(case "$RC" in 0) echo ran:ran;; *) echo landlock:1;; esac)"
 done
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 989 "${touch_cmd[@]}"
+eq "T1g: …while the same low gid UNLISTED is still refused (exit 3, group message)" "$RC|$(groupmsg)" "3|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="0,989" -- "${UG[@]}" --groups 989,0 "${touch_cmd[@]}"
+eq "T1g: …and a 0 entry in the allow-list never makes gid 0 usable (exit 3)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="50000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";         eq "T1g: whole-token match: 5000 is not in '50000'" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000" -- "${UG[@]}" --groups 50000 "${touch_cmd[@]}";         eq "T1g: …nor 50000 in '5000'" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="15000,25000" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";    eq "T1g: …nor 5000 in '15000,25000' (suffix)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
