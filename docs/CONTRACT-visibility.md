@@ -611,13 +611,19 @@ Every field, documented:
 Schema 2 additively gives every agent a `supervisor` member. It is `null` unless the registry mode is
 `supervised`; otherwise it contains the supervisor's unit/session health, bounded state reason,
 tick/current-turn/session counters, brake and off-duty state, inbox count, journal sequence, and the
-newest five deduplicated control outcomes. Each control outcome has exactly
-`{req, verb, outcome, reason, at}`. Only documented `agentctl` verbs enter this list; caller, argument,
-and payload text never do.
+newest five deduplicated control outcomes. The projection reads only the last 256 KiB of
+`journal.jsonl`, drops the first partial line when that suffix starts mid-line, and skips malformed
+lines independently. Restart counts, journal sequence, and control outcomes therefore describe that
+bounded window. Each control outcome has exactly `{req, verb, outcome, reason, at}`. Requests are
+positive integers; only documented `agentctl` verbs enter this list; caller, argument, and payload text
+never do. State and rejected-control reasons are empty or machine words matching
+`^[a-z][a-z0-9_]{0,39}$`; invalid non-empty values project as `other`.
 
 `supervisor.account` is `null` when neither deployment nor login-status data exists. Otherwise it is
-`{provider, state, label, id_hint, expires_at, checked_at}`. The timestamps are real UTC
-`YYYY-MM-DDTHH:MM:SSZ` instants or `null`; `state` is
+`{provider, state, label, id_hint, expires_at, checked_at}`. The hint contains at most the last four
+characters supplied by the status writer. Input timestamps accept real UTC
+`YYYY-MM-DDTHH:MM:SS[.fraction]Z` instants and project as whole-second
+`YYYY-MM-DDTHH:MM:SSZ` values or `null`; `state` is
 `absent|ok|expiring|expired|pending`. New `attention` entries use `kind: brake` for a tripped brake,
 `kind: login` for a supervised agent whose account is expiring, expired, or absent, and `kind: unit`
 for a failed supervisor unit. Each names the affected agent.

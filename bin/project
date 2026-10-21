@@ -87,13 +87,16 @@ def event_epoch(value):
         raise ValueError('attempt timestamp has no offset')
     return stamp.timestamp()
 def utc_instant(value):
-    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z', value)
+    if match is None:
         return None
     try:
-        dt.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
+        dt.datetime.strptime(match[1], '%Y-%m-%dT%H:%M:%S')
     except ValueError:
         return None
-    return value
+    return match[1] + 'Z'
 def read_regular(path):
     # Heartbeat paths are agent-controlled: never follow symlinks or wait on FIFOs.
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
@@ -102,6 +105,19 @@ def read_regular(path):
         if not stat.S_ISREG(info.st_mode):
             raise ValueError('reader input is not a regular file')
         return f.read(), info.st_mtime
+
+def read_regular_tail(path, limit):
+    # Journals are agent-controlled and unbounded. Preserve read_regular's file
+    # checks while reading only the bounded suffix used by the projection.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('reader input is not a regular file')
+        truncated = info.st_size > limit
+        if truncated:
+            f.seek(-limit, os.SEEK_END)
+        return f.read(limit), truncated
 
 def zoned_epoch(parts):
     # Date.UTC normalization and beats.mjs's two offset passes, including DST gaps.
@@ -231,24 +247,33 @@ def read_json_file(path):
 
 def journal_records(path):
     try:
-        data, _ = read_regular(path)
+        data, truncated = read_regular_tail(path, 256 * 1024)
     except (OSError, ValueError):
         return []
+    lines = data.split(b'\n')
+    if truncated:
+        lines = lines[1:]
     records = []
-    try:
-        for raw in data.decode('utf-8').splitlines():
-            if raw.strip():
-                value = json.loads(raw)
-                if isinstance(value, dict):
-                    records.append(value)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return []
+    for raw in lines:
+        if raw.strip():
+            try:
+                value = json.loads(raw.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                records.append(value)
     return records
 
 CONTROL_VERBS = frozenset((
     'status', 'neustart', 'feierabend', 'standup', 'abschalten',
     'start', 'reset-brake', 'say', 'attach'))
 CONTROL_PRIORITY = {'ctl.accepted': 1, 'ctl.rejected': 2, 'ctl.done': 3}
+MACHINE_WORD = re.compile(r'[a-z][a-z0-9_]{0,39}')
+
+def machine_word(value):
+    if value == '':
+        return ''
+    return value if isinstance(value, str) and MACHINE_WORD.fullmatch(value) else 'other'
 
 def last_control(records):
     selected = {}
@@ -258,19 +283,17 @@ def last_control(records):
         req = record.get('req')
         verb = record.get('verb')
         at = utc_instant(record.get('ts'))
-        if priority is None or type(req) is not int or verb not in CONTROL_VERBS or at is None:
+        if priority is None or type(req) is not int or req < 1 or verb not in CONTROL_VERBS or at is None:
             continue
         previous = selected.get(req)
         if previous is not None:
             previous_priority, previous_at, previous_index, _ = previous
             if priority < previous_priority or (priority == previous_priority and (at, index) <= (previous_at, previous_index)):
                 continue
-        reason = record.get('reason', '') if event == 'ctl.rejected' else ''
-        if not isinstance(reason, str):
-            reason = ''
-        entry = dict(req=req, verb=verb, outcome=event[4:], reason=reason[:200], at=at)
+        reason = machine_word(record.get('reason', '')) if event == 'ctl.rejected' else ''
+        entry = dict(req=req, verb=verb, outcome=event[4:], reason=reason, at=at)
         selected[req] = (priority, at, index, entry)
-    return [item[3] for item in sorted(selected.values(), key=lambda item: (item[1], item[2]), reverse=True)[:5]]
+    return [item[3] for item in sorted(selected.values(), key=lambda item: (item[1], item[3]['req']), reverse=True)[:5]]
 
 def inbox_open(path):
     try:
@@ -327,12 +350,17 @@ def supervisor_projection(agent):
     off_duty = False
     if live is not None:
         session_state = live.get('state', 'OFFLINE')
-        state_reason = live.get('state_reason', '')
+        state_reason = machine_word(live.get('state_reason', ''))
         tick_seq = live.get('seq')
         current_turn = live.get('turn')
         turns = live.get('turns_in_session', 0)
-        if isinstance(live.get('brake'), dict):
-            brake = live['brake']
+        live_brake = live.get('brake')
+        if isinstance(live_brake, dict):
+            consecutive = live_brake.get('consecutive')
+            brake = {
+                'consecutive': consecutive if type(consecutive) is int and consecutive >= 0 else 0,
+                'tripped_at': utc_instant(live_brake.get('tripped_at')),
+            }
         if type(live.get('off_duty')) is bool:
             off_duty = live['off_duty']
         sid = live.get('session_id')
@@ -368,7 +396,7 @@ def supervisor_projection(agent):
         account = dict(provider=provider,
                        state=state if state in ('absent', 'ok', 'expiring', 'expired', 'pending') else 'absent',
                        label=account_label,
-                       id_hint=hint if isinstance(hint, str) else '',
+                       id_hint=hint[-4:] if isinstance(hint, str) else '',
                        expires_at=utc_instant(login.get('expires_at')) if login is not None else None,
                        checked_at=utc_instant(login.get('checked_at')) if login is not None else None)
     return dict(

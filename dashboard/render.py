@@ -136,7 +136,8 @@ def supervised_card(agent_uid, supervisor, now, stale):
     else:
         turn = supervisor['current_turn']
         result += '<p>' + field('current turn', turn['msg_id']) + sub(field('attempt', turn['attempt_id'])) + '</p>'
-    result += '<p>' + field('session', supervisor['session_id_short']) + sub(field('turns', supervisor['turns_in_session'])) + '</p></div>'
+    session = '—' if supervisor['session_id_short'] is None else supervisor['session_id_short']
+    result += '<p>' + field('session', session) + sub(field('turns', supervisor['turns_in_session'])) + '</p></div>'
     result += '<div class="sup-controls"><h4>Last control</h4>'
     if supervisor['last_control']:
         result += '<ol>'

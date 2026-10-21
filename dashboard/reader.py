@@ -77,14 +77,14 @@ def account(value):
         provider=bounded_text,
         state=lambda v: v in ACCOUNT_STATES,
         label=bounded_text,
-        id_hint=lambda v: isinstance(v, str) and len(v) <= 8,
+        id_hint=lambda v: isinstance(v, str) and len(v) <= 4,
         expires_at=nullable(is_instant),
         checked_at=nullable(is_instant)))
 
 
 def control(value):
     return exact_fields(value, dict(
-        req=count,
+        req=lambda v: count(v) and v >= 1,
         verb=lambda v: v in CONTROL_VERBS,
         outcome=lambda v: v in ('done', 'rejected', 'accepted'),
         reason=bounded_text,
