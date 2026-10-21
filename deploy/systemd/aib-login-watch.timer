@@ -2,6 +2,8 @@
 Description=BobNet shared-login expiry watch timer
 
 [Timer]
+OnBootSec=5min
+OnActiveSec=5min
 OnUnitActiveSec=1h
 Unit=aib-login-watch.service
 
