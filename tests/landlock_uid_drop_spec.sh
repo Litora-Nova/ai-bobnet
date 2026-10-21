@@ -225,11 +225,11 @@ else
     chown root:aib-shared "$VMD/shared/_control.jsonl" "$VMD/shared/outbox/team.md"; chmod 660 "$VMD/shared/_control.jsonl" "$VMD/shared/outbox/team.md"
     cat > "$VMD/probe.sh" <<PROBE
 #!/bin/sh
-b=\$(cat '$VMD/login/claude.buf' 2>/dev/null); c=\$(cat '$VMD/login/codex/auth.json' 2>/dev/null)
+b=\$(cat '$VMD/login/claude.buf' 2>>'$WORK/rw/probe.err'); c=\$(cat '$VMD/login/codex/auth.json' 2>>'$WORK/rw/probe.err')
 [ "\$b" = fake-claude-token-buffer ] && echo buffer-read || echo buffer-denied
 [ -n "\$c" ] && echo codex-read || echo codex-denied
-echo '{"k":1}' >> '$VMD/shared/_control.jsonl' 2>/dev/null && echo control-append || echo control-denied
-echo 'line' >> '$VMD/shared/outbox/team.md' 2>/dev/null && echo outbox-append || echo outbox-denied
+echo '{"k":1}' >> '$VMD/shared/_control.jsonl' 2>>'$WORK/rw/probe.err' && echo control-append || echo control-denied
+echo 'line' >> '$VMD/shared/outbox/team.md' 2>>'$WORK/rw/probe.err' && echo outbox-append || echo outbox-denied
 PROBE
     chmod 755 "$VMD/probe.sh"
     run_role() { # run_role [--groups list]   (the full list is always in the unit allow-list)
