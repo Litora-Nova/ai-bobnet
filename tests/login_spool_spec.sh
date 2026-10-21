@@ -253,20 +253,20 @@ if [ "$ME_UID" -ne 0 ]; then
   printf 'ok   - (skipped: T7 needs root - real st_uid of another account and a spool dir owned by someone else; run this spec as root on the dev VM)\n'
 else
   fresh; printf '{"provider":"codex","state":"ok","expires_at":null,"label":"","id_hint":"","checked_at":"x"}' > "$LSTAT/codex.json"
-  printf '%s=gateway:gw\n' 65534 > "$IDMAP"; spool_put codex 5 '{"seq":5,"provider":"codex","caller":"human:x"}'; chown 65534:65534 "$LREQ/codex.5.req"
+  printf '%s=gateway:gw\n' 65534 > "$IDMAP"; spool_put codex 5 '{"seq":5,"provider":"codex","caller":"human:x"}' 644 aaaa0005; chown 65534:65534 "$LREQ/codex.5.aaaa0005.req"
   forge login.requested 0 human:x codex
   urun codex
   eq "T7 (root): a file really owned by uid 65534 (mapped gateway:gw) is gated as gateway:gw whatever the log and the content say" "$(cli_called)|$(evf login.rejected reason)|$(evf login.rejected caller)" "uncalled|not_due|gateway:gw"
-  fresh; printf '%s=human:other\n' 65534 > "$IDMAP"; spool_put codex 5; chown 65534:65534 "$LREQ/codex.5.req"
+  fresh; printf '%s=human:other\n' 65534 > "$IDMAP"; spool_put codex 5 "" 644 aaaa0005; chown 65534:65534 "$LREQ/codex.5.aaaa0005.req"
   urun codex
   eq "T7 (root): …and a file owned by 65534 mapped human:other starts as human:other" "$(cli_called)|$(evf login.started caller)" "called|human:other"
-  fresh; printf '%s=role:aib-agent\n%s=human:operator\n' 65534 0 > "$IDMAP"; spool_put codex 5; spool_put codex 9; chown 65534:65534 "$(ls -d "$LREQ"/codex.9.*)"
+  fresh; printf '%s=role:aib-agent\n%s=human:operator\n' 65534 0 > "$IDMAP"; spool_put codex 5 "" 644 aaaa0005; spool_put codex 9 "" 644 aaaa0009; chown 65534:65534 "$LREQ/codex.9.aaaa0009.req"
   urun codex
   eq "T7 (root): (Q1) the NEWEST entry (9, owned by a role uid) is unauthorized and is removed; the newest AUTHORIZED one (5, owned by root->human) is served" "$(evf login.started req)|$(evf login.started caller)|$(nspool)" "5|human:operator|0"
-  fresh; printf '%s=human:other\n' 65534 > "$IDMAP"; spool_put codex 5; chown 65534:65534 "$LREQ/"codex.5.*
+  fresh; printf '%s=human:other\n' 65534 > "$IDMAP"; spool_put codex 5 "" 644 aaaa0005; chown 65534:65534 "$LREQ/codex.5.aaaa0005.req"
   urun codex AIB_ROLE_UIDS=65534
   eq "T7 (root): (Q4) a file really owned by a role uid is refused whatever the identity command says (human:other)" "$(cli_called)|$(evf login.rejected reason)" "uncalled|no_request"
-  fresh; as human:operator; spool_put codex 3; chown 65534:65534 "$LREQ"; setmode "$LREQ" 1733
+  fresh; as human:operator; spool_put codex 3 "" 644 aaaa0003; chown 65534:65534 "$LREQ"; setmode "$LREQ" 1733
   urun codex
   eq "T7 (root): a spool directory owned by someone other than the unit's uid => login.failed reason=spool, CLI not called" "$(cli_called)|$(evf login.failed reason)" "uncalled|spool"
   chown "$ME_UID" "$LREQ"
