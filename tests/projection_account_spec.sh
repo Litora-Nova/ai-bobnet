@@ -13,7 +13,14 @@
 #   Nothing else of the status file is copied: a planted `email`, `token` or any other key never reaches the projection (whitelist, not blacklist).
 #   Agents that are not supervised keep `supervisor: null`. The dashboard/projection contract elsewhere is untouched.
 #
-#   Expected on the unbuilt tree: account stays null for everybody.
+#   S2a (agent view, design A3): the block gains `expires_at` and `checked_at`, so it has exactly SIX keys
+#       {"provider","state","label","id_hint","expires_at","checked_at"}
+#   expires_at/checked_at come from the status file; a value is passed through verbatim iff it is a string of the form YYYY-MM-DDTHH:MM:SSZ
+#   (a real calendar instant, UTC `Z`); anything else (non-string, empty, date only, garbage, impossible date) becomes null; a missing
+#   status file gives null/null. FLIPS of earlier expectations (design-driven, additive keys): the three exact-block checks T1/T2 now expect
+#   the two extra keys (the old fixtures carry checked_at "x" => null). Nothing else of the status file leaks (unchanged).
+#
+#   Expected on the unbuilt tree: account stays null for everybody; the S2a block (T5) is RED because the keys do not exist yet.
 set -uo pipefail
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 PROJECT_BIN="$SRC_ROOT/bin/project"; JGET="$SRC_ROOT/tests/fixtures/projection_jget.py"
@@ -50,16 +57,34 @@ acc() { python3 -I -c 'import json,sys;a=json.load(open(sys.argv[1]))["agents"][
 
 proj "$DEP"
 eq "T0: bin/project runs" "$RC" 0
-eq "T1: account = provider, state and id_hint from the status file, label from the deployment — exactly four keys" "$(acc acme-core)" '{"id_hint": "c0de", "label": "Interim: PO account", "provider": "claude-code", "state": "expiring"}'
+eq "T1: account = provider, state and id_hint from the status file, label from the deployment — exactly six keys (S2a: expires_at/checked_at added; the fixture's checked_at "x" is garbage => null)" "$(acc acme-core)" '{"checked_at": null, "expires_at": "2026-12-01T00:00:00Z", "id_hint": "c0de", "label": "Interim: PO account", "provider": "claude-code", "state": "expiring"}'
 eq "T1: the label of the CURRENT deployment wins over the (stale) label in the status file" "$(jg agents.acme-core.supervisor.account.label)" "Interim: PO account"
 eq "T1: nothing else of the status file reaches the projection (no email, no token)" "$(grep -c -e 'leak@example' -e 'SECRET-TOKEN' "$OUT")" 0
 eq "T1: a oneshot agent keeps supervisor null" "$(jg agents.acme-solo.supervisor)" null
 proj "$DEP" bolt; eq "T1: an agent whose provider has no accounts entry and no status file => account null (and the run succeeds)" "$RC|$(acc bolt-core)" "0|null"
 printf '{"provider":"codex","state":"ok","expires_at":null,"label":"","id_hint":"beef","checked_at":"x"}' > "$LSTAT/codex.json"
 proj "$DEP" bolt
-eq "T2: a status file alone (no accounts entry) is enough: label empty" "$(acc bolt-core)" '{"id_hint": "beef", "label": "", "provider": "codex", "state": "ok"}'
+eq "T2: a status file alone (no accounts entry) is enough: label empty (S2a: plus expires_at null, checked_at garbage => null)" "$(acc bolt-core)" '{"checked_at": null, "expires_at": null, "id_hint": "beef", "label": "", "provider": "codex", "state": "ok"}'
 rm -f "$LSTAT/claude-code.json"; proj "$DEP"
-eq "T2: an accounts entry without a status file => state absent, id_hint empty" "$(acc acme-core)" '{"id_hint": "", "label": "Interim: PO account", "provider": "claude-code", "state": "absent"}'
+eq "T2: an accounts entry without a status file => state absent, id_hint empty (S2a: expires_at/checked_at null)" "$(acc acme-core)" '{"checked_at": null, "expires_at": null, "id_hint": "", "label": "Interim: PO account", "provider": "claude-code", "state": "absent"}'
 printf 'not json' > "$WORK/bad.json"; chmod 644 "$WORK/bad.json"; proj "$WORK/bad.json"
 eq "T2: an invalid deployment config => label \"\" (fail closed), the projection still runs" "$RC|$(jg agents.acme-core.supervisor.account.label)" "0|"
+
+# T5 (S2a A3): ISO pass-through, garbage => null, missing file
+ex() { python3 -I -c 'import json,sys;a=json.load(open(sys.argv[1]))["agents"]["acme-core"]["supervisor"]["account"];print("null" if a is None else json.dumps([a.get("expires_at","MISSING"),a.get("checked_at","MISSING")]))' "$OUT" 2>/dev/null; }
+printf '{"provider":"claude-code","state":"ok","expires_at":"2026-12-01T09:30:00Z","label":"x","id_hint":"c0de","checked_at":"2026-10-21T08:15:42Z"}' > "$LSTAT/claude-code.json"; proj "$DEP"
+eq "T5: valid ISO UTC expires_at and checked_at pass through verbatim" "$(ex)" '["2026-12-01T09:30:00Z", "2026-10-21T08:15:42Z"]'
+for bad in '"x"' '12345' '""' '"2026-12-01"' '"2026-13-45T99:00:00Z"' '"tomorrow at noon"' 'true' '["2026-12-01T00:00:00Z"]'; do
+  printf '{"provider":"claude-code","state":"ok","expires_at":%s,"label":"x","id_hint":"c0de","checked_at":%s}' "$bad" "$bad" > "$LSTAT/claude-code.json"; proj "$DEP"
+  eq "T5: garbage $bad => expires_at and checked_at null (and the run succeeds)" "$RC|$(ex)" '0|[null, null]'
+done
+printf '{"provider":"claude-code","state":"ok","expires_at":null,"label":"x","id_hint":"c0de"}' > "$LSTAT/claude-code.json"; proj "$DEP"
+eq "T5: expires_at null and checked_at key missing in the status file => both null" "$(ex)" '[null, null]'
+printf '{"provider":"claude-code","state":"expired","expires_at":"2026-10-20T00:00:00Z","label":"x","id_hint":"c0de","checked_at":"2026-10-21T00:00:00Z"}' > "$LSTAT/claude-code.json"; proj "$DEP"
+eq "T5: an expired state keeps its expires_at (the past instant is data, not an error)" "$(jg agents.acme-core.supervisor.account.state)|$(ex)" 'expired|["2026-10-20T00:00:00Z", "2026-10-21T00:00:00Z"]'
+rm -f "$LSTAT/claude-code.json"; proj "$DEP"
+eq "T5: missing status file (accounts entry only) => state absent, expires_at/checked_at null" "$(jg agents.acme-core.supervisor.account.state)|$(ex)" 'absent|[null, null]'
+printf 'not json at all' > "$LSTAT/claude-code.json"; proj "$DEP"
+eq "T5: an unparsable status file never crashes the projection" "$RC" 0
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

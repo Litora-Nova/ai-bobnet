@@ -34,7 +34,17 @@
 #   The pre-existing fields of agents[uid] (state, since, message, …) stay exactly as they were.
 #
 #   Expected on the unbuilt tree: bin/project knows neither schema 5 nor `supervisor`, so it refuses
-#   the registry (rc 2) and every functional assertion fails.
+#   the registry (rc 2) and every functional assertion fails.#
+#   S2a (agent view, design A1/A2/A4) — section "S2a" at the end of this file. One FLIP of an earlier expectation: `last_control` was
+#   pinned `null` "until S1b"; it is now a list (`[]` when the journal holds no control records). `off_duty` stays false when live.json
+#   has no (or a non-bool) `off_duty`; it is true iff live.json `off_duty` is the JSON boolean true.
+#     last_control  newest 5 control outcomes from <root>/<uid>/journal.jsonl: one entry per `req` (events ctl.done > ctl.rejected >
+#                   ctl.accepted by PRIORITY, not recency; `ctl.consumed` ignored), entry keys exactly {req,verb,outcome,reason,at},
+#                   outcome done|rejected|accepted, reason = the ctl.rejected `reason` else "", at = ts of the chosen event;
+#                   verbs outside agentctl's queued set (neustart feierabend standup abschalten reset-brake) are dropped BEFORE the
+#                   limit; order = `at` descending, newest first; caller/args/text payload fields never appear anywhere in the output.
+#     attention     kind "brake" (brake.tripped_at set), "login" (supervised agent with an account whose state is expiring|expired|absent;
+#                   NOT for account null, ok or pending), "unit" (unit_state failed); each item names the agent in `agent`.
 set -uo pipefail
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 PROJECT_BIN="$SRC_ROOT/bin/project"
@@ -123,7 +133,7 @@ eq "T1: brake.consecutive" "$(jg "$S.brake.consecutive")" 2
 eq "T1: brake.tripped_at" "$(jg "$S.brake.tripped_at")" null
 eq "T1: off_duty key present, false until S1b" "$(jg "$S.off_duty")" false
 eq "T1: inbox_open counts non-terminal messages (3 sent, 1 processed)" "$(jg "$S.inbox_open")" 2
-eq "T1: last_control key present, null until S1b" "$(jg "$S.last_control")" null
+eq "T1: last_control is an empty list when the journal has no control records (S2a FLIP: was null until S1b)" "$(jg "$S.last_control")" "[]"
 eq "T1: journal_seq traces to the journal's last record" "$(jg "$S.journal_seq")" 4
 
 S="agents.acme-stale.supervisor"
@@ -146,6 +156,84 @@ eq "T3: …journal_seq 0 without a journal" "$(jg "$S.journal_seq")" 0
 eq "T4: a oneshot agent has supervisor null" "$(jg agents.acme-solo.supervisor)" null
 eq "T4: an agent without a mode has supervisor null" "$(jg agents.acme-plain.supervisor)" null
 eq "T4: the agents key set is still exactly the registered agents" "$(python3 -I -c 'import json,sys;print(",".join(sorted(json.load(open(sys.argv[1]))["agents"])))' "$OUT" 2>/dev/null)" "acme-core,acme-down,acme-plain,acme-solo,acme-stale"
+
+# =========================================================================
+# S2a — off_duty (A1), last_control (A2), attention brake/login/unit (A4)
+# =========================================================================
+SUP2="$WORK/sup2"; LST2="$WORK/lstat2"; EVR2="$WORK/events2"; STD2="$WORK/standup2"
+mkdir -p "$SUP2/s-ctl" "$SUP2/s-brk" "$SUP2/s-ok" "$SUP2/s-badoff" "$LST2" "$EVR2/attempts" "$STD2/inbox"
+REG2="$WORK/registry2.json"
+cat > "$REG2" <<JSON
+{ "schema_version": 5,
+  "providers": { "acme": { "adapter": "/bin/true", "cap_sandbox": "workspace-write", "cap_tier": "t2", "cap_effort": "high", "cap_timeout": "900" } },
+  "projects": { "acme": { "home": "$HOMEDIR", "standup_dir": "$STD2", "mux_session": "acme", "provider": "acme", "model": "m", "effort": "low" } },
+  "agents": {
+    "s-ctl":    { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "s-brk":    { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "s-ok":     { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "s-badoff": { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
+    "s-solo":   { "mode": "oneshot",    "project": "acme", "profile": "engine-dev", "clearance": "t2" }
+  } }
+JSON
+for u in s-ctl s-ok s-badoff; do printf 'ActiveState=active\nSubState=running\nUnitFileState=enabled\n' > "$WORK/unit.$u"; done
+printf 'ActiveState=failed\nSubState=failed\nUnitFileState=enabled\n' > "$WORK/unit.s-brk"
+live2() { # live2 <uid> <extra-json-fields-with-leading-comma> <brake-json>
+  printf '{"seq":5,"ts":"%s","interval_s":30,"pid":9,"state":"WORKING","state_reason":"","turn":null,"brake":%s,"session_id":null,"turns_in_session":0%s}\n' "$now" "$3" "$2" > "$SUP2/$1/live.json"; }
+NOBRAKE='{"consecutive":0,"tripped_at":null}'
+TRIP="$(iso '10 minutes ago')"
+live2 s-ctl ',"off_duty":true' "$NOBRAKE"
+live2 s-brk ',"off_duty":false' "{\"consecutive\":3,\"tripped_at\":\"$TRIP\"}"
+live2 s-ok '' "$NOBRAKE"
+live2 s-badoff ',"off_duty":"yes"' "$NOBRAKE"
+T1="$(iso '100 minutes ago')"; T2="$(iso '95 minutes ago')"; T3="$(iso '90 minutes ago')"; T4="$(iso '80 minutes ago')"
+T5="$(iso '70 minutes ago')"; T6="$(iso '60 minutes ago')"; T7="$(iso '50 minutes ago')"; T8="$(iso '40 minutes ago')"; T9="$(iso '30 minutes ago')"
+cat > "$SUP2/s-ctl/journal.jsonl" <<JSON
+{"seq":1,"ts":"$T1","event":"ctl.accepted","req":1,"verb":"neustart","target":"s-ctl","result":"accepted"}
+{"seq":2,"ts":"$T1","event":"ctl.consumed","req":1}
+{"seq":3,"ts":"$T2","event":"ctl.done","req":1,"verb":"neustart","target":"s-ctl","result":"ok"}
+{"seq":4,"ts":"$T3","event":"ctl.rejected","req":2,"verb":"feierabend","target":"s-ctl","caller":"CALLER-LEAK","reason":"not_authorized","args":{"x":"ARGS-LEAK"}}
+{"seq":5,"ts":"$T4","event":"ctl.accepted","req":3,"verb":"standup","target":"s-ctl","result":"accepted"}
+{"seq":6,"ts":"$T5","event":"ctl.accepted","req":4,"verb":"abschalten","target":"s-ctl","result":"accepted"}
+{"seq":7,"ts":"$T6","event":"ctl.rejected","req":4,"verb":"abschalten","target":"s-ctl","reason":"busy"}
+{"seq":8,"ts":"$T6","event":"ctl.done","req":5,"verb":"reset-brake","target":"s-ctl","result":"ok"}
+{"seq":9,"ts":"$T7","event":"ctl.rejected","req":5,"verb":"reset-brake","target":"s-ctl","reason":"late_reject"}
+{"seq":10,"ts":"$T8","event":"ctl.done","req":6,"verb":"frobnicate","target":"s-ctl","result":"ok"}
+{"seq":11,"ts":"$T9","event":"ctl.done","req":7,"verb":"neustart","target":"s-ctl","result":"ok","text":"SAYPAYLOAD-LEAK","caller":"CALLER-LEAK","args":{"y":"ARGS-LEAK"}}
+JSON
+proj2() { # proj2 [login-state-json-or-empty]
+  RC=0; env -i PATH="$WORK/fakebin:$PATH" TZ=UTC AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$(id -u)" AIB_DEPLOYMENT_CONFIG="$WORK/none.json" AIB_LOGIN_STATUS_DIR="$LST2" \
+    AIBOBNET_REGISTRY="$REG2" AIB_PROJECTION_ROOT="$WORK/proj2" AIB_EVENT_ROOT="$EVR2" AIB_SUP_STATE_ROOT="$SUP2" "$PROJECT_BIN" acme --stdout > "$OUT" 2>"$WORK/err2" || RC=$?; }
+proj2
+eq "S2a: bin/project runs on the S2a fixture" "$RC" 0
+eq "A1: off_duty true from live.json" "$(jg agents.s-ctl.supervisor.off_duty)" true
+eq "A1: off_duty false from live.json false" "$(jg agents.s-brk.supervisor.off_duty)" false
+eq "A1: off_duty false when live.json has no off_duty" "$(jg agents.s-ok.supervisor.off_duty)" false
+eq "A1: off_duty false when live.json off_duty is not a boolean" "$(jg agents.s-badoff.supervisor.off_duty)" false
+lc() { python3 -I -c 'import json,sys;l=json.load(open(sys.argv[1]))["agents"]["s-ctl"]["supervisor"]["last_control"];print(sys.argv[2].join(str(e[sys.argv[3]]) for e in l))' "$OUT" "$1" "$2" 2>/dev/null; }
+S="agents.s-ctl.supervisor.last_control"
+eq "A2: at most 5 entries, newest first, one per req, unknown verb dropped before the limit (reqs)" "$(lc , req)" "7,5,4,3,2"
+eq "A2: verbs" "$(lc , verb)" "neustart,reset-brake,abschalten,standup,feierabend"
+eq "A2: outcome priority done > rejected > accepted (req 5 done beats a later reject; req 4 rejected beats accepted)" "$(lc , outcome)" "done,done,rejected,accepted,rejected"
+eq "A2: reason only from ctl.rejected, else empty" "$(lc , reason)" ",,busy,,not_authorized"
+eq "A2: at = ts of the chosen event" "$(lc , at)" "$T9,$T6,$T6,$T4,$T3"
+eq "A2: entry keys are exactly req,verb,outcome,reason,at" "$(python3 -I -c 'import json,sys;l=json.load(open(sys.argv[1]))["agents"]["s-ctl"]["supervisor"]["last_control"];print(sorted({",".join(sorted(e)) for e in l}))' "$OUT" 2>/dev/null)" "['at,outcome,reason,req,verb']"
+eq "A2: no caller / args / say payload text anywhere in the projection" "$(grep -c -e CALLER-LEAK -e ARGS-LEAK -e SAYPAYLOAD-LEAK -e late_reject "$OUT")" 0
+eq "A2: a supervised agent without ctl records has last_control []" "$(jg agents.s-ok.supervisor.last_control)" "[]"
+eq "A2: a oneshot agent keeps supervisor null" "$(jg agents.s-solo.supervisor)" null
+kinds() { python3 -I -c 'import json,sys;print(",".join(sorted(i["kind"]+":"+str(i["agent"]) for i in json.load(open(sys.argv[1]))["attention"] if i["kind"] in ("brake","login","unit"))))' "$OUT" 2>/dev/null; }
+eq "A4: brake (tripped_at set) and unit (failed) name the agent; account null => no login item; ok/idle agents none" "$(kinds)" "brake:s-brk,unit:s-brk"
+for st in expiring expired absent; do
+  printf '{"provider":"acme","state":"%s","expires_at":null,"label":"","id_hint":"ab12","checked_at":null}' "$st" > "$LST2/acme.json"; proj2
+  eq "A4: account state $st => login item for each supervised agent (not the oneshot)" "$(kinds)" "brake:s-brk,login:s-badoff,login:s-brk,login:s-ctl,login:s-ok,unit:s-brk"
+done
+for st in ok pending; do
+  printf '{"provider":"acme","state":"%s","expires_at":null,"label":"","id_hint":"ab12","checked_at":null}' "$st" > "$LST2/acme.json"; proj2
+  eq "A4: account state $st => no login item" "$(kinds)" "brake:s-brk,unit:s-brk"
+done
+rm -f "$LST2/acme.json"; live2 s-brk ',"off_duty":false' "$NOBRAKE"; printf 'ActiveState=active\nSubState=running\nUnitFileState=enabled\n' > "$WORK/unit.s-brk"; proj2
+eq "A4: no tripped brake and an active unit => none of the three kinds" "$(kinds)" ""
+printf 'ActiveState=inactive\nSubState=dead\nUnitFileState=enabled\n' > "$WORK/unit.s-brk"; proj2
+eq "A4: an inactive (not failed) unit is not a unit item" "$(kinds)" ""
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
