@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -283,9 +284,18 @@ def login_terminal(log: Path, request: int) -> dict[str, object] | None:
 
 def create_login_request(provider: str, sequence: int) -> Path:
     directory = Path(os.environ.get("AIB_LOGIN_REQ_DIR", "/run/aib/login-requests"))
-    path = directory / f"{provider}.{sequence}.req"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o644)
+    collision: FileExistsError | None = None
+    for _attempt in range(6):
+        path = directory / f"{provider}.{sequence}.{secrets.token_hex(4)}.req"
+        try:
+            descriptor = os.open(path, flags, 0o644)
+            break
+        except FileExistsError as error:
+            collision = error
+    else:
+        assert collision is not None
+        raise collision
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o644)
