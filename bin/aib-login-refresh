@@ -23,6 +23,16 @@ def cadence() -> int:
     return max(1, integer("AIB_LOGIN_ACCESS_LIFETIME_S", 3600) // 2 - 1)
 
 
+def store_meets_broker_floor(provider: str, path: Path) -> bool:
+    expiry = access_expiry(provider, read_object(path) or {})
+    floor = (integer("AIB_LOGIN_MAX_TURN_S", 900) + integer("AIB_LOGIN_MARGIN_S", 300)
+             + integer("AIB_LOGIN_SLACK_S", 600))
+    if expiry is None or expiry - now() < floor:
+        print(f"aib-login-refresh: {provider} credential remains below broker floor", file=sys.stderr)
+        return False
+    return True
+
+
 def force_private_expiry(provider: str, path: Path) -> bytes:
     """Move only the private copy into the CLIs' measured <=300 s refresh window."""
     data = read_object(path)
@@ -128,7 +138,7 @@ def main(argv: list[str]) -> int:
                     updated = local.read_bytes()
                 if updated == forced:
                     print(f"aib-login-refresh: {provider} credential unchanged", file=sys.stderr)
-                    return 0
+                    return 0 if store_meets_broker_floor(provider, path) else 1
                 if path.read_bytes() != original:
                     print(f"aib-login-refresh: newer {provider} login preserved", file=sys.stderr)
                     return 0
@@ -144,7 +154,7 @@ def main(argv: list[str]) -> int:
                         tmp.unlink()
                     except FileNotFoundError:
                         pass
-                return 0
+                return 0 if store_meets_broker_floor(provider, path) else 1
             finally:
                 shutil.rmtree(private, ignore_errors=True)
     except (OSError, subprocess.SubprocessError, ValueError):

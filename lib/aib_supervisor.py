@@ -857,11 +857,7 @@ class Supervisor:
         self.append_transcript(output)
         self.current_turn = None
         lowered = output.lower()
-        login_hint = (
-            (rc == 78 and "hint:login" in lowered)
-            or "not logged in" in lowered
-            or "failed to authenticate. api error" in lowered
-        )
+        login_hint = rc == 78 and "hint:login" in lowered
         if rc != 0 and session_arg.startswith("new:") and "already in use" in lowered:
             self.end_turn(work, attempt_id, "session_in_use", rc)
             self.retry_at = time.monotonic()

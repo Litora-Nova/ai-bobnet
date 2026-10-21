@@ -1561,7 +1561,7 @@ aib_enact_launch() {
   local _credential_source="login" _login_root="/var/lib/aib/login" _login_store_path=""
   local _credential_dir="" _credential_tmp="" _credential_error="" _credential_error_text=""
   local _credential_fd_open=0 _credential_refusal=0
-  local _role_uid="${AIB_ROLE_UID:-}" _role_gid="${AIB_ROLE_GID:-}"
+  local _role_uid="${AIB_ROLE_UID:-}" _role_gid="${AIB_ROLE_GID:-}" _role_groups="${AIB_ROLE_GROUPS:-}"
 
   case "$mode" in confined|direct) ;; *) aib_die 2 "aib_enact_launch: invalid mode '$mode' (confined|direct)";; esac
   [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$decided_id" ] ||
@@ -2163,9 +2163,13 @@ aib_enact_launch__run_confined() {
     local _role_args=()
     if [ -n "$_role_uid" ] && [ -n "$_role_gid" ]; then
       _role_args=(--uid "$_role_uid" --gid "$_role_gid")
+      [ -z "$_role_groups" ] || _role_args+=(--groups "$_role_groups")
     fi
     local _role_env=()
-    [ "${#_role_args[@]}" -eq 0 ] || _role_env+=("AIB_ROLE_UIDS=${AIB_ROLE_UIDS:-}")
+    if [ "${#_role_args[@]}" -ne 0 ]; then
+      _role_env+=("AIB_ROLE_UIDS=${AIB_ROLE_UIDS:-}")
+      [ -z "$_role_groups" ] || _role_env+=("AIB_ROLE_GROUPS=$_role_groups")
+    fi
     exec "$_env_bin" -i "${_child_env[@]}" "${_role_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
       "LL_STATUS_FD=9" "LL_STDERR_FD=1" \
       "$AIB_CONFINE_BIN" "${_role_args[@]}" "$adapter" "${adapter_mode[@]}" \
