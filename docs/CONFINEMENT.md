@@ -276,14 +276,21 @@ first grants access to the shared credential store; the second grants only the g
 needed to publish the mode-`0660` code socket in `/run/aib/login` for gateway clients.
 
 Two further residuals follow from the group grants and are accepted for the shared subscription
-mode. The role account is not a member of `aib-login` itself; it holds the group only inside the
-confined turn, where Landlock keeps the store out of `LL_RW`. On a path without Landlock (the
-mount-namespace fallback), DAC alone would let it create, rename or remove entries in the setgid
-store directory (mode `2770`); there only the owner and mode checks the refresher and broker apply to
-every store file stand in the way, and they turn a tampered file into a refusal and an alarm rather
-than a silent use. A role in `aib-shared` can append arbitrary lines to
-`_control.jsonl` and the team outbox. Both are report streams, so no component may authorize or act on
-a line from them without its own check.
+mode. First, the role account is not a member of `aib-login` itself; it holds the group only inside
+the confined turn, and the role switch exists only in `landlock-exec`, which fails closed without
+Landlock. There the store stays outside `LL_RW`. Should a future path grant the group without
+Landlock, DAC alone would let the role create, rename or remove entries in the setgid store directory
+(mode `2770`); only the owner and mode checks the refresher and broker apply to every store file would
+then stand in the way, turning a tampered file into a refusal and an alarm rather than a silent use.
+
+Second, `_control.jsonl` and the team outbox are mode `0660` for `aib-shared`. A confined turn
+cannot write them, because the standup and outbox trees are not in its `LL_RW`, but every other
+process in `aib-shared` can append arbitrary lines. Both files are report streams. One consumer is a
+known exception: `bin/aib-login` reads the latest `login.requested` record and its `caller` from
+`_control.jsonl` to apply the "due" and rate-limit gate. A forged record from an `aib-shared` member
+could therefore bypass that gate or mask a real request. The reach is bounded: starting the login unit
+still needs the gateway's polkit grant, and the code channel still checks the peer over
+`SO_PEERCRED`. Moving login requests to a source only the gateway can write is a planned follow-up.
 
 API-key mode is the path that restores the stronger "the agent never sees the shared credential"
 property. The deployment schema reserves `credential_mode=proxy` for that later mediation path; it
