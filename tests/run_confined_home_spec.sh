@@ -192,4 +192,34 @@ launch acme-core "provider=claude-code" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_LOG
 eq "T5: an expired/near-expiry login: the response carries exit_code=78 and the hint:login marker, provider not started" "$(printf '%s' "$RESP" | grep -c '^exit_code=78$')|$(printf '%s' "$RESP" | grep -c 'hint:login')|$(provider_ran)" "1|1|not-run"
 eq "T5: …and still no token in the response" "$(printf '%s' "$RESP" | grep -c "$SENT")" 0
 
+# --- T6 (design v3.7 P5 / W2) project-root guard: the provider's tree must not be (or hold, or sit in) the shared control tree ------------------------------
+# The confined launch refuses with stage=policy and reason=shared_tree_in_project, provider NOT started, when realpath(project root) equals, contains or lies
+# inside realpath of: the standup dir (AIB_STANDUP_DIR here: the resolved standup dir of the managed agent), the outbox root (AIB_OUTBOX_ROOT) or the
+# directory of the control log (AIB_CONTROL_LOG). realpath on both sides (a symlink to the root counts as the root). Disjoint trees launch as before.
+# (Expectation to confirm at build time: the standup dir arrives via AIB_STANDUP_DIR, as aib_resolve_managed_agent exports it to the enact call.)
+shared_case() { # shared_case <label> <var> <path-for-var> [more VAR=val...]  — expects a policy refusal
+  local label="$1" var="$2" val="$3"; shift 3
+  launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" "$var=$val" "$@"
+  eq "T6: $label => provider not started, stage=policy, reason=shared_tree_in_project" "$(provider_ran)|$(printf '%s' "$RESP" | grep -c '^stage=policy$')|$(printf '%s' "$RESP" | grep -c '^reason=shared_tree_in_project$')" "not-run|1|1"
+}
+mkdir -p "$PROJ/inside" "$WORK/shared/outbox" "$WORK/shared/standup" "$WORK/shared/log" "$WORK/elsewhere"
+ln -sfn "$PROJ" "$WORK/link-to-project"
+shared_case "outbox root == project root" AIB_OUTBOX_ROOT "$PROJ"
+shared_case "outbox root INSIDE the project" AIB_OUTBOX_ROOT "$PROJ/inside"
+shared_case "outbox root CONTAINS the project" AIB_OUTBOX_ROOT "$WORK"
+shared_case "outbox root reached through a symlink to the project root (realpath)" AIB_OUTBOX_ROOT "$WORK/link-to-project"
+shared_case "standup dir == project root" AIB_STANDUP_DIR "$PROJ"
+shared_case "standup dir INSIDE the project" AIB_STANDUP_DIR "$PROJ/inside"
+shared_case "standup dir CONTAINS the project" AIB_STANDUP_DIR "$WORK"
+shared_case "control log directory == project root" AIB_CONTROL_LOG "$PROJ/_control.jsonl"
+shared_case "control log directory INSIDE the project" AIB_CONTROL_LOG "$PROJ/inside/_control.jsonl"
+shared_case "control log directory CONTAINS the project" AIB_CONTROL_LOG "$WORK/_control.jsonl"
+shared_case "one bad tree among two disjoint ones (outbox disjoint, standup disjoint, log inside)" AIB_CONTROL_LOG "$PROJ/inside/_control.jsonl" AIB_OUTBOX_ROOT="$WORK/shared/outbox" AIB_STANDUP_DIR="$WORK/shared/standup"
+launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_OUTBOX_ROOT="$WORK/shared/outbox" AIB_STANDUP_DIR="$WORK/shared/standup" AIB_CONTROL_LOG="$WORK/shared/log/_control.jsonl"
+eq "T6: guard — all three shared trees disjoint from the project (sibling dirs) => the provider is started as before" "$(provider_ran)|$(printf '%s' "$RESP" | grep -c '^stage=policy$')" "ran|0"
+launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_OUTBOX_ROOT="$WORK/shared/outbox-nonexistent"
+eq "T6: guard — a shared tree that does not exist (not yet provisioned) is not a reason to refuse" "$(provider_ran)|$(printf '%s' "$RESP" | grep -c '^stage=policy$')" "ran|0"
+launch acme-core "" AIB_OUTBOX_ROOT="$PROJ"
+eq "T6: …also without the S1c state root (any confined launch): outbox root == project root => stage=policy, provider not started" "$(provider_ran)|$(printf '%s' "$RESP" | grep -c '^reason=shared_tree_in_project$')" "not-run|1"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

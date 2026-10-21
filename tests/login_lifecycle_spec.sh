@@ -4,8 +4,8 @@
 #
 # WHAT THIS PINS
 #   bin/aib-login <provider>           the ExecStart of aib-login@<provider>.service (User=aib-broker; the only process that creates a login).
-#     It serves ONE request: the newest `login.requested` record for <provider> in $AIB_CONTROL_LOG without a terminal record
-#     ({"event":"login.requested","verb":"login-start","target":<provider>,"caller":C,"actor":A}). Audit events it appends (same
+#     It serves ONE request: the newest request file <provider>.<seq>.req in the spool $AIB_LOGIN_REQ_DIR (design v3.7; was: the newest
+#     `login.requested` record in $AIB_CONTROL_LOG), caller = identity_for(st_uid of that file). The log is audit output only. Audit events it appends (same
 #     seq allocator + lock as every writer): login.started | login.rejected{reason} | login.code_accepted | login.code_rejected{reason}
 #     | login.succeeded | login.failed{reason}, each with provider, req (the requested seq), caller (the requester) and, where it
 #     exists, vorgang. THE CODE IS NEVER IN ANY RECORD.
@@ -75,8 +75,11 @@ FAKE
 chmod +x "$W/fakes/claude" "$W/fakes/codex"
 LENV+=(AIB_CLAUDE_BIN="$W/fakes/claude" AIB_CODEX_BIN="$W/fakes/codex" AIB_LOGIN_WINDOW_S=30 AIB_LOGIN_CODE_FRESH_S=60 AIB_LOGIN_START_INTERVAL_S=3600)
 
-# a login.requested record, as agentctl writes it: lreq <provider> <caller> [actor] -> echoes the seq
-lreq() { python3 -I - "$CLOG" "$1" "$2" "${3:-}" <<'PY'
+# a request, as agentctl writes it (design v3.7 P1): the audit record in the log AND the spool file <provider>.<seq>.req; lreq <provider> <caller> [actor] -> echoes the seq
+# FLIPPED in v3.7 (P2/P3): the unit used to take the request AND its caller from the log record (`caller` field), so this helper only appended that record. The
+# unit now reads ONLY the spool and derives the caller from the file owner's uid via AIB_IDENTITY_CMD, so the helper also makes the spool file and maps
+# our uid to <caller> (`as`) before the unit looks. The audit record stays (events keep their shape; ev/cf counts are unchanged).
+lreq() { local seq; seq="$(python3 -I - "$CLOG" "$1" "$2" "${3:-}" <<'PY'
 import json, sys, datetime, fcntl
 path, prov, caller, actor = sys.argv[1:5]
 lock = open(path + ".lock", "a"); fcntl.flock(lock, fcntl.LOCK_EX)
@@ -89,7 +92,7 @@ rec = {"seq": seq + 1, "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M
        "target": prov, "provider": prov, "caller": caller, "actor": actor}
 open(path, "a").write(json.dumps(rec) + "\n"); print(seq + 1)
 PY
-}
+)"; as "$2"; spool_put "$1" "$seq"; echo "$seq"; }
 # sendcode <provider> <vorgang> <code> [age_s] -> prints the reply line (empty on a connect failure)
 sendcode() { python3 -I - "$LSOCK/login-$1.sock" "$1" "$2" "$3" "${4:-0}" <<'PY'
 import json, socket, sys, time

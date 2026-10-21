@@ -165,4 +165,12 @@ for spec in "aib-login-refresh@.timer:1799" "aib-login-watch.timer:3600"; do
   done
 done
 
+# --- T10 (design v3.7 P1/P2) the login request spool is provisioned ---------------------------------------------------------------------------------------
+# tmpfiles: `d /run/aib/login-requests 1733 aib-broker aib-broker -` (any uid can create a request, nobody can list, sticky: only the owner of a file or
+# the directory owner can remove it). The login unit unlinks the requests it has read, so it must be able to write there (a `-` prefixed ReadWritePaths
+# entry, like the other runtime-created directories of T4).
+l="$(line /run/aib/login-requests)"
+eq "T10: tmpfiles: d /run/aib/login-requests 1733 aib-broker aib-broker -" "$(fld "$l" 1) $(fld "$l" 2) $(fld "$l" 3) $(fld "$l" 4) $(fld "$l" 5) $(fld "$l" 6)" "d /run/aib/login-requests 1733 aib-broker aib-broker -"
+eq "T10: aib-login@.service may write the spool (ReadWritePaths has -/run/aib/login-requests, '-' prefixed)" "$(body "$U/aib-login@.service" | grep -E '^ReadWritePaths=' | cut -d= -f2- | tr ' ' '\n' | grep -Fxc -e '-/run/aib/login-requests')" 1
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]
