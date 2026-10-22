@@ -11,11 +11,12 @@ exercise, where "confined" becomes true rather than contractual, has a precondit
 
 ## What §2.1 requires
 
-The provider child runs under the broker account, but the prompt that drives it comes from the
-request. So it is agent-directed computation running inside the account that owns the event stream,
-the anchor, the credentials and the adapter map. §2.1 therefore requires the child to be **confined
-before `exec`**, with two properties: the restriction is installed before the foreign code runs, and
-the restricted process cannot revoke it.
+The broker owns the launch, but the prompt that drives the provider child comes from the request.
+S1c switches that child to an allow-listed role account before the adapter exec; earlier deployments
+ran it as the broker itself. In either case it is agent-directed computation crossing a boundary
+whose privileged side owns the event stream, anchor, credentials and adapter map. §2.1 therefore
+requires the child to be **confined before `exec`**, with two properties: the restriction is installed
+before the foreign code runs, and the restricted process cannot revoke it.
 
 **Minimum:** no write access to the event stream, the high-water anchor, the registry, the adapter
 map, the installed engine, or **the visibility projection root** (`AIB_PROJECTION_ROOT`,
@@ -275,6 +276,14 @@ The login unit runs as `aib-broker` with supplementary groups `aib-login` and `a
 first grants access to the shared credential store; the second grants only the group membership
 needed to publish the mode-`0660` code socket in `/run/aib/login` for gateway clients.
 
+Control-plane caller identities come from the kernel uid, then resolve into four disjoint classes.
+`role:<name>` is selected first when the numeric uid appears in `AIB_ROLE_UIDS` in the root-owned
+`/etc/aib/role.env`; the file is parsed as data and never sourced. `gateway:<name>` is reserved for
+accounts named exactly `aib-gw` or `aib-gateway` — membership in the `aib-gateway` group does not
+confer gateway identity. A remaining account in `aib-shared` or `aib-ops` is `human:<name>`; every
+other uid is `unknown:<uid>`. This ordering prevents a role account's shared-group membership from
+turning it into a human operator.
+
 Two further residuals follow from the group grants and are accepted for the shared subscription
 mode. First, the role account is not a member of `aib-login` itself; it holds the group only inside
 the confined turn, and the role switch exists only in `landlock-exec`, which fails closed without
@@ -486,6 +495,9 @@ never creates them.
 cc -O2 -Wall -o /opt/aib/engine/libexec/landlock-exec src/landlock-exec.c
 chown root:aib-broker /opt/aib/engine/libexec/landlock-exec
 chmod 0750 /opt/aib/engine/libexec/landlock-exec
+install -d -o root -g root -m 0755 /opt/aib/adapters
+install -o root -g aib-shared -m 0750 adapters/codex /opt/aib/adapters/codex
+install -o root -g aib-shared -m 0750 adapters/claude-code /opt/aib/adapters/claude-code
 ```
 
 Owned `root:aib-broker 0750` (never `aib-broker:aib-broker`, the same reasoning as the TCB
@@ -496,6 +508,11 @@ via `Environment=`, unconditionally — there is no code path in `bin/aib-broker
 `aib_enact_launch` that falls back to a different location or skips the helper when it is missing;
 a missing or non-executable helper is D-A's pre-flight failure (`io-refused`, `stage=confine`), not
 a silent bypass.
+
+The adapters differ from the helper deliberately: the broker executes `landlock-exec`, but after the
+uid switch the role account executes the adapter. Adapter ownership is therefore
+`root:aib-shared 0750`: provisioned role accounts can execute it through their allow-listed shared
+group, while neither they nor the broker can replace it.
 
 ### Registry and writable project paths
 

@@ -11,7 +11,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
-    for name in ("AIB_SUP_STATE_ROOT", "AIB_STANDUP_DIR", "AIB_OPS_GROUP", "AIB_SETFACL"):
+    for name in (
+        "AIB_SUP_STATE_ROOT",
+        "AIB_STANDUP_DIR",
+        "AIB_OPS_GROUP",
+        "AIB_BROKER_GROUP",
+        "AIB_SETFACL",
+    ):
         os.environ.pop(name, None)
 
 UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
@@ -50,6 +56,7 @@ def main(argv: list[str]) -> int:
     state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
     standup = Path(os.environ.get("AIB_STANDUP_DIR", "/srv/aib/standup"))
     group = os.environ.get("AIB_OPS_GROUP", "aib-ops")
+    broker_group = os.environ.get("AIB_BROKER_GROUP", "aib-broker")
     setfacl = os.environ.get("AIB_SETFACL", "setfacl")
     state = state_root / uid
     transcripts = standup / "transcripts"
@@ -82,6 +89,7 @@ def main(argv: list[str]) -> int:
             return 78
     calls = [
         ["-m", f"g:{group}:--x", str(state)],
+        ["-m", f"g:{broker_group}:--x", str(state)],
         ["-d", "-m", f"g:{group}:r-x", str(state)],
         ["-m", f"g:{group}:--x", str(transcripts)],
         ["-d", "-m", f"g:{group}:r-x", str(transcripts)],
