@@ -75,6 +75,8 @@ def identity_for(numeric_uid: int) -> str:
                 return f"role:{account.pw_name}"
             if account.pw_name in ("aib-gw", "aib-gateway"):
                 return f"gateway:{account.pw_name}"
+            if account.pw_name.startswith("aib-"):
+                return f"role:{account.pw_name}"
             groups = {grp.getgrgid(account.pw_gid).gr_name}
             groups.update(entry.gr_name for entry in grp.getgrall() if account.pw_name in entry.gr_mem)
             if groups.intersection(("aib-shared", "aib-ops")):
