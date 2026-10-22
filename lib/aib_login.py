@@ -42,6 +42,17 @@ def setting(name: str, default: str) -> str:
     return default
 
 
+def runtime_integer(name: str, default: int) -> int:
+    """A per-run input set by the caller (the broker), read on installed engines too.
+
+    Unlike setting()/integer(), which honour the environment only as test seams,
+    this is for values the production caller passes on purpose. A missing or
+    malformed value yields the default.
+    """
+    value = os.environ.get(name, "")
+    return int(value) if re.fullmatch(r"-?[0-9]{1,9}", value) else default
+
+
 def integer(name: str, default: int) -> int:
     try:
         value = int(setting(name, str(default)))

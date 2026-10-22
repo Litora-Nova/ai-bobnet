@@ -253,4 +253,19 @@ else
   printf 'ok   - (skipped: not root - the arbitrary-uid case needs chown; the seam-based cases above pin the same check)\n'
 fi
 
+# --- T17 an INSTALLED engine honours the broker's per-launch turn timeout ------------------------------------------------------------------------------
+# The broker passes AIB_TURN_TIMEOUT_S to aib-login-token for every fd launch. It is a runtime input from the broker, not a test seam: on an installed
+# engine (.aib-installed present, seams off) it must still be read, otherwise every fd launch is refused with 78 "login token unavailable".
+IW="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-ttinst.XXXXXX")"; mkdir -p "$IW/eng"; cp -a "$ENGINE/lib" "$ENGINE/bin" "$IW/eng/"; : > "$IW/eng/.aib-installed"
+RT="$(env -i PATH="$PATH" AIB_TEST_SEAMS=1 AIB_TURN_TIMEOUT_S=900 AIB_LOGIN_WINDOW_S=5 python3 -I -c '
+import sys; sys.path.insert(0, sys.argv[1]); import aib_login as a
+rt = getattr(a, "runtime_integer", None)
+print(("%s|%s" % (rt("AIB_TURN_TIMEOUT_S", -1), a.integer("AIB_LOGIN_WINDOW_S", 1800))) if rt else "missing")
+' "$IW/eng/lib" 2>/dev/null)"
+eq "T17: on an installed engine the turn timeout from the broker is read (900), while ordinary seams stay off (window keeps its default 1800)" "$RT" "900|1800"
+RB="$(env -i PATH="$PATH" AIB_TURN_TIMEOUT_S=9x python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import aib_login as a; print(a.runtime_integer("AIB_TURN_TIMEOUT_S", -1))' "$IW/eng/lib" 2>/dev/null)"
+eq "T17: …a malformed value falls back to the default (fail closed: -1 => 78 downstream)" "$RB" "-1"
+grep -q 'runtime_integer("AIB_TURN_TIMEOUT_S"' "$ENGINE/bin/aib-login-token" && ok "T17: aib-login-token reads the turn timeout as a runtime input" || no "T17: aib-login-token reads the turn timeout as a runtime input"
+rm -rf "$IW"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]

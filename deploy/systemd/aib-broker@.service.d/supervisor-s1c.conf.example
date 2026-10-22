@@ -1,6 +1,7 @@
 [Service]
 EnvironmentFile=/etc/aib/role.env
-Environment=AIB_LOGIN_MAX_TURN_S=900
+# Turns are bounded to 900 s by the login refresher (its fixed AIB_LOGIN_MAX_TURN_S default);
+# the broker must not grant longer turns to fd or shared-login launches.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID
 SupplementaryGroups=aib-login

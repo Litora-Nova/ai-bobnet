@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_login import access_expiry, credential_path, integer, now, read_object, trusted_store_file  # noqa: E402
+from aib_login import access_expiry, credential_path, integer, now, read_object, runtime_integer, trusted_store_file  # noqa: E402
 
 
 def regular_0640(path: Path) -> int:
@@ -48,7 +48,7 @@ def main(argv: list[str]) -> int:
     oauth = data.get("claudeAiOauth") if data else None
     token = oauth.get("accessToken") if isinstance(oauth, dict) else None
     expiry = access_expiry("claude-code", data or {})
-    timeout = integer("AIB_TURN_TIMEOUT_S", -1)
+    timeout = runtime_integer("AIB_TURN_TIMEOUT_S", -1)
     if not isinstance(token, str) or not token or expiry is None or timeout < 0:
         print("claude-code login token unavailable hint:login", file=sys.stderr)
         return 78
