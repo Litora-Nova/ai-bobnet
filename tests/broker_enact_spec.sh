@@ -652,6 +652,25 @@ has "…the pre-flight call itself targets /bin/true, not the real adapter" "$(<
 has "…and the wire names reason=confinement_unavailable, not just stage=confine" \
   "$(<"$WORK/resp-4b")" "reason=confinement_unavailable"
 
+# --- S1c pre-flight failure: one journal diagnostic, unchanged wire ----------
+reset_run
+rm -rf "$WORK/missing-s1c-home"
+AIB_SUP_STATE_ROOT="$WORK/missing-s1c-home" AIB_TEST_SEAMS=1 AIB_CONFINE_BIN="$LANDLOCK_STUB" \
+  aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" \
+  >"$WORK/resp-4b-s1c" 2>"$WORK/enact-err-4b-s1c"
+eq "S1c missing agent home writes one fixed diagnostic to broker stderr" \
+  "$(cat "$WORK/enact-err-4b-s1c")" "aib: s1c preflight failed: agent_home"
+normalized_s1c_wire="$(sed 's/^ended_event_id=.*/ended_event_id=<id>/' "$WORK/resp-4b-s1c")"
+eq "…and its complete wire terminal frame remains unchanged" "$normalized_s1c_wire" "chunk_bytes=0
+
+exit_class=io-refused
+exit_code=126
+stage=confine
+reason=confinement_unavailable
+ended_event_id=<id>
+end=ok"
+
 # =============================================================================
 # --- 4c. LL_RW is composed from the registry snapshot only; a request cwd
 #     cannot widen it (SPEC-wire-format :82) ---------------------------------

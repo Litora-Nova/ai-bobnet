@@ -184,4 +184,11 @@ has "T11: …but never start or authorize one" "$DOCL" "never start or authorize
 has "T11: …and that the project-root guard (P5) covers configured and resolvable directories only" "$DOCL" "configured and resolvable"
 has "T11: …naming the spool directory" "$DOC" "/run/aib/login-requests"
 
+# --- T12 role-switched adapter placement ----------------------------------------------------------------------------------------------------
+PROVIDERS="$SRC_ROOT/docs/PROVIDERS.md"
+eq "T12: both provider adapter rows are root:aib-shared 0750" \
+  "$(grep -Ec '^\| Adapter \| `/opt/aib/adapters/(codex|claude-code)` \| root:aib-shared 0750,' "$PROVIDERS")" 2
+eq "T12: no provider adapter row still grants execute only to aib-broker" \
+  "$(grep -Ec '^\| Adapter \| `/opt/aib/adapters/.*root:aib-broker 0750' "$PROVIDERS")" 0
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]
