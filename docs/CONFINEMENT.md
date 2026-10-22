@@ -11,11 +11,12 @@ exercise, where "confined" becomes true rather than contractual, has a precondit
 
 ## What §2.1 requires
 
-The provider child runs under the broker account, but the prompt that drives it comes from the
-request. So it is agent-directed computation running inside the account that owns the event stream,
-the anchor, the credentials and the adapter map. §2.1 therefore requires the child to be **confined
-before `exec`**, with two properties: the restriction is installed before the foreign code runs, and
-the restricted process cannot revoke it.
+The broker owns the launch, but the prompt that drives the provider child comes from the request.
+S1c switches that child to an allow-listed role account before the adapter exec; earlier deployments
+ran it as the broker itself. In either case it is agent-directed computation crossing a boundary
+whose privileged side owns the event stream, anchor, credentials and adapter map. §2.1 therefore
+requires the child to be **confined before `exec`**, with two properties: the restriction is installed
+before the foreign code runs, and the restricted process cannot revoke it.
 
 **Minimum:** no write access to the event stream, the high-water anchor, the registry, the adapter
 map, the installed engine, or **the visibility projection root** (`AIB_PROJECTION_ROOT`,
@@ -244,11 +245,15 @@ The helper applies Landlock first, sets exactly the allow-listed supplementary g
 when no `--groups` is given), switches gid and uid, clears all remaining capability sets and the
 ambient set, and then executes the adapter. Every `--groups` gid must be strict decimal, not 0, and
 listed in `AIB_ROLE_GROUPS`; there is no numeric floor, because provisioning creates the shared and
-login groups as system groups. The role, gid and group list come from the root-owned
-`/etc/aib/role.env` (template `deploy/role.env.example`) read by the broker drop-in, never from a
+login groups as system groups. The role, gid and group list come from
+`/etc/aib/role.env`, which provisioning must keep root-owned and not writable by others (the engine does
+not check its owner or mode) (template `deploy/role.env.example`) read by the broker drop-in, never from a
 request. Groups the role account has outside this list, such as the control group, do not reach the
 confined turn. `bin/aib-agent-dirs` prepares the role-owned private home beneath `/var/lib/aib-sup` before
-the unit starts. The broker unit therefore needs only `CAP_SETUID` and `CAP_SETGID`, bounded as shown
+the unit starts; a one-shot agent without a supervisor unit needs one root run of it as well. The home is
+mode `0710` and carries one extra ACL entry, search-only (`--x`) for the broker group, so the broker can
+run its pre-flight and set the Landlock path rules inside it; there is no default entry and no read or
+write grant. The broker unit therefore needs only `CAP_SETUID` and `CAP_SETGID`, bounded as shown
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
 
@@ -274,6 +279,17 @@ and user codes are sent only to the human-ops server outbox.
 The login unit runs as `aib-broker` with supplementary groups `aib-login` and `aib-gateway`. The
 first grants access to the shared credential store; the second grants only the group membership
 needed to publish the mode-`0660` code socket in `/run/aib/login` for gateway clients.
+
+Control-plane caller identities come from the kernel uid, then resolve into four disjoint classes.
+`role:<name>` is selected first when the numeric uid appears in `AIB_ROLE_UIDS` in the root-owned
+`/etc/aib/role.env`; the file is parsed as data and never sourced. `gateway:<name>` is reserved for
+accounts named exactly `aib-gw` or `aib-gateway` — membership in the `aib-gateway` group does not
+confer gateway identity. Any other account whose name starts with `aib-` is `role:<name>` as well, so
+system and role accounts should keep that prefix. A remaining account in `aib-shared` or `aib-ops` is
+`human:<name>`; every other uid is `unknown:<uid>`. An unreadable or malformed `AIB_ROLE_UIDS` (for
+example a quoted value) makes every caller `unknown:` until root fixes the file: control is locked
+out, never widened. This ordering prevents a role account's shared-group membership from
+turning it into a human operator.
 
 Two further residuals follow from the group grants and are accepted for the shared subscription
 mode. First, the role account is not a member of `aib-login` itself; it holds the group only inside
@@ -486,6 +502,9 @@ never creates them.
 cc -O2 -Wall -o /opt/aib/engine/libexec/landlock-exec src/landlock-exec.c
 chown root:aib-broker /opt/aib/engine/libexec/landlock-exec
 chmod 0750 /opt/aib/engine/libexec/landlock-exec
+install -d -o root -g root -m 0755 /opt/aib/adapters
+install -o root -g aib-shared -m 0750 adapters/codex /opt/aib/adapters/codex
+install -o root -g aib-shared -m 0750 adapters/claude-code /opt/aib/adapters/claude-code
 ```
 
 Owned `root:aib-broker 0750` (never `aib-broker:aib-broker`, the same reasoning as the TCB
@@ -496,6 +515,14 @@ via `Environment=`, unconditionally — there is no code path in `bin/aib-broker
 `aib_enact_launch` that falls back to a different location or skips the helper when it is missing;
 a missing or non-executable helper is D-A's pre-flight failure (`io-refused`, `stage=confine`), not
 a silent bypass.
+
+The adapters differ from the helper deliberately: the broker executes `landlock-exec`, but after the
+uid switch the role account executes the adapter. Adapter ownership is therefore
+`root:aib-shared 0750`: provisioned role accounts can execute it through their allow-listed shared
+group, while neither they nor the broker can replace it. This assumes `aib-shared` is in
+`AIB_ROLE_GROUPS`, which provisioning sets and the engine does not verify. Human members of
+`aib-shared` can read and execute the adapters too; they hold no secrets. Installed adapters are copies,
+so they must be reinstalled whenever the engine is updated.
 
 ### Registry and writable project paths
 

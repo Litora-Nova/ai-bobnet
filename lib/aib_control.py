@@ -14,9 +14,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parent.parent
+ROLE_UIDS_RE = re.compile(r"[0-9]+(?:,[0-9]+)*\Z", re.ASCII)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def configured_role_uids() -> set[int] | None:
+    path = Path("/etc/aib/role.env")
+    if os.environ.get("AIB_TEST_SEAMS") == "1" and not (ROOT / ".aib-installed").exists():
+        path = Path(os.environ.get("AIB_ROLE_ENV_FILE", path))
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    except (OSError, UnicodeError):
+        return None
+    value = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, raw = stripped.partition("=")
+        if separator and key == "AIB_ROLE_UIDS":
+            value = raw.strip()
+    if value is None:
+        return set()
+    if ROLE_UIDS_RE.fullmatch(value) is None:
+        return None
+    role_uids = {int(item) for item in value.split(",")}
+    return role_uids if all(uid >= 1000 for uid in role_uids) else None
 
 
 def identity_for(numeric_uid: int) -> str:
@@ -39,12 +68,17 @@ def identity_for(numeric_uid: int) -> str:
     else:
         try:
             account = pwd.getpwuid(numeric_uid)
-            groups = {grp.getgrgid(account.pw_gid).gr_name}
-            groups.update(entry.gr_name for entry in grp.getgrall() if account.pw_name in entry.gr_mem)
-            if account.pw_name in ("aib-gw", "aib-gateway") or "aib-gateway" in groups:
+            role_uids = configured_role_uids()
+            if role_uids is None:
+                return f"unknown:{numeric_uid}"
+            if numeric_uid in role_uids:
+                return f"role:{account.pw_name}"
+            if account.pw_name in ("aib-gw", "aib-gateway"):
                 return f"gateway:{account.pw_name}"
             if account.pw_name.startswith("aib-"):
                 return f"role:{account.pw_name}"
+            groups = {grp.getgrgid(account.pw_gid).gr_name}
+            groups.update(entry.gr_name for entry in grp.getgrall() if account.pw_name in entry.gr_mem)
             if groups.intersection(("aib-shared", "aib-ops")):
                 return f"human:{account.pw_name}"
         except (KeyError, OSError):

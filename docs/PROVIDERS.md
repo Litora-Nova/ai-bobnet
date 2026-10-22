@@ -13,7 +13,7 @@ it.
 | What | Path | Owner / mode |
 |---|---|---|
 | Wrapped binary | `/opt/aib/codex/<version>/codex` | root:aib-runtime 0755, static build, checksum pinned by provisioning |
-| Adapter | `/opt/aib/adapters/codex` | root:aib-broker 0750, from this repo's `adapters/codex`, install-time copy |
+| Adapter | `/opt/aib/adapters/codex` | root:aib-shared 0750, from this repo's `adapters/codex`, install-time copy |
 | `CODEX_HOME` | `/var/lib/aib/.codex` | aib-broker:aib-broker 0700, created empty by provisioning |
 | `config.toml` inside it | `/var/lib/aib/.codex/config.toml` | root:aib-broker 0644 |
 
@@ -175,7 +175,7 @@ there for what stays identical to `codex`'s translation and what differs.
 | What | Path | Owner / mode |
 |---|---|---|
 | Wrapped binary | `/opt/aib/claude-code/<version>/claude` | root:aib-runtime 0755, dynamically-linked ELF, checksum pinned by provisioning |
-| Adapter | `/opt/aib/adapters/claude-code` | root:aib-broker 0750, from this repo's `adapters/claude-code`, install-time copy |
+| Adapter | `/opt/aib/adapters/claude-code` | root:aib-shared 0750, from this repo's `adapters/claude-code`, install-time copy |
 | `CLAUDE_CONFIG_DIR` | `/var/lib/aib/.claude` | aib-broker:aib-broker 0700, created empty by provisioning |
 
 `/opt/aib/claude-code/<version>/claude` is an immutable versioned install, exactly like `codex`'s own

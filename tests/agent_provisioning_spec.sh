@@ -11,10 +11,12 @@
 #     touched; a team_uid outside [a-z0-9]+(-[a-z0-9]+)* is skipped (rc 65 at the end, the other dirs are still created); an existing SYMLINK
 #     where a dir belongs => rc 78 for that entry, nothing written through it; an unreadable registry => rc 66.
 #   bin/aib-agent-dirs <uid>            (unit: ExecStartPre=+/…/bin/aib-agent-dirs %i; seams AIB_SUP_STATE_ROOT (default /var/lib/aib-sup),
-#     AIB_STANDUP_DIR (default /srv/aib/standup), AIB_OPS_GROUP (default aib-ops), AIB_SETFACL (default setfacl))
+#     AIB_STANDUP_DIR (default /srv/aib/standup), AIB_OPS_GROUP (default aib-ops), AIB_BROKER_GROUP (default aib-broker),
+#     AIB_SETFACL (default setfacl))
 #     ensures <root>/<uid> exists as a real directory (never follows/creates through a symlink: rc 78) and $AIB_STANDUP_DIR/transcripts exists,
 #     then runs EXACTLY these setfacl calls, in this order (the unit's StateDirectoryMode stays 0700, the ACL adds traverse for the human group):
-#         -m g:<grp>:--x <root>/<uid>          -d -m g:<grp>:r-x <root>/<uid>
+#         -m g:<grp>:--x <root>/<uid>          -m g:<broker-grp>:--x <root>/<uid>
+#                                                -d -m g:<grp>:r-x <root>/<uid>
 #         -m g:<grp>:--x <standup>/transcripts -d -m g:<grp>:r-x <standup>/transcripts
 #         -m g:<grp>:r-- <root>/<uid>/live.json      (only when that file exists)
 #     uid must match [a-z0-9]+(-[a-z0-9]+)+ else rc 64 and nothing is created or run. A failing setfacl => rc 69.
@@ -67,19 +69,20 @@ cat > "$W/fakes/setfacl" <<'FAKE'
 w=$(cd -P "$(dirname "$0")/.." && pwd); printf '%s\n' "$*" >> "$w/setfacl.log"; exit "$(cat "$w/setfacl.rc" 2>/dev/null || echo 0)"
 FAKE
 chmod +x "$W/fakes/setfacl"
-SR="$W/sup-root"; SD="$W/standup2"; GRP="$(id -gn)"
-dirs() { RC=0; : > "$W/setfacl.log"; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SR" AIB_STANDUP_DIR="$SD" AIB_OPS_GROUP="$GRP" AIB_SETFACL="$W/fakes/setfacl" \
+SR="$W/sup-root"; SD="$W/standup2"; GRP="$(id -gn)"; BROKER_GRP="aib-broker-test"
+dirs() { RC=0; : > "$W/setfacl.log"; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SR" AIB_STANDUP_DIR="$SD" AIB_OPS_GROUP="$GRP" AIB_BROKER_GROUP="$BROKER_GRP" AIB_SETFACL="$W/fakes/setfacl" \
     timeout 30 "$ENGINE/bin/aib-agent-dirs" "$@" 2>"$W/dirs.err")" || RC=$?; ERR="$(cat "$W/dirs.err")"; }
 rm -rf "$SR" "$SD"; mkdir -p "$SR" "$SD"
 dirs acme-core
 eq "T2: state dir 0700 and transcripts dir created" "$RC|$(mode_of "$SR/acme-core")|$([ -d "$SD/transcripts" ] && echo dir)" "0|700|dir"
-eq "T2: exactly the four pinned setfacl calls, in order (no live.json yet)" "$(cat "$W/setfacl.log")" "-m g:$GRP:--x $SR/acme-core
+eq "T2: exactly the five pinned setfacl calls, in order (no live.json yet)" "$(cat "$W/setfacl.log")" "-m g:$GRP:--x $SR/acme-core
+-m g:$BROKER_GRP:--x $SR/acme-core
 -d -m g:$GRP:r-x $SR/acme-core
 -m g:$GRP:--x $SD/transcripts
 -d -m g:$GRP:r-x $SD/transcripts"
 echo '{}' > "$SR/acme-core/live.json"; dirs acme-core
-eq "T2: with a live.json a fifth call grants the human group read on it" "$(tail -1 "$W/setfacl.log")|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "-m g:$GRP:r-- $SR/acme-core/live.json|5"
-dirs acme-core; eq "T2: idempotent (same calls, rc 0)" "$RC|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "0|5"
+eq "T2: with a live.json a sixth call grants the human group read on it" "$(tail -1 "$W/setfacl.log")|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "-m g:$GRP:r-- $SR/acme-core/live.json|6"
+dirs acme-core; eq "T2: idempotent (same calls, rc 0)" "$RC|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "0|6"
 for bad in 'ACME' '../x' 'a' 'a b' 'acme_core' ''; do dirs "$bad"; eq "T2: uid '$bad' => rc 64, nothing run or created" "$RC|$(wc -c < "$W/setfacl.log" | tr -d ' ')" "64|0"; done
 rm -rf "${SR:?}/acme-sib"; ln -s "$W" "$SR/acme-sib"; dirs acme-sib
 eq "T2: a symlink in place of the state dir => rc 78, no setfacl" "$RC|$(wc -c < "$W/setfacl.log" | tr -d ' ')" "78|0"
@@ -135,7 +138,7 @@ eq "T4: the supervisor itself still has NoNewPrivileges and StateDirectoryMode=0
 #   - creates the symlink <root>/<uid>/.codex/auth.json -> $AIB_LOGIN_ROOT/codex/auth.json (default /var/lib/aib/login; dangling is fine: the login
 #     may not exist yet; an existing correct link is left alone). Without AIB_ROLE_UID none of this happens (S1c off = today's behaviour).
 LR="$W/login-root"; RU="$(id -u)"; RG="$(id -g)"; [ "$RU" -ge 1000 ] || RU=""
-rdirs() { RC=0; : > "$W/setfacl.log"; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SR" AIB_STANDUP_DIR="$SD" AIB_OPS_GROUP="$GRP" AIB_SETFACL="$W/fakes/setfacl" AIB_LOGIN_ROOT="$LR" "$@" \
+rdirs() { RC=0; : > "$W/setfacl.log"; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SR" AIB_STANDUP_DIR="$SD" AIB_OPS_GROUP="$GRP" AIB_BROKER_GROUP="$BROKER_GRP" AIB_SETFACL="$W/fakes/setfacl" AIB_LOGIN_ROOT="$LR" "$@" \
     timeout 30 "$ENGINE/bin/aib-agent-dirs" acme-core 2>"$W/dirs.err")" || RC=$?; ERR="$(cat "$W/dirs.err")"; }
 rm -rf "$SR" "$SD" "$LR"; mkdir -p "$SR" "$SD" "$LR"
 rdirs
@@ -149,7 +152,7 @@ else
   eq "T5: role setup: rc 0, state dir 0700 and owned by the role uid:gid" "$RC|$(stat -c '%a %u:%g' "$d")" "0|700 $RU:$RG"
   eq "T5: ….claude and .codex are real 0700 dirs owned by the role account" "$(for x in .claude .codex; do [ -d "$d/$x" ] && [ ! -L "$d/$x" ] && stat -c '%a %u:%g' "$d/$x"; done | tr '\n' ',')" "700 $RU:$RG,700 $RU:$RG,"
   eq "T5: ….codex/auth.json is a symlink to the shared store (dangling is fine)" "$([ -L "$d/.codex/auth.json" ] && readlink "$d/.codex/auth.json")" "$LR/codex/auth.json"
-  eq "T5: …the setfacl calls are unchanged (still exactly four)" "$(wc -l < "$W/setfacl.log" | tr -d ' ')" 4
+  eq "T5: …the setfacl calls include the broker search ACL (still exactly five)" "$(wc -l < "$W/setfacl.log" | tr -d ' ')" 5
   rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"
   eq "T5: idempotent (rc 0, link unchanged)" "$RC|$(readlink "$d/.codex/auth.json")" "0|$LR/codex/auth.json"
   rm -rf "$d/.claude"; ln -s "$W" "$d/.claude"; rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"

@@ -2017,7 +2017,7 @@ aib_enact_launch__run_confined() {
   }
 
   # --- D-A / D-A2: pre-flight, before ANYTHING else runs -----------------------
-  local _preflight_tmp _preflight_rc=1 state_path=""
+  local _preflight_tmp _preflight_rc=1 _s1c_preflight_diag="" state_path=""
   if [ "$_s1c_enabled" -eq 1 ]; then
     if [[ "$_agent_uid" =~ ^[a-z0-9]+(-[a-z0-9]+)+$ ]] &&
        [ -d "$_agent_home" ] && [ ! -L "$_agent_home" ]; then
@@ -2025,8 +2025,14 @@ aib_enact_launch__run_confined() {
         _preflight_rc=0
       else
         state_path="$_agent_home/$state_dir"
-        [ -d "$state_path" ] && [ ! -L "$state_path" ] && _preflight_rc=0
+        if [ -d "$state_path" ] && [ ! -L "$state_path" ]; then
+          _preflight_rc=0
+        else
+          _s1c_preflight_diag=provider_state
+        fi
       fi
+    else
+      _s1c_preflight_diag=agent_home
     fi
   elif [ -z "$state_dir" ]; then
     _preflight_rc=0
@@ -2105,6 +2111,7 @@ aib_enact_launch__run_confined() {
   if [ "$_preflight_rc" -ne 0 ]; then
     [ "$_credential_fd_open" -eq 0 ] || { exec 3<&-; _credential_fd_open=0; }
     _aib_enact_cleanup_credential_tmp || true
+    [ -z "$_s1c_preflight_diag" ] || printf 'aib: s1c preflight failed: %s\n' "$_s1c_preflight_diag" >&2
     local _reported_refusal=126
     [ "$_credential_refusal" -ne 78 ] || _reported_refusal=78
     _aib_enact_commit_ended io-refused confine "$_reported_refusal"
