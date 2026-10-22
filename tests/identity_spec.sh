@@ -28,6 +28,7 @@ accounts = {
     40001: SimpleNamespace(pw_name="operator", pw_gid=50001),
     40002: SimpleNamespace(pw_name="aib-gw", pw_gid=50002),
     41002: SimpleNamespace(pw_name="worker", pw_gid=50003),
+    40003: SimpleNamespace(pw_name="aib-broker", pw_gid=50001),
 }
 primary_groups = {
     50001: SimpleNamespace(gr_name="aib-shared"),
@@ -46,5 +47,6 @@ PY
 eq "an aib-gateway group member who is also aib-shared remains human" "$(printf '%s\n' "$OUT" | sed -n '1p')" "human:operator"
 eq "the dedicated aib-gw account is a gateway" "$(printf '%s\n' "$OUT" | sed -n '2p')" "gateway:aib-gw"
 eq "a non-aib account whose numeric uid is in role.env is a role" "$(printf '%s\n' "$OUT" | sed -n '3p')" "role:worker"
+eq "a system aib- account outside role.env stays a role, even as an aib-shared member" "$(printf '%s\n' "$OUT" | sed -n '4p')" "role:aib-broker"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]
