@@ -32,7 +32,7 @@ if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists()
     ):
         os.environ.pop(name, None)
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_control import append_record, identity_for, terminal_record, utc_now  # noqa: E402
+from aib_control import append_record, identity_for, registry_path, terminal_record, utc_now  # noqa: E402
 from aib_deployment import load_deployment  # noqa: E402
 
 USAGE = "usage: agentctl <status|neustart|feierabend|standup|abschalten|start|reset-brake|say|attach> <uid> | login <status|start> [provider]"
@@ -49,7 +49,7 @@ def die(code: int, text: str = "") -> int:
 
 
 def load_registry() -> dict:
-    path = Path(os.environ.get("AIBOBNET_REGISTRY", ROOT / "registry.json"))
+    path = registry_path(ROOT)
     with path.open(encoding="utf-8") as stream:
         return json.load(stream)
 

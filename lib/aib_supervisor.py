@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from aib_control import append_record, identity_for, requested_record
+from aib_control import append_record, identity_for, registry_path, requested_record
 from aib_deployment import deployment_allows
 
 
@@ -58,7 +58,7 @@ class Supervisor:
     def __init__(self, root: Path, uid: str) -> None:
         self.root = root
         self.uid = uid
-        self.registry_path = Path(os.environ.get("AIBOBNET_REGISTRY", root / "registry.json"))
+        self.registry_path = registry_path(root)
         state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
         self.state_dir = Path(os.environ.get("STATE_DIRECTORY", state_root / uid))
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
