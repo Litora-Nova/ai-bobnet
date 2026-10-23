@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
     os.environ.pop("AIBOBNET_REGISTRY", None)
     os.environ.pop("AIB_OUTBOX_ROOT", None)
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_control import registry_path  # noqa: E402
 
 NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
 
@@ -31,10 +33,10 @@ def ensure_dir(path: Path, mode: int) -> bool:
 
 
 def main() -> int:
-    registry_path = Path(os.environ.get("AIBOBNET_REGISTRY", ROOT / "registry.json"))
+    registry_file = registry_path(ROOT)
     outbox_root = Path(os.environ.get("AIB_OUTBOX_ROOT", "/srv/aib/outbox"))
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry = json.loads(registry_file.read_text(encoding="utf-8"))
         agents = registry["agents"]
         if not isinstance(agents, dict):
             raise ValueError

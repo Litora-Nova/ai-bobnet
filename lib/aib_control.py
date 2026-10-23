@@ -15,7 +15,17 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+PRODUCTION_REGISTRY = Path("/opt/aib/registry.json")
 ROLE_UIDS_RE = re.compile(r"[0-9]+(?:,[0-9]+)*\Z", re.ASCII)
+
+
+def registry_path(root: Path = ROOT) -> Path:
+    """Return the authoritative registry path for this engine tree."""
+    if (root / ".aib-installed").exists():
+        return PRODUCTION_REGISTRY
+    if os.environ.get("AIB_TEST_SEAMS") == "1":
+        return Path(os.environ.get("AIBOBNET_REGISTRY", root / "registry.json"))
+    return root / "registry.json"
 
 
 def utc_now() -> str:

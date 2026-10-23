@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
     os.environ.pop("AIBOBNET_REGISTRY", None)
     os.environ.pop("AIB_OUTBOX_ROOT", None)
+sys.path.insert(0, str(ROOT / "lib"))
+from aib_control import registry_path  # noqa: E402
 
 AGENT_RE = re.compile(r"aib-agent@([a-z0-9]+(?:-[a-z0-9]+)+)\.service\Z", re.ASCII)
 LOGIN_RE = re.compile(r"aib-login(?:-refresh)?@([a-z0-9]+(?:-[a-z0-9]+)*)\.service\Z", re.ASCII)
@@ -50,7 +52,7 @@ def main(argv: list[str]) -> int:
     uid = agent_match.group(1)
     team = None
     try:
-        registry = json.loads(Path(os.environ.get("AIBOBNET_REGISTRY", ROOT / "registry.json")).read_text(encoding="utf-8"))
+        registry = json.loads(registry_path(ROOT).read_text(encoding="utf-8"))
         agent = registry.get("agents", {}).get(uid)
         if isinstance(agent, dict) and isinstance(agent.get("team_uid"), str):
             team = agent["team_uid"]
