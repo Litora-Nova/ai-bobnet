@@ -15,8 +15,9 @@
 #     AIB_SETFACL (default setfacl))
 #     ensures <root> is a real 0755 directory owned by the executing uid:gid (root:root in the unit), <root>/<uid> is a real directory
 #     (never follows/creates through a symlink: rc 78), and $AIB_STANDUP_DIR/transcripts exists. It also creates
-#     <standup>/<uid>.log as a regular 0664 file owned by the standup directory owner and group. An existing regular log keeps its group/mode,
-#     but is chowned to the standup directory owner; a symlink is refused (rc 78). This prevents Linux fs.protected_regular=2 from rejecting
+#     <standup>/<uid>.log as a regular 0664 file owned by the standup directory owner and group. An existing regular log keeps its group and
+#     non-executable permission bits, but is chowned to the standup directory owner; a multiply-linked file or symlink is refused (rc 78).
+#     This prevents Linux fs.protected_regular=2 from rejecting
 #     cross-writer O_CREAT opens in the sticky shared standup directory. Then it runs EXACTLY these setfacl calls, in this order:
 #         -m g:<grp>:--x <root>/<uid>          -m g:<broker-grp>:--x <root>/<uid>
 #                                                -d -m g:<grp>:r-x <root>/<uid>
@@ -90,14 +91,22 @@ eq "T2: with a live.json a sixth call grants the human group read on it" "$(tail
 dirs acme-core; eq "T2: idempotent (same calls, rc 0)" "$RC|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "0|6"
 chmod 604 "$SD/acme-core.log"; before_group="$(stat -c %g "$SD/acme-core.log")"; dirs acme-core
 eq "T2: an existing same-owner heartbeat keeps its mode and group" "$(stat -c '%a %g' "$SD/acme-core.log")" "604 $before_group"
-rm -f "$SD/acme-core.log"; printf 'sentinel\n' > "$W/heartbeat-target"; ln -s "$W/heartbeat-target" "$SD/acme-core.log"; dirs acme-core
+for unsafe_mode in 4775 2775; do
+  chmod "$unsafe_mode" "$SD/acme-core.log"; dirs acme-core
+  eq "T2: an existing heartbeat mode $unsafe_mode loses special and execute bits" "$RC|$(mode_of "$SD/acme-core.log")" "0|664"
+done
+rm -f "$SD/acme-core.log"; printf 'hardlinked\n' > "$SD/acme-core.log"; chmod 4775 "$SD/acme-core.log"; ln "$SD/acme-core.log" "$SD/acme-core-link.log"
+before_hardlink="$(stat -c '%a %u:%g %h %s' "$SD/acme-core.log")|$(cat "$SD/acme-core.log")"; dirs acme-core
+eq "T2: a hardlinked heartbeat is refused and left untouched" "$RC|$(stat -c '%a %u:%g %h %s' "$SD/acme-core.log")|$(cat "$SD/acme-core.log")|$(wc -c < "$W/setfacl.log" | tr -d ' ')" "78|$before_hardlink|0"
+rm -f "$SD/acme-core.log" "$SD/acme-core-link.log"
+printf 'sentinel\n' > "$W/heartbeat-target"; ln -s "$W/heartbeat-target" "$SD/acme-core.log"; dirs acme-core
 eq "T2: a symlinked heartbeat is refused without touching its target" "$RC|$(cat "$W/heartbeat-target")" "78|sentinel"
 rm -f "$SD/acme-core.log"
 if [ "$(id -u)" -eq 0 ]; then
-  printf 'foreign\n' > "$SD/acme-core.log"; chown 64211:64212 "$SD/acme-core.log"; chmod 604 "$SD/acme-core.log"; dirs acme-core
-  eq "T2 (root): a foreign-owned heartbeat is re-owned to the standup owner while group/mode stay unchanged" "$(stat -c '%a %u:%g' "$SD/acme-core.log")" "604 $(stat -c %u "$SD"):64212"
+  printf 'foreign\n' > "$SD/acme-core.log"; chown 64211:64212 "$SD/acme-core.log"; chmod 4775 "$SD/acme-core.log"; dirs acme-core
+  eq "T2 (root): a foreign-owned heartbeat is re-owned while special and execute bits are removed" "$(stat -c '%a %u:%g' "$SD/acme-core.log")" "664 $(stat -c %u "$SD"):64212"
 else
-  printf 'ok   - (skipped: not root - constructing a foreign-owned heartbeat needs root; creation, preservation, and symlink refusal are covered)\n'
+  printf 'ok   - (skipped: not root - the foreign-owner re-own path needs root; same-owner mode stripping and hardlink refusal are covered)\n'
 fi
 for bad in 'ACME' '../x' 'a' 'a b' 'acme_core' ''; do dirs "$bad"; eq "T2: uid '$bad' => rc 64, nothing run or created" "$RC|$(wc -c < "$W/setfacl.log" | tr -d ' ')" "64|0"; done
 rm -rf "${SR:?}/acme-sib"; ln -s "$W" "$SR/acme-sib"; dirs acme-sib
