@@ -68,6 +68,14 @@ class Supervisor:
         self.live_path = self.state_dir / "live.json"
         self.records, dropped_bytes = self._load_records()
         self.journal_seq = max((r.get("seq", 0) for r in self.records), default=0)
+        self.inbox_unavailable = next(
+            (
+                record.get("event") == "inbox.unavailable"
+                for record in reversed(self.records)
+                if record.get("event") in ("inbox.unavailable", "inbox.recovered")
+            ),
+            False,
+        )
         if dropped_bytes:
             self.journal("journal.repaired", dropped_bytes=dropped_bytes)
         self.tick_seq = self._old_tick_seq()
@@ -639,7 +647,13 @@ class Supervisor:
     def open_messages(self) -> list[dict[str, str]]:
         result = self.message_command("inbox", capture=True)
         if result.returncode != 0:
+            if not self.inbox_unavailable:
+                self.journal("inbox.unavailable", rc=result.returncode)
+                self.inbox_unavailable = True
             return []
+        if self.inbox_unavailable:
+            self.journal("inbox.recovered")
+            self.inbox_unavailable = False
         messages: list[dict[str, str]] = []
         for order, line in enumerate(result.stdout.splitlines()):
             parts = line.split(" | ", 3)

@@ -74,5 +74,22 @@ eq "T3: …so a second instance is still refused after the re-exec (exit 78)" "$
 stop_sup
 if flock -n "$STATE/supervisor.lock" true 2>/dev/null; then ok "T3: the lock is released when the supervisor stops"; else no "T3: the lock is released when the supervisor stops"; fi
 
+# --- T4 inbox helper failures are journalled once per health transition --------------
+sup_world inbox-health
+start_sup
+wait_for 8 lj_is state READY
+mv "$ENGINE/registry.json" "$ENGINE/registry.away"
+wait_for 8 bash -c "[ \"\$(python3 -I '$SJ' count '$JOURNAL' inbox.unavailable)\" -eq 1 ]"
+eq "T4: a failing inbox call is journalled" "$(jcount inbox.unavailable)" 1
+eq "T4: the unavailable event records the helper rc" "$(jfield inbox.unavailable 1 rc)" 2
+sleep 0.5
+eq "T4: a persistent inbox failure is not journalled on every poll" "$(jcount inbox.unavailable)" 1
+mv "$ENGINE/registry.away" "$ENGINE/registry.json"
+wait_for 8 bash -c "[ \"\$(python3 -I '$SJ' count '$JOURNAL' inbox.recovered)\" -eq 1 ]"
+eq "T4: inbox recovery is journalled once" "$(jcount inbox.recovered)" 1
+sleep 0.3
+eq "T4: a healthy inbox does not repeat the recovery event" "$(jcount inbox.recovered)" 1
+stop_sup
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

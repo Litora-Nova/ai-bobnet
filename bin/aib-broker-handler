@@ -52,9 +52,9 @@ set -uo pipefail
 # process that only ever wants EPIPE-as-return-code for its whole life.
 trap '' PIPE
 
-AIB_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
-. "$AIB_ROOT/lib/aibobnet.sh"
+. "$REPO_ROOT/lib/aibobnet.sh"
 
 # Unit-only admission settings are checked before reading even a frame.
 _broker_misconfigured() {

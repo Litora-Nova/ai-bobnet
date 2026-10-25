@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,52 @@ def real_directory(path: Path, mode: int | None = None) -> bool:
         return False
 
 
+def prepare_heartbeat(standup: Path, name: str) -> bool:
+    """Create or repair a shared heartbeat without following a planted link."""
+    directory_fd = -1
+    file_fd = -1
+    try:
+        directory_fd = os.open(standup, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory.st_mode):
+            return False
+        created = False
+        try:
+            file_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
+        except FileNotFoundError:
+            try:
+                file_fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o664,
+                    dir_fd=directory_fd,
+                )
+                created = True
+            except FileExistsError:
+                file_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        if info.st_nlink > 1:
+            return False
+        if created:
+            os.fchown(file_fd, directory.st_uid, directory.st_gid)
+            os.fchmod(file_fd, 0o664)
+        else:
+            safe_mode = stat.S_IMODE(info.st_mode) & 0o666
+            if info.st_uid != directory.st_uid:
+                os.fchown(file_fd, directory.st_uid, -1)
+            os.fchmod(file_fd, safe_mode)
+        return True
+    except OSError:
+        return False
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 1 or UID_RE.fullmatch(argv[0]) is None:
         return 64
@@ -61,11 +108,20 @@ def main(argv: list[str]) -> int:
     state = state_root / uid
     transcripts = standup / "transcripts"
     try:
-        state_root.mkdir(parents=True, exist_ok=True)
         standup.mkdir(parents=True, exist_ok=True)
     except OSError:
         return 78
+    if not real_directory(state_root, 0o755):
+        return 78
+    if os.geteuid() == 0:
+        try:
+            os.chown(state_root, 0, 0)
+            os.chmod(state_root, 0o755)
+        except OSError:
+            return 78
     if not real_directory(state, 0o700) or not real_directory(transcripts):
+        return 78
+    if not prepare_heartbeat(standup, f"{uid}.log"):
         return 78
     if role_enabled:
         try:
