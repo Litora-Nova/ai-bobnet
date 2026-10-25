@@ -203,10 +203,15 @@ aib_log_resolved() {
 }
 
 # --- registry location --------------------------------------------------------
-# AIBOBNET_REGISTRY overrides for advanced/local use; otherwise the canonical
-# location is <REPO_ROOT>/registry.json. (bin/run-agent scrubs AIBOBNET_* by
-# design, so under run-agent the canonical repo-root registry is always used.)
+# An installed engine (<REPO_ROOT>/.aib-installed) always uses the production
+# registry at /opt/aib/registry.json and ignores AIBOBNET_REGISTRY. Otherwise,
+# AIBOBNET_REGISTRY overrides for advanced/local use, with
+# <REPO_ROOT>/registry.json as the fallback.
 aib_registry_file() {
+  if [ -e "$REPO_ROOT/.aib-installed" ]; then
+    printf '%s\n' /opt/aib/registry.json
+    return
+  fi
   printf '%s\n' "${AIBOBNET_REGISTRY:-$REPO_ROOT/registry.json}"
 }
 

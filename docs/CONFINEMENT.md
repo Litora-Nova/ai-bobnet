@@ -544,9 +544,9 @@ so they must be reinstalled whenever the engine is updated.
 
 The shipped `deploy/systemd/aib-broker@.service` sets
 `AIBOBNET_REGISTRY=/opt/aib/registry.json`. Install the registry at that path with
-broker read access; installed Python control tools also select this path unconditionally
-when the engine root contains `.aib-installed`. Without this binding the handler reports
-`registry_unavailable`.
+broker read access; installed Python control tools and shell tools that use the shared
+registry resolver also select this path unconditionally when the engine root contains
+`.aib-installed`. Without this binding the handler reports `registry_unavailable`.
 
 **ReadWritePaths MUST include every registry project home and standup_dir.**
 `ProtectSystem=strict` makes other persistent paths read-only even when their normal

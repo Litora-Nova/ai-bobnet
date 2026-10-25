@@ -46,9 +46,10 @@ shift
 [ -z "$actor" ] || aib_validate_token "$actor" actor_label
 
 # --- scrub inherited routing env FIRST — before ANY registry resolution ------
-# Order is load-bearing: aib_registry_file honors AIBOBNET_REGISTRY, so a poisoned
-# AIBOBNET_REGISTRY=/evil.json would otherwise make the attacker's file the resolution
-# authority and route the agent into a foreign project. Scrub MUST precede resolution.
+# Order is load-bearing: outside installed mode aib_registry_file honors
+# AIBOBNET_REGISTRY, so a poisoned AIBOBNET_REGISTRY=/evil.json would otherwise make
+# the attacker's file the resolution authority and route the agent into a foreign
+# project. Scrub MUST precede resolution.
 for _v in $(compgen -v); do
   case "$_v" in
     STANDUP_DIR|STANDUP_DIR_*|INBOX*|MUX*|BOOT_*|PROJECT_*|AIBOBNET_*)
