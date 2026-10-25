@@ -31,17 +31,12 @@ while IFS= read -r protected_uid; do
 done <<< "$projects"
 
 _project_one() (
-  local uid="$1" standup home provider account_label account_present agent owner mode scratch='' temp='' output_fd
+  local uid="$1" standup home agent owner mode team agent_provider account_label account_present invalid_deployment=0 scratch='' temp='' output_fd
   aib_validate_token "$uid" project_uid
   standup="$(_aib_snapshot_query projects field "$uid" standup_dir)" || aib_die 2 "cannot resolve standup_dir for $uid"
   home="$(_aib_snapshot_query projects field "$uid" home)" || aib_die 2 "cannot resolve home for $uid"
-  provider="$(_aib_snapshot_query projects field "$uid" provider)" || aib_die 2 "cannot resolve provider for $uid"
-  account_label="$(aib_deployment_account "$provider" label 2>/dev/null)" || account_label=''
-  account_present=0; _aib_deployment_account_present "$provider" 2>/dev/null && account_present=1
-  if [ "$account_present" -eq 0 ] && [ -e "${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" ] && ! aib_deployment_valid; then
-    # Invalid policy is still a known (but unreadable) account source. Expose an
-    # empty label rather than making the projection disappear or copying data.
-    account_present=1
+  if [ -e "${AIB_DEPLOYMENT_CONFIG:-/etc/aib/deployment.json}" ] && ! aib_deployment_valid; then
+    invalid_deployment=1
   fi
   [ -d "$standup" ] && [ -r "$standup" ] && [ -x "$standup" ] || aib_die 2 "standup_dir unavailable for $uid"
   [ -d "$home" ] || aib_die 2 "home unavailable for $uid"
@@ -49,6 +44,7 @@ _project_one() (
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/aib-project.XXXXXX") || aib_die 2 'cannot create reader scratch directory'
   : > "$scratch/agents"
   : > "$scratch/agent-modes"
+  : > "$scratch/agent-accounts"
   while IFS= read -r agent; do
     [ -n "$agent" ] || continue
     owner="$(_aib_snapshot_query agents field "$agent" project)" || continue
@@ -58,9 +54,21 @@ _project_one() (
     mode=oneshot
     mode="$(_aib_snapshot_query agents field "$agent" mode 2>/dev/null)" || mode=oneshot
     printf '%s\t%s\n' "$agent" "$mode" >> "$scratch/agent-modes" || aib_die 2 'cannot buffer agent modes'
+    team="$(_aib_snapshot_query agents field "$agent" team_uid 2>/dev/null)" || team=''
+    _aib_resolve_binding_field provider "$agent" "$team" "$uid"
+    agent_provider="$AIB_RESOLVED_VALUE"
+    aib_validate_provider "$agent_provider"
+    account_label="$(aib_deployment_account "$agent_provider" label 2>/dev/null)" || account_label=''
+    account_present=0; _aib_deployment_account_present "$agent_provider" 2>/dev/null && account_present=1
+    if [ "$account_present" -eq 0 ] && [ "$invalid_deployment" -eq 1 ]; then
+      # Invalid policy is still a known (but unreadable) account source. Expose an
+      # empty label rather than making the projection disappear or copying data.
+      account_present=1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$agent" "$agent_provider" "$account_label" "$account_present" >> "$scratch/agent-accounts" || aib_die 2 'cannot buffer agent accounts'
   done <<< "$agents"
   aib_attempts_fold "$AIB_EVENT_ROOT/$uid/main.events" > "$scratch/fold" || aib_die 2 "fold failed for $uid"
-  python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" "$provider" "$account_label" "$account_present" > "$scratch/result" <<'PY'
+  python3 -I - "$REPO_ROOT/lib/aibobnet.sh" "$uid" "$standup" "$AIB_EVENT_ROOT" "$scratch" "$dead_minutes" "$capacity" > "$scratch/result" <<'PY'
 import datetime as dt
 import errno
 import json
@@ -73,7 +81,7 @@ import sys
 import time
 from zoneinfo import ZoneInfo
 
-lib, uid, standup, eventroot, scratch, minutes, limit, provider, account_label, account_present = sys.argv[1:]
+lib, uid, standup, eventroot, scratch, minutes, limit = sys.argv[1:]
 scratch = Path(scratch)
 zone = ZoneInfo(os.environ.get('TZ') or 'UTC')
 now = time.time()
@@ -203,6 +211,12 @@ def integer_file(path):
 fold = json.loads((scratch/'fold').read_text())
 roster = (scratch/'agents').read_text().splitlines()
 agent_modes = dict(line.split('\t', 1) for line in (scratch/'agent-modes').read_text().splitlines())
+agent_accounts = {
+    agent: (provider, label, present)
+    for agent, provider, label, present in (
+        line.split('\t', 3) for line in (scratch/'agent-accounts').read_text().splitlines()
+    )
+}
 status = fold['status']
 reason = fold['reason']
 if not fold['present']:
@@ -387,6 +401,7 @@ def supervisor_projection(agent):
                     restarts += 1
             except ValueError:
                 pass
+    provider, account_label, account_present = agent_accounts[agent]
     status_dir = Path(os.environ.get('AIB_LOGIN_STATUS_DIR', '/run/aib/login-status'))
     login = read_json_file(status_dir/(provider+'.json'))
     account = None

@@ -619,8 +619,10 @@ positive integers; only documented `agentctl` verbs enter this list; caller, arg
 never do. State and rejected-control reasons are empty or machine words matching
 `^[a-z][a-z0-9_]{0,39}$`; invalid non-empty values project as `other`.
 
-`supervisor.account` is `null` when neither deployment nor login-status data exists. Otherwise it is
-`{provider, state, label, id_hint, expires_at, checked_at}`. The hint contains at most the last four
+`supervisor.account` is `null` when neither deployment nor login-status data exists for the agent's
+effective provider, resolved with the same agent → direct-team → project precedence as launch. Otherwise
+it is `{provider, state, label, id_hint, expires_at, checked_at}`. The label and login-status file are
+selected for that effective provider, never unconditionally for the project default. The hint contains at most the last four
 characters supplied by the status writer. Input timestamps accept real UTC
 `YYYY-MM-DDTHH:MM:SS[.fraction]Z` instants and project as whole-second
 `YYYY-MM-DDTHH:MM:SSZ` values or `null`; `state` is

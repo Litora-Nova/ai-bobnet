@@ -23,9 +23,6 @@ RestartForceExitStatus=75
 RestartPreventExitStatus=78
 KillMode=mixed
 TimeoutStopSec=60
-StateDirectory=aib-sup/%i
-StateDirectoryMode=0700
-
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -33,4 +30,4 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-ReadWritePaths=/var/lib/aib /run/aib /srv/aib/standup /srv/aib/outbox
+ReadWritePaths=/var/lib/aib /var/lib/aib-sup /run/aib /srv/aib/standup /srv/aib/outbox

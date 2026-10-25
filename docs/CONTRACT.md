@@ -175,6 +175,9 @@ behalf of an existing Agent — never a new Agent** (DOMAIN §2).
 `scripts/log.sh <agent_uid> <busy|idle|blocked|done> "<one line>"`:
 - Requires a resolvable context (agent_uid must be a registry agent → standup_dir). **Unknown/inconsistent → error + hint; never a default dir.**
 - Writes `<standup_dir>/<agent_uid>.log`. `agent_uid` is canonical; persona is display-only (the dashboard maps it via the theme).
+- On supervised deployments, the root pre-start helper pre-creates that top-level heartbeat with the
+  standup directory's owner/group so Linux `fs.protected_regular=2` cannot block the broker/supervisor
+  cross-writer pattern in the sticky shared directory; symlinks and non-regular files are refused.
 - Validates the closed status enum and collapses LF/CR while encoding `|` in free text before its
   single-line append.
 

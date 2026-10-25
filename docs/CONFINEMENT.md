@@ -257,6 +257,22 @@ write grant. The broker unit therefore needs only `CAP_SETUID` and `CAP_SETGID`,
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
 
+The helper is the sole owner of this directory contract. It creates `/var/lib/aib-sup` as root-owned
+`0755`, then prepares the per-agent home, provider directories, and named ACLs. The agent unit therefore
+does not use systemd `StateDirectory=` or `StateDirectoryMode=`: the template has no `User=`, so systemd
+would recursively restore root ownership and its configured mode after the privileged pre-start helper,
+destroying the role ownership and ACLs. `ProtectSystem=strict` remains enabled; the unit grants write
+access to `/var/lib/aib-sup` explicitly.
+
+`/srv/aib/standup` is setgid, sticky, and group-writable. With `fs.protected_regular=2`, a writer cannot
+open an existing `O_CREAT` heartbeat owned by neither the writer nor the directory owner, even when the
+writer is root. Before the supervisor starts, `aib-agent-dirs` therefore creates
+`<standup>/<agent>.log` as a regular `0664` file owned by the standup directory owner and group, or
+re-owns an existing foreign-owned regular file to the directory owner while preserving its group and
+mode. Directory-relative `O_NOFOLLOW` opens reject symlinks and non-regular files. The supervisor's
+`inbox/<agent>.md` and `transcripts/<agent>.log` append paths live in non-sticky subdirectories, so the
+protected-regular condition does not apply there and their existing ownership contracts are unchanged.
+
 ### Documented divergence: shared subscription login (2026-10-20)
 
 Subscription credentials are shared server-wide under `/var/lib/aib/login/<provider>/`. Credential
