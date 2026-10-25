@@ -9,8 +9,12 @@ pass=0 fail=0
 ok() { printf 'ok   - %s\n' "$1"; pass=$((pass + 1)); }
 no() { printf 'FAIL - %s\n' "$1"; fail=$((fail + 1)); }
 eq() { if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2', want '$3')"; fi; }
+has() { case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3')";; esac; }
 
-mkdir -p "$WORK/installed/lib" "$WORK/dev/lib" "$WORK/outbox"
+mkdir -p "$WORK/installed/bin" "$WORK/installed/lib" "$WORK/dev/lib" "$WORK/outbox"
+cp "$SRC_ROOT/bin/run-agent" "$WORK/installed/bin/"
+cp "$SRC_ROOT/lib/aibobnet.sh" "$WORK/installed/lib/"
+cp "$SRC_ROOT/lib/aibobnet.sh" "$WORK/dev/lib/"
 cp "$SRC_ROOT/lib/aib_control.py" "$WORK/installed/lib/"
 cp "$SRC_ROOT/lib/aib_control.py" "$WORK/dev/lib/"
 : > "$WORK/installed/.aib-installed"
@@ -41,6 +45,27 @@ eq "test seams without AIBOBNET_REGISTRY keep the engine-root fallback" \
   "$(resolve "$WORK/dev" 1 - 2>/dev/null)" "$WORK/dev/registry.json"
 eq "plain development ignores AIBOBNET_REGISTRY and keeps the engine-root fallback" \
   "$(resolve "$WORK/dev" - "$evil" 2>/dev/null)" "$WORK/dev/registry.json"
+
+shell_resolve() { # shell_resolve <engine> <registry env value or ->
+  local engine=$1 registry=$2 env_args=()
+  [ "$registry" = - ] || env_args+=(AIBOBNET_REGISTRY="$registry")
+  env -i PATH="$PATH" "${env_args[@]}" bash -c \
+    'REPO_ROOT=$1; . "$REPO_ROOT/lib/aibobnet.sh"; aib_registry_file' _ "$engine"
+}
+
+eq "installed shell tools always resolve the production registry and ignore the env override" \
+  "$(shell_resolve "$WORK/installed" "$evil" 2>/dev/null)" "/opt/aib/registry.json"
+eq "uninstalled shell tools honour AIBOBNET_REGISTRY" \
+  "$(shell_resolve "$WORK/dev" "$fixture" 2>/dev/null)" "$fixture"
+eq "uninstalled shell tools keep the engine-root fallback" \
+  "$(shell_resolve "$WORK/dev" - 2>/dev/null)" "$WORK/dev/registry.json"
+
+# /opt/aib/registry.json cannot be replaced by a fixture in an unprivileged test.
+# Trace the copied installed entry point through its real resolver instead.
+run_agent_trace=$(env -i PATH="$PATH" HOME="$WORK" AIBOBNET_REGISTRY="$evil" \
+  bash -x "$WORK/installed/bin/run-agent" acme-registry-path-probe -- true 2>&1 || true)
+has "run-agent in an installed engine resolves the production registry after scrubbing the poisoned env" \
+  "$run_agent_trace" "_AIB_RESOLVER_REGISTRY=/opt/aib/registry.json"
 
 # Pin every affected Python caller to the one policy function. The helper tests above
 # cover installed/dev selection; these checks prevent a caller from reintroducing its
