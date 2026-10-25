@@ -269,9 +269,10 @@ open an existing `O_CREAT` heartbeat owned by neither the writer nor the directo
 writer is root. Before the supervisor starts, `aib-agent-dirs` therefore creates
 `<standup>/<agent>.log` as a regular `0664` file owned by the standup directory owner and group, or
 re-owns an existing foreign-owned regular file to the directory owner while preserving its group and
-mode. Directory-relative `O_NOFOLLOW` opens reject symlinks and non-regular files. The supervisor's
-`inbox/<agent>.md` and `transcripts/<agent>.log` append paths live in non-sticky subdirectories, so the
-protected-regular condition does not apply there and their existing ownership contracts are unchanged.
+only its read/write permission bits (special and execute bits are removed). The directory-relative
+`O_NOFOLLOW` open rejects symlinks; descriptor checks reject non-regular and multiply-linked files. The
+supervisor's `inbox/<agent>.md` and `transcripts/<agent>.log` append paths live in non-sticky subdirectories,
+so the protected-regular condition does not apply there and their existing ownership contracts are unchanged.
 
 ### Documented divergence: shared subscription login (2026-10-20)
 

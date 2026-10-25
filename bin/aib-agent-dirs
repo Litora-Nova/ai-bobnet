@@ -64,13 +64,16 @@ def prepare_heartbeat(standup: Path, name: str) -> bool:
         info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode):
             return False
+        if info.st_nlink > 1:
+            return False
         if created:
             os.fchown(file_fd, directory.st_uid, directory.st_gid)
             os.fchmod(file_fd, 0o664)
-        elif info.st_uid != directory.st_uid:
-            original_mode = stat.S_IMODE(info.st_mode)
-            os.fchown(file_fd, directory.st_uid, -1)
-            os.fchmod(file_fd, original_mode)
+        else:
+            safe_mode = stat.S_IMODE(info.st_mode) & 0o666
+            if info.st_uid != directory.st_uid:
+                os.fchown(file_fd, directory.st_uid, -1)
+            os.fchmod(file_fd, safe_mode)
         return True
     except OSError:
         return False
