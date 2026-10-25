@@ -4,10 +4,11 @@
 #
 # WHAT THIS PINS
 #   agents[uid].supervisor.account (for a `mode: supervised` agent) becomes
-#       null                                                         when the agent's project provider has neither an `accounts.<provider>` entry
+#       null                                                         when the agent's effective provider has neither an `accounts.<provider>` entry
 #                                                                    in the deployment config nor a login status file
 #       {"provider":P,"state":S,"label":L,"id_hint":H}               otherwise — exactly these four keys
-#   P = the registry provider of the agent's project; S/H = `state`/`id_hint` of $AIB_LOGIN_STATUS_DIR/<P>.json (absent file => state "absent",
+#   P = the agent's effective registry provider (agent -> direct team -> project, matching launch resolution); S/H = `state`/`id_hint` of
+#   $AIB_LOGIN_STATUS_DIR/<P>.json (absent file => state "absent",
 #   id_hint ""); L = deployment `accounts.<P>.label` ("" when none). Seams (gate AIB_TEST_SEAMS=1, no `.aib-installed`): AIB_DEPLOYMENT_CONFIG,
 #   AIB_DEPLOYMENT_OWNER_UID, AIB_LOGIN_STATUS_DIR. An INVALID deployment config yields label "" (fail closed), never a crash.
 #   Nothing else of the status file is copied: a planted `email`, `token` or any other key never reaches the projection (whitelist, not blacklist).
@@ -47,6 +48,7 @@ cat > "$REG" <<JSON
   "agents": {
     "acme-core": { "mode": "supervised", "project": "acme", "profile": "engine-dev", "clearance": "t2" },
     "bolt-core": { "mode": "supervised", "project": "bolt", "profile": "engine-dev", "clearance": "t2" },
+    "bolt-claude": { "mode": "supervised", "project": "bolt", "provider": "claude-code", "profile": "engine-dev", "clearance": "t2" },
     "acme-solo": { "mode": "oneshot",    "project": "acme", "profile": "engine-dev", "clearance": "t2" }
   } }
 JSON
@@ -66,6 +68,7 @@ eq "T1: the label of the CURRENT deployment wins over the (stale) label in the s
 eq "T1: nothing else of the status file reaches the projection (no email, no token)" "$(grep -c -e 'leak@example' -e 'SECRET-TOKEN' "$OUT")" 0
 eq "T1: a oneshot agent keeps supervisor null" "$(jg agents.acme-solo.supervisor)" null
 proj "$DEP" bolt; eq "T1: an agent whose provider has no accounts entry and no status file => account null (and the run succeeds)" "$RC|$(acc bolt-core)" "0|null"
+eq "T1: an agent override selects its effective provider's account, not the project's provider" "$(acc bolt-claude)" '{"checked_at": null, "expires_at": "2026-12-01T00:00:00Z", "id_hint": "c0de", "label": "Interim: PO account", "provider": "claude-code", "state": "expiring"}'
 printf '{"provider":"codex","state":"ok","expires_at":null,"label":"","id_hint":"beef","checked_at":"x"}' > "$LSTAT/codex.json"
 proj "$DEP" bolt
 eq "T2: a status file alone (no accounts entry) is enough: label empty (S2a: plus expires_at null, checked_at garbage => null)" "$(acc bolt-core)" '{"checked_at": null, "expires_at": null, "id_hint": "beef", "label": "", "provider": "codex", "state": "ok"}'

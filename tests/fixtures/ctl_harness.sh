@@ -28,9 +28,8 @@
 #                          semantics for the shell side (aib_deployment_*) and the supervisor: JSON shape, duplicate keys,
 #                          owner == required uid, no group/other write bit, regular file, readable.
 #
-# OPEN (not pinned, needs a PO/Remote-Bob decision): `status` and the projection read <state>/live.json, but the unit template sets
-#   StateDirectoryMode=0700 and the unit runs as the (role) account, so neither a human's agentctl nor the aib-broker projection
-#   user can read it. The specs run everything under one uid and therefore do NOT cover this.
+# `status` and the projection read <state>/live.json through the ACLs installed by aib-agent-dirs. The unit deliberately has no
+#   StateDirectory=: systemd must not recursively reset the role ownership, mode, or named ACLs after ExecStartPre.
 #
 # ===== AUDIT LOG `_control.jsonl` (JSON Lines, ONE seq allocator for agentctl AND every supervisor: 1,2,3,... gap-free) =====
 #   {"seq":N,"ts":"<ISO UTC>","event":"ctl.requested","verb":V,"target":UID,"caller":ID,"actor":CLAIM|"","reason":TEXT|"",

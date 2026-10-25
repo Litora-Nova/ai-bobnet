@@ -13,8 +13,11 @@
 #   bin/aib-agent-dirs <uid>            (unit: ExecStartPre=+/…/bin/aib-agent-dirs %i; seams AIB_SUP_STATE_ROOT (default /var/lib/aib-sup),
 #     AIB_STANDUP_DIR (default /srv/aib/standup), AIB_OPS_GROUP (default aib-ops), AIB_BROKER_GROUP (default aib-broker),
 #     AIB_SETFACL (default setfacl))
-#     ensures <root>/<uid> exists as a real directory (never follows/creates through a symlink: rc 78) and $AIB_STANDUP_DIR/transcripts exists,
-#     then runs EXACTLY these setfacl calls, in this order (the unit's StateDirectoryMode stays 0700, the ACL adds traverse for the human group):
+#     ensures <root> is a real 0755 directory owned by the executing uid:gid (root:root in the unit), <root>/<uid> is a real directory
+#     (never follows/creates through a symlink: rc 78), and $AIB_STANDUP_DIR/transcripts exists. It also creates
+#     <standup>/<uid>.log as a regular 0664 file owned by the standup directory owner and group. An existing regular log keeps its group/mode,
+#     but is chowned to the standup directory owner; a symlink is refused (rc 78). This prevents Linux fs.protected_regular=2 from rejecting
+#     cross-writer O_CREAT opens in the sticky shared standup directory. Then it runs EXACTLY these setfacl calls, in this order:
 #         -m g:<grp>:--x <root>/<uid>          -m g:<broker-grp>:--x <root>/<uid>
 #                                                -d -m g:<grp>:r-x <root>/<uid>
 #         -m g:<grp>:--x <standup>/transcripts -d -m g:<grp>:r-x <standup>/transcripts
@@ -72,9 +75,11 @@ chmod +x "$W/fakes/setfacl"
 SR="$W/sup-root"; SD="$W/standup2"; GRP="$(id -gn)"; BROKER_GRP="aib-broker-test"
 dirs() { RC=0; : > "$W/setfacl.log"; OUT="$(env -i PATH="$PATH" HOME="$W/home-ctl" AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SR" AIB_STANDUP_DIR="$SD" AIB_OPS_GROUP="$GRP" AIB_BROKER_GROUP="$BROKER_GRP" AIB_SETFACL="$W/fakes/setfacl" \
     timeout 30 "$ENGINE/bin/aib-agent-dirs" "$@" 2>"$W/dirs.err")" || RC=$?; ERR="$(cat "$W/dirs.err")"; }
-rm -rf "$SR" "$SD"; mkdir -p "$SR" "$SD"
+rm -rf "$SR" "$SD"; mkdir -p "$SD"
 dirs acme-core
+eq "T2: state root is created 0755 and owned by the helper uid:gid (root:root in the unit)" "$(stat -c '%a %u:%g' "$SR")" "755 $(id -u):$(id -g)"
 eq "T2: state dir 0700 and transcripts dir created" "$RC|$(mode_of "$SR/acme-core")|$([ -d "$SD/transcripts" ] && echo dir)" "0|700|dir"
+eq "T2: heartbeat log is a real 0664 file owned by the standup directory owner:group" "$([ -f "$SD/acme-core.log" ] && [ ! -L "$SD/acme-core.log" ] && stat -c '%a %u:%g' "$SD/acme-core.log")" "664 $(stat -c '%u:%g' "$SD")"
 eq "T2: exactly the five pinned setfacl calls, in order (no live.json yet)" "$(cat "$W/setfacl.log")" "-m g:$GRP:--x $SR/acme-core
 -m g:$BROKER_GRP:--x $SR/acme-core
 -d -m g:$GRP:r-x $SR/acme-core
@@ -83,6 +88,17 @@ eq "T2: exactly the five pinned setfacl calls, in order (no live.json yet)" "$(c
 echo '{}' > "$SR/acme-core/live.json"; dirs acme-core
 eq "T2: with a live.json a sixth call grants the human group read on it" "$(tail -1 "$W/setfacl.log")|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "-m g:$GRP:r-- $SR/acme-core/live.json|6"
 dirs acme-core; eq "T2: idempotent (same calls, rc 0)" "$RC|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "0|6"
+chmod 604 "$SD/acme-core.log"; before_group="$(stat -c %g "$SD/acme-core.log")"; dirs acme-core
+eq "T2: an existing same-owner heartbeat keeps its mode and group" "$(stat -c '%a %g' "$SD/acme-core.log")" "604 $before_group"
+rm -f "$SD/acme-core.log"; printf 'sentinel\n' > "$W/heartbeat-target"; ln -s "$W/heartbeat-target" "$SD/acme-core.log"; dirs acme-core
+eq "T2: a symlinked heartbeat is refused without touching its target" "$RC|$(cat "$W/heartbeat-target")" "78|sentinel"
+rm -f "$SD/acme-core.log"
+if [ "$(id -u)" -eq 0 ]; then
+  printf 'foreign\n' > "$SD/acme-core.log"; chown 64211:64212 "$SD/acme-core.log"; chmod 604 "$SD/acme-core.log"; dirs acme-core
+  eq "T2 (root): a foreign-owned heartbeat is re-owned to the standup owner while group/mode stay unchanged" "$(stat -c '%a %u:%g' "$SD/acme-core.log")" "604 $(stat -c %u "$SD"):64212"
+else
+  printf 'ok   - (skipped: not root - constructing a foreign-owned heartbeat needs root; creation, preservation, and symlink refusal are covered)\n'
+fi
 for bad in 'ACME' '../x' 'a' 'a b' 'acme_core' ''; do dirs "$bad"; eq "T2: uid '$bad' => rc 64, nothing run or created" "$RC|$(wc -c < "$W/setfacl.log" | tr -d ' ')" "64|0"; done
 rm -rf "${SR:?}/acme-sib"; ln -s "$W" "$SR/acme-sib"; dirs acme-sib
 eq "T2: a symlink in place of the state dir => rc 78, no setfacl" "$RC|$(wc -c < "$W/setfacl.log" | tr -d ' ')" "78|0"
@@ -129,7 +145,7 @@ fi
 eq "T4: aib-agent@.service: OnFailure=aib-alarm@%n.service in [Unit] (not [Service])" "$(sec "$AG" Unit | grep -c '^OnFailure=aib-alarm@%n.service$')|$(sec "$AG" Service | grep -c '^OnFailure=')" "1|0"
 es="$(sec "$AG" Service | grep '^ExecStartPre=' | head -1)"
 case "$es" in ExecStartPre=+/*/bin/aib-agent-dirs\ %i) ok "T4: ExecStartPre=+<abs>/bin/aib-agent-dirs %i in [Service]";; *) no "T4: ExecStartPre=+<abs>/bin/aib-agent-dirs %i (got '$es')";; esac
-eq "T4: the supervisor itself still has NoNewPrivileges and StateDirectoryMode=0700" "$(sec "$AG" Service | grep -cx -e 'NoNewPrivileges=yes' -e 'StateDirectoryMode=0700')" 2
+eq "T4: the supervisor still has NoNewPrivileges and systemd does not own its state directory" "$(sec "$AG" Service | grep -cx -e 'NoNewPrivileges=yes')|$(sec "$AG" Service | grep -c '^StateDirectory')" "1|0"
 
 # --- T5 (K7) aib-agent-dirs prepares the ROLE account's home (S1c) -------------------------------------------------------------------------------
 # With AIB_ROLE_UID/AIB_ROLE_GID set (the same variables the broker uses; decimal, uid >= 1000) the helper also

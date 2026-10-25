@@ -9,7 +9,8 @@
 # ===== THE INTERFACE THIS HARNESS PINS FOR bin/aib-supervisor (S1a-2) =====
 #   bin/aib-supervisor <agent_uid>          one long-lived process; exit 0 = deliberate stop, 78 = refusal (table below)
 #   env (unit/test supplied, never agent- or request-derived):
-#     STATE_DIRECTORY            the per-agent state dir (systemd StateDirectory=aib-sup/%i)
+#     STATE_DIRECTORY            test-only explicit per-agent state dir; the shipped unit leaves it unset and
+#                                the supervisor uses AIB_SUP_STATE_ROOT/<uid> (default /var/lib/aib-sup/<uid>)
 #     AIBOBNET_REGISTRY          registry file (the unit sets it)
 #     AIB_LAUNCH_AGENT           launcher command, default <repo>/bin/launch-agent
 #     AIB_BROKER_CLIENT          command: broker frame on stdin -> broker response on stdout
@@ -31,7 +32,7 @@
 #   Every interval is handed to `sleep`, so a test may use 0.05. Time is therefore injectable by
 #   scaling the intervals. Positive waits are poll-until-condition with generous deadlines (wait_for);
 #   only NEGATIVE windows ("nothing happened") are fixed sleeps.
-#   files under $STATE_DIRECTORY:
+#   files under the resolved per-agent state directory:
 #     journal.jsonl   append-only JSON Lines, one object per line, {"seq":N,"ts":"<ISO>","event":"...",...},
 #                     seq = 1,2,3,... and CONTINUES across restarts and re-exec (single writer: the supervisor)
 #     live.json       rewritten atomically (tmp + rename) on every tick:

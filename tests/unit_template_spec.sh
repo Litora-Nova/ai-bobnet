@@ -9,13 +9,15 @@
 # AIB_UNIT_VERIFY=1 on the VM. Elsewhere that single check is skipped with a stated reason.
 #
 #   - template: no [Install] (the VM drop-in / provisioning adds WantedBy; it is the dashboard-unit
-#     pattern), no User=/Group= (a per-instance drop-in from the clearance->role map writes those;
-#     agents never write units), no ConditionPathExists= marker (F5b: nothing that carries authority
+#     pattern), no User=/Group= (the supervisor stays root; the confined provider child drops to the
+#     provisioned role account), no ConditionPathExists= marker (F5b: nothing that carries authority
 #     lives in agent-writable space; abschalten is `systemctl disable`).
 #   - lifecycle: Type=notify + NotifyAccess=all, WatchdogSec=90, Restart=on-failure, RestartSec=5,
 #     RestartSteps=5, RestartMaxDelaySec=300, StartLimitIntervalSec=900 + StartLimitBurst=5 (outer
 #     brake), RestartForceExitStatus=75 (neustart --hard), KillMode=mixed, TimeoutStopSec=60.
-#   - state: StateDirectory=aib-sup/%i with StateDirectoryMode=0700 (F1: v2 wins over v1's 0750).
+#   - state: no StateDirectory=/StateDirectoryMode=. systemd would recursively re-own and chmod the
+#     role-owned home after ExecStartPre, erasing the ACL contract. aib-agent-dirs is the sole owner
+#     of that setup; ProtectSystem=strict grants the supervisor the /var/lib/aib-sup root it needs.
 #   - confinement: ProtectSystem=strict, NoNewPrivileges=yes, and ReadWritePaths that include
 #     /run/aib (broker socket + ctl dir — F9) and the shared standup tree /srv/aib/standup.
 #   - ExecStart runs bin/aib-supervisor with the instance name (%i) as the agent uid, by absolute path.
@@ -41,7 +43,7 @@ not_anywhere() { # not_anywhere <regex> <why>
 }
 
 eq "sections are exactly [Unit][Service] (no [Install])" "$(sections)" "[Unit][Service]"
-not_anywhere '^\s*User=|^\s*Group=' "no User=/Group= in the template (per-instance drop-in owns the role account)"
+not_anywhere '^\s*User=|^\s*Group=' "no User=/Group= in the template (root supervisor; confined child drops role)"
 not_anywhere '^\s*ConditionPathExists' "no ConditionPathExists marker (disable state is systemd's, not a file an agent can delete)"
 
 in_sec Unit "StartLimitIntervalSec=900"
@@ -57,14 +59,16 @@ in_sec Service "RestartForceExitStatus=75"
 in_sec Service "RestartPreventExitStatus=78"
 in_sec Service "KillMode=mixed"
 in_sec Service "TimeoutStopSec=60"
-in_sec Service "StateDirectory=aib-sup/%i"
-in_sec Service "StateDirectoryMode=0700"
+not_anywhere '^\s*StateDirectory=' "no StateDirectory= (systemd must not reset the role-owned home)"
+not_anywhere '^\s*StateDirectoryMode=' "no StateDirectoryMode= (aib-agent-dirs owns mode and ACL setup)"
 in_sec Service "ProtectSystem=strict"
 in_sec Service "NoNewPrivileges=yes"
 
 rw="$(sec Service | grep '^ReadWritePaths=' | head -1)"
 case " ${rw#ReadWritePaths=} " in *" /run/aib "*) ok "ReadWritePaths includes /run/aib";; *) no "ReadWritePaths includes /run/aib (got '$rw')";; esac
 case " ${rw#ReadWritePaths=} " in *" /srv/aib/standup "*) ok "ReadWritePaths includes /srv/aib/standup";; *) no "ReadWritePaths includes /srv/aib/standup (got '$rw')";; esac
+case " ${rw#ReadWritePaths=} " in *" /var/lib/aib-sup "*) ok "ReadWritePaths includes /var/lib/aib-sup";; *) no "ReadWritePaths includes /var/lib/aib-sup (got '$rw')";; esac
+case " ${rw#ReadWritePaths=} " in *" -/var/lib/aib-sup "*) no "ReadWritePaths does not silently ignore a missing state root";; *) ok "ReadWritePaths does not silently ignore a missing state root";; esac
 eq "exactly one ReadWritePaths= line" "$(sec Service | grep -c '^ReadWritePaths=')" 1
 
 es="$(sec Service | grep '^ExecStart=' | head -1)"
