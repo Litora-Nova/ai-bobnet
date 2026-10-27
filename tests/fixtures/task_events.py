@@ -48,7 +48,34 @@ def main() -> int:
         with path.open("ab") as stream:
             stream.write(frame(record, seq))
         return 0
-    raise SystemExit("usage: task_events.py <count|field|append> ...")
+    if command == "inject":
+        kind, actor_type, actor_id, project, team, run_id, task_id, causation, payload_json = sys.argv[3:12]
+        seq = len(records(path)) + 1
+        record = {
+            "event_id": f"{project}-tasks-{seq}",
+            "event_type": kind,
+            "occurred_at": "2026-10-27T12:00:00Z",
+            "actor_type": actor_type,
+            "actor_id": actor_id,
+            "project_uid": project,
+            "team_uid": team,
+            "agent_uid": actor_id if actor_type == "agent" else None,
+            "session_id": None,
+            "run_id": run_id,
+            "task_id": None if task_id == "-" else task_id,
+            "gate_id": None,
+            "grant_id": None,
+            "effect_id": None,
+            "attempt_id": None,
+            "correlation_id": run_id,
+            "causation_id": causation,
+            "schema_version": 2,
+            "payload": json.loads(payload_json),
+        }
+        with path.open("ab") as stream:
+            stream.write(frame(record, seq))
+        return 0
+    raise SystemExit("usage: task_events.py <count|field|append|inject> ...")
 
 
 if __name__ == "__main__":
