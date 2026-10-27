@@ -144,6 +144,7 @@ class Supervisor:
         self.brake_consecutive = 0
         self.brake_tripped_at: str | None = None
         self.message_failures: dict[str, int] = {}
+        self.session_loss_counts: dict[str, int] = {}
         self.off_duty = False
         self.consumed: set[int] = set()
 
@@ -491,6 +492,8 @@ class Supervisor:
                     self.message_failures[msg_id] = self.message_failures.get(msg_id, 0) + 1
                     self.infra_episode = None
                     self.infra_login_hint = False
+                elif record.get("class") == "session_lost" and isinstance(msg_id, str):
+                    self.session_loss_counts[msg_id] = self.session_loss_counts.get(msg_id, 0) + 1
                 elif record.get("class") == "infra":
                     if self.infra_episode is None:
                         attempt_id = record.get("attempt_id")
@@ -505,6 +508,7 @@ class Supervisor:
                         self.turns_in_session += 1
                     if isinstance(msg_id, str):
                         self.message_failures.pop(msg_id, None)
+                        self.session_loss_counts.pop(msg_id, None)
             elif event == "duty.off":
                 self.off_duty = True
             elif event == "duty.on":
@@ -518,6 +522,16 @@ class Supervisor:
                 self.session_cwd = None
                 self.turns_in_session = 0
                 self.session_new = False
+            elif event == "session.persistence_failed":
+                msg_id = record.get("msg_id")
+                if isinstance(msg_id, str):
+                    self.message_failures.pop(msg_id, None)
+                    self.session_loss_counts.pop(msg_id, None)
+                if record.get("sid") == self.session_id:
+                    self.session_id = None
+                    self.session_cwd = None
+                    self.turns_in_session = 0
+                    self.session_new = False
             elif event == "ctl.consumed" and isinstance(record.get("req"), int):
                 self.consumed.add(record["req"])
         if self.brake_consecutive >= self.brake_burst and self.brake_tripped_at is None:
@@ -837,6 +851,11 @@ class Supervisor:
         self.journal("session.bound", agent=self.uid, sid=sid, cwd=self.project_home)
 
     def add_handover_note(self, reason: str, previous: str | None) -> None:
+        if any(
+            message["from"] == self.uid and message["body"].startswith("kind:handover;")
+            for message in self.open_messages()
+        ):
+            return
         note_id = f"handover-{uuid.uuid4().hex}"
         body = f"kind:handover; reason:{reason}; previous_session:{previous or 'none'}; establish context before continuing queued work"
         if self.message_command("send", self.uid, body, "--id", note_id).returncode != 0:
@@ -1043,6 +1062,45 @@ class Supervisor:
             self.retry_at = time.monotonic()
             return
         if refusal_reason is None and rc != 0 and not session_arg.startswith("new:") and "no conversation found" in lowered:
+            losses = self.session_loss_counts.get(work["id"], 0) + 1
+            self.session_loss_counts[work["id"]] = losses
+            if losses >= 2:
+                self.infra_since = None
+                self.infra_episode = None
+                self.infra_login_hint = False
+                self.brake_consecutive += 1
+                if self.brake_consecutive >= self.brake_burst:
+                    self.brake_tripped_at = utc_now()
+                reason = "session_persistence_unavailable"
+                self.end_turn(work, attempt_id, "provider_failure", rc, reason=reason)
+                failed_sid = self.session_id
+                self.journal(
+                    "session.persistence_failed",
+                    msg_id=work["id"],
+                    sid=failed_sid,
+                    reason=reason,
+                    brake=self.brake_consecutive,
+                    tripped_at=self.brake_tripped_at,
+                )
+                self.session_loss_counts.pop(work["id"], None)
+                self.session_id = None
+                self.session_cwd = None
+                self.turns_in_session = 0
+                self.session_new = False
+                if not work.get("synthetic"):
+                    self.message_command("fail", work["id"], reason)
+                self.work = None
+                now = time.monotonic()
+                if self.brake_tripped_at is not None:
+                    self.set_state("FAILED", "brake")
+                    self.heartbeat("blocked", "supervisor provider-failure brake tripped")
+                    self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
+                    self.retry_at = float("inf")
+                else:
+                    delay = min(self.backoff_cap, self.backoff_base * (2 ** (self.brake_consecutive - 1)))
+                    self.set_state("WAITING", "infra")
+                    self.retry_at = now + delay
+                return
             self.end_turn(work, attempt_id, "session_lost", rc)
             self.rotate_with_note("unknown_sid")
             self.work = None
