@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Visibility gate regressions. Optional case argument supports focused mutation runs.
 set -uo pipefail
+export AIB_TEST_SEAMS=1
+export AIB_TEST_PEER_UID=0
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 python3 - "$ROOT" "${1:-all}" <<'PY'
 import ast,contextlib,datetime as dt,fcntl,io,json,os,pathlib,re,signal,subprocess,sys,tempfile

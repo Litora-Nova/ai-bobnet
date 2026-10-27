@@ -24,6 +24,8 @@
 #     the request field marking a supervised launch is `lease_class=supervised` (token field,
 #     allow-listed at the wire; any other value is refused as malformed_request).
 set -uo pipefail
+export AIB_TEST_SEAMS=1
+export AIB_TEST_PEER_UID=0
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 HANDLER="$SRC_ROOT/bin/aib-broker-handler"

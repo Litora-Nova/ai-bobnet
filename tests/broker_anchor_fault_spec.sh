@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Anchor durability failures and admission configuration must fail closed.
 set -uo pipefail
+export AIB_TEST_SEAMS=1
+export AIB_TEST_PEER_UID=0
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 . "$SRC_ROOT/lib/aibobnet.sh"
 WORK=$(mktemp -d)

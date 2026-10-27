@@ -124,7 +124,7 @@ deploy_customer_code=true"
 # --- T4 the broker handler denies a launch for a customer project --------------------------------------------
 ctl_world handler; ctl_registry customer
 frame() { printf 'op=launch\nagent_uid=acme-core\ncwd_bytes=0\nlabel_bytes=0\nprompt_bytes=5\n\nhallo'; }
-hand() { env -i PATH="$PATH" HOME="$W" AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$ME_UID" AIBOBNET_REGISTRY="$ENGINE/registry.json" AIB_EVENT_ROOT="$W/event-root" ${1:+AIB_DEPLOYMENT_CONFIG="$1"} "$ENGINE/bin/aib-broker-handler" 2>/dev/null; }
+hand() { env -i PATH="$PATH" HOME="$W" AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID=0 AIB_DEPLOYMENT_OWNER_UID="$ME_UID" AIBOBNET_REGISTRY="$ENGINE/registry.json" AIB_EVENT_ROOT="$W/event-root" ${1:+AIB_DEPLOYMENT_CONFIG="$1"} "$ENGINE/bin/aib-broker-handler" 2>/dev/null; }
 put cfg_no.json '{"deployment_id":"d","allow":{"customer_code":false,"comms_secrets":false}}'
 resp="$(frame | hand "$WORK/cfg_no.json")"
 has "T4: customer project + customer_code=false => end=denied" "$resp" "end=denied"

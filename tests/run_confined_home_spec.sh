@@ -121,6 +121,13 @@ launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=5001 AIB_ROLE_
 case "$(ll_field ARGV)" in "--uid 5001 --gid 5002 --groups 5004,5005 $STUB/provider exec "*) ok "T2g: helper argv is --uid 5001 --gid 5002 --groups 5004,5005, then the adapter and its normal ABI";; *) no "T2g: helper argv carries --groups from the unit env (got '$(ll_field ARGV)')";; esac
 eq "T2g: …the allow-list AIB_ROLE_GROUPS reaches the helper's env" "$(ll_field AIB_ROLE_GROUPS)" "5004,5005"
 eq "T2g: …but not the provider chain" "$(penv AIB_ROLE_GROUPS)|$(provider_ran)" "|ran"
+launch acme-core "" AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID=5005 AIB_SUP_STATE_ROOT="$STATE_ROOT" \
+  AIB_ROLE_UID=5001 AIB_ROLE_GID=5002 AIB_ROLE_UIDS=5001 AIB_ROLE_GROUPS=5004,5005
+eq "T2g: aib-shared in the requested supplementary groups refuses before provider exec" "$(provider_ran)" not-run
+has "T2g: the shared-group refusal is a confinement failure on the wire" "$RESP" "reason=confinement_unavailable"
+launch acme-core "" AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID=5005 AIB_SUP_STATE_ROOT="$STATE_ROOT" \
+  AIB_ROLE_UID=5001 AIB_ROLE_GID=5005 AIB_ROLE_UIDS=5001 AIB_ROLE_GROUPS=5004
+eq "T2g: aib-shared as the primary role gid also refuses before provider exec" "$(provider_ran)" not-run
 launch acme-core "groups=6000
 AIB_ROLE_GROUPS=6000
 role_groups=6000

@@ -31,7 +31,7 @@ eq(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi; }
 has(){ case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3' in: ${2:0:200})";; esac; }
 
 CC="$(command -v cc || command -v gcc || true)"
-if [ -z "$CC" ] || ! "$CC" -O2 -o "$WORK/ll" "$SRC_ROOT/src/landlock-exec.c" 2>"$WORK/cc.err"; then
+if [ -z "$CC" ] || ! "$CC" -O2 -DAIB_TEST_SHARED_GID=5001 -o "$WORK/ll" "$SRC_ROOT/src/landlock-exec.c" 2>"$WORK/cc.err"; then
   skip "no C compiler (or src/landlock-exec.c does not compile: $(head -c 200 "$WORK/cc.err" 2>/dev/null)) — nothing in this spec can run"
   printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]; exit
 fi
@@ -94,6 +94,10 @@ ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5000 -
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5002 "${touch_cmd[@]}";    eq "T1g: a gid outside AIB_ROLE_GROUPS => exit 3, CMD not run, the refusal names the group" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 has "T1g: …the refusal reaches the status fd as one confine: line" "$STATUS" "confine:"
 has "T1g: …and that line says group" "$STATUS" "group"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5001 "${touch_cmd[@]}"
+eq "T1g: the aib-shared gid is refused even when it is allow-listed" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
+ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000" -- --uid "$ME" --gid 5001 "${touch_cmd[@]}"
+eq "T1g: the aib-shared gid is also refused as the primary role gid" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS="5000,5001" -- "${UG[@]}" --groups 5000,5002 "${touch_cmd[@]}"; eq "T1g: one listed + one unlisted gid => exit 3 (all-or-nothing), CMD not run" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";                                 eq "T1g: AIB_ROLE_GROUPS unset => nobody allowed (exit 3)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
 ll AIB_ROLE_UIDS="$ME" AIB_ROLE_GROUPS= -- "${UG[@]}" --groups 5000 "${touch_cmd[@]}";                 eq "T1g: AIB_ROLE_GROUPS empty => nobody allowed (exit 3)" "$RC|$(ran)|$(groupmsg)" "3|not-run|1"
