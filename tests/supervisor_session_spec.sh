@@ -29,6 +29,7 @@ trap sup_cleanup EXIT
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 is_uuid() { printf '%s\n' "$1" | grep -Eq "$UUID_RE"; }
 obn() { cat "$W/outbox/acme-engine/outbox.md" 2>/dev/null | grep -c "alarm:$1"; }
+obn_is() { [ "$(obn "$1")" = "$2" ]; }
 
 # --- T1 bind before launch; new: then resume ---------------------------------
 sup_world bind
@@ -166,6 +167,7 @@ start_sup acme-core AIB_OUTBOX_ROOT="$W/outbox"
 m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
 fail_resumes
 m_send m-1 "first persistence failure"; wait_for 10 state_is m-1 FAILED
+wait_for 10 obn_is session_persistence_failed 1
 eq "T4e: the first persistence failure raises one operator alarm" "$(obn session_persistence_failed)" 1
 eq "T4e: live state exposes the persistence failure" "$(lj state_reason)" session_persistence_unavailable
 m_send m-2 "opens the next session"; wait_for 10 state_is m-2 PROCESSED
@@ -191,6 +193,7 @@ m_send m-3 "successful resume"; wait_for 10 state_is m-3 PROCESSED
 eq "T4f: a successful resume journals recovery" "$(jcount session.persistence_restored)" 1
 fail_resumes
 m_send m-4 "second episode"; wait_for 10 state_is m-4 FAILED
+wait_for 10 obn_is session_persistence_failed 2
 eq "T4f: recovery re-arms exactly one alarm for the next episode" "$(obn session_persistence_failed)|$(jfield session.persistence_failed 2 streak)" "2|1"
 stop_sup
 
