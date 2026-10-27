@@ -28,6 +28,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supsess.XXXXXX")"
 trap sup_cleanup EXIT
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 is_uuid() { printf '%s\n' "$1" | grep -Eq "$UUID_RE"; }
+obn() { cat "$W/outbox/acme-engine/outbox.md" 2>/dev/null | grep -c "alarm:$1"; }
 
 # --- T1 bind before launch; new: then resume ---------------------------------
 sup_world bind
@@ -135,6 +136,62 @@ eq "T4b: the persistence failure's brake count survives restart" "$(lj brake.con
 eq "T4b: restart does not restore the unusable session binding" "$(lj session_id)" null
 sleep 0.4
 eq "T4b: restart does not resurrect the failed message" "$(ncalls)" 0
+stop_sup
+
+# --- T4d the per-message loss count survives a supervisor restart ------------
+sup_world persistence-restart
+start_sup acme-core AIB_SUP_POLL_S=1
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "restart between losses"
+session_losses() { python3 -I - "$JOURNAL" <<'PY'
+import json, sys
+print(sum(json.loads(line).get("class") == "session_lost" for line in open(sys.argv[1]) if line.strip()))
+PY
+}
+one_loss() { [ "$(session_losses)" -eq 1 ]; }
+wait_for 8 one_loss
+stop_sup
+eq "T4d: the first loss is durable before restart" "$(session_losses)|$(m_state m-1)" "1|SEEN"
+start_sup
+wait_for 10 state_is m-1 FAILED
+eq "T4d: the second loss after restart fails the original message" "$(m_state m-1)|$(jcount session.persistence_failed)" "FAILED|1"
+eq "T4d: restart does not grant a second rotation budget" "$(jcount session.rotated)" 1
+stop_sup
+
+# --- T4e persistence failures across message ids alarm once and trip the brake -
+sup_world persistence-streak
+sup_write_registry 900 '"restart_burst": "3",'
+start_sup acme-core AIB_OUTBOX_ROOT="$W/outbox"
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "first persistence failure"; wait_for 10 state_is m-1 FAILED
+eq "T4e: the first persistence failure raises one operator alarm" "$(obn session_persistence_failed)" 1
+eq "T4e: live state exposes the persistence failure" "$(lj state_reason)" session_persistence_unavailable
+m_send m-2 "opens the next session"; wait_for 10 state_is m-2 PROCESSED
+m_send m-3 "second persistence failure"; wait_for 10 state_is m-3 FAILED
+m_send m-4 "opens another session"; wait_for 10 state_is m-4 PROCESSED
+m_send m-5 "third persistence failure"; wait_for 10 state_is m-5 FAILED
+wait_for 10 lj_is state FAILED
+eq "T4e: different message ids share the persistence-failure streak" "$(jfield session.persistence_failed 1 streak)|$(jfield session.persistence_failed 2 streak)|$(jfield session.persistence_failed 3 streak)" "1|2|3"
+eq "T4e: the existing threshold trips the provider brake" "$(lj brake.consecutive)|$(lj state_reason)" "3|brake"
+eq "T4e: one persistence alarm covers the whole unhealed streak" "$(obn session_persistence_failed)" 1
+stop_sup
+
+# --- T4f only a successful resume heals and re-arms the persistence alarm -----
+sup_world persistence-rearm
+start_sup acme-core AIB_OUTBOX_ROOT="$W/outbox"
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "first episode"; wait_for 10 state_is m-1 FAILED
+m_send m-2 "opens a session but does not prove persistence"; wait_for 10 state_is m-2 PROCESSED
+eq "T4f: a successful new-session turn does not re-arm the alarm" "$(obn session_persistence_failed)" 1
+rm -f "$W/fail-resumes"
+m_send m-3 "successful resume"; wait_for 10 state_is m-3 PROCESSED
+eq "T4f: a successful resume journals recovery" "$(jcount session.persistence_restored)" 1
+fail_resumes
+m_send m-4 "second episode"; wait_for 10 state_is m-4 FAILED
+eq "T4f: recovery re-arms exactly one alarm for the next episode" "$(obn session_persistence_failed)|$(jfield session.persistence_failed 2 streak)" "2|1"
 stop_sup
 
 # --- T4c a pending handover survives its own lost resume without duplication ---

@@ -43,7 +43,7 @@
 #                      "brake":{"consecutive":N,"tripped_at":null|"<ISO>"},"session_id":"<uuid>"|null,
 #                      "turns_in_session":N}
 #                     state in STARTING|READY|WORKING|WAITING|ORPHANED|STOPPING|FAILED (DOMAIN §3.1);
-#                     state_reason in ""|capacity|infra|orphan|brake.
+#                     state_reason in ""|capacity|infra|orphan|brake|session_persistence_unavailable.
 #   launcher call (what the loop runs per unit of work, one at a time):
 #     $AIB_LAUNCH_AGENT --as <uid> --supervised --session <new:UUID|UUID> --cwd <project home> -
 #     prompt on stdin; rc/stdout/stderr map as pinned in supervisor_brake_spec.sh.

@@ -219,6 +219,37 @@ wait_for 15 state_is m-3 PROCESSED
 eq "T7: neustart also clears the brake (journal brake.reset, loop resumes)" "$(jcount brake.reset)|$(lj brake.consecutive)|$(m_state m-3)" "1|0|PROCESSED"
 stop_sup
 
+# --- T7b reset-brake also clears an in-flight session-loss count ----------------
+ctl_world lossreset; as human:operator
+start_sup acme-core "${CTLENV[@]}" AIB_SUP_POLL_S=1
+m_send m-0 "establish a session"; wait_for 10 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "reset between losses"
+control_session_losses() { python3 -I - "$JOURNAL" <<'PY'
+import json, sys
+print(sum(json.loads(line).get("class") == "session_lost" for line in open(sys.argv[1]) if line.strip()))
+PY
+}
+one_session_loss() { [ "$(control_session_losses)" -eq 1 ]; }
+wait_for 10 one_session_loss
+s="$(audit reset-brake acme-core human:operator)"; drop acme-core "$s" reset-brake
+wait_for 10 done_for "$s"
+wait_for 15 state_is m-1 FAILED
+eq "T7b: reset-brake gives the message a fresh two-loss budget" "$(jcount session.rotated)|$(jcount session.persistence_failed)" "2|1"
+stop_sup
+
+# --- T7c a synthetic control turn is failed and bounded after two losses --------
+ctl_world controlloss; as human:operator; boot
+m_send m-0 "establish a session"; wait_for 10 state_is m-0 PROCESSED
+fail_resumes
+s="$(audit standup acme-core human:operator)"; drop acme-core "$s" standup
+wait_for 15 done_for "$s"
+eq "T7c: the failed control request gets a terminal audited result" "$(cf ctl.done -1 req)|$(cf ctl.done -1 result)" "$s|session_persistence_unavailable"
+eq "T7c: its second loss is journalled as a persistence failure" "$(jfield session.persistence_failed -1 msg_id)" "control-standup-$s"
+calls="$(ncalls)"; sleep 0.8
+eq "T7c: the failed synthetic turn is not re-dispatched" "$(ncalls)" "$calls"
+stop_sup
+
 # --- T8 the executor repeats the authorization table ---------------------------------------------------
 ctl_world authz; as human:operator; boot
 xrow() { # xrow <identity> <actor> <verb> <target> <ok|deny>
