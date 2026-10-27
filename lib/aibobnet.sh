@@ -1271,18 +1271,20 @@ aib_inbox_path() {
 }
 
 # =============================================================================
-# RM-2 — framed event primitive (the first spine-conformant stream)
+# RM-2 — framed event primitive (shared spine transport)
 # =============================================================================
-# This section is the durable-attempt-audit foundation. It is the writer AND the
-# read-only scan/validate interface for one framed, sequenced stream per project.
+# This section began as the durable-attempt-audit foundation. It is the writer AND
+# read-only scan/validate interface for the framed, sequenced main and tasks streams.
 # The legacy journals (Delivery/Memory/Heartbeat, ADR-0001) are NOT retrofitted —
-# they keep their unframed line protocol. This stream is the envelope's first real
-# customer, not a third ad-hoc line format.
+# they keep their unframed line protocol. These streams share one framing primitive,
+# not separate ad-hoc line formats.
 #
 # --- FROZEN SCHEMA (envelope + payload) --------------------------------------
-# Stream identity: (project_uid, "main"). File: <standup_dir>/events/main.events
-# with a separate sidecar lock <...>/main.events.lock. The `.events` (not `.jsonl`)
-# name is deliberate: a record is NOT bare JSON, it is framed.
+# Stream identity is (project_uid, stream_name). `main` carries attempt.decided and
+# attempt.ended at the ADR-0004/0005 main.events location; `tasks` carries its closed
+# run/task type list at $AIB_TASK_ROOT/<project_uid>/tasks.events. Each stream has a
+# separate sibling `.lock`. The `.events` (not `.jsonl`) name is deliberate: a record
+# is NOT bare JSON, it is framed.
 #
 # FRAME (§B5, Tim decision B) — pure transport, parsed strictly positionally from
 # line-start; a crafted body cannot push bytes before the line start, so there is no
@@ -1306,10 +1308,11 @@ aib_inbox_path() {
 #
 # ENVELOPE (DOMAIN §5, additive-only) — every field present, absent optionals emitted
 # as JSON null so the shape is stable for readers:
-#   event_id        "<project_uid>-main-<seq>" — deterministic from (stream, seq),
+#   event_id        "<project_uid>-<stream_name>-<seq>" — deterministic from (stream, seq),
 #                   host- and restart-unique WITHOUT a clock. COMPOSED IN-LOCK by the
 #                   broker after seq allocation; the caller never pre-composes it (§B4).
-#   event_type      "attempt.decided" | "attempt.ended"
+#   event_type      main: "attempt.decided" | "attempt.ended"; tasks: the closed
+#                   run/task type list enforced by aib_event_commit below.
 #   occurred_at     ISO-8601 UTC, DISPLAY ONLY (§6); uniqueness never depends on it.
 #   actor_type      human|agent|service|provider  (RM-2 attempts: service)
 #   actor_id        REQUIRED (§B7) — the service/actor that observed the decision.
@@ -1317,14 +1320,11 @@ aib_inbox_path() {
 #   team_uid, agent_uid, session_id, run_id, task_id, gate_id, grant_id, effect_id
 #                   optional envelope fields; null when not applicable (agent_uid MAY
 #                   be null when actor_type≠agent, §5).
-#   attempt_id      the grouping identity. For attempt.decided it EQUALS its own
-#                   event_id; for attempt.ended it equals the decided event_id passed
-#                   in by the caller. Inherits the under-lock seq uniqueness (§B4) —
-#                   the wall-clock/PID label some callers keep is display only, never
-#                   the grouping authority.
-#   correlation_id  = attempt_id (groups the attempt's records).
-#   causation_id    decided: its own event_id (root). ended: the decided event_id
-#                   (the persisted id returned by the broker, never re-guessed, §B4).
+#   attempt_id      main: grouping identity (decided's own event_id, or ended's passed
+#                   decided event_id); tasks: null.
+#   correlation_id  main: attempt_id; tasks: caller run_id.
+#   causation_id    main decided: its own event_id; main ended: the persisted decided
+#                   event_id returned by the broker (§B4); tasks: caller-supplied.
 #   schema_version  AIB_EVENT_SCHEMA_VERSION (the ENVELOPE version, not the registry's).
 #   payload         the per-type object below.
 #
@@ -1399,8 +1399,8 @@ aib_event_stream_paths() {
 }
 
 # aib_task_event_stream_paths <project_uid> — resolve the second per-project
-# spine stream. AIB_TASK_ROOT is an operator-owned deployment seam, parallel to
-# AIB_EVENT_ROOT; callers cannot supply it through an event envelope.
+# spine stream. AIB_TASK_ROOT is a unit-environment-only deployment seam, parallel
+# to AIB_EVENT_ROOT (ADR-0005); it is never request- or registry-supplied.
 # Sets AIB_TASK_EVENT_DIR / AIB_TASK_EVENT_FILE / AIB_TASK_EVENT_LOCK.
 aib_task_event_stream_paths() {
   local project_uid="${1:-}" task_root="${AIB_TASK_ROOT:-/var/lib/aib/tasks}"

@@ -210,9 +210,11 @@ gate_id? · grant_id? · effect_id? · correlation_id · causation_id · schema_
   detectable and quarantinable rather than silently corrupting the fold.
 - **A stream is identified by `(project_uid, stream_name)`.** `seq` counts within one stream; a consumer
   cursor is `(stream, seq)`. The addressing is frozen. Two names are reserved: `main` for
-  `attempt.decided|attempt.ended`, and `tasks` for `run.*|task.*`. The latter lives at
-  `$AIB_TASK_ROOT/<project_uid>/tasks.events` (default `AIB_TASK_ROOT=/var/lib/aib/tasks`) with a sibling
-  `tasks.events.lock`. Its closed type list is `run.requested`, `run.started`, `run.closed`,
+  `attempt.decided|attempt.ended`, and `tasks` for `run.*|task.*`. `AIB_TASK_ROOT` is a
+  unit-environment variable, never request-supplied and never registry-supplied, parallel to
+  `AIB_EVENT_ROOT` in ADR-0005. The tasks stream lives at `$AIB_TASK_ROOT/<project_uid>/tasks.events`
+  (default `AIB_TASK_ROOT=/var/lib/aib/tasks`) with a sibling `tasks.events.lock`. Its closed type list is
+  `run.requested`, `run.started`, `run.closed`,
   `task.created`, `task.started`, `task.reported`, `task.cancelled`, `task.reassigned`, `task.reopened`,
   `task.overdue`, `task.rejected`, `task.review_passed`, and `task.review_failed`. Adding another stream
   remains additive: a new name, type list, and identity contract, with no framing change. Relations across
