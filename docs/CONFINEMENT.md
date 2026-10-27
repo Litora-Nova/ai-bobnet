@@ -252,8 +252,11 @@ request. Groups the role account has outside this list, such as the control grou
 confined turn. `bin/aib-agent-dirs` prepares the role-owned private home beneath `/var/lib/aib-sup` before
 the unit starts; a one-shot agent without a supervisor unit needs one root run of it as well. The home is
 mode `0710` and carries one extra ACL entry, search-only (`--x`) for the broker group, so the broker can
-run its pre-flight and set the Landlock path rules inside it; there is no default entry and no read or
-write grant. The broker unit therefore needs only `CAP_SETUID` and `CAP_SETGID`, bounded as shown
+run its pre-flight and set the Landlock path rules inside it without listing the directory. A default
+broker ACL grants read-only (`r--`) access to newly created state files, including `journal.jsonl` and
+atomic replacements of `live.json`; an existing `live.json` receives the same named read ACL during
+provisioning. The broker receives no write permission. The broker unit therefore needs only
+`CAP_SETUID` and `CAP_SETGID`, bounded as shown
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
 

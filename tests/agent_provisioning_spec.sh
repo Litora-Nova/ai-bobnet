@@ -20,9 +20,9 @@
 #     This prevents Linux fs.protected_regular=2 from rejecting
 #     cross-writer O_CREAT opens in the sticky shared standup directory. Then it runs EXACTLY these setfacl calls, in this order:
 #         -m g:<grp>:--x <root>/<uid>          -m g:<broker-grp>:--x <root>/<uid>
-#                                                -d -m g:<grp>:r-x <root>/<uid>
+#         -d -m g:<grp>:r-x <root>/<uid>       -d -m g:<broker-grp>:r-- <root>/<uid>
 #         -m g:<grp>:--x <standup>/transcripts -d -m g:<grp>:r-x <standup>/transcripts
-#         -m g:<grp>:r-- <root>/<uid>/live.json      (only when that file exists)
+#         -m g:<grp>:r-- <root>/<uid>/live.json -m g:<broker-grp>:r-- <root>/<uid>/live.json (only when that file exists)
 #     uid must match [a-z0-9]+(-[a-z0-9]+)+ else rc 64 and nothing is created or run. A failing setfacl => rc 69.
 #   bin/aib-unit-alarm <failed unit name>   (unit aib-alarm@.service: Type=oneshot, User=aib-broker, ExecStart=/…/bin/aib-unit-alarm %i; v3.4 K1, was %I)
 #     aib-agent@<uid>.service           -> a line in the agent's TEAM outbox (from registry): from:aib-alarm | to:human:<team> | state:PERSISTED |
@@ -81,14 +81,16 @@ dirs acme-core
 eq "T2: state root is created 0755 and owned by the helper uid:gid (root:root in the unit)" "$(stat -c '%a %u:%g' "$SR")" "755 $(id -u):$(id -g)"
 eq "T2: state dir 0700 and transcripts dir created" "$RC|$(mode_of "$SR/acme-core")|$([ -d "$SD/transcripts" ] && echo dir)" "0|700|dir"
 eq "T2: heartbeat log is a real 0664 file owned by the standup directory owner:group" "$([ -f "$SD/acme-core.log" ] && [ ! -L "$SD/acme-core.log" ] && stat -c '%a %u:%g' "$SD/acme-core.log")" "664 $(stat -c '%u:%g' "$SD")"
-eq "T2: exactly the five pinned setfacl calls, in order (no live.json yet)" "$(cat "$W/setfacl.log")" "-m g:$GRP:--x $SR/acme-core
+eq "T2: exactly the six pinned setfacl calls, in order (no live.json yet)" "$(cat "$W/setfacl.log")" "-m g:$GRP:--x $SR/acme-core
 -m g:$BROKER_GRP:--x $SR/acme-core
 -d -m g:$GRP:r-x $SR/acme-core
+-d -m g:$BROKER_GRP:r-- $SR/acme-core
 -m g:$GRP:--x $SD/transcripts
 -d -m g:$GRP:r-x $SD/transcripts"
 echo '{}' > "$SR/acme-core/live.json"; dirs acme-core
-eq "T2: with a live.json a sixth call grants the human group read on it" "$(tail -1 "$W/setfacl.log")|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "-m g:$GRP:r-- $SR/acme-core/live.json|6"
-dirs acme-core; eq "T2: idempotent (same calls, rc 0)" "$RC|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "0|6"
+eq "T2: with a live.json the final calls grant the human and broker groups read on it" "$(tail -2 "$W/setfacl.log")|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "-m g:$GRP:r-- $SR/acme-core/live.json
+-m g:$BROKER_GRP:r-- $SR/acme-core/live.json|8"
+dirs acme-core; eq "T2: idempotent (same calls, rc 0)" "$RC|$(wc -l < "$W/setfacl.log" | tr -d ' ')" "0|8"
 chmod 604 "$SD/acme-core.log"; before_group="$(stat -c %g "$SD/acme-core.log")"; dirs acme-core
 eq "T2: an existing same-owner heartbeat keeps its mode and group" "$(stat -c '%a %g' "$SD/acme-core.log")" "604 $before_group"
 for unsafe_mode in 4775 2775; do
@@ -177,7 +179,7 @@ else
   eq "T5: role setup: rc 0, state dir 0700 and owned by the role uid:gid" "$RC|$(stat -c '%a %u:%g' "$d")" "0|700 $RU:$RG"
   eq "T5: ….claude and .codex are real 0700 dirs owned by the role account" "$(for x in .claude .codex; do [ -d "$d/$x" ] && [ ! -L "$d/$x" ] && stat -c '%a %u:%g' "$d/$x"; done | tr '\n' ',')" "700 $RU:$RG,700 $RU:$RG,"
   eq "T5: ….codex/auth.json is a symlink to the shared store (dangling is fine)" "$([ -L "$d/.codex/auth.json" ] && readlink "$d/.codex/auth.json")" "$LR/codex/auth.json"
-  eq "T5: …the setfacl calls include the broker search ACL (still exactly five)" "$(wc -l < "$W/setfacl.log" | tr -d ' ')" 5
+  eq "T5: …the setfacl calls include broker search and default-read ACLs (still exactly six)" "$(wc -l < "$W/setfacl.log" | tr -d ' ')" 6
   rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"
   eq "T5: idempotent (rc 0, link unchanged)" "$RC|$(readlink "$d/.codex/auth.json")" "0|$LR/codex/auth.json"
   rm -rf "$d/.claude"; ln -s "$W" "$d/.claude"; rdirs AIB_ROLE_UID="$RU" AIB_ROLE_GID="$RG"
