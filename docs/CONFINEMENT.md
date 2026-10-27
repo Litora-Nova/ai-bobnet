@@ -302,6 +302,8 @@ partial cut-over:
 2. Create one project group per project (for example `aib-proj-example`) for the home and repository.
    Use setgid directories, `core.sharedRepository=group`, and umask `002`; add the relevant role
    accounts and human operators to the project group.
+   Set a default ACL of `g:aib-proj-<project>:rwX` on the project home; the confined exec path applies
+   umask `0002` only to the child, not to the broker.
 3. Update `/etc/aib/role.env`: `AIB_ROLE_GID` is the role account's own primary group;
    `AIB_ROLE_GROUPS` contains the numeric gids for `aib-provider-exec`, `aib-login`, and the project
    group, without `aib-shared`; `AIB_ROLE_UIDS` remains the role-account allow-list.

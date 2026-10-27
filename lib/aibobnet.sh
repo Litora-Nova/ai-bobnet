@@ -2294,6 +2294,7 @@ aib_enact_launch__run_confined() {
       _role_env+=("AIB_ROLE_UIDS=${AIB_ROLE_UIDS:-}")
       [ -z "$_role_groups" ] || _role_env+=("AIB_ROLE_GROUPS=$_role_groups")
     fi
+    umask 0002
     exec "$_env_bin" -i "${_child_env[@]}" "${_role_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
       "LL_STATUS_FD=9" "LL_STDERR_FD=1" \
       "$AIB_CONFINE_BIN" "${_role_args[@]}" "$adapter" "${adapter_mode[@]}" \
