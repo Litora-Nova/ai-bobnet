@@ -19,6 +19,9 @@ ME=$(id -u)
 OTHER=$((ME + 10000))
 HUMAN=$((ME + 10001))
 GATEWAY=$((ME + 10002))
+ROLE_GID=$(( $(id -g) + 10000 ))
+SHARED_GID=$(getent group aib-shared 2>/dev/null | cut -d: -f3)
+[ "$ROLE_GID" != "${SHARED_GID:-}" ] || ROLE_GID=$((ROLE_GID + 1))
 mkdir -p "$WORK/home" "$WORK/standup" "$WORK/state/acme-worker" "$WORK/events"
 
 cat > "$WORK/identity" <<SH
@@ -101,19 +104,19 @@ frame(){
   printf 'op=launch\nagent_uid=%s\nsandbox=read-only\ntimeout=10\ncwd_bytes=0\nlabel_bytes=0\nprompt_bytes=2\n\nhi' "$1"
 }
 run_as(){
-  local peer=$1 target=$2
+  local peer=$1 target=$2 role_uid=${3:-$ME} role_gid=${4:-$ROLE_GID}
   frame "$target" | env -i PATH="$PATH" HOME="$WORK" \
     AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID="$peer" AIB_IDENTITY_CMD="$WORK/identity" \
-    AIB_ROLE_UIDS="$ME" \
+    AIB_ROLE_UID="$role_uid" AIB_ROLE_GID="$role_gid" AIB_ROLE_UIDS="$role_uid" \
     AIB_SUP_STATE_ROOT="$WORK/state" AIBOBNET_REGISTRY="$WORK/registry.json" \
     AIB_EVENT_ROOT="$WORK/events" AIB_CONFINE_BIN="$WORK/landlock" \
     "$ROOT/bin/aib-broker-handler" 2>"$WORK/handler.err"
 }
 
-# The state directory is kernel-owned by ME. A role peer with another uid must not
-# use the caller-supplied agent label to acquire that agent's launch authority.
-RC=0; OUT=$(run_as "$OTHER" acme-lead) || RC=$?
-has "a role peer cannot launch an agent whose state owner is another uid" "$OUT" "end=denied"
+# Role accounts never have broker authority, including over a state directory they
+# own. Only root supervisors and human operators may request a launch.
+RC=0; OUT=$(run_as "$ME" acme-worker) || RC=$?
+has "a role peer cannot launch even the agent whose state directory it owns" "$OUT" "end=denied"
 has "the denial names the peer authorization stage" "$OUT" "stage=peer"
 has "the denial uses the existing authorization reason" "$OUT" "reason=unauthorized"
 hasnt "a peer denial never enacts the provider" "$OUT" "provider-ran"
@@ -122,12 +125,23 @@ hasnt "a peer denial never enacts the provider" "$OUT" "provider-ran"
 SCAN=$(aib_event_scan "$WORK/events/acme/main.events")
 has "the peer denial is durably audited as attempt.decided" "$SCAN" '"event_type":"attempt.decided"'
 has "the audit records a deny decision" "$SCAN" '"decision":"deny"'
-has "the audit reason distinguishes a role/agent mismatch" "$SCAN" 'peer_role_mismatch'
+has "the audit records the unauthorized role peer" "$SCAN" 'peer_unauthorized caller=role:aib-worker'
 
-OUT=$(run_as "$ME" acme-worker)
-has "the role account bound to the target state owner may launch its own agent" "$OUT" "provider-ran"
-has "the own-agent launch completes normally" "$OUT" "end=ok"
-has "the target role uid/gid come from the prepared agent state directory" "$(cat "$WORK/landlock.args")" "--uid $ME --gid $(id -g)"
+OUT=$(run_as 0 acme-worker)
+has "the root supervisor path may launch a prepared agent" "$OUT" "provider-ran"
+has "the supervisor launch completes normally" "$OUT" "end=ok"
+has "the child uid/gid come from role.env, not passwd lookup on the state owner" \
+  "$(cat "$WORK/landlock.args")" "--uid $ME --gid $ROLE_GID"
+
+# Directory ownership is only a consistency check. A mismatch against role.env
+# refuses before enactment and leaves a durable deny record.
+RC=0; OUT=$(run_as 0 acme-worker "$OTHER" "$((ROLE_GID + 1))") || RC=$?
+has "a state owner differing from AIB_ROLE_UID is denied" "$OUT" "end=denied"
+has "the owner mismatch is a confinement refusal" "$OUT" "stage=confine"
+has "the owner mismatch uses the existing confinement wire reason" "$OUT" "reason=confinement_unavailable"
+hasnt "an owner mismatch never enacts the provider" "$OUT" "provider-ran"
+SCAN=$(aib_event_scan "$WORK/events/acme/main.events")
+has "the owner mismatch is durably audited" "$SCAN" 'target_role_mismatch'
 
 mkdir -p "$WORK/state/acme-lead"
 OUT=$(run_as 0 acme-lead)
@@ -140,9 +154,10 @@ RC=0; OUT=$(run_as "$GATEWAY" acme-lead) || RC=$?
 has "a gateway identity does not inherit the human launch exception" "$OUT" "reason=unauthorized"
 hasnt "a gateway denial never enacts" "$OUT" "provider-ran"
 
-RC=0; OUT=$(run_as "$ME" acme-worker) || RC=$?
-has "one role uid owning two agent state dirs is ambiguous and denied" "$OUT" "peer_role_mismatch"
-hasnt "an ambiguous role binding never enacts" "$OUT" "provider-ran"
+RC=0; OUT=$(run_as "$((GATEWAY + 1))" acme-lead) || RC=$?
+has "an unknown identity cannot request a launch" "$OUT" "reason=unauthorized"
+has "the unknown denial names the peer stage" "$OUT" "stage=peer"
+hasnt "an unknown peer denial never enacts" "$OUT" "provider-ran"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
