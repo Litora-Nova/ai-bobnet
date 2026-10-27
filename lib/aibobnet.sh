@@ -1398,6 +1398,23 @@ aib_event_stream_paths() {
   AIB_EVENT_LOCK="$AIB_EVENT_DIR/${AIB_EVENT_STREAM_NAME}.events.lock"
 }
 
+# aib_task_event_stream_paths <project_uid> — resolve the second per-project
+# spine stream. AIB_TASK_ROOT is an operator-owned deployment seam, parallel to
+# AIB_EVENT_ROOT; callers cannot supply it through an event envelope.
+# Sets AIB_TASK_EVENT_DIR / AIB_TASK_EVENT_FILE / AIB_TASK_EVENT_LOCK.
+aib_task_event_stream_paths() {
+  local project_uid="${1:-}" task_root="${AIB_TASK_ROOT:-/var/lib/aib/tasks}"
+  [ -n "$project_uid" ] || aib_die 2 "task event stream requires a project_uid"
+  aib_validate_token "$project_uid" project_uid
+  [ -n "$task_root" ] || aib_die 2 "task event stream requires AIB_TASK_ROOT"
+  case "$task_root" in
+    *$'\n'*|*$'\r'*) aib_die 2 "invalid AIB_TASK_ROOT (contains a line break)";;
+  esac
+  AIB_TASK_EVENT_DIR="$task_root/$project_uid"
+  AIB_TASK_EVENT_FILE="$AIB_TASK_EVENT_DIR/tasks.events"
+  AIB_TASK_EVENT_LOCK="$AIB_TASK_EVENT_DIR/tasks.events.lock"
+}
+
 # --- occurred_at helper + %N guard (display only) ----------------------------
 # `date +%N` is GNU-specific. A non-GNU date emits the literal string `N`; that must
 # fail closed rather than silently poison the timestamp. Uniqueness hangs on the
@@ -2947,7 +2964,7 @@ _aib_event_compose_record() {
     "$(_aib_json_or_null "$team_uid")" "$(_aib_json_or_null "$agent_uid")" "$(_aib_json_or_null "$session_id")" \
     "$(_aib_json_or_null "$run_id")" "$(_aib_json_or_null "$task_id")" "$(_aib_json_or_null "$gate_id")" \
     "$(_aib_json_or_null "$grant_id")" "$(_aib_json_or_null "$effect_id")" \
-    "$(aib_json "$attempt_id")" "$(aib_json "$correlation_id")" "$(aib_json "$causation_id")" \
+    "$(_aib_json_or_null "$attempt_id")" "$(aib_json "$correlation_id")" "$(aib_json "$causation_id")" \
     "$schema_version" "$payload_json"
 }
 
@@ -2992,27 +3009,58 @@ _aib_anchor_write() {
 }
 
 # --- aib_event_commit — the serialising append broker ------------------------
-# aib_event_commit <events_path> <lock_path> <event_type> <envelope_kv> <payload_json> [decided_event_id] [anchor_mode]
+# New shape:
+#   aib_event_commit <events_path> <lock_path> <stream_name> <event_type> \
+#     <envelope_kv> <payload_json> [decided_event_id] [anchor_mode]
+# Compatibility shape (the main attempt stream only):
+#   aib_event_commit <events_path> <lock_path> <event_type> <envelope_kv> \
+#     <payload_json> [decided_event_id] [anchor_mode]
 #
-# `payload_json` is trusted composer output from aib_event_compose_decided_payload or
-# aib_event_compose_ended_payload. The broker enforces object/one-line shape, identity,
-# framing, size, and stream invariants; it deliberately does not duplicate a JSON parser.
+# `payload_json` is trusted composer output. The broker enforces object/one-line
+# shape, identity, framing, size, and per-stream type invariants; it deliberately
+# does not duplicate a JSON parser or validate domain payloads (that is the
+# stream's sole writer's responsibility).
 #
-# The caller passes payload + envelope fields WITHOUT any identity field. INSIDE the
-# exclusive sidecar lock the broker: validates the whole stream fail-closed, truncates
-# an uncommitted tail, allocates `seq`, COMPOSES the identity from that seq (§B4 — no
-# pre-composed line ever crosses the seam), frames + checked-appends, and only THEN
-# publishes the result. Returns AIB_EVENT_COMMIT_SEQ / AIB_EVENT_COMMIT_EVENT_ID.
+# The caller never supplies broker-owned event_id/seq. Main composes all attempt
+# identity; tasks accepts its run/task/causation IDs and derives correlation from
+# run_id. INSIDE the exclusive sidecar lock the broker validates the whole stream
+# fail-closed, truncates an uncommitted tail, allocates `seq`, composes the remaining
+# identity, frames + checked-appends, and only THEN publishes the result. Returns
+# AIB_EVENT_COMMIT_SEQ / AIB_EVENT_COMMIT_EVENT_ID.
 # At most one attempt.ended per attempt_id is revalidated UNDER the lock (§B3). The lock
 # wait is FINITE (flock -w) so a stuck cooperating writer cannot silently freeze all
 # launches (§3/§5 DoS bound); a timeout fails loudly with a stable exit code (75).
 aib_event_commit() {
-  local events_path="${1:-}" lock_path="${2:-}" event_type="${3:-}"
-  local envelope_kv="${4-}" payload_json="${5-}" decided_id="${6-}" anchor_mode="${7-}"
+  local events_path="${1:-}" lock_path="${2:-}" stream_name event_type
+  local envelope_kv payload_json decided_id anchor_mode
   local _fd timeout k LC_ALL=C
   local project_uid actor_type actor_id agent_uid team_uid session_id run_id task_id gate_id grant_id effect_id occurred_at
+  local attempt_id correlation_id causation_id
 
   [ "$#" -ge 5 ] || aib_die 2 "event commit requires events path, lock path, event_type, envelope, payload"
+
+  # Valid legacy calls are unambiguous because the old primitive accepted only
+  # attempt.* in argument 3. Keep that shape as a main-stream compatibility shim.
+  case "${3:-}" in
+    attempt.decided|attempt.ended)
+      stream_name=main
+      event_type="${3:-}"
+      envelope_kv="${4-}"
+      payload_json="${5-}"
+      decided_id="${6-}"
+      anchor_mode="${7-}"
+      ;;
+    *)
+      [ "$#" -ge 6 ] || aib_die 2 "event commit requires a stream name, event_type, envelope, and payload"
+      stream_name="${3:-}"
+      event_type="${4:-}"
+      envelope_kv="${5-}"
+      payload_json="${6-}"
+      decided_id="${7-}"
+      anchor_mode="${8-}"
+      ;;
+  esac
+
   [ -n "$events_path" ] && [ -n "$lock_path" ] && [ -n "$event_type" ] ||
     aib_die 2 "event commit requires events path, lock path, and event_type"
   [ -z "${AIB_EVENT_ACTIVE_LOCK:-}" ] || aib_die 2 "nested event commits are not supported"
@@ -3020,9 +3068,20 @@ aib_event_commit() {
   command -v cksum >/dev/null 2>&1 || aib_die 6 "required runtime dependency not found: cksum"
   if [ "$anchor_mode" = anchor ]; then _aib_anchor_sync_capability; fi
 
-  case "$event_type" in
-    attempt.decided|attempt.ended) ;;
-    *) aib_die 2 "unknown event_type '$event_type' (expected attempt.decided|attempt.ended)";;
+  case "$stream_name" in
+    main)
+      case "$event_type" in
+        attempt.decided|attempt.ended) ;;
+        *) aib_die 2 "event_type '$event_type' is not allowed in stream 'main'";;
+      esac
+      ;;
+    tasks)
+      case "$event_type" in
+        run.requested|run.started|run.closed|task.created|task.started|task.reported|task.cancelled|task.reassigned|task.reopened|task.overdue|task.rejected|task.review_passed|task.review_failed) ;;
+        *) aib_die 2 "event_type '$event_type' is not allowed in stream 'tasks'";;
+      esac
+      ;;
+    *) aib_die 2 "unknown event stream '$stream_name' (expected main|tasks)";;
   esac
   [ -n "$payload_json" ] || aib_die 2 "event commit requires a payload"
   case "$payload_json" in
@@ -3033,8 +3092,12 @@ aib_event_commit() {
     *$'\n'*|*$'\r'*) aib_die 2 "event payload must be a single physical line";;
   esac
 
-  # No pre-composed identity field may cross the seam (§B4/N1) — the broker owns them.
-  for k in event_id attempt_id correlation_id causation_id seq; do
+  # event_id and seq are always composed under the stream lock. Main retains
+  # its attempt-specific identity composition byte-for-byte; tasks supplies its
+  # domain IDs but correlation_id remains derived from run_id.
+  local forbidden_identity_fields="event_id attempt_id correlation_id seq"
+  [ "$stream_name" != main ] || forbidden_identity_fields="$forbidden_identity_fields causation_id"
+  for k in $forbidden_identity_fields; do
     if _aib_record_field "$envelope_kv" "$k" >/dev/null; then
       aib_die 2 "envelope must not carry identity field '$k' (the broker composes identity under the lock)"
     fi
@@ -3052,15 +3115,28 @@ aib_event_commit() {
   grant_id="$(_aib_record_field "$envelope_kv" grant_id)"       || grant_id=""
   effect_id="$(_aib_record_field "$envelope_kv" effect_id)"     || effect_id=""
   occurred_at="$(_aib_record_field "$envelope_kv" occurred_at)" || occurred_at=""
+  causation_id="$(_aib_record_field "$envelope_kv" causation_id)" || causation_id=""
 
   [ -n "$project_uid" ] || aib_die 2 "event envelope requires project_uid"
   aib_validate_token "$project_uid" project_uid
   [ -n "$actor_type" ] || aib_die 2 "event envelope requires actor_type"
   case "$actor_type" in human|agent|service|provider) ;; *) aib_die 2 "invalid actor_type '$actor_type'";; esac
   [ -n "$actor_id" ] || aib_die 2 "event envelope requires actor_id (§B7)"
-  if [ "$event_type" = attempt.ended ]; then
-    [ -n "$decided_id" ] || aib_die 2 "attempt.ended requires the decided event_id (causation)"
-  fi
+  case "$stream_name" in
+    main)
+      if [ "$event_type" = attempt.ended ]; then
+        [ -n "$decided_id" ] || aib_die 2 "attempt.ended requires the decided event_id (causation)"
+      fi
+      ;;
+    tasks)
+      [ -z "$decided_id" ] || aib_die 2 "tasks commit does not accept an attempt decided event_id"
+      [ -n "$run_id" ] || aib_die 2 "tasks event envelope requires caller run_id"
+      [ -n "$causation_id" ] || aib_die 2 "tasks event envelope requires caller causation_id"
+      case "$event_type" in
+        task.*) [ -n "$task_id" ] || aib_die 2 "task event envelope requires caller task_id";;
+      esac
+      ;;
+  esac
 
   timeout="${AIBOBNET_EVENT_LOCK_TIMEOUT:-10}"
   case "$timeout" in ''|*[!0-9.]*) aib_die 2 "invalid event lock timeout '$timeout'";; esac
@@ -3104,21 +3180,28 @@ aib_event_commit() {
   fi
 
   local seq="$AIB_EVENT_SCAN_NEXT_SEQ"
-  local event_id="${project_uid}-${AIB_EVENT_STREAM_NAME}-${seq}"
-  local attempt_id correlation_id causation_id
-  if [ "$event_type" = attempt.decided ]; then
-    attempt_id="$event_id"; correlation_id="$event_id"; causation_id="$event_id"
-  else
-    case $'\n'"${AIB_EVENT_SCAN_DECIDED_IDS}" in
-      *$'\n'"$decided_id"$'\n'*) ;;
-      *) aib_die 2 "attempt.ended requires a persisted prior attempt.decided event_id";;
-    esac
-    case $'\n'"${AIB_EVENT_SCAN_ENDED_IDS}" in
-      *$'\n'"$decided_id"$'\n'*)
-        aib_die 2 "attempt '$decided_id' already has an attempt.ended — refusing a second terminal record";;
-    esac
-    attempt_id="$decided_id"; correlation_id="$decided_id"; causation_id="$decided_id"
-  fi
+  local event_id="${project_uid}-${stream_name}-${seq}"
+  case "$stream_name" in
+    main)
+      if [ "$event_type" = attempt.decided ]; then
+        attempt_id="$event_id"; correlation_id="$event_id"; causation_id="$event_id"
+      else
+        case $'\n'"${AIB_EVENT_SCAN_DECIDED_IDS}" in
+          *$'\n'"$decided_id"$'\n'*) ;;
+          *) aib_die 2 "attempt.ended requires a persisted prior attempt.decided event_id";;
+        esac
+        case $'\n'"${AIB_EVENT_SCAN_ENDED_IDS}" in
+          *$'\n'"$decided_id"$'\n'*)
+            aib_die 2 "attempt '$decided_id' already has an attempt.ended — refusing a second terminal record";;
+        esac
+        attempt_id="$decided_id"; correlation_id="$decided_id"; causation_id="$decided_id"
+      fi
+      ;;
+    tasks)
+      attempt_id=""
+      correlation_id="$run_id"
+      ;;
+  esac
 
   [ -n "$occurred_at" ] || occurred_at="$(aib_event_now)"
 
