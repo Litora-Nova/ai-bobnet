@@ -259,7 +259,12 @@ provisioning. The broker receives no write permission. Group-readable files the 
 in its home become readable by the broker group by name through the default ACL, while files it creates
 with mode `0600` stay private. The broker unit therefore needs only
 `CAP_SETUID` and `CAP_SETGID`, bounded as shown
-in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
+in the shipped S1c drop-in example. That drop-in must also add
+`ReadWritePaths=/var/lib/aib-sup`: the role-switched child inherits the broker's
+`ProtectSystem=strict` mount namespace, so ordinary ownership alone cannot let provider state under
+the agent home (such as `.claude` sessions) persist. This systemd write allowance covers the agent-home
+root; Landlock still restricts each child to its own configured state path. The helper deliberately
+rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
 The root supervisor opens this home with `O_DIRECTORY|O_NOFOLLOW`; descriptor-relative writable state opens use `O_NOFOLLOW` and regular-file checks, with a single-link requirement for `journal.jsonl`.
 An unsafe state object makes the supervisor exit 78, which stops the unit permanently via `RestartPreventExitStatus=78` and triggers the `OnFailure=` alarm.

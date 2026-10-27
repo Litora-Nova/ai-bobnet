@@ -10,7 +10,9 @@
 #       is retried once as a resume, and that retry does not touch the brake.
 #   (c) "No conversation found" on a resume = forced ROTATION (new sid, `session.rotated`, a handover
 #       note in the agent's OWN inbox marked `kind:handover`, read first by the next turn), not a
-#       brake count. Rotation is never silent: no new session without a handover turn (Q7).
+#       brake count. Rotation is never silent: no new session without a handover turn (Q7). If the
+#       same message loses the freshly rotated session too, persistence is unavailable: fail the
+#       message, count one provider failure, and stop rotating or adding handovers.
 #   (d) The bound cwd must equal the registry's project home for the agent; a mismatch rotates
 #       (`session.rebound`) instead of resuming the old sid.
 #   rotation by policy: registry `session_max_turns` (flat string field, schema 5) -> after that many
@@ -26,6 +28,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supsess.XXXXXX")"
 trap sup_cleanup EXIT
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 is_uuid() { printf '%s\n' "$1" | grep -Eq "$UUID_RE"; }
+obn() { cat "$W/outbox/acme-engine/outbox.md" 2>/dev/null | grep -c "alarm:$1"; }
 
 # --- T1 bind before launch; new: then resume ---------------------------------
 sup_world bind
@@ -103,6 +106,106 @@ has "T4: …and reads the handover note first" "$(prompt 3)" "kind:handover"
 has "T4: the handover note sits in the agent's OWN inbox" "$(grep -F 'kind:handover' "$INBOX")" "from:acme-core | to:acme-core"
 eq "T4: the original message then runs in the new session" "$(callf 4 session)" "$sidB"
 has "T4: …with its own text" "$(prompt 4)" "after the session vanished"
+stop_sup
+
+# --- T4b every resume is lost -> one rotation, then bounded terminal failure ---
+sup_world persistence
+start_sup
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "requires a persistent session"
+wait_for 10 state_is m-1 FAILED
+eq "T4b: the message is failed after the rotated session also disappears" "$(m_state m-1)" FAILED
+eq "T4b: exactly three turns follow setup: lost resume, handover, lost retry" "$(ncalls)" 4
+eq "T4b: only the first loss rotates the session" "$(jcount session.rotated)" 1
+eq "T4b: only one handover note is queued" "$(grep -c 'kind:handover' "$INBOX")" 1
+eq "T4b: the terminal persistence failure is journalled once" "$(jcount session.persistence_failed)" 1
+eq "T4b: …names the original message" "$(jfield session.persistence_failed 1 msg_id)" m-1
+eq "T4b: …has the stable failure reason" "$(jfield session.persistence_failed 1 reason)" session_persistence_unavailable
+eq "T4b: the terminal failure counts once toward the provider brake" "$(lj brake.consecutive)" 1
+eq "T4b: the terminal turn is a provider failure with that reason" "$(jfield turn.ended -1 class)|$(jfield turn.ended -1 reason)" "provider_failure|session_persistence_unavailable"
+has "T4b: the DLQ exposes the persistence failure reason" "$(m_dlq)" "session_persistence_unavailable"
+calls="$(ncalls)"; sleep 0.6
+eq "T4b: the supervisor does not restart the failed message loop" "$(ncalls)" "$calls"
+eq "T4b: the unusable provider session is no longer bound" "$(lj session_id)" null
+stop_sup
+: > "$W/calls.log"; echo 0 > "$W/calls.n"
+start_sup
+wait_for 5 lj_is brake.consecutive 1
+eq "T4b: the persistence failure's brake count survives restart" "$(lj brake.consecutive)" 1
+eq "T4b: restart does not restore the unusable session binding" "$(lj session_id)" null
+sleep 0.4
+eq "T4b: restart does not resurrect the failed message" "$(ncalls)" 0
+stop_sup
+
+# --- T4d the per-message loss count survives a supervisor restart ------------
+sup_world persistence-restart
+start_sup acme-core AIB_SUP_POLL_S=1
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "restart between losses"
+session_losses() { python3 -I - "$JOURNAL" <<'PY'
+import json, sys
+print(sum(json.loads(line).get("class") == "session_lost" for line in open(sys.argv[1]) if line.strip()))
+PY
+}
+one_loss() { [ "$(session_losses)" -eq 1 ]; }
+wait_for 8 one_loss
+stop_sup
+eq "T4d: the first loss is durable before restart" "$(session_losses)|$(m_state m-1)" "1|SEEN"
+start_sup
+wait_for 10 state_is m-1 FAILED
+eq "T4d: the second loss after restart fails the original message" "$(m_state m-1)|$(jcount session.persistence_failed)" "FAILED|1"
+eq "T4d: restart does not grant a second rotation budget" "$(jcount session.rotated)" 1
+stop_sup
+
+# --- T4e persistence failures across message ids alarm once and trip the brake -
+sup_world persistence-streak
+sup_write_registry 900 '"restart_burst": "3",'
+start_sup acme-core AIB_OUTBOX_ROOT="$W/outbox"
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "first persistence failure"; wait_for 10 state_is m-1 FAILED
+eq "T4e: the first persistence failure raises one operator alarm" "$(obn session_persistence_failed)" 1
+eq "T4e: live state exposes the persistence failure" "$(lj state_reason)" session_persistence_unavailable
+m_send m-2 "opens the next session"; wait_for 10 state_is m-2 PROCESSED
+m_send m-3 "second persistence failure"; wait_for 10 state_is m-3 FAILED
+m_send m-4 "opens another session"; wait_for 10 state_is m-4 PROCESSED
+m_send m-5 "third persistence failure"; wait_for 10 state_is m-5 FAILED
+wait_for 10 lj_is state FAILED
+eq "T4e: different message ids share the persistence-failure streak" "$(jfield session.persistence_failed 1 streak)|$(jfield session.persistence_failed 2 streak)|$(jfield session.persistence_failed 3 streak)" "1|2|3"
+eq "T4e: the existing threshold trips the provider brake" "$(lj brake.consecutive)|$(lj state_reason)" "3|brake"
+eq "T4e: one persistence alarm covers the whole unhealed streak" "$(obn session_persistence_failed)" 1
+stop_sup
+
+# --- T4f only a successful resume heals and re-arms the persistence alarm -----
+sup_world persistence-rearm
+start_sup acme-core AIB_OUTBOX_ROOT="$W/outbox"
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+fail_resumes
+m_send m-1 "first episode"; wait_for 10 state_is m-1 FAILED
+m_send m-2 "opens a session but does not prove persistence"; wait_for 10 state_is m-2 PROCESSED
+eq "T4f: a successful new-session turn does not re-arm the alarm" "$(obn session_persistence_failed)" 1
+rm -f "$W/fail-resumes"
+m_send m-3 "successful resume"; wait_for 10 state_is m-3 PROCESSED
+eq "T4f: a successful resume journals recovery" "$(jcount session.persistence_restored)" 1
+fail_resumes
+m_send m-4 "second episode"; wait_for 10 state_is m-4 FAILED
+eq "T4f: recovery re-arms exactly one alarm for the next episode" "$(obn session_persistence_failed)|$(jfield session.persistence_failed 2 streak)" "2|1"
+stop_sup
+
+# --- T4c a pending handover survives its own lost resume without duplication ---
+sup_world handover-dedupe
+start_sup
+m_send m-0 "establish a session"; wait_for 6 state_is m-0 PROCESSED
+sidA="$(callf 1 session)"; sidA="${sidA#new:}"
+plan "1||E:No conversation found with session ID: $sidA"
+m_self_handover h-1
+wait_for 10 state_is h-1 PROCESSED
+eq "T4c: the pending handover recovers in the rotated session" "$(m_state h-1)" PROCESSED
+eq "T4c: no duplicate handover note was created" "$(grep -c 'kind:handover' "$INBOX")" 1
+eq "T4c: recovery uses only the lost resume and one new-session retry" "$(ncalls)" 3
+eq "T4c: the lost pending handover rotates only once" "$(jcount session.rotated)" 1
 stop_sup
 
 # --- T5 cwd mismatch -> rebound, never resume the old sid ----------------------

@@ -63,6 +63,8 @@ for k in AmbientCapabilities CapabilityBoundingSet; do
   eq "T3: $k= names CAP_SETUID and CAP_SETGID" "$(printf '%s' "$v" | grep -c CAP_SETUID)|$(printf '%s' "$v" | grep -c CAP_SETGID)" "1|1"
 done
 eq "T3: SupplementaryGroups=aib-login (the broker reads the shared store)" "$(printf '%s\n' "$dt" | grep -c '^SupplementaryGroups=.*aib-login')" 1
+eq "T3: the broker mount namespace allows role-account agent homes to persist provider sessions" "$(printf '%s\n' "$dt" | grep '^ReadWritePaths=' | cut -d= -f2- | tr ' ' '\n' | grep -Fxc /var/lib/aib-sup)" 1
+has "T3: the drop-in documents that its writable root must follow AIB_SUP_STATE_ROOT" "$(cat "${DI:-/nonexistent}" 2>/dev/null)" "AIB_SUP_STATE_ROOT"
 eq "T3: the example is an example: it resets nothing (no empty ReadWritePaths=) and names no NOPASSWD" "$(printf '%s\n' "$dt" | grep -Ec '^ReadWritePaths=$|NOPASSWD')" 0
 
 # --- T4 (K7/M5) optional runtime dirs are `-` prefixed -----------------------------------------------------------------------------------------------

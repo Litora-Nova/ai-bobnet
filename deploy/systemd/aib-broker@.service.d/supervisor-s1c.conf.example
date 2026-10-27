@@ -1,5 +1,9 @@
 [Service]
 EnvironmentFile=/etc/aib/role.env
+# ProtectSystem=strict applies to the role-switched child too. Permit the broker mount namespace
+# to write agent homes; Landlock still narrows each child to its own configured state path.
+# If AIB_SUP_STATE_ROOT is overridden in role.env, this path must be changed to match it.
+ReadWritePaths=/var/lib/aib-sup
 # Turns are bounded to 900 s by the login refresher (its fixed AIB_LOGIN_MAX_TURN_S default);
 # the broker must not grant longer turns to fd or shared-login launches.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
