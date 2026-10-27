@@ -218,7 +218,9 @@ class Supervisor:
     def journal(self, event: str, **fields: Any) -> dict[str, Any]:
         self.journal_seq += 1
         record = {"seq": self.journal_seq, "ts": utc_now(), "event": event, **fields}
-        with self.journal_path.open("a", encoding="utf-8") as stream:
+        journal_fd = os.open(self.journal_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        with os.fdopen(journal_fd, "a", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o644)
             stream.write(json.dumps(record, separators=(",", ":")) + "\n")
             stream.flush()
         self.records.append(record)
@@ -240,7 +242,10 @@ class Supervisor:
             "off_duty": self.off_duty,
         }
         temporary = self.state_dir / f".live.{os.getpid()}.tmp"
-        temporary.write_text(json.dumps(live, separators=(",", ":")) + "\n", encoding="utf-8")
+        live_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(live_fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o644)
+            stream.write(json.dumps(live, separators=(",", ":")) + "\n")
         os.replace(temporary, self.live_path)
 
     def notify(self, value: str) -> None:

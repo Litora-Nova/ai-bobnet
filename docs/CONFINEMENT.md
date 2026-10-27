@@ -255,7 +255,9 @@ mode `0710` and carries one extra ACL entry, search-only (`--x`) for the broker 
 run its pre-flight and set the Landlock path rules inside it without listing the directory. A default
 broker ACL grants read-only (`r--`) access to newly created state files, including `journal.jsonl` and
 atomic replacements of `live.json`; an existing `live.json` receives the same named read ACL during
-provisioning. The broker receives no write permission. The broker unit therefore needs only
+provisioning. The broker receives no write permission. Group-readable files the role account creates
+in its home become readable by the broker group by name through the default ACL, while files it creates
+with mode `0600` stay private. The broker unit therefore needs only
 `CAP_SETUID` and `CAP_SETGID`, bounded as shown
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
