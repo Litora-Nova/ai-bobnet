@@ -482,7 +482,7 @@ components. All guarantees in §7 and §8 therefore assume a cooperating agent t
 monitor: the policy-gate assumption applies to integrity as well as invocation. Integrity precedes
 non-bypassability. Separating those accounts is RM-3's precondition, not optional hardening.
 
-DP makes the broker-side recorded agent identity trustworthy across durable agents without assigning
+Peer binding makes the broker-side recorded agent identity trustworthy across durable agents without assigning
 one uid per agent: `SO_PEERCRED` must identify root or a human operator, while role, gateway, and
 unknown peers are denied. The child uid remains the configured role uid, and the target state owner
 must match it before the broker commits an allow decision. Direct in-process launches that bypass the

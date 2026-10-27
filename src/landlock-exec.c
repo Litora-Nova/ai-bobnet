@@ -216,7 +216,7 @@ static int shared_group_gid(gid_t *gid){
     return 1;
   }
 #endif
-  return 0;
+  return -1;
 }
 
 static int role_refuse(const char *message){
@@ -325,6 +325,8 @@ int main(int argc, char **argv){
     if (!uid_allowed((uid_t)uid_value)) return role_refuse("uid is not present in AIB_ROLE_UIDS");
     gid_t forbidden_group = 0;
     int has_forbidden_group = shared_group_gid(&forbidden_group);
+    if (has_forbidden_group < 0)
+      return role_refuse("confinement_unavailable: cannot resolve the aib-shared group");
     if (has_forbidden_group && (gid_t)gid_value == forbidden_group)
       return role_refuse("aib-shared is forbidden as the confined primary group");
     for (size_t i = 0; i < group_count; ++i){

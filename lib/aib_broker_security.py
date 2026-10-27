@@ -19,7 +19,7 @@ if not TEST_SEAMS:
         os.environ.pop(name, None)
 
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_control import identity_for  # noqa: E402
+from aib_control import configured_role_uids, identity_for  # noqa: E402
 
 UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
 GROUPS_RE = re.compile(r"[0-9]+(?:,[0-9]+)*\Z", re.ASCII)
@@ -65,11 +65,14 @@ def peer_agent(target: str) -> int:
         print("peer_uid=-1")
         return 0
     caller = "root:root" if uid == 0 else identity_for(uid)
+    role_config_unavailable = (
+        uid != 0 and caller.startswith("unknown:") and configured_role_uids() is None
+    )
     target_uid = target_owner(target) if "AIB_SUP_STATE_ROOT" in os.environ else None
     role_uid_raw = os.environ.get("AIB_ROLE_UID", "")
     role_uid = int(role_uid_raw) if role_uid_raw.isdecimal() else None
     authorization = "deny"
-    reason = "peer_unauthorized"
+    reason = "role_config_unavailable" if role_config_unavailable else "peer_unauthorized"
     stage = "peer"
     if uid == 0:
         authorization, reason = "allow", "root_supervisor"
@@ -109,7 +112,9 @@ def groups_safe(raw: str, primary: str) -> int:
     if raw:
         groups.update(int(item) for item in raw.split(","))
     forbidden = shared_gid()
-    return 3 if forbidden is not None and forbidden in groups else 0
+    if forbidden is None:
+        return 4
+    return 3 if forbidden in groups else 0
 
 
 def main(argv: list[str]) -> int:

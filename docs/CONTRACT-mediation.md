@@ -121,7 +121,7 @@ That reduction is the substantive gain of putting the boundary in the right plac
 
 ## 4. Peer-bound agent identity
 
-DP retains one uid per role. The broker reads `SO_PEERCRED` from the accepted AF_UNIX connection;
+Peer binding retains one uid per role. The broker reads `SO_PEERCRED` from the accepted AF_UNIX connection;
 only root supervisors and the existing `human:` operator class may request launches. `role:`,
 `gateway:`, and `unknown:` peers are always denied, and peer denials are durable `attempt.decided`
 records.
