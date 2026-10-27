@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ai-bobnet — DP: broker launches are bound to the connecting AF_UNIX peer.
+# ai-bobnet — peer binding: broker launches are bound to the connecting AF_UNIX peer.
 set -uo pipefail
 
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
@@ -12,8 +12,10 @@ pass=0 fail=0
 ok(){ pass=$((pass+1)); printf 'ok   - %s\n' "$1"; }
 no(){ fail=$((fail+1)); printf 'FAIL - %s\n' "$1"; }
 skip(){ printf 'ok   - (skipped: %s)\n' "$1"; }
+eq(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi; }
 has(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else no "$1 (missing '$3')"; fi; }
 hasnt(){ if printf '%s\n' "$2" | grep -qF -- "$3"; then no "$1 (unexpected '$3')"; else ok "$1"; fi; }
+target_unavailable_count(){ aib_event_scan "$WORK/events/acme/main.events" | grep -c 'target_role_unavailable'; }
 
 ME=$(id -u)
 OTHER=$((ME + 10000))
@@ -21,6 +23,7 @@ HUMAN=$((ME + 10001))
 GATEWAY=$((ME + 10002))
 ROLE_GID=$(( $(id -g) + 10000 ))
 SHARED_GID=$(getent group aib-shared 2>/dev/null | cut -d: -f3)
+: "${SHARED_GID:=424242}"
 [ "$ROLE_GID" != "${SHARED_GID:-}" ] || ROLE_GID=$((ROLE_GID + 1))
 mkdir -p "$WORK/home" "$WORK/standup" "$WORK/state/acme-worker" "$WORK/events"
 
@@ -106,12 +109,30 @@ frame(){
 run_as(){
   local peer=$1 target=$2 role_uid=${3:-$ME} role_gid=${4:-$ROLE_GID}
   frame "$target" | env -i PATH="$PATH" HOME="$WORK" \
-    AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID="$peer" AIB_IDENTITY_CMD="$WORK/identity" \
+    AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID="$peer" AIB_TEST_SHARED_GID="$SHARED_GID" \
+    AIB_IDENTITY_CMD="$WORK/identity" \
     AIB_ROLE_UID="$role_uid" AIB_ROLE_GID="$role_gid" AIB_ROLE_UIDS="$role_uid" \
     AIB_SUP_STATE_ROOT="$WORK/state" AIBOBNET_REGISTRY="$WORK/registry.json" \
     AIB_EVENT_ROOT="$WORK/events" AIB_CONFINE_BIN="$WORK/landlock" \
     "$ROOT/bin/aib-broker-handler" 2>"$WORK/handler.err"
 }
+run_pipe_without_seams(){
+  frame "$1" | env -i PATH="$PATH" HOME="$WORK" \
+    AIB_ROLE_UID="$ME" AIB_ROLE_GID="$ROLE_GID" AIB_ROLE_UIDS="$ME" \
+    AIB_SUP_STATE_ROOT="$WORK/state" AIBOBNET_REGISTRY="$WORK/registry.json" \
+    AIB_EVENT_ROOT="$WORK/events" AIB_CONFINE_BIN="$WORK/landlock" \
+    "$ROOT/bin/aib-broker-handler" 2>"$WORK/handler.err"
+}
+
+# fd 0 is a plain pipe and no test seam is enabled. The handler itself must
+# preserve the Python peer-credential refusal, audit it, and never enact.
+RC=0; OUT=$(run_pipe_without_seams acme-worker) || RC=$?
+has "the handler denies a plain-pipe fd 0 when peer credentials are unavailable" "$OUT" "end=denied"
+has "the handler-level credential refusal is at the peer stage" "$OUT" "stage=peer"
+hasnt "the handler-level credential refusal never enacts the provider" "$OUT" "provider-ran"
+[ "$RC" -eq 3 ] && ok "the handler-level credential refusal exits 3" || no "the handler-level credential refusal exits 3 (got $RC)"
+SCAN=$(aib_event_scan "$WORK/events/acme/main.events")
+has "the handler durably audits unavailable peer credentials" "$SCAN" "peer_credentials_unavailable"
 
 # Role accounts never have broker authority, including over a state directory they
 # own. Only root supervisors and human operators may request a launch.
@@ -158,6 +179,67 @@ RC=0; OUT=$(run_as "$((GATEWAY + 1))" acme-lead) || RC=$?
 has "an unknown identity cannot request a launch" "$OUT" "reason=unauthorized"
 has "the unknown denial names the peer stage" "$OUT" "stage=peer"
 hasnt "an unknown peer denial never enacts" "$OUT" "provider-ran"
+
+# A broken protected role configuration is operationally different from an
+# ordinary unknown account, although both remain denied at the peer boundary.
+printf 'AIB_ROLE_UIDS=not-a-uid\n' > "$WORK/broken-role.env"
+RC=0
+OUT=$(frame acme-lead | env -i PATH="$PATH" HOME="$WORK" \
+  AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID="$ME" AIB_ROLE_ENV_FILE="$WORK/broken-role.env" \
+  AIB_ROLE_UID="$ME" AIB_ROLE_GID="$ROLE_GID" AIB_ROLE_UIDS="$ME" \
+  AIB_SUP_STATE_ROOT="$WORK/state" AIBOBNET_REGISTRY="$WORK/registry.json" \
+  AIB_EVENT_ROOT="$WORK/events" AIB_CONFINE_BIN="$WORK/landlock" \
+  "$ROOT/bin/aib-broker-handler" 2>"$WORK/handler.err") || RC=$?
+has "a broken role.env still denies the peer" "$OUT" "end=denied"
+hasnt "a broken role.env never enacts" "$OUT" "provider-ran"
+SCAN=$(aib_event_scan "$WORK/events/acme/main.events")
+has "the audit distinguishes broken role configuration from an ordinary unknown peer" \
+  "$SCAN" "role_config_unavailable caller=unknown:$ME"
+
+# Every unavailable target-role input refuses at the confinement stage.
+BEFORE=$(target_unavailable_count)
+rmdir "$WORK/state/acme-lead"
+RC=0; OUT=$(run_as 0 acme-lead) || RC=$?
+has "a missing target state directory is unavailable" "$OUT" "stage=confine"
+AFTER=$(target_unavailable_count)
+eq "the missing target state directory adds one target_role_unavailable audit" "$((AFTER - BEFORE))" 1
+mkdir "$WORK/state/acme-lead"
+
+BEFORE=$AFTER
+RC=0
+OUT=$(frame acme-lead | env -i PATH="$PATH" HOME="$WORK" \
+  AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID=0 AIB_IDENTITY_CMD="$WORK/identity" \
+  AIB_ROLE_GID="$ROLE_GID" AIB_ROLE_UIDS="$ME" AIB_SUP_STATE_ROOT="$WORK/state" \
+  AIBOBNET_REGISTRY="$WORK/registry.json" AIB_EVENT_ROOT="$WORK/events" \
+  AIB_CONFINE_BIN="$WORK/landlock" "$ROOT/bin/aib-broker-handler" 2>"$WORK/handler.err") || RC=$?
+has "an unset AIB_ROLE_UID makes the target role unavailable" "$OUT" "stage=confine"
+AFTER=$(target_unavailable_count)
+eq "the unset role uid adds one target_role_unavailable audit" "$((AFTER - BEFORE))" 1
+
+BEFORE=$AFTER
+RC=0; OUT=$(run_as 0 acme-lead 999) || RC=$?
+has "an AIB_ROLE_UID below 1000 makes the target role unavailable" "$OUT" "stage=confine"
+AFTER=$(target_unavailable_count)
+eq "the low role uid adds one target_role_unavailable audit" "$((AFTER - BEFORE))" 1
+
+LOW_OWNER=$(env -i PATH="$PATH" AIB_TEST_SEAMS=1 AIB_TEST_PEER_UID=0 \
+  AIB_ROLE_UID="$ME" AIB_SUP_STATE_ROOT="$WORK/state" python3 -I - "$ROOT/lib" <<'PY'
+import sys
+import stat
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+import aib_broker_security
+
+fake_info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=999)
+with patch.object(aib_broker_security.Path, "lstat", return_value=fake_info):
+    aib_broker_security.peer_agent("acme-worker")
+PY
+)
+has "a target state directory owner below 1000 makes the role unavailable" \
+  "$LOW_OWNER" "reason=target_role_unavailable"
+has "the low-owner refusal is at the confinement stage" "$LOW_OWNER" "stage=confine"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

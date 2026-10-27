@@ -35,6 +35,14 @@ if [ -z "$CC" ] || ! "$CC" -O2 -DAIB_TEST_SHARED_GID=5001 -o "$WORK/ll" "$SRC_RO
   skip "no C compiler (or src/landlock-exec.c does not compile: $(head -c 200 "$WORK/cc.err" 2>/dev/null)) — nothing in this spec can run"
   printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]; exit
 fi
+cat > "$WORK/no-shared-group.c" <<'CEOF'
+#include <grp.h>
+struct group *aib_test_getgrnam(const char *name){ (void)name; return 0; }
+CEOF
+if ! "$CC" -O2 -Dgetgrnam=aib_test_getgrnam -o "$WORK/ll-no-shared" \
+  "$SRC_ROOT/src/landlock-exec.c" "$WORK/no-shared-group.c" 2>"$WORK/cc-no-shared.err"; then
+  no "the no-shared-group policy helper compiles ($(head -c 200 "$WORK/cc-no-shared.err" 2>/dev/null))"
+fi
 ME="$(id -u)"; MG="$(id -g)"; SENT="$WORK/ran"; mkdir -p "$WORK/rw" "$WORK/outside"
 # DAC must not be the reason for a denial: the dirs are world-writable (sticky) and $WORK is traversable, so only Landlock can deny a write
 chmod o+x "$WORK"; chmod 1777 "$WORK/rw" "$WORK/outside"
@@ -49,6 +57,20 @@ uidmsg() { printf '%s
 %s' "$STATUS" "$ERR" | grep -ci 'uid' | awk '{print ($1>0)?1:0}'; }
 ran() { [ -e "$SENT" ] && echo ran || echo not-run; }
 touch_cmd=(/bin/sh -c ": > '$SENT'")
+
+# Production has no numeric override. Stub only NSS group lookup at compile time
+# so this pure policy case is deterministic even on a provisioned host.
+if [ -x "$WORK/ll-no-shared" ]; then
+  : > "$WORK/status"; rm -f "$SENT"; RC=0
+  OUT="$(env -i PATH="$PATH" LL_RO=/ LL_RW="$WORK/rw:/tmp" LL_STATUS_FD=3 \
+    AIB_ROLE_UIDS=5000 AIB_ROLE_GROUPS=60001 "$WORK/ll-no-shared" \
+    --uid 5000 --gid 5000 --groups 60001 "${touch_cmd[@]}" \
+    3>"$WORK/status" 2>"$WORK/err")" || RC=$?
+  ERR="$(cat "$WORK/err")"; STATUS="$(cat "$WORK/status")"
+  eq "T1: an unresolvable aib-shared group refuses before CMD runs" "$RC|$(ran)" "3|not-run"
+  has "T1: the unresolvable-group refusal reports confinement_unavailable" \
+    "$STATUS $ERR" "confinement_unavailable"
+fi
 
 # --- T1 policy refusals (no Landlock needed: they happen before anything is installed) -------------------------------------------------------------
 ll AIB_ROLE_UIDS="$ME,5000" -- --uid "$ME" "${touch_cmd[@]}";                          eq "T1: --uid without --gid => exit 2, CMD not run" "$RC|$(ran)" "2|not-run"

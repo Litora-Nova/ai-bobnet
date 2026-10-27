@@ -38,6 +38,7 @@ eq(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi; }
 has(){ case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3' in: ${2:0:300})";; esac; }
 hasnt(){ case "$2" in *"$3"*) no "$1 (unexpected '$3')";; *) ok "$1";; esac; }
 SENT="SECRET-TOKEN-0123456789abcdef"
+TEST_SHARED_GID=424242
 
 BROKER_HOME="$WORK/broker-home"; STATE_ROOT="$WORK/sup"; LROOT="$WORK/login"; PROJ="$WORK/project"; EV="$WORK/events"; STUB="$WORK/stub"
 mkdir -p "$BROKER_HOME/.codex" "$STATE_ROOT/acme-core/.codex" "$STATE_ROOT/acme-core/.claude" "$LROOT/codex" "$LROOT/claude-code" "$PROJ" "$EV" "$STUB"
@@ -80,7 +81,7 @@ launch() { # launch <agent_uid> <record-extra-lines> [VAR=val...]  -> RESP
   payload="$(aib_event_compose_decided_payload "$kv")"
   aib_event_commit "$EVF" "$EVL" attempt.decided "$(KV "$uid")" "$payload" >/dev/null 2>&1; decided="$AIB_EVENT_COMMIT_EVENT_ID"
   rec="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5%s' "$STUB/provider" "$PROJ" "$PROJ" "${extra:+$'\n'$extra}")"
-  RESP="$(env HOME="$BROKER_HOME" AIB_VERDICT_ENV_ALLOW="HOME PATH" AIB_CONFINE_BIN="$STUB/landlock-exec" AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$(id -u)" AIB_DEPLOYMENT_CONFIG="$DEP" "$@" \
+  RESP="$(env HOME="$BROKER_HOME" AIB_VERDICT_ENV_ALLOW="HOME PATH" AIB_CONFINE_BIN="$STUB/landlock-exec" AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID="$TEST_SHARED_GID" AIB_DEPLOYMENT_OWNER_UID="$(id -u)" AIB_DEPLOYMENT_CONFIG="$DEP" "$@" \
       bash -c '. "$1/lib/aibobnet.sh"; shift; aib_enact_launch "$@"' _ "$SRC_ROOT" "$rec" hello "$EVF" "$EVL" "$(KV "$uid")" "$decided" 2>"$WORK/err")"
 }
 ll_field() { grep "^$1=" "$LOG" | tail -1 | sed "s/^$1=//"; }

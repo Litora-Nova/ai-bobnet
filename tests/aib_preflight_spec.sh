@@ -42,5 +42,57 @@ eq "aib-shared in AIB_ROLE_GROUPS refuses installation" "$RC" 1
 has "the supplementary-group refusal names AIB_ROLE_GROUPS" "$OUT" "AIB_ROLE_GROUPS"
 has "the supplementary-group refusal gives a clear provisioning instruction" "$OUT" "aib-shared"
 
+RC=0
+OUT=$(env AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID="$SHARED_GID" \
+  "$ROOT/bin/aib-preflight" "$WORK/missing-role.env" 2>&1) || RC=$?
+eq "a missing role.env refuses installation" "$RC" 1
+has "the missing-role.env refusal says the file cannot be read" "$OUT" "cannot read"
+
+mkdir "$WORK/unreadable-role.env"
+RC=0
+OUT=$(env AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID="$SHARED_GID" \
+  "$ROOT/bin/aib-preflight" "$WORK/unreadable-role.env" 2>&1) || RC=$?
+eq "an unreadable role.env path refuses installation" "$RC" 1
+has "the unreadable-role.env refusal says the path cannot be read" "$OUT" "cannot read"
+
+# Stub only the host NSS result inside this test process. No application test
+# seam supplies a gid, so both callers exercise the real unresolved branch.
+write_role_env 5001 5002,5003
+RC=0
+OUT=$(
+env -i PATH="$PATH" python3 -I - "$ROOT" "$ROLE_ENV" 2>&1 <<'PY'
+import runpy
+import sys
+
+root, role_env = sys.argv[1:]
+sys.path.insert(0, f"{root}/lib")
+import aib_broker_security
+
+def missing_group(_name):
+    raise KeyError
+
+aib_broker_security.grp.getgrnam = missing_group
+preflight = runpy.run_path(f"{root}/bin/aib-preflight")
+raise SystemExit(preflight["main"]([role_env]))
+PY
+) || RC=$?
+eq "aib-preflight refuses when aib-shared is unresolvable" "$RC" 1
+has "the unresolvable-group refusal names the missing group" "$OUT" "cannot resolve the aib-shared group"
+
+RC=0
+env -i PATH="$PATH" python3 -I - "$ROOT/lib" >/dev/null 2>&1 <<'PY' || RC=$?
+import sys
+sys.path.insert(0, sys.argv[1])
+import aib_broker_security
+
+def missing_group(_name):
+    raise KeyError
+
+aib_broker_security.grp.getgrnam = missing_group
+raise SystemExit(aib_broker_security.groups_safe("5002,5003", "5001"))
+PY
+[ "$RC" -ne 0 ] && ok "the Python runtime group check fails closed when aib-shared is unresolvable" || \
+  no "the Python runtime group check fails closed when aib-shared is unresolvable (got rc 0)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
