@@ -120,7 +120,11 @@ bound=0; grep -s 'session.bound' "$w/state/acme-core/journal.jsonl" | grep -qF "
 seen=$(grep -sc 'event:SEEN' "$w/standup/inbox/acme-core.md"); seen=${seen:-0}
 printf '%s session=%s as=%s cwd=%s supervised=%s bound=%s seen=%s extra=%s t=%s\n' "$n" "$session" "$as" "$cwd" "$sup" "$bound" "$seen" "$extra" "$(date +%s.%N)" >> "$w/calls.log"
 env | grep -E '^(TMUX|ZELLIJ)' >> "$w/mux-env.log"
-line=$( ( flock 8; l=$(head -n1 "$w/plan" 2>/dev/null); sed -i 1d "$w/plan" 2>/dev/null; printf '%s' "$l" ) 8>"$w/plan.lock" )
+if [ -f "$w/fail-resumes" ] && [ "$session" = "${session#new:}" ]; then
+  line="1||E:No conversation found with session ID: $session"
+else
+  line=$( ( flock 8; l=$(head -n1 "$w/plan" 2>/dev/null); sed -i 1d "$w/plan" 2>/dev/null; printf '%s' "$l" ) 8>"$w/plan.lock" )
+fi
 [ -n "$line" ] || line=$(cat "$w/default" 2>/dev/null || echo '0||ok turn')
 rc="${line%%|*}"; rest="${line#*|}"; hold="${rest%%|*}"; text="${rest#*|}"
 if ! mkdir "$w/turn.lock" 2>/dev/null; then echo "overlap call $n" >> "$w/overlap.log"; else trap 'rmdir "$w/turn.lock" 2>/dev/null' EXIT; fi
@@ -223,9 +227,10 @@ m_inbox() { env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- 
 state_is() { [ "$(m_state "$1")" = "$2" ]; }
 # a human-lane line, as `agentctl say` will write it (from:human:<login>)
 m_self_handover() { # m_self_handover <id> — a handover note as the supervisor itself writes it (from = the agent)
-  env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- "$ENGINE4/bin/message" send acme-core "kind:handover reason:test" --id "$1" >/dev/null
+  env -i PATH="$PATH" HOME="$W" "$ENGINE4/bin/run-agent" acme-core -- "$ENGINE4/bin/message" send acme-core "kind:handover; reason:test" --id "$1" >/dev/null
 }
 m_human() { printf '%s | id:%s | from:human:operator | to:acme-core | state:PERSISTED | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$INBOX"; }
 # set the scripted launcher outcomes (one per call, head first) / the fallback after the plan runs out
 plan()    { : > "$W/plan"; local l; for l in "$@"; do printf '%s\n' "$l" >> "$W/plan"; done; }
 default() { printf '%s\n' "$1" > "$W/default"; }
+fail_resumes() { : > "$W/fail-resumes"; }
