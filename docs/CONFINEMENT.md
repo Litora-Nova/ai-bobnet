@@ -22,8 +22,8 @@ The broker also authenticates the local launch peer before this confinement step
 `Accept=yes`, systemd places the accepted AF_UNIX connection on the handler's fd 0; the handler reads
 `SO_PEERCRED` from that socket and never treats the frame's `agent_uid` as caller identity. Root (the
 supervisor path) and identities classified as `human:` by `identity_for` may launch a prepared agent.
-A `role:` peer may launch only the one agent whose real state directory it uniquely owns. `gateway:`
-and `unknown:` peers cannot launch. A refusal is an audited `attempt.decided` deny and returns
+`role:`, `gateway:`, and `unknown:` peers cannot launch, regardless of which prepared state directories
+their uid owns. A refusal is an audited `attempt.decided` deny and returns
 `stage=peer`, `reason=unauthorized`; the audit reason includes the kernel uid and classified caller.
 The fake-peer test seam works only with `AIB_TEST_SEAMS=1` in an uninstalled engine tree.
 
@@ -254,13 +254,14 @@ The helper applies Landlock first, sets exactly the allow-listed supplementary g
 when no `--groups` is given), switches gid and uid, clears all remaining capability sets and the
 ambient set, and then executes the adapter. Every `--groups` gid must be strict decimal, not 0, and
 listed in `AIB_ROLE_GROUPS`; there is no numeric floor, because provisioning creates the shared and
-login groups as system groups. The broker derives the target uid from the prepared
-`/var/lib/aib-sup/<agent_uid>` directory and its primary gid from that uid's passwd entry, rather than
-trusting the request or one global role uid. The
-uid must still appear in `AIB_ROLE_UIDS`. Each agent directory must therefore have one distinct role
-owner; if the same role uid owns more than one agent directory, a role peer is denied for all of them
-because the binding is ambiguous. The uid allow-list, supplementary group list, and state-root setting come from
-`/etc/aib/role.env`; per-agent directory ownership comes from the matching agent-unit provisioning.
+login groups as system groups. The broker takes the child identity from `AIB_ROLE_UID` and
+`AIB_ROLE_GID` in `/etc/aib/role.env`, never from the request, state-directory
+ownership, or a passwd lookup. `AIB_ROLE_UID` must still appear in `AIB_ROLE_UIDS`. The real owner of
+`/var/lib/aib-sup/<agent_uid>` is a consistency check only: if it differs from `AIB_ROLE_UID`, the
+broker records an `attempt.decided` deny with `target_role_mismatch` and returns
+`stage=confine`, `reason=confinement_unavailable`. One role uid may own multiple agent state
+directories; the account model is one uid per role, not one uid per agent. The uid allow-list,
+primary gid, supplementary group list, and state-root setting all come from `/etc/aib/role.env`.
 Provisioning must keep that policy root-owned and not writable by others (the engine does
 not check its owner or mode) (template `deploy/role.env.example`) read by the broker drop-in, never from a
 request. Groups the role account has outside this list, such as the control group, do not reach the
@@ -292,27 +293,34 @@ Landlock path mediation: removing socket access by DAC is what prevents a confin
 
 ### DP provisioning hand-off
 
-Deployments must make the following changes before enabling a multi-agent team:
+Provisioning must finish **before the engine is installed or upgraded**. The old engine does not
+enforce these child-group checks, so operators can prepare and verify the new DAC layout without a
+partial cut-over:
 
-- Assign one distinct role uid to each durable agent, own its prepared state directory by that uid,
-  and list all such uids in root-owned `AIB_ROLE_UIDS`. The per-agent systemd pre-start environment
-  must supply the matching uid/gid when `aib-agent-dirs` creates that directory.
-- Remove the `aib-shared` gid from `AIB_ROLE_GROUPS`, and do not use it as `AIB_ROLE_GID`.
-- Put direct human launch operators in `aib-ops` and retain a DAC path for them to the socket
-  (currently membership in `aib-shared`). For compatibility, the current `identity_for` classifier
-  also recognizes non-role accounts in `aib-shared` as `human:`, but new deployments should not use
-  socket membership alone as their operator-role definition.
-- Move provider-adapter execute permission from `aib-shared` to a dedicated, non-socket group (for
-  example `aib-provider-exec`) and put that gid in `AIB_ROLE_GROUPS`. Keep `aib-login` where the
-  selected credential mode requires it.
-- If shared Git objects or project files currently rely on setgid `aib-shared` plus umask 002, move
-  them to a distinct project/workspace group or equivalent ACL. Do not reuse the broker-socket group.
+1. Create a dedicated `aib-provider-exec` group. Install adapters, and every executable reached by
+   `landlock-exec` after the uid drop, as `root:aib-provider-exec 0750`; add the role accounts to it.
+2. Create one project group per project (for example `aib-proj-example`) for the home and repository.
+   Use setgid directories, `core.sharedRepository=group`, and umask `002`; add the relevant role
+   accounts and human operators to the project group.
+3. Update `/etc/aib/role.env`: `AIB_ROLE_GID` is the role account's own primary group;
+   `AIB_ROLE_GROUPS` contains the numeric gids for `aib-provider-exec`, `aib-login`, and the project
+   group, without `aib-shared`; `AIB_ROLE_UIDS` remains the role-account allow-list.
+4. Remove the role accounts from the `aib-shared` entry in `/etc/group`. The engine sets the child's
+   groups explicitly, but removing stale membership keeps the host policy comprehensible.
+5. Keep human operators (`aib-ops`) in `aib-shared` for broker-socket DAC. Keep the gateway account
+   out of that group.
+6. While the old engine is still active, run a probe turn through the normal operator path (for
+   example `agentctl say`) and verify that the adapter executes, login state is readable, and the
+   repository is writable. Then run `bin/aib-preflight /etc/aib/role.env`. It fails closed if
+   `AIB_ROLE_GID` or `AIB_ROLE_GROUPS` still contains the resolved `aib-shared` gid. Only after it
+   succeeds may provisioning install the new engine and create its root-owned `.aib-installed`
+   marker.
+7. After deployment, verify a supervisor turn, a human `run-agent --as` turn, a confined child that
+   cannot connect to the broker socket, a `role:` peer launch that returns an audited
+   `stage=peer` denial, and a launch refusal when a test `role.env` carries `aib-shared`.
 
-Without those changes, removing `aib-shared` has two precise effects: the shipped
-`root:aib-shared 0750` adapters stop executing after the uid switch, and cross-role writes to a shared
-repository/worktree fail wherever group `aib-shared` is the only DAC grant. Private agent state keeps
-working because it is role-owned. Standup, inbox/outbox, heartbeat, and control writes do not require
-the group in the confined child: the root supervisor/broker performs those writes outside the child.
+There is **no transition switch** that disables the group check: such a switch would be a fail-open
+control. Rollback means restoring the previous engine version, not setting a compatibility flag.
 
 The helper is the sole owner of this directory contract. It creates `/var/lib/aib-sup` as root-owned
 `0755`, then prepares the per-agent home, provider directories, and named ACLs. The agent unit therefore

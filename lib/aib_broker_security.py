@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import grp
 import os
-import pwd
 import re
 import socket
 import stat
@@ -42,37 +41,15 @@ def peer_uid() -> int:
         connection.close()
 
 
-def target_role(target: str) -> tuple[int, int] | None:
+def target_owner(target: str) -> int | None:
     state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
     try:
         target_info = (state_root / target).lstat()
         if not stat.S_ISDIR(target_info.st_mode) or target_info.st_uid < 1000:
             return None
-        primary_gid = pwd.getpwuid(target_info.st_uid).pw_gid
-        if primary_gid == 0:
-            return None
-        return target_info.st_uid, primary_gid
-    except (KeyError, OSError):
-        return None
-
-
-def role_owns_only_target(uid: int, target: str) -> bool:
-    state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
-    target_ids = target_role(target)
-    if target_ids is None or target_ids[0] != uid:
-        return False
-    try:
-        owned = []
-        with os.scandir(state_root) as entries:
-            for entry in entries:
-                if UID_RE.fullmatch(entry.name) is None:
-                    continue
-                info = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode) and info.st_uid == uid:
-                    owned.append(entry.name)
-        return owned == [target]
+        return target_info.st_uid
     except OSError:
-        return False
+        return None
 
 
 def peer_agent(target: str) -> int:
@@ -83,30 +60,33 @@ def peer_agent(target: str) -> int:
     except (OSError, ValueError, struct.error):
         print("authorization=deny")
         print("reason=peer_credentials_unavailable")
+        print("stage=peer")
         print("caller=unknown:peer")
         print("peer_uid=-1")
         return 0
     caller = "root:root" if uid == 0 else identity_for(uid)
-    target_ids = target_role(target) if "AIB_SUP_STATE_ROOT" in os.environ else None
+    target_uid = target_owner(target) if "AIB_SUP_STATE_ROOT" in os.environ else None
+    role_uid_raw = os.environ.get("AIB_ROLE_UID", "")
+    role_uid = int(role_uid_raw) if role_uid_raw.isdecimal() else None
     authorization = "deny"
     reason = "peer_unauthorized"
+    stage = "peer"
     if uid == 0:
         authorization, reason = "allow", "root_supervisor"
     elif caller.startswith("human:"):
         authorization, reason = "allow", "human_operator"
-    elif caller.startswith("role:"):
-        if role_owns_only_target(uid, target):
-            authorization, reason = "allow", "role_agent_match"
-        else:
-            reason = "peer_role_mismatch"
-    if authorization == "allow" and "AIB_SUP_STATE_ROOT" in os.environ and target_ids is None:
-        authorization, reason = "deny", "target_role_unavailable"
+    if authorization == "allow" and "AIB_SUP_STATE_ROOT" in os.environ:
+        if target_uid is None or role_uid is None or role_uid < 1000:
+            authorization, reason, stage = "deny", "target_role_unavailable", "confine"
+        elif target_uid != role_uid:
+            authorization, reason, stage = "deny", "target_role_mismatch", "confine"
     print(f"authorization={authorization}")
     print(f"reason={reason}")
+    print(f"stage={stage}")
     print(f"caller={caller}")
     print(f"peer_uid={uid}")
-    print(f"target_uid={target_ids[0] if target_ids else -1}")
-    print(f"target_gid={target_ids[1] if target_ids else -1}")
+    print(f"target_uid={target_uid if target_uid is not None else -1}")
+    print(f"role_uid={role_uid if role_uid is not None else -1}")
     return 0
 
 

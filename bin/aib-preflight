@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Fail closed before installing an engine with unsafe role-account groups."""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+from aib_broker_security import shared_gid  # noqa: E402
+
+ENV_LINE_RE = re.compile(r"([A-Z][A-Z0-9_]*)=([^\s]*)\Z", re.ASCII)
+GROUP_LIST_RE = re.compile(r"[0-9]+(?:,[0-9]+)*\Z", re.ASCII)
+
+
+def load_role_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = ENV_LINE_RE.fullmatch(line)
+        if match is None:
+            raise ValueError(f"{path}:{number}: expected unquoted KEY=value")
+        key, value = match.groups()
+        if key in values:
+            raise ValueError(f"{path}:{number}: duplicate {key}")
+        values[key] = value
+    return values
+
+
+def check_role_groups(path: Path) -> None:
+    values = load_role_env(path)
+    primary = values.get("AIB_ROLE_GID", "")
+    supplementary = values.get("AIB_ROLE_GROUPS", "")
+    if not primary.isdecimal():
+        raise ValueError(f"{path}: AIB_ROLE_GID must be one decimal gid")
+    if GROUP_LIST_RE.fullmatch(supplementary) is None:
+        raise ValueError(f"{path}: AIB_ROLE_GROUPS must be a comma-separated decimal gid list")
+    forbidden = shared_gid()
+    if forbidden is None:
+        raise ValueError("cannot resolve the aib-shared group; provision it before installing the engine")
+    if int(primary) == forbidden:
+        raise ValueError(
+            f"{path}: AIB_ROLE_GID contains aib-shared (gid {forbidden}); "
+            "provision a private primary group before installing the engine"
+        )
+    if forbidden in {int(item) for item in supplementary.split(",")}:
+        raise ValueError(
+            f"{path}: AIB_ROLE_GROUPS contains aib-shared (gid {forbidden}); "
+            "remove the broker-socket group before installing the engine"
+        )
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 1:
+        print("usage: aib-preflight [ROLE_ENV]", file=sys.stderr)
+        return 2
+    path = Path(argv[0]) if argv else Path("/etc/aib/role.env")
+    try:
+        check_role_groups(path)
+    except ValueError as exc:
+        print(f"aib-preflight: refusing install: {exc}", file=sys.stderr)
+        return 1
+    print(f"aib-preflight: {path} excludes aib-shared; install may proceed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

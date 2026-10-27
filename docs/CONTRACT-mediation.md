@@ -121,16 +121,17 @@ That reduction is the substantive gain of putting the boundary in the right plac
 
 ## 4. Peer-bound agent identity
 
-DP supersedes the former single-uid limitation. Durable agents use distinct role uids. The broker
-reads `SO_PEERCRED` from the accepted AF_UNIX connection and binds a `role:` peer to the one prepared
-agent state directory it uniquely owns; the requested `agent_uid` is not sufficient. Root and the
-existing `human:` operator class retain cross-agent launch authority, while `gateway:` and `unknown:`
-do not. Peer denials are durable `attempt.decided` records.
+DP retains one uid per role. The broker reads `SO_PEERCRED` from the accepted AF_UNIX connection;
+only root supervisors and the existing `human:` operator class may request launches. `role:`,
+`gateway:`, and `unknown:` peers are always denied, and peer denials are durable `attempt.decided`
+records.
 
-This depends on provisioning maintaining unique per-agent directory ownership. A duplicated owner is
-ambiguous and fails closed. Confined provider children additionally receive neither `aib-shared` as
-their primary gid nor in their supplementary group list, so DAC prevents them from reaching the
-mode-0660 broker socket before peer binding is needed as defense in depth.
+The confined child's uid and gid come only from root-owned `/etc/aib/role.env`. Prepared state
+directory ownership is a consistency check against that configured uid, not an authority source; a
+mismatch fails closed before enactment and is durably audited. Multiple agent directories may share
+the role uid. Confined provider children additionally receive neither `aib-shared` as their primary
+gid nor in their supplementary group list, so DAC prevents them from reaching the mode-0660 broker
+socket; peer authorization remains defense in depth.
 
 ## 5. `high_water` — a self-check, not a boundary
 

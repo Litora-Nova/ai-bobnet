@@ -252,26 +252,25 @@ _snapshot="${_resolve_out#*$'\n'}"
 # Bind the caller-supplied agent label to the kernel-authenticated AF_UNIX peer.
 # systemd's Accept=yes instance leaves the accepted connection on fd 0, so
 # SO_PEERCRED remains available after the frame has been read. Root is the
-# supervisor path; current human operators retain their launch authority. A role
-# uid is accepted only when it uniquely owns this target's prepared state dir.
+# supervisor path; current human operators retain their launch authority. Role,
+# gateway, and unknown peers never have broker launch authority. The prepared
+# state directory owner is only a consistency check against AIB_ROLE_UID from the
+# root-owned role.env; it never selects the confined child's uid or gid.
 _peer_denied=0
 _peer_result="$(python3 -I "$REPO_ROOT/lib/aib_broker_security.py" peer-agent "${AIB_REQ_AGENT_UID:-}" 2>/dev/null)"
 _peer_rc=$?
 if [ "$_peer_rc" -ne 0 ]; then
-  _peer_result=$'authorization=deny\nreason=peer_credentials_unavailable\ncaller=unknown:peer\npeer_uid=-1'
+  _peer_result=$'authorization=deny\nreason=peer_credentials_unavailable\nstage=peer\ncaller=unknown:peer\npeer_uid=-1'
 fi
 _peer_authorization="$(_aib_record_field "$_peer_result" authorization)" || _peer_authorization=deny
 _peer_reason="$(_aib_record_field "$_peer_result" reason)" || _peer_reason=peer_credentials_unavailable
+_peer_stage="$(_aib_record_field "$_peer_result" stage)" || _peer_stage=peer
 _peer_caller="$(_aib_record_field "$_peer_result" caller)" || _peer_caller=unknown:peer
 _peer_uid="$(_aib_record_field "$_peer_result" peer_uid)" || _peer_uid=-1
 _target_role_uid="$(_aib_record_field "$_peer_result" target_uid)" || _target_role_uid=-1
-_target_role_gid="$(_aib_record_field "$_peer_result" target_gid)" || _target_role_gid=-1
+_configured_role_uid="$(_aib_record_field "$_peer_result" role_uid)" || _configured_role_uid=-1
 if [ "$_peer_authorization" != allow ]; then
   _peer_denied=1
-fi
-if [ "$_peer_denied" -eq 0 ] && [ -n "${AIB_SUP_STATE_ROOT+x}" ]; then
-  AIB_ROLE_UID="$_target_role_uid"
-  AIB_ROLE_GID="$_target_role_gid"
 fi
 
 # --- cwd containment: the registry-derived root, never the caller's choice ----------
@@ -291,6 +290,9 @@ if [ "$_peer_denied" -eq 1 ]; then
   AIB_VERDICT_DECISION=deny
   AIB_VERDICT_CODE=3
   AIB_VERDICT_REASONS="$_peer_reason caller=$_peer_caller peer_uid=$_peer_uid"
+  if [ "$_peer_stage" = confine ]; then
+    AIB_VERDICT_REASONS+=" target_uid=$_target_role_uid role_uid=$_configured_role_uid"
+  fi
   AIB_VERDICT_EFFECTIVE_CLEARANCE=""
   AIB_VERDICT_EFFECTIVE_SANDBOX=""
   AIB_VERDICT_EFFECTIVE_EFFORT=""
@@ -413,7 +415,11 @@ if [ "$_verdict_allow" -ne 1 ]; then
     "decided_event_id=$_decided_event_id"
   )
   if [ "$_peer_denied" -eq 1 ]; then
-    _deny_fields+=("stage=peer" "reason=unauthorized")
+    if [ "$_peer_stage" = confine ]; then
+      _deny_fields+=("stage=confine" "reason=confinement_unavailable")
+    else
+      _deny_fields+=("stage=peer" "reason=unauthorized")
+    fi
   fi
   aib_wire_write_response denied "${_deny_fields[@]}"
   exit 3

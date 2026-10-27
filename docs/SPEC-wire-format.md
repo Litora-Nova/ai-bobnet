@@ -325,7 +325,7 @@ additive discriminator `stage=peer`:
 ```
 decision=deny
 code=3
-reasons=peer_role_mismatch caller=role:aib-worker peer_uid=20002
+reasons=peer_unauthorized caller=role:aib-worker peer_uid=20002
 decided_event_id=acme-main-45
 stage=peer
 reason=unauthorized
@@ -334,6 +334,12 @@ end=denied
 
 The detailed `reasons` value is durable audit context derived from `SO_PEERCRED` and the local
 identity classifier; the fixed wire reason is safe for callers to branch on.
+
+Root and `human:` peers are the only authorized launch peers. `role:`, `gateway:`, and `unknown:`
+peers always receive the denial above. For an authorized peer, the prepared state-directory owner
+is checked against the configured `AIB_ROLE_UID` without replacing it. A mismatch is also a durable
+deny, with `reasons=target_role_mismatch ...`, `stage=confine`, and the existing fixed wire
+`reason=confinement_unavailable`; no child is started.
 
 Wire-level errors (malformed request, registry unavailable, registry misconfigured) keep the
 slice-1/2 shape unchanged — a flat set of `reason=`/`detail=` lines and `end=error`, with no prologue
