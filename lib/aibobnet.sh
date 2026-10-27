@@ -3089,7 +3089,7 @@ _aib_anchor_write() {
 aib_event_commit() {
   local events_path="${1:-}" lock_path="${2:-}" stream_name event_type
   local envelope_kv payload_json decided_id anchor_mode
-  local _fd timeout k LC_ALL=C
+  local _fd timeout k own_lock=1 held_lock_fd="${AIB_EVENT_HELD_LOCK_FD:-}" LC_ALL=C
   local project_uid actor_type actor_id agent_uid team_uid session_id run_id task_id gate_id grant_id effect_id occurred_at
   local attempt_id correlation_id causation_id
 
@@ -3188,8 +3188,14 @@ aib_event_commit() {
       [ -z "$decided_id" ] || aib_die 2 "tasks commit does not accept an attempt decided event_id"
       [ -n "$run_id" ] || aib_die 2 "tasks event envelope requires caller run_id"
       [ -n "$causation_id" ] || aib_die 2 "tasks event envelope requires caller causation_id"
+      case "$run_id" in r-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) aib_die 2 "invalid tasks run_id '$run_id' (expected r-<12 hex>)";; esac
+      aib_validate_token "$causation_id" causation_id
       case "$event_type" in
-        task.*) [ -n "$task_id" ] || aib_die 2 "task event envelope requires caller task_id";;
+        task.rejected) ;;
+        task.*)
+          [ -n "$task_id" ] || aib_die 2 "task event envelope requires caller task_id"
+          case "$task_id" in t-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) aib_die 2 "invalid tasks task_id '$task_id' (expected t-<12 hex>)";; esac
+          ;;
       esac
       ;;
   esac
@@ -3197,13 +3203,29 @@ aib_event_commit() {
   timeout="${AIBOBNET_EVENT_LOCK_TIMEOUT:-10}"
   case "$timeout" in ''|*[!0-9.]*) aib_die 2 "invalid event lock timeout '$timeout'";; esac
 
-  mkdir -p -- "$(dirname -- "$events_path")" || aib_die 2 "cannot create events directory for: $events_path"
+  if [ "$stream_name" = tasks ]; then
+    [ -d "$(dirname -- "$events_path")" ] && [ ! -L "$(dirname -- "$events_path")" ] ||
+      aib_die 2 "task events directory must be pre-provisioned as a real directory: $(dirname -- "$events_path")"
+  else
+    mkdir -p -- "$(dirname -- "$events_path")" || aib_die 2 "cannot create events directory for: $events_path"
+  fi
   AIB_EVENT_COMMIT_SEQ=""
   AIB_EVENT_COMMIT_EVENT_ID=""
 
-  exec {_fd}>>"$lock_path" || aib_die 2 "cannot open event lock: $lock_path"
-  if ! flock -w "$timeout" -x "$_fd"; then
-    aib_die 75 "event stream lock not acquired within ${timeout}s (contention or a stuck writer): $lock_path"
+  if [ -n "$held_lock_fd" ]; then
+    [ "$stream_name" = tasks ] || aib_die 2 "an inherited event lock is supported only for the tasks transaction writer"
+    case "$held_lock_fd" in ''|*[!0-9]*) aib_die 2 "invalid inherited event lock fd";; esac
+    [ -e "/proc/self/fd/$held_lock_fd" ] || aib_die 2 "inherited event lock fd is not open"
+    [ "$(stat -Lc '%d:%i' "/proc/self/fd/$held_lock_fd" 2>/dev/null)" = "$(stat -Lc '%d:%i' "$lock_path" 2>/dev/null)" ] ||
+      aib_die 2 "inherited event lock fd does not name the task stream lock"
+    flock -n -x "$held_lock_fd" || aib_die 2 "inherited task stream lock is not held exclusively"
+    _fd="$held_lock_fd"
+    own_lock=0
+  else
+    exec {_fd}>>"$lock_path" || aib_die 2 "cannot open event lock: $lock_path"
+    if ! flock -w "$timeout" -x "$_fd"; then
+      aib_die 75 "event stream lock not acquired within ${timeout}s (contention or a stuck writer): $lock_path"
+    fi
   fi
   local AIB_EVENT_ACTIVE_LOCK="$lock_path"
   local AIB_EVENT_LOCK_FD="$_fd"
@@ -3281,7 +3303,9 @@ aib_event_commit() {
     sync -d -- "$events_path" || aib_die 2 "cannot sync event stream: $events_path"
     _aib_anchor_write "${events_path}.high_water" "$seq"
   fi
-  exec {_fd}>&- || aib_die 2 "cannot close event lock: $lock_path"
+  if [ "$own_lock" -eq 1 ]; then
+    exec {_fd}>&- || aib_die 2 "cannot close event lock: $lock_path"
+  fi
   AIB_EVENT_COMMIT_SEQ="$seq"
   AIB_EVENT_COMMIT_EVENT_ID="$event_id"
 }

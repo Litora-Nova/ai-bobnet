@@ -9,7 +9,9 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > adapter, P3 scoped memory, the legacy-journal serialized commit protocol, the Codex managed-launch path,
 > and the RM-2 durable attempt audit (`attempt.decided`/`attempt.ended` per managed launch) are built
 > and tested. The same framed commit primitive now reserves the per-project `tasks` stream and its
-> run/task event vocabulary; the task ledger writer and task behavior are not built yet. The **rest**
+> run/task event vocabulary; D1a now implements the authoritative task ledger writer, fold, authority
+> checks, and task body sidecars. Confined-turn intents, supervisor application, worker pickup,
+> agentctl task verbs, and projection remain later slices. The **rest**
 > of the serialized event spine (cursors, projections, rebuild tooling), the provider-wide reference monitor, the
 > provider-change audit event, Gate/Grant/Effect state machines, profile provisioning, full runtime
 > lifecycle, external adapters, and dashboard projection remain specified but unimplemented. Until the
@@ -150,6 +152,51 @@ precedence ladder, and every displayed state MUST be traceable to a causing even
 6. **Health** — `healthy | warning | idle | unhealthy`
 7. **Grant** — `ISSUED → EXPIRED | REVOKED | ROTATED`
 
+### 3.2 Task and Run ledger (D1a)
+
+`bin/task` is the only task-stream writer. It is a supervisor/agentctl-side interface, not a command
+available to confined children. Every mutation is one locked transaction: replay the stream, read the
+current registry authority, validate the closed transition and ledger limits, then append through
+`aib_event_commit(stream=tasks)`. A domain refusal appends `task.rejected` and changes no Run or Task
+state. A malformed `run_id`, `task_id`, or `causation_id` is rejected before commit because these values
+are fold keys and, for tasks, sidecar filenames.
+
+A Run begins at `QUEUED`; its first Task makes it `RUNNING`. `run.closed` selects the terminal Run state.
+A created D1a Task is assigned immediately and then follows the closed Work transitions:
+
+```
+ASSIGNED -> IN_PROGRESS
+IN_PROGRESS -> IN_PROGRESS | BLOCKED | FAILED | DONE
+BLOCKED -> ASSIGNED                 (reassign or reopen)
+FAILED  -> ASSIGNED                 (reopen within the assignment budget)
+any non-terminal state -> CANCELLED
+```
+
+The fold contains the future gate behavior now: `task.reported {state: done}` reaches `REVIEW` when
+`gate != none`, otherwise `DONE`. D1a creation accepts only `gate: none`, so `REVIEW` is modelled and
+tested but unreachable through the writer until the gate slice enables it. `depth` is present, but D1a
+accepts only `1`; `parent` is the Run id. The reserved sub-team-lead authority row and
+`teams.<team>.parent_team` remain model seams only.
+
+Task ids are deterministic: `t-` plus the first 12 hex digits of SHA-256 over
+`<causation_id>:<intent_n>`. Retry dedupe is separately keyed by `(source_msg_id, assignee)` for an open
+Task. State is never stored outside the events. `list` and `show` replay the same fold used by writers.
+The body is a stable 0640 sidecar at
+`$AIB_TASK_ROOT/<project_uid>/bodies/<task_id>.md`; creation refuses symlinks and hard links. Directory,
+ownership, setgid, stream-file, and lock-file modes are provisioned by `bin/aib-task-dirs`, never by the
+commit primitive.
+
+Authority is evaluated from the registry snapshot at commit time. Team leads and humans may create,
+reassign, cancel, reopen, and close; only the assignee claim may report; assignee supervisors may start
+and may emit the closed engine failure/delivery reasons; the lead supervisor may mark overdue. The
+payload records the kernel-derived `caller` next to the envelope's claimed actor. Human authority is an
+override. The reserved sub-team-lead row is not implemented.
+
+Ledger defaults are `max_open=8`, `max_tasks_per_run=20` (creation plus reassign/reopen allocations),
+`max_assignments_per_task=3`, `max_depth=1`,
+`task_deadline_s=14400`, and `max_turns_per_task=8`. Schema-5 teams may override these under
+`teams.<team>.delegation`; `max_depth` may not exceed 1 in D1a.
+
 ### 3.7 Grant — notes that are load-bearing
 - There is **no `ACTIVE` state.** It conflated *in force* (time-derived) with *has been used* (observable
   only in the proxy case, and **repeatable** — a grant may be used many times). Usage emits a repeatable
@@ -220,7 +267,8 @@ gate_id? · grant_id? · effect_id? · correlation_id · causation_id · schema_
   remains additive: a new name, type list, and identity contract, with no framing change. Relations across
   streams are carried by `causation_id`/`correlation_id` — never by timestamps (see below).
 - **Identity composition is stream-specific.** `main` retains the attempt contract frozen by ADR-0004.
-  For `tasks`, the sole writer supplies `run_id`, `task_id` for `task.*`, and `causation_id`; the commit
+  For `tasks`, the sole writer supplies `run_id`, `task_id` for task-specific events (a rejection of a
+  run-level request has no `task_id`), and `causation_id`; the commit
   primitive derives `correlation_id = run_id`, leaves `attempt_id` null, and assigns
   `event_id = <project_uid>-tasks-<seq>` under the lock.
 - Each stream has **one serializing append broker**. Encoding is: *encode → enforce byte cap → one checked

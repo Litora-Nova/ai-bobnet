@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Provision one project's task stream and body-sidecar directories."""
+
+from __future__ import annotations
+
+import grp
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists():
+    os.environ.pop("AIB_TASK_ROOT", None)
+    os.environ.pop("AIB_TASK_GROUP", None)
+
+TOKEN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
+
+
+def real_dir(path: Path, mode: int, gid: int, *, parents: bool = False) -> bool:
+    try:
+        if path.is_symlink():
+            return False
+        path.mkdir(mode=mode, parents=parents, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            return False
+        if os.geteuid() == 0:
+            os.chown(path, 0, gid)
+        else:
+            os.chown(path, -1, gid)
+        # chown may clear setgid; mode is the final provisioning assertion.
+        os.chmod(path, mode)
+        return True
+    except OSError:
+        return False
+
+
+def real_file(directory: Path, name: str, gid: int) -> bool:
+    directory_fd = file_fd = -1
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            file_fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660, dir_fd=directory_fd)
+        except FileExistsError:
+            file_fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return False
+        os.fchmod(file_fd, 0o660)
+        if os.geteuid() == 0:
+            os.fchown(file_fd, 0, gid)
+        else:
+            os.fchown(file_fd, -1, gid)
+        return True
+    except OSError:
+        return False
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or TOKEN.fullmatch(argv[0]) is None:
+        return 64
+    try:
+        gid = grp.getgrnam(os.environ.get("AIB_TASK_GROUP", "aib-tasks")).gr_gid
+    except KeyError:
+        return 78
+    root = Path(os.environ.get("AIB_TASK_ROOT", "/var/lib/aib/tasks"))
+    project = root / argv[0]
+    bodies = project / "bodies"
+    if not real_dir(root, 0o755, gid, parents=True):
+        return 78
+    if not real_dir(project, 0o2770, gid) or not real_dir(bodies, 0o2770, gid):
+        return 78
+    if not real_file(project, "tasks.events", gid) or not real_file(project, "tasks.events.lock", gid):
+        return 78
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
