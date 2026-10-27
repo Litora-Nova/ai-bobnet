@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ai-bobnet — supervisor state writes never follow role-account-controlled links.
+# ai-bobnet — supervisor state access never follows role-account-controlled links.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supstate.XXXXXX")"
@@ -58,6 +58,43 @@ start_sup; sp=$SUP_PID; wait_exit "$sp"; rc=$RC; SUP_PID=""
 eq "T3: a hardlinked journal is a fatal state refusal" "$rc" 78
 eq "T3: the other hardlink's mode and content are unchanged" "$(snapshot "$protected")" "$before"
 has "T3: the refusal names the unsafe journal" "$(cat "$W/sup.out")" "journal.jsonl"
+
+# --- T4 a planted live-state symlink is refused without reading its target --------
+sup_world live-symlink
+protected="$W/protected-live"
+printf '{"seq":987654321,"secret":"LIVE-SYMLINK-SECRET"}\n' > "$protected"
+chmod 0600 "$protected"
+before="$(snapshot "$protected")"
+ln -s "$protected" "$LIVE"
+start_sup; sp=$SUP_PID; wait_exit "$sp"; rc=$RC; SUP_PID=""
+eq "T4: a symlinked live.json is a fatal state refusal" "$rc" 78
+eq "T4: the live.json symlink target is unchanged" "$(snapshot "$protected")" "$before"
+has "T4: the refusal names the unsafe live state" "$(cat "$W/sup.out")" "live.json"
+
+# --- T5 an in-flight turn-output symlink fails the turn without disclosure --------
+sup_world turn-output-symlink
+protected="$W/protected-output"
+sentinel="TURN-OUTPUT-SYMLINK-SECRET"
+printf '%s already in use\n' "$sentinel" > "$protected"
+chmod 0600 "$protected"
+m_send m-1 "replace my output path"
+plan "1|0.5|benign provider failure"
+start_sup AIB_SUP_BACKOFF_BASE_S=5 AIB_SUP_BACKOFF_CAP_S=5
+wait_for 8 lj_is state WORKING
+attempt_id="$(lj turn.attempt_id)"
+turn_output="$STATE/.turn-$attempt_id.out"
+wait_for 8 test -f "$turn_output"
+rm -f -- "$turn_output"
+ln -s "$protected" "$turn_output"
+wait_for 8 bash -c "[ \"\$(python3 -I '$SJ' count '$JOURNAL' turn.ended)\" -ge 1 ]"
+eq "T5: refused turn output is a provider failure with a clear reason" \
+  "$(jfield turn.ended 1 class)|$(jfield turn.ended 1 reason)" \
+  "provider_failure|unsafe_turn_output"
+observed="$(printf 'journal\n'; cat "$JOURNAL" 2>/dev/null; printf 'transcript\n'; cat "$TRANSCRIPT" 2>/dev/null; printf 'message-state\n'; m_state m-1; m_dlq)"
+hasnt "T5: symlink-target content reaches no journal, transcript, or message result" "$observed" "$sentinel"
+eq "T5: the refused output does not complete the message" "$(m_state m-1)" SEEN
+kill -0 "$SUP_PID" 2>/dev/null && ok "T5: a bad turn output does not exit the supervisor" || no "T5: a bad turn output does not exit the supervisor"
+stop_sup
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
