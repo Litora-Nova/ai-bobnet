@@ -7,9 +7,10 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > **Implementation status:** this document defines the target contract, not the current feature set.
 > P0 identity/registry, schema-3/4 execution binding with per-field provenance, P1 delivery, P2 wakeup/local
 > adapter, P3 scoped memory, the legacy-journal serialized commit protocol, the Codex managed-launch path,
-> and the RM-2 durable attempt audit (the first framed §6 event stream — `attempt.decided`/`attempt.ended`
-> per managed launch) are built and tested. The **rest** of the serialized event spine (cursors,
-> projections, rebuild tooling, the other streams), the provider-wide reference monitor, the
+> and the RM-2 durable attempt audit (`attempt.decided`/`attempt.ended` per managed launch) are built
+> and tested. The same framed commit primitive now reserves the per-project `tasks` stream and its
+> run/task event vocabulary; the task ledger writer and task behavior are not built yet. The **rest**
+> of the serialized event spine (cursors, projections, rebuild tooling), the provider-wide reference monitor, the
 > provider-change audit event, Gate/Grant/Effect state machines, profile provisioning, full runtime
 > lifecycle, external adapters, and dashboard projection remain specified but unimplemented. Until the
 > reference monitor exists, `clearance` is registry/audit data rather than an enforced authorization
@@ -208,14 +209,24 @@ gate_id? · grant_id? · effect_id? · correlation_id · causation_id · schema_
 - Each record is **framed with a terminator and integrity marker** so a torn tail (kill during append) is
   detectable and quarantinable rather than silently corrupting the fold.
 - **A stream is identified by `(project_uid, stream_name)`.** `seq` counts within one stream; a consumer
-  cursor is `(stream, seq)`. The addressing is frozen; *how many* streams exist is policy, not format.
-  The engine starts with exactly **one stream `main` per project** — at agent-orchestration volumes a single
-  serialized append path is ample, and it buys total order for free (one broker, one cursor, a trivial
-  rebuild, an ops lens that is a plain read instead of a merge). Splitting later (blast radius of a torn
-  tail, a runaway writer flooding a shared journal) is **additive**: a new stream name, no format change.
-  Relations across streams are carried by `causation_id`/`correlation_id` — never by timestamps (see below).
+  cursor is `(stream, seq)`. The addressing is frozen. Two names are reserved: `main` for
+  `attempt.decided|attempt.ended`, and `tasks` for `run.*|task.*`. `AIB_TASK_ROOT` is a
+  unit-environment variable, never request-supplied and never registry-supplied, parallel to
+  `AIB_EVENT_ROOT` in ADR-0005. The tasks stream lives at `$AIB_TASK_ROOT/<project_uid>/tasks.events`
+  (default `AIB_TASK_ROOT=/var/lib/aib/tasks`) with a sibling `tasks.events.lock`. Its closed type list is
+  `run.requested`, `run.started`, `run.closed`,
+  `task.created`, `task.started`, `task.reported`, `task.cancelled`, `task.reassigned`, `task.reopened`,
+  `task.overdue`, `task.rejected`, `task.review_passed`, and `task.review_failed`. Adding another stream
+  remains additive: a new name, type list, and identity contract, with no framing change. Relations across
+  streams are carried by `causation_id`/`correlation_id` — never by timestamps (see below).
+- **Identity composition is stream-specific.** `main` retains the attempt contract frozen by ADR-0004.
+  For `tasks`, the sole writer supplies `run_id`, `task_id` for `task.*`, and `causation_id`; the commit
+  primitive derives `correlation_id = run_id`, leaves `attempt_id` null, and assigns
+  `event_id = <project_uid>-tasks-<seq>` under the lock.
 - Each stream has **one serializing append broker**. Encoding is: *encode → enforce byte cap → one checked
   append*. A record that exceeds the cap becomes an **Artifact by reference**; it is never inlined.
+- A stream-lock timeout returns **75**. It is transient and MUST be retried by the caller; it is never a
+  domain rejection and MUST NOT be represented as `task.rejected`.
 - Replay reports gaps explicitly (`lost`); a stale consumer cursor after a rebuild is answered with an
   explicit resync signal, never with silent divergence.
 - **Cross-file ordering is never derived from timestamps.** Stream order is truth; `occurred_at` is display.

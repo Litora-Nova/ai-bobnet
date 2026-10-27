@@ -252,8 +252,8 @@ expect_targeted_failure "frame-prefix-seq-tie-disabled" \
 # (event_commit_spec, Fall 9 — at-most-one attempt.ended)
 M7="$(make_mutant broker-second-ended-allowed)"
 replace_exact "$M7/lib/aibobnet.sh" \
-  '        aib_die 2 "attempt '"'"'$decided_id'"'"' already has an attempt.ended — refusing a second terminal record";;' \
-  '        : ;;'
+  '            aib_die 2 "attempt '"'"'$decided_id'"'"' already has an attempt.ended — refusing a second terminal record";;' \
+  '            : ;;'
 record_mutation "broker-second-ended-allowed" "$?"
 expect_targeted_failure "broker-second-ended-allowed" \
   "$M7/tests/event_commit_spec.sh" \
