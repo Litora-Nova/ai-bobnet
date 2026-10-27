@@ -1147,20 +1147,20 @@ class Supervisor:
                 self.session_cwd = None
                 self.turns_in_session = 0
                 self.session_new = False
+                self.write_alarm(
+                    "session_persistence_failed",
+                    consecutive=self.persistence_failure_streak,
+                )
                 if work.get("control"):
                     self.done_control(work["control"], reason)
                 elif not work.get("synthetic"):
                     self.message_command("fail", work["id"], reason)
                 self.work = None
                 now = time.monotonic()
-                self.write_alarm(
-                    "session_persistence_failed",
-                    consecutive=self.persistence_failure_streak,
-                )
                 if self.brake_tripped_at is not None:
+                    self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
                     self.set_state("FAILED", "brake")
                     self.heartbeat("blocked", "supervisor provider-failure brake tripped")
-                    self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
                     self.retry_at = float("inf")
                 else:
                     delay = min(self.backoff_cap, self.backoff_base * (2 ** (self.brake_consecutive - 1)))
@@ -1281,9 +1281,9 @@ class Supervisor:
             self.brake_tripped_at = utc_now()
         self.end_turn(work, attempt_id, result_class, rc, reason=refusal_reason)
         if self.brake_tripped_at is not None:
+            self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
             self.set_state("FAILED", "brake")
             self.heartbeat("blocked", "supervisor provider-failure brake tripped")
-            self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
             self.retry_at = float("inf")
             return
         if failures >= 3 and not work.get("synthetic"):
@@ -1332,9 +1332,9 @@ class Supervisor:
         self.journal("supervisor.started", pid=os.getpid(), reexec=reexec)
         self.install_signals()
         if self.brake_tripped_at:
+            self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
             self.set_state("FAILED", "brake")
             self.heartbeat("blocked", "supervisor provider-failure brake tripped")
-            self.write_alarm("brake_tripped", consecutive=self.brake_consecutive)
         elif self.off_duty:
             self.set_state("WAITING", "off_duty")
             self.heartbeat("done", "supervisor off duty")
