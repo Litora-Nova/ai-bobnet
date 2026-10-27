@@ -15,18 +15,32 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_login import (CLAUDE_BIN, CODEX_BIN, PROVIDERS, access_expiry, credential_path, integer, now, read_object,
-                       setting, store_lock, trusted_store_file)  # noqa: E402
+from aib_login import (  # noqa: E402
+    CLAUDE_BIN,
+    CODEX_BIN,
+    PROVIDERS,
+    access_expiry,
+    credential_path,
+    integer,
+    login_margin_seconds,
+    login_max_turn_seconds,
+    login_slack_seconds,
+    now,
+    read_object,
+    refresh_cadence_seconds,
+    setting,
+    store_lock,
+    trusted_store_file,
+)
 
 
 def cadence() -> int:
-    return max(1, integer("AIB_LOGIN_ACCESS_LIFETIME_S", 3600) // 2 - 1)
+    return refresh_cadence_seconds()
 
 
 def store_meets_broker_floor(provider: str, path: Path) -> bool:
     expiry = access_expiry(provider, read_object(path) or {})
-    floor = (integer("AIB_LOGIN_MAX_TURN_S", 900) + integer("AIB_LOGIN_MARGIN_S", 300)
-             + integer("AIB_LOGIN_SLACK_S", 600))
+    floor = login_max_turn_seconds() + login_margin_seconds() + login_slack_seconds()
     if expiry is None or expiry - now() < floor:
         print(f"aib-login-refresh: {provider} credential remains below broker floor", file=sys.stderr)
         return False
@@ -116,8 +130,8 @@ def main(argv: list[str]) -> int:
             expiry = access_expiry(provider, data or {})
             if expiry is None:
                 return 78
-            threshold = integer("AIB_LOGIN_REFRESH_BELOW_S", cadence() + integer("AIB_LOGIN_MAX_TURN_S", 900)
-                                + integer("AIB_LOGIN_MARGIN_S", 300) + integer("AIB_LOGIN_SLACK_S", 600))
+            threshold = integer("AIB_LOGIN_REFRESH_BELOW_S", cadence() + login_max_turn_seconds()
+                                + login_margin_seconds() + login_slack_seconds())
             if expiry - now() > threshold:
                 return 0
 

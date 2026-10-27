@@ -8,7 +8,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from aib_login import access_expiry, credential_path, integer, now, read_object, runtime_integer, trusted_store_file  # noqa: E402
+from aib_login import (  # noqa: E402
+    access_expiry,
+    credential_path,
+    login_margin_seconds,
+    login_slack_seconds,
+    now,
+    read_object,
+    runtime_integer,
+    trusted_store_file,
+)
 
 
 def regular_0640(path: Path) -> int:
@@ -52,7 +61,7 @@ def main(argv: list[str]) -> int:
     if not isinstance(token, str) or not token or expiry is None or timeout < 0:
         print("claude-code login token unavailable hint:login", file=sys.stderr)
         return 78
-    floor = now() + timeout + integer("AIB_LOGIN_MARGIN_S", 300) + integer("AIB_LOGIN_SLACK_S", 600)
+    floor = now() + timeout + login_margin_seconds() + login_slack_seconds()
     if expiry < floor:
         print("claude-code login token inside refresh margin hint:login", file=sys.stderr)
         return 78

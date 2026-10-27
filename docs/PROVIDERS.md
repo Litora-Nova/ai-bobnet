@@ -162,10 +162,22 @@ the broker-owned login publisher and the role-account boundary described above.
 }
 ```
 
-`cap_timeout` above is generous (an hour) relative to `docs/CONTRACT-codex-run.md`'s own `1200`s
-default at the compatibility layer — the registry cap and a request's own `--timeout` still clamp to
-`min(requested, cap_timeout)` (`docs/CONTRACT-execution-binding.md` §7.2) exactly as for every other
-provider; nothing about the `codex` adapter changes that arithmetic.
+`cap_timeout` above is intentionally generous. The ordinary provider limit remains
+`min(requested, cap_timeout)` (`docs/CONTRACT-execution-binding.md` §7.2). When the deployment account
+uses an expiring shared subscription login (`credential_mode=shared`, or `credential_mode=fd` with
+`credential_source=login`), the effective timeout is additionally capped at the shared-login turn
+bound: 900 seconds by default. That default is derived from the same login constants used by the token
+preflight and refresher: `3600` access-token lifetime − `1799` worst-case refresh-poll delay − `300`
+CLI margin − `600` safety slack − one second = `900`. The clamp is visible in the launch verdict's
+reason and effective timeout. Provider-local `file` credentials and `credential_mode=fd` with the
+non-expiring `credential_source=setup_token` path retain the ordinary registry/request minimum. In
+`shared` mode, `credential_source` does not change the store the Codex adapter consumes, so the bound
+still applies.
+
+The bound is enforced at launch and by the supervisor's own `cap_timeout` use. It is not a registry
+validation rule: `credential_mode` is deployment policy and the same registry may legitimately use a
+provider-local credential on another host. The runtime clamp is therefore the authoritative behavior
+for the selected deployment account.
 
 ## `claude-code`
 
@@ -374,7 +386,9 @@ unlinked `aib-broker:aib-login 0640` buffer inside a transient broker-private `0
 passes an already-open descriptor, named by
 `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`. This isolates histories but not subscription authority;
 every server role may request the same shared token. API-key proxy mode is the later "never sees"
-path. See the dated divergence in `docs/CONFINEMENT.md`.
+path. Its `credential_mode=fd`, `credential_source=login` turns use the same 900-second default
+shared-login bound documented in the `codex` registry example above. See the dated divergence in
+`docs/CONFINEMENT.md`.
 
 ### Registry entry (example, `acme`)
 

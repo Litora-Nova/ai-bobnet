@@ -203,9 +203,11 @@ _pep_request="$(printf 'agent_uid=%s\nsandbox=%s\ncwd=%s\ntimeout=%s\nlabel=%s' 
 # min(timeout_s, cap_timeout), never max.
 _deploy_customer_code=false
 aib_deployment_allow customer_code && _deploy_customer_code=true
+aib_resolve_provider_credential_policy "$AIB_PROVIDER"
 _pep_snapshot="$(aib_build_pdp_snapshot_record "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" \
   "$AIB_ADAPTER_PATH" "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" \
-  "$AIB_CAP_TIMEOUT" "$AIB_DATA_CLASS" "$_deploy_customer_code")"
+  "$AIB_CAP_TIMEOUT" "$AIB_DATA_CLASS" "$_deploy_customer_code" "$AIB_PROVIDER_CREDENTIAL_MODE" \
+  "$AIB_PROVIDER_CREDENTIAL_SOURCE" "$AIB_PROVIDER_LOGIN_MAX_TURN")"
 aib_authorize_launch "$_pep_request" "$_pep_snapshot" || true
 
 # --- durable write-ahead decision --------------------------------------------

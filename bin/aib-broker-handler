@@ -192,10 +192,12 @@ _aib_broker_resolve_snapshot() {
   aib_resolve_managed_agent "$1" || return $?
   local deploy_customer_code=false
   aib_deployment_allow customer_code && deploy_customer_code=true
+  aib_resolve_provider_credential_policy "$AIB_PROVIDER"
   printf 'home=%s\n%s' "$AIB_HOME" \
     "$(aib_build_pdp_snapshot_record "$AIB_CLEARANCE" "$AIB_PROVIDER" "$AIB_EFFORT" \
         "$AIB_ADAPTER_PATH" "$AIB_CAP_SANDBOX" "$AIB_CAP_TIER" "$AIB_CAP_EFFORT" "$AIB_CAP_TIMEOUT" \
-        "$AIB_DATA_CLASS" "$deploy_customer_code")"
+        "$AIB_DATA_CLASS" "$deploy_customer_code" "$AIB_PROVIDER_CREDENTIAL_MODE" \
+        "$AIB_PROVIDER_CREDENTIAL_SOURCE" "$AIB_PROVIDER_LOGIN_MAX_TURN")"
 }
 
 # stdout and stderr are merged deliberately: on success the ONLY output is the printf

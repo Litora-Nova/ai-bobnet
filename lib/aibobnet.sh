@@ -903,9 +903,11 @@ aib_resolve_managed_agent() {
 #
 #   request  keys:  agent_uid · sandbox (requested) · cwd · timeout · label
 #   snapshot keys:  clearance · provider · effort · adapter (absolute) ·
-#                   cap_sandbox (ceiling) · cap_tier · cap_effort · cap_timeout
-#                   (all DECLARED registry data, resolved by aib_resolve_managed_agent,
-#                   never probed)
+#                   cap_sandbox (ceiling) · cap_tier · cap_effort · cap_timeout ·
+#                   data_class · deploy_customer_code · credential_mode ·
+#                   credential_source · login_max_turn. Registry fields are resolved
+#                   by aib_resolve_managed_agent; deployment fields are resolved by
+#                   the PEP before this pure function runs.
 #
 # Authority lives ONLY here: the sandbox ceiling, min(clearance, cap_tier), the
 # effort cap, and (RM-3 slice 2) the timeout cap are computed in this function and
@@ -920,7 +922,8 @@ aib_resolve_managed_agent() {
 #   AIB_VERDICT_EFFECTIVE_CLEARANCE  min(clearance, cap_tier)      (empty on deny)
 #   AIB_VERDICT_EFFECTIVE_SANDBOX    min(requested, cap_sandbox)   (empty on deny)
 #   AIB_VERDICT_EFFECTIVE_EFFORT     min(effort, cap_effort)       (empty on deny)
-#   AIB_VERDICT_EFFECTIVE_TIMEOUT    min(requested, cap_timeout); cap alone if absent
+#   AIB_VERDICT_EFFECTIVE_TIMEOUT    min(requested, cap_timeout, shared-login bound
+#                                    when applicable); cap alone if request absent
 #                                    (empty on deny) — never max (§3: resource
 #                                    authority does not belong to the caller)
 #   AIB_VERDICT_ADAPTER_PATH         the absolute adapter path     (empty on deny)
@@ -975,6 +978,34 @@ _aib_deployment_account_present() {
     root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || return 1
   fi
   python3 -I "$root/lib/aib_deployment.py" "$root" "$path" --account-present "$1"
+}
+
+_aib_login_max_turn() {
+  local root="${REPO_ROOT:-}"
+  if [ -z "$root" ]; then
+    root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || return 1
+  fi
+  python3 -I -c \
+    'import sys; sys.path.insert(0, sys.argv[1]); from aib_login import login_max_turn_seconds; print(login_max_turn_seconds())' \
+    "$root/lib"
+}
+
+# Resolve the deployment-owned credential policy for one provider. The registry
+# selects the provider; deployment.json selects how that provider authenticates on
+# this host. The login turn bound exists only for expiring shared-login access tokens.
+aib_resolve_provider_credential_policy() {
+  local provider="$1"
+  AIB_PROVIDER_CREDENTIAL_MODE="$(aib_deployment_account "$provider" credential_mode 2>/dev/null)" ||
+    AIB_PROVIDER_CREDENTIAL_MODE=file
+  AIB_PROVIDER_CREDENTIAL_SOURCE="$(aib_deployment_account "$provider" credential_source 2>/dev/null)" ||
+    AIB_PROVIDER_CREDENTIAL_SOURCE=login
+  AIB_PROVIDER_LOGIN_MAX_TURN=""
+  case "$AIB_PROVIDER_CREDENTIAL_MODE:$AIB_PROVIDER_CREDENTIAL_SOURCE" in
+    shared:*|fd:login)
+      AIB_PROVIDER_LOGIN_MAX_TURN="$(_aib_login_max_turn)" ||
+        aib_die 2 "cannot resolve shared-login turn bound"
+      ;;
+  esac
 }
 
 # _aib_record_field <record> <key> -> value on stdout; rc 0 present, rc 1 absent.
@@ -1037,7 +1068,7 @@ aib_authorize_launch() {
   local request="${1-}" snapshot="${2-}"
   local agent_uid req_sandbox cwd timeout label
   local clearance provider effort adapter cap_sandbox cap_tier cap_effort cap_timeout
-  local data_class deploy_customer_code
+  local data_class deploy_customer_code credential_mode credential_source login_max_turn shared_login=0
   local deny=0 code=0 reasons=""
   local eff_clearance="" eff_sandbox="" eff_effort="" eff_timeout=""
   local rreq rcap
@@ -1062,6 +1093,9 @@ aib_authorize_launch() {
     data_class="customer"
   fi
   deploy_customer_code="$(_aib_record_field "$snapshot" deploy_customer_code)" || deploy_customer_code=""
+  credential_mode="$(_aib_record_field "$snapshot" credential_mode)" || credential_mode=""
+  credential_source="$(_aib_record_field "$snapshot" credential_source)" || credential_source=""
+  login_max_turn="$(_aib_record_field "$snapshot" login_max_turn)" || login_max_turn=""
 
   # --- deny checks, ordered by severity (adapter 127 > config 2 > refusal 64) --
   # Adapter map is the authority for what a provider may run: an absent adapter is a
@@ -1090,6 +1124,24 @@ aib_authorize_launch() {
   # resource authority does not belong to the caller, so there is no "no cap" default.
   _aib_valid_positive_int "$cap_timeout" ||
     _aib_verdict_deny 2 "provider '${provider:-?}' declares no valid timeout capability (cap_timeout='$cap_timeout')"
+
+  if [ -n "$credential_mode" ]; then
+    case "$credential_mode" in
+      file|fd|shared|proxy) ;;
+      *) _aib_verdict_deny 2 "provider '${provider:-?}' has invalid deployment credential mode '$credential_mode'" ;;
+    esac
+    case "$credential_source" in
+      login|setup_token) ;;
+      *) _aib_verdict_deny 2 "provider '${provider:-?}' has invalid deployment credential source '$credential_source'" ;;
+    esac
+    case "$credential_mode:$credential_source" in
+      shared:*|fd:login)
+        shared_login=1
+        _aib_valid_positive_int "$login_max_turn" ||
+          _aib_verdict_deny 2 "provider '${provider:-?}' has no valid shared-login turn bound (login_max_turn='$login_max_turn')"
+        ;;
+    esac
+  fi
 
   # Request/identity form (input hygiene the caller also enforces; re-checked here so
   # the PDP is safe to call in isolation and under RM-3's process boundary).
@@ -1144,6 +1196,10 @@ aib_authorize_launch() {
     else
       eff_timeout="$cap_timeout"
       _aib_verdict_note "timeout '$timeout' exceeds provider cap '$cap_timeout'; clamped to '$cap_timeout'"
+    fi
+    if [ "$shared_login" -eq 1 ] && [ "$eff_timeout" -gt "$login_max_turn" ]; then
+      _aib_verdict_note "timeout '$eff_timeout' exceeds shared login turn bound '$login_max_turn'; clamped to '$login_max_turn'"
+      eff_timeout="$login_max_turn"
     fi
   fi
 
@@ -3465,11 +3521,16 @@ aib_build_pdp_request_record() {
 
 # aib_build_pdp_snapshot_record <clearance> <provider> <effort> <adapter> <cap_sandbox>
 #                                <cap_tier> <cap_effort> <cap_timeout>
+#                                [data_class deploy_customer_code
+#                                 credential_mode credential_source login_max_turn]
 #   -> the snapshot record aib_authorize_launch expects, on stdout.
 aib_build_pdp_snapshot_record() {
   printf 'clearance=%s\nprovider=%s\neffort=%s\nadapter=%s\ncap_sandbox=%s\ncap_tier=%s\ncap_effort=%s\ncap_timeout=%s' \
     "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
   if [ "$#" -ge 9 ]; then
     printf '\ndata_class=%s\ndeploy_customer_code=%s' "$9" "${10-}"
+  fi
+  if [ "$#" -ge 11 ]; then
+    printf '\ncredential_mode=%s\ncredential_source=%s\nlogin_max_turn=%s' "${11-}" "${12-}" "${13-}"
   fi
 }

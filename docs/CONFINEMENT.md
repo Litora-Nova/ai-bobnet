@@ -255,10 +255,14 @@ mode `0710` and carries one extra ACL entry, search-only (`--x`) for the broker 
 run its pre-flight and set the Landlock path rules inside it without listing the directory. A default
 broker ACL grants read-only (`r--`) access to newly created state files, including `journal.jsonl` and
 atomic replacements of `live.json`; an existing `live.json` receives the same named read ACL during
-provisioning. The broker receives no write permission. The broker unit therefore needs only
+provisioning. The broker receives no write permission. Group-readable files the role account creates
+in its home become readable by the broker group by name through the default ACL, while files it creates
+with mode `0600` stay private. The broker unit therefore needs only
 `CAP_SETUID` and `CAP_SETGID`, bounded as shown
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
+The root supervisor opens this home with `O_DIRECTORY|O_NOFOLLOW`; descriptor-relative writable state opens use `O_NOFOLLOW` and regular-file checks, with a single-link requirement for `journal.jsonl`.
+An unsafe state object makes the supervisor exit 78, which stops the unit permanently via `RestartPreventExitStatus=78` and triggers the `OnFailure=` alarm.
 
 The helper is the sole owner of this directory contract. It creates `/var/lib/aib-sup` as root-owned
 `0755`, then prepares the per-agent home, provider directories, and named ACLs. The agent unit therefore
