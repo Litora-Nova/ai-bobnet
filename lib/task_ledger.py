@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""D1a task-stream fold and domain decision engine.
+"""Task-stream fold and domain decision engine.
 
 The files are the only state.  ``bin/task`` holds the stream lock before calling
 ``decide`` and keeps it through the shared ``aib_event_commit`` append.
@@ -29,6 +29,12 @@ TERMINAL = {"DONE", "FAILED", "CANCELLED"}
 NONTERMINAL = {"QUEUED", "ASSIGNED", "IN_PROGRESS", "BLOCKED", "REVIEW"}
 OPEN_LIMIT = {"QUEUED", "ASSIGNED"}
 ENGINE_REASONS = {"turn_failed", "turn_budget", "no_report"}
+CLOSED_RUN = {"COMPLETED", "FAILED", "CANCELLED"}
+FORBIDDEN_DISPLAY = {
+    "\u0085", "\u061c", "\u200e", "\u200f", "\u2028", "\u2029",
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+    "\u2066", "\u2067", "\u2068", "\u2069",
+}
 EVENT_TYPES = {
     "run.requested", "run.started", "run.closed", "task.created", "task.started",
     "task.reported", "task.cancelled", "task.reassigned", "task.reopened",
@@ -36,6 +42,7 @@ EVENT_TYPES = {
 }
 DEFAULT_LIMITS = {
     "max_open": 8,
+    "max_new_per_turn": 4,
     "max_tasks_per_run": 20,
     "max_assignments_per_task": 3,
     "max_depth": 1,
@@ -71,15 +78,19 @@ def _text(value: Any, name: str, *, optional: bool = False) -> str | None:
 
 def _caller_matches(record: dict[str, Any]) -> bool:
     caller = record.get("payload", {}).get("caller")
+    payload = record.get("payload", {})
     actor_type, actor_id = record.get("actor_type"), record.get("actor_id")
-    if not isinstance(caller, str):
+    if caller != "root:root":
         return False
-    if caller.startswith("human:"):
-        return actor_type == "human" and actor_id == caller[6:]
-    if caller.startswith("gateway:"):
-        return actor_type == "human" and actor_id == caller
-    if caller.startswith("role:"):
-        return actor_type in {"agent", "service"}
+    via, requester = payload.get("via"), payload.get("requester")
+    if actor_type == "service":
+        return isinstance(actor_id, str) and actor_id.startswith("supervisor:") and via is None and requester is None
+    if actor_type == "agent":
+        return isinstance(via, str) and re.fullmatch(r"intent:[a-z0-9]+(?:-[a-z0-9]+)*", via, re.ASCII) is not None and requester is None
+    if actor_type == "human" and isinstance(via, str) and re.fullmatch(r"ctl:[0-9]+", via, re.ASCII):
+        if isinstance(actor_id, str) and actor_id.startswith("gateway:"):
+            return requester == actor_id
+        return isinstance(actor_id, str) and requester == f"human:{actor_id}"
     return False
 
 
@@ -131,11 +142,14 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
         "context_refs": payload.get("context_refs", []),
         "state": "ASSIGNED",
         "assignments": 1,
+        "attempts": 1,
         "turns": 0,
+        "turns_total": 0,
         "result_ref": None,
         "last_reason": None,
         "created_seq": None,
         "last_seq": None,
+        "state_seq": None,
     }
 
 
@@ -184,7 +198,7 @@ def fold(path: Path) -> dict[str, Any]:
             reason = payload.get("reason")
             requested = payload.get("requested_type")
             caller = payload.get("caller")
-            if isinstance(reason, str) and isinstance(requested, str) and isinstance(caller, str) and caller.startswith(("human:", "gateway:", "role:", "unknown:")):
+            if isinstance(reason, str) and isinstance(requested, str) and caller == "root:root":
                 rejections.append({"seq": seq, "task_id": record.get("task_id"), "run_id": record.get("run_id"), "requested_type": requested, "reason": reason})
             else:
                 invalid(seq, "invalid_rejection")
@@ -200,18 +214,32 @@ def fold(path: Path) -> dict[str, Any]:
             elif kind == "run.started":
                 if run_id not in runs or runs[run_id]["state"] != "QUEUED":
                     raise LedgerError("invalid_run_start")
+                if runs[run_id]["team_uid"] != team_uid:
+                    raise LedgerError("cross_team")
+                if record.get("actor_type") != "service":
+                    raise LedgerError("invalid_run_start_actor")
                 runs[run_id]["state"] = "RUNNING"
             elif kind == "run.closed":
-                if run_id not in runs or runs[run_id]["state"] in {"COMPLETED", "FAILED", "CANCELLED"}:
+                if run_id not in runs or runs[run_id]["state"] in CLOSED_RUN:
                     raise LedgerError("invalid_run_close")
+                if runs[run_id]["team_uid"] != team_uid:
+                    raise LedgerError("cross_team")
+                if record.get("actor_type") not in {"human", "agent"}:
+                    raise LedgerError("invalid_run_close_actor")
                 outcome = payload.get("outcome")
                 if outcome not in {"completed", "failed", "cancelled"}:
                     raise LedgerError("invalid_run_outcome")
+                if any(task["run_id"] == run_id and task["state"] in NONTERMINAL for task in tasks.values()):
+                    raise LedgerError("open_tasks")
                 runs[run_id]["state"] = outcome.upper()
                 runs[run_id]["outcome"] = outcome
             elif kind == "task.created":
                 if run_id not in runs or ident in tasks:
                     raise LedgerError("invalid_task_create")
+                if runs[run_id]["team_uid"] != team_uid:
+                    raise LedgerError("cross_team")
+                if runs[run_id]["state"] in CLOSED_RUN:
+                    raise LedgerError("run_closed")
                 task = _base_task(record, payload)
                 if record.get("actor_type") == "agent" and record.get("actor_id") != task["owner"]:
                     raise LedgerError("invalid_creator")
@@ -219,6 +247,7 @@ def fold(path: Path) -> dict[str, Any]:
                     raise LedgerError("invalid_creator")
                 task["created_seq"] = seq
                 task["last_seq"] = seq
+                task["state_seq"] = seq
                 tasks[ident] = task
                 if runs[run_id]["state"] == "QUEUED":
                     runs[run_id]["state"] = "RUNNING"
@@ -226,7 +255,15 @@ def fold(path: Path) -> dict[str, Any]:
                 if not isinstance(ident, str) or ident not in tasks or tasks[ident]["run_id"] != run_id:
                     raise LedgerError("unknown_task")
                 task = tasks[ident]
+                if task["team_uid"] != team_uid:
+                    raise LedgerError("cross_team")
+                run = runs.get(run_id)
+                if run is None or run["team_uid"] != task["team_uid"]:
+                    raise LedgerError("invalid_task_run")
+                if run["state"] in CLOSED_RUN:
+                    raise LedgerError("run_closed")
                 state = task["state"]
+                old_state, old_assignee = state, task["assignee"]
                 if kind == "task.started":
                     if state != "ASSIGNED" or record.get("actor_type") != "service" or record.get("actor_id") != f"supervisor:{task['assignee']}":
                         raise LedgerError("invalid_start")
@@ -237,16 +274,23 @@ def fold(path: Path) -> dict[str, Any]:
                     service_ok = (record.get("actor_type") == "service" and record.get("actor_id") == f"supervisor:{task['assignee']}" and report in {"failed", "blocked"} and payload.get("reason") in ENGINE_REASONS)
                     if state != "IN_PROGRESS" or not (actor_ok or service_ok) or report not in {"progress", "done", "failed", "blocked"}:
                         raise LedgerError("invalid_report")
-                    task["turns"] += 1
+                    if report == "progress":
+                        task["turns"] += 1
+                        task["turns_total"] += 1
                     task["result_ref"] = payload.get("result_ref")
                     task["last_reason"] = payload.get("reason")
                     task["state"] = {"progress": "IN_PROGRESS", "done": "REVIEW" if task["gate"] != "none" else "DONE", "failed": "FAILED", "blocked": "BLOCKED"}[report]
                 elif kind == "task.cancelled":
                     if state in TERMINAL:
                         raise LedgerError("invalid_cancel")
+                    delivery = record.get("actor_type") == "service" and record.get("actor_id") == f"supervisor:{task['assignee']}" and payload.get("reason") == "delivery_failed" and state == "ASSIGNED"
+                    if record.get("actor_type") not in {"human", "agent"} and not delivery:
+                        raise LedgerError("invalid_cancel_actor")
                     task["state"] = "CANCELLED"
                     task["last_reason"] = payload.get("reason")
                 elif kind in {"task.reassigned", "task.reopened"}:
+                    if record.get("actor_type") not in {"human", "agent"}:
+                        raise LedgerError("invalid_reassignment_actor")
                     allowed = state == "BLOCKED" or (kind == "task.reopened" and state == "FAILED")
                     if not allowed:
                         raise LedgerError("invalid_reassignment")
@@ -255,17 +299,21 @@ def fold(path: Path) -> dict[str, Any]:
                         raise LedgerError("invalid_assignee")
                     task["assignee"] = assignee
                     task["assignments"] += 1
+                    task["attempts"] += 1
+                    task["turns"] = 0
                     task["state"] = "ASSIGNED"
                 elif kind == "task.overdue":
                     if state in TERMINAL or record.get("actor_type") != "service" or not str(record.get("actor_id", "")).startswith("supervisor:"):
                         raise LedgerError("invalid_overdue")
                     task["last_reason"] = "overdue"
                 elif kind in {"task.review_passed", "task.review_failed"}:
-                    # Reserved events do not acquire D1a transition semantics.
+                    # Reserved events do not yet acquire transition semantics.
                     raise LedgerError("reserved_event")
                 else:
                     raise LedgerError("unknown_event")
                 task["last_seq"] = seq
+                if task["state"] != old_state or task["assignee"] != old_assignee:
+                    task["state_seq"] = seq
         except LedgerError as error:
             invalid(seq, str(error))
 
@@ -273,7 +321,7 @@ def fold(path: Path) -> dict[str, Any]:
     # run events remain terminal; otherwise a wholly blocked active frontier is
     # BLOCKED, any task means RUNNING, and no task means QUEUED.
     for folded_run_id, run in runs.items():
-        if run["state"] in {"COMPLETED", "FAILED", "CANCELLED"}:
+        if run["state"] in CLOSED_RUN:
             continue
         children = [task for task in tasks.values() if task["run_id"] == folded_run_id]
         active = [task for task in children if task["state"] in NONTERMINAL]
@@ -301,6 +349,8 @@ def limits(registry: dict[str, Any], team_uid: str) -> dict[str, int]:
         raise LedgerError("unknown_team")
     delegation = teams[team_uid].get("delegation", {})
     if not isinstance(delegation, dict):
+        raise LedgerError("invalid_delegation_limits")
+    if set(delegation) - set(DEFAULT_LIMITS):
         raise LedgerError("invalid_delegation_limits")
     result = dict(DEFAULT_LIMITS)
     for name, default in DEFAULT_LIMITS.items():
@@ -355,14 +405,11 @@ def _valid_assignee(registry: dict[str, Any], uid: str, team: str) -> str | None
     return None
 
 
-def caller_actor_reason(caller: str, actor_type: str, actor_id: str) -> str | None:
-    if caller.startswith("human:"):
-        return None if actor_type == "human" and actor_id == caller[6:] else "caller_actor_mismatch"
-    if caller.startswith("gateway:"):
-        return None if actor_type == "human" and actor_id == caller else "caller_actor_mismatch"
-    if caller.startswith("role:"):
-        return None if actor_type in {"agent", "service"} else "caller_actor_mismatch"
-    return "unauthorized"
+def caller_actor_reason(caller: str, actor_type: str, actor_id: str, payload: dict[str, Any]) -> str | None:
+    if caller != "root:root":
+        return "caller_unauthorized"
+    record = {"actor_type": actor_type, "actor_id": actor_id, "payload": payload}
+    return None if _caller_matches(record) else "caller_actor_mismatch"
 
 
 def _write_body(body_dir: Path, ident: str, body: bytes) -> bool:
@@ -383,17 +430,21 @@ def _write_body(body_dir: Path, ident: str, body: bytes) -> bool:
                 view = view[written:]
             os.fsync(file_fd)
         except FileExistsError:
-            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=bodies_fd)
+            file_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=bodies_fd)
             info = os.fstat(file_fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
+            test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (Path(__file__).resolve().parent.parent / ".aib-installed").exists()
+            expected_uid = os.geteuid() if test_seam else 0
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
                 return False
-            chunks = []
+            chunks: list[bytes] = []
+            total = 0
             while True:
-                chunk = os.read(file_fd, 8193)
+                chunk = os.read(file_fd, 8193 - total)
                 if not chunk:
                     break
                 chunks.append(chunk)
-                if sum(map(len, chunks)) > 8192:
+                total += len(chunk)
+                if total > 8192:
                     return False
             return b"".join(chunks) == body
         return True
@@ -415,13 +466,14 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
     actor_type, actor_id, caller = request["actor_type"], request["actor_id"], request["caller"]
     team, run_id, ident = request["team_uid"], request["run_id"], request.get("task_id")
     payload["caller"] = caller
-    mismatch = caller_actor_reason(caller, actor_type, actor_id)
+    mismatch = caller_actor_reason(caller, actor_type, actor_id, payload)
     if mismatch:
         return rejection(request, mismatch)
     team_limits = limits(registry, team)
     runs, tasks = current["runs"], current["tasks"]
-    is_human = caller.startswith("human:")
-    is_gateway = caller.startswith("gateway:")
+    requester = payload.get("requester")
+    is_human = actor_type == "human" and isinstance(requester, str) and requester.startswith("human:")
+    is_gateway = actor_type == "human" and isinstance(requester, str) and requester.startswith("gateway:")
     lead_uid = team_lead(registry, team)
     is_lead = actor_type == "agent" and actor_id == lead_uid
     is_service = actor_type == "service"
@@ -432,15 +484,29 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
         if run_id in runs:
             return rejection(request, "duplicate")
     elif kind == "run.closed":
+        run = runs.get(run_id)
+        if run is None:
+            return rejection(request, "unknown_run")
+        if run["team_uid"] != team:
+            return rejection(request, "cross_team")
+        if run["state"] in CLOSED_RUN:
+            return rejection(request, "run_closed")
         if not (is_human or is_lead):
             return rejection(request, "not_lead")
-        if run_id not in runs or runs[run_id]["state"] in {"COMPLETED", "FAILED", "CANCELLED"}:
-            return rejection(request, "invalid_transition")
+        if payload.get("outcome") == "completed" and any(task["run_id"] == run_id and task["state"] in NONTERMINAL for task in tasks.values()):
+            return rejection(request, "open_tasks")
     elif kind == "task.created":
         if not (is_human or is_lead):
             return rejection(request, "not_lead")
-        if run_id not in runs:
+        run = runs.get(run_id)
+        if run is None:
             return rejection(request, "unknown_run")
+        if run["team_uid"] != team:
+            return rejection(request, "cross_team")
+        if run["state"] in CLOSED_RUN:
+            return rejection(request, "run_closed")
+        if ident in tasks:
+            return rejection(request, "duplicate")
         if payload.get("gate") != "none":
             return rejection(request, "gate_not_available")
         if payload.get("depth") != 1 or payload["depth"] > team_limits["max_depth"]:
@@ -454,8 +520,6 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
             return rejection(request, "max_open")
         if sum(task["assignments"] for task in tasks.values() if task["run_id"] == run_id) >= team_limits["max_tasks_per_run"]:
             return rejection(request, "max_tasks_per_run")
-        if ident in tasks:
-            return rejection(request, "duplicate")
         if payload.get("deadline_at") is None:
             payload["deadline_at"] = (datetime.now(timezone.utc) + timedelta(seconds=team_limits["task_deadline_s"])).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         payload["budget"] = {"max_turns": team_limits["max_turns_per_task"], "max_attempts": team_limits["max_assignments_per_task"]}
@@ -465,10 +529,17 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
         task = tasks.get(ident)
         if not task or task["run_id"] != run_id:
             return rejection(request, "unknown_task")
-        expected_seq = request.get("expected_task_seq")
-        if expected_seq is not None and task["last_seq"] != expected_seq:
-            return rejection(request, "concurrent_update")
+        if task["team_uid"] != team:
+            return rejection(request, "cross_team")
+        run = runs.get(run_id)
+        if run is None or run["team_uid"] != task["team_uid"]:
+            return rejection(request, "unknown_run")
+        if run["state"] in CLOSED_RUN:
+            return rejection(request, "run_closed")
         state = task["state"]
+        expected_seq = request.get("expected_task_seq")
+        if kind in {"task.reassigned", "task.reopened", "task.cancelled"} and (is_human or is_gateway or is_lead) and expected_seq is not None and task["state_seq"] != expected_seq:
+            return rejection(request, "concurrent_update")
         if kind == "task.started":
             if not (is_service and actor_id == f"supervisor:{task['assignee']}"):
                 return rejection(request, "not_assignee")
@@ -482,7 +553,7 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
                 return rejection(request, "not_assignee" if not is_service else "unauthorized_reason")
             if state != "IN_PROGRESS":
                 return rejection(request, "invalid_transition")
-            if task["turns"] >= team_limits["max_turns_per_task"]:
+            if report == "progress" and task["turns"] >= team_limits["max_turns_per_task"]:
                 return rejection(request, "max_turns_per_task")
         elif kind == "task.cancelled":
             delivery = is_service and actor_id == f"supervisor:{task['assignee']}" and payload.get("reason") == "delivery_failed" and state == "ASSIGNED"
@@ -501,6 +572,8 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
                 return rejection(request, assignee_reason)
             if task["assignments"] >= team_limits["max_assignments_per_task"]:
                 return rejection(request, "max_assignments_per_task")
+            if sum(item["state"] in OPEN_LIMIT and item["team_uid"] == team for item in tasks.values()) >= team_limits["max_open"]:
+                return rejection(request, "max_open")
             if sum(item["assignments"] for item in tasks.values() if item["run_id"] == run_id) >= team_limits["max_tasks_per_run"]:
                 return rejection(request, "max_tasks_per_run")
         elif kind == "task.overdue":
@@ -529,10 +602,10 @@ def list_view(current: dict[str, Any], *, team: str | None = None, run_id: str |
 
 def _fixture_gated(path: Path) -> None:
     events = [
-        ("run.requested", None, {"caller": "human:operator"}, "human", "operator"),
-        ("task.created", "t-aaaaaaaaaaaa", {"caller": "human:operator", "parent": "r-aaaaaaaaaaaa", "depth": 1, "source_msg_id": "msg-gate", "owner": "human:operator", "assignee": "acme-dev1", "title": "Gate", "body_ref": "msg:gate", "deadline_at": "2026-10-28T00:00:00Z", "budget": {"max_turns": 8, "max_attempts": 3}, "gate": "code", "context_refs": []}, "human", "operator"),
-        ("task.started", "t-aaaaaaaaaaaa", {"caller": "role:acme-dev1"}, "service", "supervisor:acme-dev1"),
-        ("task.reported", "t-aaaaaaaaaaaa", {"caller": "role:acme-dev1", "state": "done", "result_ref": "msg:result", "reason": None}, "agent", "acme-dev1"),
+        ("run.requested", None, {"caller": "root:root", "via": "ctl:1", "requester": "human:operator"}, "human", "operator"),
+        ("task.created", "t-aaaaaaaaaaaa", {"caller": "root:root", "via": "ctl:2", "requester": "human:operator", "parent": "r-aaaaaaaaaaaa", "depth": 1, "source_msg_id": "msg-gate", "owner": "human:operator", "assignee": "acme-dev1", "title": "Gate", "body_ref": "msg:gate", "deadline_at": "2026-10-28T00:00:00Z", "budget": {"max_turns": 8, "max_attempts": 3}, "gate": "code", "context_refs": []}, "human", "operator"),
+        ("task.started", "t-aaaaaaaaaaaa", {"caller": "root:root"}, "service", "supervisor:acme-dev1"),
+        ("task.reported", "t-aaaaaaaaaaaa", {"caller": "root:root", "via": "intent:fixture-4", "state": "done", "result_ref": "msg:result", "reason": None}, "agent", "acme-dev1"),
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as stream:

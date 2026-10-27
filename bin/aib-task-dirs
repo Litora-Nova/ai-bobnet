@@ -18,48 +18,92 @@ if os.environ.get("AIB_TEST_SEAMS") != "1" or (ROOT / ".aib-installed").exists()
 TOKEN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
 
 
-def real_dir(path: Path, mode: int, gid: int, *, parents: bool = False) -> bool:
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def set_dir(fd: int, mode: int, gid: int) -> bool:
     try:
-        if path.is_symlink():
-            return False
-        path.mkdir(mode=mode, parents=parents, exist_ok=True)
-        if path.is_symlink() or not path.is_dir():
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
             return False
         if os.geteuid() == 0:
-            os.chown(path, 0, gid)
+            os.fchown(fd, 0, gid)
         else:
-            os.chown(path, -1, gid)
+            os.fchown(fd, -1, gid)
         # chown may clear setgid; mode is the final provisioning assertion.
-        os.chmod(path, mode)
+        os.fchmod(fd, mode)
         return True
     except OSError:
         return False
 
 
-def real_file(directory: Path, name: str, gid: int) -> bool:
-    directory_fd = file_fd = -1
+def root_dir(path: Path, mode: int, gid: int) -> int:
+    if not path.is_absolute():
+        return -1
+    current_fd = os.open("/", DIR_FLAGS)
     try:
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        parts = path.parts[1:]
+        if not parts:
+            return -1
+        for index, name in enumerate(parts):
+            try:
+                next_fd = os.open(name, DIR_FLAGS, dir_fd=current_fd)
+            except FileNotFoundError:
+                os.mkdir(name, mode if index == len(parts) - 1 else 0o755, dir_fd=current_fd)
+                next_fd = os.open(name, DIR_FLAGS, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        if not set_dir(current_fd, mode, gid):
+            return -1
+        result, current_fd = current_fd, -1
+        return result
+    except OSError:
+        return -1
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def real_dir(parent_fd: int, name: str, mode: int, gid: int) -> int:
+    child_fd = -1
+    try:
         try:
-            file_fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660, dir_fd=directory_fd)
+            os.mkdir(name, mode, dir_fd=parent_fd)
         except FileExistsError:
-            file_fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+            pass
+        child_fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+        if not set_dir(child_fd, mode, gid):
+            return -1
+        result, child_fd = child_fd, -1
+        return result
+    except OSError:
+        return -1
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+
+
+def real_file(directory_fd: int, name: str, gid: int) -> bool:
+    file_fd = -1
+    try:
+        flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            file_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=directory_fd)
+        except FileExistsError:
+            file_fd = os.open(name, flags, dir_fd=directory_fd)
         info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             return False
-        os.fchmod(file_fd, 0o660)
         if os.geteuid() == 0:
             os.fchown(file_fd, 0, gid)
         else:
             os.fchown(file_fd, -1, gid)
+        os.fchmod(file_fd, 0o640)
         return True
     except OSError:
         return False
     finally:
         if file_fd >= 0:
             os.close(file_fd)
-        if directory_fd >= 0:
-            os.close(directory_fd)
 
 
 def main(argv: list[str]) -> int:
@@ -69,16 +113,30 @@ def main(argv: list[str]) -> int:
         gid = grp.getgrnam(os.environ.get("AIB_TASK_GROUP", "aib-tasks")).gr_gid
     except KeyError:
         return 78
-    root = Path(os.environ.get("AIB_TASK_ROOT", "/var/lib/aib/tasks"))
-    project = root / argv[0]
-    bodies = project / "bodies"
-    if not real_dir(root, 0o755, gid, parents=True):
+    root_value = os.environ.get("AIB_TASK_ROOT", "/var/lib/aib/tasks")
+    if not root_value:
         return 78
-    if not real_dir(project, 0o2770, gid) or not real_dir(bodies, 0o2770, gid):
+    root = Path(root_value)
+    if not root.is_absolute():
         return 78
-    if not real_file(project, "tasks.events", gid) or not real_file(project, "tasks.events.lock", gid):
-        return 78
-    return 0
+    root_fd = project_fd = bodies_fd = -1
+    try:
+        root_fd = root_dir(root, 0o755, gid)
+        if root_fd < 0:
+            return 78
+        project_fd = real_dir(root_fd, argv[0], 0o2750, gid)
+        if project_fd < 0:
+            return 78
+        bodies_fd = real_dir(project_fd, "bodies", 0o2750, gid)
+        if bodies_fd < 0:
+            return 78
+        if not real_file(project_fd, "tasks.events", gid) or not real_file(project_fd, "tasks.events.lock", gid):
+            return 78
+        return 0
+    finally:
+        for fd in (bodies_fd, project_fd, root_fd):
+            if fd >= 0:
+                os.close(fd)
 
 
 if __name__ == "__main__":

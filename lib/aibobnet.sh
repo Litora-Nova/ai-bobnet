@@ -3218,7 +3218,13 @@ aib_event_commit() {
     [ -e "/proc/self/fd/$held_lock_fd" ] || aib_die 2 "inherited event lock fd is not open"
     [ "$(stat -Lc '%d:%i' "/proc/self/fd/$held_lock_fd" 2>/dev/null)" = "$(stat -Lc '%d:%i' "$lock_path" 2>/dev/null)" ] ||
       aib_die 2 "inherited event lock fd does not name the task stream lock"
-    flock -n -x "$held_lock_fd" || aib_die 2 "inherited task stream lock is not held exclusively"
+    # A try-lock on the inherited descriptor is not an assertion: it also
+    # succeeds by acquiring an unlocked descriptor. Probe through a fresh open
+    # file description instead; success proves the caller did not already hold
+    # the transaction lock.
+    if flock -n -x "$lock_path" -c true >/dev/null 2>&1; then
+      aib_die 2 "inherited task stream lock was not held before commit"
+    fi
     _fd="$held_lock_fd"
     own_lock=0
   else

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authoritative D1a run/task ledger CLI (supervisor/agentctl side only)."""
+"""Authoritative run/task ledger CLI for trusted control-plane writers."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import fcntl
 import json
 import os
 import re
+import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +25,8 @@ from task_ledger import (  # noqa: E402
     RUN_RE,
     TASK_RE,
     TOKEN_RE,
+    FORBIDDEN_DISPLAY,
+    NONTERMINAL,
     LedgerError,
     decide,
     fold,
@@ -46,9 +50,68 @@ COMMAND_EVENT = {
 REF_RE = re.compile(r"(?:msg:[a-z0-9]+(?:-[a-z0-9]+)*|git:[^\s]+|file:[^\s]+)\Z", re.ASCII)
 
 
+def valid_ref(value: str) -> bool:
+    if REF_RE.fullmatch(value) is None:
+        return False
+    if value.startswith("file:"):
+        path = value[5:]
+        if not path or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/")):
+            return False
+    return True
+
+
+def safe_display_text(value: str) -> bool:
+    return not any(char in FORBIDDEN_DISPLAY or char in "\x00\r\n" for char in value)
+
+
+def read_body_file(path: str) -> bytes:
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise LedgerError("task body file must be a regular file")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= 8192:
+            chunk = os.read(fd, 8193 - total)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+        raise LedgerError("task body exceeds 8192-byte limit")
+    except OSError as error:
+        raise LedgerError(f"cannot read body file: {error}") from error
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def fail(code: int, message: str) -> int:
     print(f"ai-bobnet: {message}", file=sys.stderr)
     return code
+
+
+def task_caller(test_seam: bool) -> str:
+    if os.geteuid() == 0:
+        return "root:root"
+    caller = identity_for(os.geteuid())
+    if test_seam and os.environ.get("AIB_IDENTITY_CMD"):
+        try:
+            result = subprocess.run(
+                [*shlex.split(os.environ["AIB_IDENTITY_CMD"]), str(os.geteuid())],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            value = result.stdout.splitlines()[0] if result.returncode == 0 and result.stdout else ""
+            if value == "root:root":
+                return value
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return caller
 
 
 def parser() -> argparse.ArgumentParser:
@@ -62,6 +125,8 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("--actor-id", required=True)
         sub.add_argument("--causation-id", required=True)
         sub.add_argument("--run-id", required=True)
+        sub.add_argument("--via")
+        sub.add_argument("--requester")
         if name not in {"run-create", "run-close", "create"}:
             sub.add_argument("--task-id", required=True)
         if name == "run-create":
@@ -88,6 +153,8 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("--reason")
         elif name == "cancel":
             sub.add_argument("--reason")
+        if name in {"assign", "reopen", "cancel"}:
+            sub.add_argument("--expect-seq", type=int)
     listing = subs.add_parser("list")
     listing.add_argument("--project", required=True)
     listing.add_argument("--team")
@@ -129,6 +196,14 @@ def validate_common(args: argparse.Namespace) -> None:
     }
     if re.fullmatch(patterns[args.actor_type], args.actor_id) is None:
         raise LedgerError("invalid actor_id for actor_type")
+    if args.via is not None and re.fullmatch(r"(?:intent:[a-z0-9]+(?:-[a-z0-9]+)*|ctl:[0-9]+)", args.via, re.ASCII) is None:
+        raise LedgerError("invalid relay reference")
+    if args.requester is not None and re.fullmatch(r"(?:human:[a-z0-9][a-z0-9_-]*|gateway:[a-z0-9][a-z0-9_-]*)", args.requester, re.ASCII) is None:
+        raise LedgerError("invalid requester")
+    if getattr(args, "expect_seq", None) is not None and args.expect_seq < 1:
+        raise LedgerError("expect-seq must be positive")
+    if getattr(args, "expect_seq", None) is not None and args.actor_type not in {"human", "agent"}:
+        raise LedgerError("engine events do not accept expect-seq")
 
 
 def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object], str | None, bytes | None]:
@@ -144,19 +219,13 @@ def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object
         ident = derive_task_id(args.causation_id, args.intent_n)
         if TOKEN_RE.fullmatch(args.source_msg_id) is None:
             raise LedgerError("invalid source_msg_id token")
-        if len(args.title) > 120 or not args.title or any(char in args.title for char in "\x00\r\n"):
+        if len(args.title) > 120 or not args.title or not safe_display_text(args.title):
             raise LedgerError("title must be one line of 1..120 characters")
         if re.fullmatch(r"msg:[a-z0-9]+(?:-[a-z0-9]+)*", args.body_ref) is None:
             raise LedgerError("invalid body_ref")
-        if len(args.context_ref) > 5 or any(REF_RE.fullmatch(ref) is None for ref in args.context_ref):
+        if len(args.context_ref) > 5 or any(not valid_ref(ref) for ref in args.context_ref):
             raise LedgerError("invalid context_refs")
-        try:
-            body_path = Path(args.body_file)
-            if body_path.stat().st_size > 8192:
-                raise LedgerError("task body exceeds 8192-byte limit")
-            body = body_path.read_bytes()
-        except OSError as error:
-            raise LedgerError(f"cannot read body file: {error}") from error
+        body = read_body_file(args.body_file)
         deadline = args.deadline_at
         if deadline is not None:
             try:
@@ -169,18 +238,22 @@ def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object
     elif args.command in {"assign", "reopen"}:
         payload = {"assignee": args.assignee}
     elif args.command == "report":
-        if args.result_ref is not None and REF_RE.fullmatch(args.result_ref) is None:
+        if args.result_ref is not None and not valid_ref(args.result_ref):
             raise LedgerError("invalid result_ref")
-        if args.reason is not None and (len(args.reason) > 512 or any(char in args.reason for char in "\x00\r\n")):
+        if args.reason is not None and (len(args.reason) > 512 or not safe_display_text(args.reason)):
             raise LedgerError("reason must be one line of at most 512 characters")
         payload = {"state": args.state, "result_ref": args.result_ref, "reason": args.reason}
     elif args.command == "cancel":
-        if args.reason is not None and (len(args.reason) > 512 or any(char in args.reason for char in "\x00\r\n")):
+        if args.reason is not None and (len(args.reason) > 512 or not safe_display_text(args.reason)):
             raise LedgerError("reason must be one line of at most 512 characters")
         payload = {"reason": args.reason}
     else:
         payload = {}
     payload["caller"] = caller
+    if args.via is not None:
+        payload["via"] = args.via
+    if args.requester is not None:
+        payload["requester"] = args.requester
     return payload, ident, body
 
 
@@ -250,17 +323,17 @@ def main(argv: list[str]) -> int:
             print(json.dumps(output, separators=(",", ":"), sort_keys=True))
             return 0
 
+        test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (ROOT / ".aib-installed").exists()
+        if os.geteuid() != 0 and not test_seam:
+            return fail(77, "caller_unauthorized")
         validate_common(args)
-        caller = identity_for(os.geteuid())
+        caller = task_caller(test_seam)
+        if caller != "root:root":
+            return fail(77, "caller_unauthorized")
         payload, ident, body = payload_for(args, caller)
         request: dict[str, object] = {"event_type": COMMAND_EVENT[args.command], "project_uid": args.project, "team_uid": args.team, "run_id": args.run_id, "task_id": ident, "causation_id": args.causation_id, "actor_type": args.actor_type, "actor_id": args.actor_id, "caller": caller, "payload": payload}
-        # Capture the task version before waiting for the stream lock.  The
-        # authoritative fold/decision still happens under the lock; this token
-        # makes two already-issued requests against the same state conflict
-        # instead of silently becoming a different valid serial sequence.
-        observed = fold(events)
-        if ident in observed["tasks"]:
-            request["expected_task_seq"] = observed["tasks"][ident]["last_seq"]
+        if getattr(args, "expect_seq", None) is not None:
+            request["expected_task_seq"] = args.expect_seq
         try:
             lock_fd = acquire(lock)
         except TimeoutError:
@@ -272,6 +345,18 @@ def main(argv: list[str]) -> int:
             validate_registry_scope(registry, args.project, args.team)
             current = fold(events)
             actual_kind, actual_payload, accepted, reason = decide(request, current, registry, directory / "bodies", body)
+            if accepted and actual_kind == "run.closed" and actual_payload.get("outcome") in {"cancelled", "failed"}:
+                for task in sorted(current["tasks"].values(), key=lambda value: value["task_id"]):
+                    if task["run_id"] != args.run_id or task["state"] not in NONTERMINAL:
+                        continue
+                    cancel_request = dict(request)
+                    cancel_request["event_type"] = "task.cancelled"
+                    cancel_request["task_id"] = task["task_id"]
+                    cancel_payload: dict[str, object] = {"caller": caller, "reason": "run_closed"}
+                    for key in ("via", "requester"):
+                        if key in actual_payload:
+                            cancel_payload[key] = actual_payload[key]
+                    commit(events, lock, lock_fd, cancel_request, "task.cancelled", cancel_payload)
             event_id, _ = commit(events, lock, lock_fd, request, actual_kind, actual_payload)
         finally:
             os.close(lock_fd)
@@ -280,6 +365,9 @@ def main(argv: list[str]) -> int:
         else:
             print(f"event_id={event_id}")
         if not accepted:
+            if reason == "concurrent_update":
+                print("ai-bobnet: task request rejected: concurrent_update (task state changed; re-read and retry)", file=sys.stderr)
+                return 76
             print(f"ai-bobnet: task request rejected: {reason}", file=sys.stderr)
             return 77
         return 0

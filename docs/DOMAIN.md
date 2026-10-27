@@ -9,7 +9,7 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > adapter, P3 scoped memory, the legacy-journal serialized commit protocol, the Codex managed-launch path,
 > and the RM-2 durable attempt audit (`attempt.decided`/`attempt.ended` per managed launch) are built
 > and tested. The same framed commit primitive now reserves the per-project `tasks` stream and its
-> run/task event vocabulary; D1a now implements the authoritative task ledger writer, fold, authority
+> run/task event vocabulary; the authoritative task ledger writer now implements fold, authority
 > checks, and task body sidecars. Confined-turn intents, supervisor application, worker pickup,
 > agentctl task verbs, and projection remain later slices. The **rest**
 > of the serialized event spine (cursors, projections, rebuild tooling), the provider-wide reference monitor, the
@@ -152,17 +152,21 @@ precedence ladder, and every displayed state MUST be traceable to a causing even
 6. **Health** — `healthy | warning | idle | unhealthy`
 7. **Grant** — `ISSUED → EXPIRED | REVOKED | ROTATED`
 
-### 3.2 Task and Run ledger (D1a)
+### 3.8 Task and Run ledger
 
-`bin/task` is the only task-stream writer. It is a supervisor/agentctl-side interface, not a command
-available to confined children. Every mutation is one locked transaction: replay the stream, read the
+`bin/task` is the only task-stream writer. Installed writers must run as root; the project directory and
+`bodies` directory are `root:aib-tasks 2750`, while the stream, lock, and sidecars are root-owned `0640`.
+The group is read-only. Non-root writes fail with `caller_unauthorized` and do not append a rejection.
+Every mutation is one locked transaction: replay the stream, read the
 current registry authority, validate the closed transition and ledger limits, then append through
 `aib_event_commit(stream=tasks)`. A domain refusal appends `task.rejected` and changes no Run or Task
 state. A malformed `run_id`, `task_id`, or `causation_id` is rejected before commit because these values
 are fold keys and, for tasks, sidecar filenames.
 
-A Run begins at `QUEUED`; its first Task makes it `RUNNING`. `run.closed` selects the terminal Run state.
-A created D1a Task is assigned immediately and then follows the closed Work transitions:
+A Run begins at `QUEUED`; its first Task makes it `RUNNING`. `run.closed completed` is accepted only when
+no task is open. `run.closed failed|cancelled` first appends `task.cancelled {reason: run_closed}` for every
+open child under the same lock, then closes the Run. A second close and every later `task.*` request are
+rejected as `run_closed`; Runs are never reopened. A created Task is assigned immediately and follows:
 
 ```
 ASSIGNED -> IN_PROGRESS
@@ -173,29 +177,52 @@ any non-terminal state -> CANCELLED
 ```
 
 The fold contains the future gate behavior now: `task.reported {state: done}` reaches `REVIEW` when
-`gate != none`, otherwise `DONE`. D1a creation accepts only `gate: none`, so `REVIEW` is modelled and
-tested but unreachable through the writer until the gate slice enables it. `depth` is present, but D1a
-accepts only `1`; `parent` is the Run id. The reserved sub-team-lead authority row and
+`gate != none`, otherwise `DONE`. Creation currently accepts only `gate: none`, so `REVIEW` is modelled and
+tested but unreachable through the writer until the gate feature enables it. `depth` is present, but the
+writer currently accepts only `1`; `parent` is the Run id. The reserved sub-team-lead authority row and
 `teams.<team>.parent_team` remain model seams only.
 
 Task ids are deterministic: `t-` plus the first 12 hex digits of SHA-256 over
 `<causation_id>:<intent_n>`. Retry dedupe is separately keyed by `(source_msg_id, assignee)` for an open
-Task. State is never stored outside the events. `list` and `show` replay the same fold used by writers.
+Task. This deliberately permits at most one open Task per worker for one source message; fan-out to the
+same worker must be bundled, while a different assignee remains valid. State is never stored outside the
+events. `list` and `show` replay the same fold used by writers.
 The body is a stable 0640 sidecar at
 `$AIB_TASK_ROOT/<project_uid>/bodies/<task_id>.md`; creation refuses symlinks and hard links. Directory,
-ownership, setgid, stream-file, and lock-file modes are provisioned by `bin/aib-task-dirs`, never by the
-commit primitive.
+ownership, setgid, stream-file, and lock-file modes are provisioned by `bin/aib-task-dirs` with dirfd and
+no-follow operations, never by the commit primitive. A sidecar is written before its event append. If the
+append fails, the root-owned orphan is harmless: an identical retry reuses it idempotently and a different
+body is refused.
 
-Authority is evaluated from the registry snapshot at commit time. Team leads and humans may create,
-reassign, cancel, reopen, and close; only the assignee claim may report; assignee supervisors may start
-and may emit the closed engine failure/delivery reasons; the lead supervisor may mark overdue. The
-payload records the kernel-derived `caller` next to the envelope's claimed actor. Human authority is an
-override. The reserved sub-team-lead row is not implemented.
+Authority is evaluated from the registry snapshot at commit time and every Run/Task verb is bound to its
+recorded `team_uid`. The writer records `caller: root:root`. An agent claim requires `via: intent:<attempt_id>`;
+a human or gateway claim requires `via: ctl:<seq>` plus a matching kernel-attested `requester`. Direct
+`role:*`, `human:*`, and `gateway:*` writers are refused. Authority is checked against the relayed
+requester: team leads and humans may create, reassign, cancel, reopen, and close; only the assignee may
+report; assignee supervisors may start and emit the closed engine failure/delivery reasons; the lead
+supervisor may mark overdue. The reserved sub-team-lead row is not implemented.
 
-Ledger defaults are `max_open=8`, `max_tasks_per_run=20` (creation plus reassign/reopen allocations),
+`state_seq` is the sequence of the last event that changed state or assignee. Human/lead cancel, reassign,
+and reopen may supply `--expect-seq`; a mismatch is the retryable `concurrent_update` outcome with rc 76.
+Engine events carry no token. `turns` counts only `progress` in the current attempt, and `turns_total`
+retains the display total. Reassign/reopen resets `turns`, increments `attempts`, and is bounded by
+`max_assignments_per_task`. Final agent reports and service `blocked turn_budget` remain valid after the
+progress budget is exhausted.
+
+Ledger defaults are `max_open=8`, `max_new_per_turn=4` (reserved for the intent applier),
+`max_tasks_per_run=20` (creation plus reassign/reopen allocations),
 `max_assignments_per_task=3`, `max_depth=1`,
 `task_deadline_s=14400`, and `max_turns_per_task=8`. Schema-5 teams may override these under
-`teams.<team>.delegation`; `max_depth` may not exceed 1 in D1a.
+`teams.<team>.delegation`; unknown keys fail closed and `max_depth` may not exceed 1.
+
+The normative rejection reasons are `caller_unauthorized`, `caller_actor_mismatch`, `unauthorized`,
+`unauthorized_reason`, `not_lead`, `not_assignee`, `unknown_project`, `unknown_team`, `unknown_run`,
+`unknown_task`, `unknown_assignee`, `invalid_assignee`, `cross_team`, `duplicate`, `run_closed`,
+`open_tasks`, `invalid_transition`, `concurrent_update`, `gate_not_available`, `max_depth`, `max_open`,
+`max_tasks_per_run`, `max_assignments_per_task`, `max_turns_per_task`, `unsafe_body_sidecar`, and
+`unsupported_event`. Titles/reasons reject Unicode line/paragraph separators, NEXT LINE, and bidi
+controls. `file:` references must be relative normalized paths: absolute paths and `.`/`..` segments are
+invalid.
 
 ### 3.7 Grant — notes that are load-bearing
 - There is **no `ACTIVE` state.** It conflated *in force* (time-derived) with *has been used* (observable

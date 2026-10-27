@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Authoritative D1a ledger entrypoint. Domain parsing/folding lives in the Python
+# Authoritative task-ledger entrypoint. Domain parsing/folding lives in the Python
 # module so JSON is strict; this public writer remains the designed Bash command.
 set -uo pipefail
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
