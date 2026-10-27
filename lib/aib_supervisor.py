@@ -11,6 +11,7 @@ import random
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -31,6 +32,10 @@ class JournalCorruptError(ValueError):
 
 class SupervisorLockError(OSError):
     """Another supervisor already owns this agent's state directory."""
+
+
+class SupervisorStateError(OSError):
+    """The supervisor state directory contains an unsafe filesystem object."""
 
 
 def utc_now() -> str:
@@ -62,7 +67,14 @@ class Supervisor:
         self.registry_path = registry_path(root)
         state_root = Path(os.environ.get("AIB_SUP_STATE_ROOT", "/var/lib/aib-sup"))
         self.state_dir = Path(os.environ.get("STATE_DIRECTORY", state_root / uid))
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.state_dir_fd = os.open(
+                self.state_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except OSError as error:
+            raise SupervisorStateError(f"unsafe supervisor state directory {self.state_dir}") from error
         self.lock_path = self.state_dir / "supervisor.lock"
         self.lock_fd = self._acquire_lock()
         self.journal_path = self.state_dir / "journal.jsonl"
@@ -154,17 +166,62 @@ class Supervisor:
             self.config_invalid = True
             return default
 
+    def _open_state_file(
+        self,
+        name: str,
+        flags: int,
+        mode: int = 0o600,
+        *,
+        single_link: bool = False,
+    ) -> int:
+        try:
+            fd = os.open(
+                name,
+                flags | os.O_NOFOLLOW | os.O_NONBLOCK,
+                mode,
+                dir_fd=self.state_dir_fd,
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise SupervisorStateError(f"refusing unsafe supervisor state file {name}") from error
+        try:
+            status = os.fstat(fd)
+            if not stat.S_ISREG(status.st_mode):
+                raise SupervisorStateError(f"refusing non-regular supervisor state file {name}")
+            if single_link and status.st_nlink != 1:
+                raise SupervisorStateError(f"refusing multiply-linked supervisor state file {name}")
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
     def _acquire_lock(self) -> int:
         inherited = os.environ.get("AIB_SUP_LOCK_FD") if os.environ.get("AIB_SUP_REEXEC") == "1" else None
         if inherited is not None:
             try:
                 lock_fd = int(inherited)
-                if lock_fd < 0 or not os.path.samestat(os.fstat(lock_fd), os.stat(self.lock_path)):
+                lock_status = os.fstat(lock_fd)
+                path_status = os.stat(
+                    self.lock_path.name,
+                    dir_fd=self.state_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    lock_fd < 0
+                    or not stat.S_ISREG(lock_status.st_mode)
+                    or not stat.S_ISREG(path_status.st_mode)
+                    or not os.path.samestat(lock_status, path_status)
+                ):
                     raise ValueError
             except (OSError, ValueError) as error:
                 raise SupervisorLockError("invalid inherited supervisor lock") from error
         else:
-            lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            lock_fd = self._open_state_file(
+                self.lock_path.name,
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -179,30 +236,35 @@ class Supervisor:
     def _load_records(self) -> tuple[list[dict[str, Any]], int]:
         records: list[dict[str, Any]] = []
         try:
-            data = self.journal_path.read_bytes()
+            journal_fd = self._open_state_file(
+                self.journal_path.name,
+                os.O_RDWR,
+                single_link=True,
+            )
         except FileNotFoundError:
             return records, 0
 
-        dropped_bytes = 0
-        complete = data
-        if data and not data.endswith(b"\n"):
-            boundary = data.rfind(b"\n") + 1
-            complete = data[:boundary]
-            dropped_bytes = len(data) - boundary
-        try:
-            for line in complete.decode("utf-8").splitlines():
-                if line.strip():
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError("supervisor journal record is not an object")
-                    records.append(record)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            raise JournalCorruptError("supervisor journal contains a corrupt record") from error
-        expected = list(range(1, len(records) + 1))
-        if [record.get("seq") for record in records] != expected:
-            raise JournalCorruptError("supervisor journal sequence is corrupt")
-        if dropped_bytes:
-            with self.journal_path.open("r+b") as stream:
+        with os.fdopen(journal_fd, "r+b") as stream:
+            data = stream.read()
+            dropped_bytes = 0
+            complete = data
+            if data and not data.endswith(b"\n"):
+                boundary = data.rfind(b"\n") + 1
+                complete = data[:boundary]
+                dropped_bytes = len(data) - boundary
+            try:
+                for line in complete.decode("utf-8").splitlines():
+                    if line.strip():
+                        record = json.loads(line)
+                        if not isinstance(record, dict):
+                            raise ValueError("supervisor journal record is not an object")
+                        records.append(record)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise JournalCorruptError("supervisor journal contains a corrupt record") from error
+            expected = list(range(1, len(records) + 1))
+            if [record.get("seq") for record in records] != expected:
+                raise JournalCorruptError("supervisor journal sequence is corrupt")
+            if dropped_bytes:
                 stream.truncate(len(complete))
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -218,7 +280,12 @@ class Supervisor:
     def journal(self, event: str, **fields: Any) -> dict[str, Any]:
         self.journal_seq += 1
         record = {"seq": self.journal_seq, "ts": utc_now(), "event": event, **fields}
-        journal_fd = os.open(self.journal_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        journal_fd = self._open_state_file(
+            self.journal_path.name,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            0o644,
+            single_link=True,
+        )
         with os.fdopen(journal_fd, "a", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o644)
             stream.write(json.dumps(record, separators=(",", ":")) + "\n")
@@ -241,12 +308,27 @@ class Supervisor:
             "turns_in_session": self.turns_in_session,
             "off_duty": self.off_duty,
         }
-        temporary = self.state_dir / f".live.{os.getpid()}.tmp"
-        live_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        temporary = f".live.{os.getpid()}.tmp"
+        try:
+            os.unlink(temporary, dir_fd=self.state_dir_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise SupervisorStateError(f"refusing unsafe supervisor state file {temporary}") from error
+        live_fd = self._open_state_file(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+        )
         with os.fdopen(live_fd, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o644)
             stream.write(json.dumps(live, separators=(",", ":")) + "\n")
-        os.replace(temporary, self.live_path)
+        os.replace(
+            temporary,
+            self.live_path.name,
+            src_dir_fd=self.state_dir_fd,
+            dst_dir_fd=self.state_dir_fd,
+        )
 
     def notify(self, value: str) -> None:
         if not os.environ.get("NOTIFY_SOCKET"):
@@ -817,7 +899,12 @@ class Supervisor:
         self.write_live()
         prompt = self.prompt_for(work)
         self.output_path = self.state_dir / f".turn-{attempt_id}.out"
-        self.output_file = self.output_path.open("wb")
+        output_fd = self._open_state_file(
+            self.output_path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        self.output_file = os.fdopen(output_fd, "wb")
         command = [*self.launcher, "--as", self.uid, "--supervised", "--session", session_arg, "--cwd", self.project_home, "-"]
         try:
             self.process = subprocess.Popen(
@@ -1094,7 +1181,7 @@ def main() -> int:
         return 64
     try:
         return Supervisor(root, uid).run()
-    except (JournalCorruptError, SupervisorLockError) as error:
+    except (JournalCorruptError, SupervisorLockError, SupervisorStateError) as error:
         print(f"aib-supervisor: {error}", file=sys.stderr)
         return 78
     except (ValueError, OSError) as error:

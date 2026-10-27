@@ -261,6 +261,7 @@ with mode `0600` stay private. The broker unit therefore needs only
 `CAP_SETUID` and `CAP_SETGID`, bounded as shown
 in the shipped S1c drop-in example. The helper deliberately rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
+The root supervisor opens this home with `O_DIRECTORY|O_NOFOLLOW`; descriptor-relative writable state opens use `O_NOFOLLOW` and regular-file checks, with a single-link requirement for `journal.jsonl`.
 
 The helper is the sole owner of this directory contract. It creates `/var/lib/aib-sup` as root-owned
 `0755`, then prepares the per-agent home, provider directories, and named ACLs. The agent unit therefore
