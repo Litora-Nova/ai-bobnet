@@ -26,6 +26,10 @@ from aib_deployment import deployment_allows, load_deployment
 from aib_login import login_max_turn_seconds
 
 
+MAX_LIVE_STATE_BYTES = 64 * 1024
+MAX_TURN_OUTPUT_BYTES = 8 * 1024 * 1024
+
+
 class JournalCorruptError(ValueError):
     """The durable journal cannot be trusted without operator repair."""
 
@@ -233,6 +237,17 @@ class Supervisor:
         os.set_inheritable(lock_fd, True)
         return lock_fd
 
+    def _read_state_text(self, name: str, max_bytes: int, *, errors: str = "strict") -> str:
+        state_fd = self._open_state_file(name, os.O_RDONLY)
+        try:
+            with os.fdopen(state_fd, "rb") as stream:
+                data = stream.read(max_bytes + 1)
+        except OSError as error:
+            raise SupervisorStateError(f"refusing unreadable supervisor state file {name}") from error
+        if len(data) > max_bytes:
+            raise SupervisorStateError(f"refusing oversized supervisor state file {name}")
+        return data.decode("utf-8", errors=errors)
+
     def _load_records(self) -> tuple[list[dict[str, Any]], int]:
         records: list[dict[str, Any]] = []
         try:
@@ -272,9 +287,15 @@ class Supervisor:
 
     def _old_tick_seq(self) -> int:
         try:
-            value = json.loads(self.live_path.read_text(encoding="utf-8")).get("seq", 0)
+            value = json.loads(
+                self._read_state_text(self.live_path.name, MAX_LIVE_STATE_BYTES)
+            ).get("seq", 0)
             return value if isinstance(value, int) and not isinstance(value, bool) else 0
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except FileNotFoundError:
+            return 0
+        except SupervisorStateError:
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError):
             return 0
 
     def journal(self, event: str, **fields: Any) -> dict[str, Any]:
@@ -594,13 +615,13 @@ class Supervisor:
             self.output_file.close()
         work = self.attempt["work"]
         attempt_id = self.attempt["attempt_id"]
-        try:
-            output = self.output_path.read_text(encoding="utf-8", errors="replace")
-            self.output_path.unlink()
-        except OSError:
-            output = ""
-        self.append_transcript(output)
-        self.end_turn(work, attempt_id, "cancelled", 137)
+        output, refusal_reason = self._read_turn_output()
+        self._discard_turn_output()
+        if refusal_reason is None:
+            self.append_transcript(output)
+            self.end_turn(work, attempt_id, "cancelled", 137)
+        else:
+            self.end_turn(work, attempt_id, "provider_failure", 137, reason=refusal_reason)
         self.work = {**work, "retry": True}
         self.process = None
         self.attempt = None
@@ -929,9 +950,34 @@ class Supervisor:
             self.output_file.write(str(error).encode())
             self.output_file.close()
             self.process = None
-            self._finish_result(69, self.output_path.read_text(encoding="utf-8", errors="replace"), work, session_arg, attempt_id)
+            output, refusal_reason = self._read_turn_output()
+            self._discard_turn_output()
+            self.output_file = None
+            self.output_path = None
+            self._finish_result(69, output, work, session_arg, attempt_id, refusal_reason)
             return
         self.attempt = {"work": work, "session_arg": session_arg, "attempt_id": attempt_id}
+
+    def _read_turn_output(self) -> tuple[str, str | None]:
+        assert self.output_path is not None
+        try:
+            return (
+                self._read_state_text(
+                    self.output_path.name,
+                    MAX_TURN_OUTPUT_BYTES,
+                    errors="replace",
+                ),
+                None,
+            )
+        except (FileNotFoundError, SupervisorStateError, OSError):
+            return "", "unsafe_turn_output"
+
+    def _discard_turn_output(self) -> None:
+        assert self.output_path is not None
+        try:
+            os.unlink(self.output_path.name, dir_fd=self.state_dir_fd)
+        except OSError:
+            pass
 
     def collect_turn(self) -> None:
         assert self.process is not None and self.attempt is not None and self.output_path is not None
@@ -939,11 +985,8 @@ class Supervisor:
         if rc is None:
             return
         self.output_file.close()
-        output = self.output_path.read_text(encoding="utf-8", errors="replace")
-        try:
-            self.output_path.unlink()
-        except OSError:
-            pass
+        output, refusal_reason = self._read_turn_output()
+        self._discard_turn_output()
         work = self.attempt["work"]
         session_arg = self.attempt["session_arg"]
         attempt_id = self.attempt["attempt_id"]
@@ -951,7 +994,7 @@ class Supervisor:
         self.attempt = None
         self.output_file = None
         self.output_path = None
-        self._finish_result(rc, output, work, session_arg, attempt_id)
+        self._finish_result(rc, output, work, session_arg, attempt_id, refusal_reason)
 
     def append_transcript(self, output: str) -> None:
         if not output:
@@ -970,6 +1013,7 @@ class Supervisor:
         rc: int,
         *,
         login_hint: bool = False,
+        reason: str | None = None,
     ) -> None:
         self.journal(
             "turn.ended",
@@ -978,25 +1022,36 @@ class Supervisor:
             attempt_id=attempt_id,
             **{"class": result_class, "rc": rc, "brake": self.brake_consecutive, "tripped_at": self.brake_tripped_at},
             **({"login_hint": True} if login_hint else {}),
+            **({"reason": reason} if reason is not None else {}),
         )
 
-    def _finish_result(self, rc: int, output: str, work: dict[str, Any], session_arg: str, attempt_id: str) -> None:
+    def _finish_result(
+        self,
+        rc: int,
+        output: str,
+        work: dict[str, Any],
+        session_arg: str,
+        attempt_id: str,
+        refusal_reason: str | None = None,
+    ) -> None:
         self.append_transcript(output)
         self.current_turn = None
         lowered = output.lower()
         login_hint = rc == 78 and "hint:login" in lowered
-        if rc != 0 and session_arg.startswith("new:") and "already in use" in lowered:
+        if refusal_reason is None and rc != 0 and session_arg.startswith("new:") and "already in use" in lowered:
             self.end_turn(work, attempt_id, "session_in_use", rc)
             self.retry_at = time.monotonic()
             return
-        if rc != 0 and not session_arg.startswith("new:") and "no conversation found" in lowered:
+        if refusal_reason is None and rc != 0 and not session_arg.startswith("new:") and "no conversation found" in lowered:
             self.end_turn(work, attempt_id, "session_lost", rc)
             self.rotate_with_note("unknown_sid")
             self.work = None
             self.retry_at = time.monotonic()
             return
 
-        if rc == 0 and output:
+        if refusal_reason is not None:
+            result_class = "provider_failure"
+        elif rc == 0 and output:
             result_class = "ok"
         elif rc in (75, 78, 69) or (rc == 0 and not output) or login_hint:
             result_class = "infra"
@@ -1068,7 +1123,7 @@ class Supervisor:
         self.message_failures[work["id"]] = failures
         if self.brake_consecutive >= self.brake_burst:
             self.brake_tripped_at = utc_now()
-        self.end_turn(work, attempt_id, result_class, rc)
+        self.end_turn(work, attempt_id, result_class, rc, reason=refusal_reason)
         if self.brake_tripped_at is not None:
             self.set_state("FAILED", "brake")
             self.heartbeat("blocked", "supervisor provider-failure brake tripped")
@@ -1076,7 +1131,10 @@ class Supervisor:
             self.retry_at = float("inf")
             return
         if failures >= 3 and not work.get("synthetic"):
-            self.message_command("fail", work["id"], f"provider failure rc={rc}")
+            detail = f"provider failure rc={rc}"
+            if refusal_reason is not None:
+                detail += f" reason={refusal_reason}"
+            self.message_command("fail", work["id"], detail)
             self.work = None
         else:
             self.work = work
