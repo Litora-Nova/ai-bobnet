@@ -141,6 +141,31 @@ req_short="${req/timeout=999999/timeout=60}"
 aib_authorize_launch "$req_short" "$snap" >/dev/null 2>&1
 eq "a shorter timeout is left alone — min, never max" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "60"
 
+login_req="${req/timeout=999999/timeout=3600}"
+login_snap="${snap/cap_timeout=900/cap_timeout=3600}
+credential_mode=shared
+credential_source=login
+login_max_turn=900"
+aib_authorize_launch "$login_req" "$login_snap" >/dev/null 2>&1
+eq "a shared-login credential clamps the effective timeout to its turn bound" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "900"
+has "…and the shared-login clamp is visible in the verdict" "${AIB_VERDICT_REASONS:-}" "shared login turn bound '900'"
+
+fd_login_snap="${login_snap/credential_mode=shared/credential_mode=fd}"
+aib_authorize_launch "$login_req" "$fd_login_snap" >/dev/null 2>&1
+eq "an fd credential sourced from the shared login has the same turn bound" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "900"
+
+setup_token_snap="${fd_login_snap/credential_source=login/credential_source=setup_token}"
+aib_authorize_launch "$login_req" "$setup_token_snap" >/dev/null 2>&1
+eq "an fd setup_token is not access-token-expiry bounded" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "3600"
+
+shared_setup_token_snap="${login_snap/credential_source=login/credential_source=setup_token}"
+aib_authorize_launch "$login_req" "$shared_setup_token_snap" >/dev/null 2>&1
+eq "shared mode stays bounded because it always consumes the expiring shared store" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "900"
+
+file_snap="${login_snap/credential_mode=shared/credential_mode=file}"
+aib_authorize_launch "$login_req" "$file_snap" >/dev/null 2>&1
+eq "a provider-local credential retains the ordinary registry cap" "${AIB_VERDICT_EFFECTIVE_TIMEOUT:-}" "3600"
+
 # --- 4. sandbox stays a CLAMP, and the clamp is visible in the verdict -------
 req_danger="${req/sandbox=workspace-write/sandbox=danger-full-access}"
 aib_authorize_launch "$req_danger" "$snap" >/dev/null 2>&1
@@ -246,7 +271,7 @@ cat > "$FIXTURE_REG" <<JSON
       "cap_sandbox": "workspace-write",
       "cap_tier": "t2",
       "cap_effort": "high",
-      "cap_timeout": "900"
+      "cap_timeout": "3600"
     },
     "acme-bad": {
       "adapter": "/opt/acme/adapters/acme-bad",
@@ -308,6 +333,17 @@ has "the handler returns a decision"                  "$resp" "decision="
 has "…and terminates with a verdict, not an error"    "$resp" "end=ok"
 hasnt "…and no longer refuses unconditionally"        "$resp" "not_implemented"
 has "…and now really launches (RM-3 slice 3 moves this boundary)" "$resp" "enacted=yes"
+has "a provider-local credential keeps the registry timeout cap" "$resp" "effective_timeout=3600"
+
+SHARED_DEP="$WORK/shared-deployment.json"
+printf '%s\n' '{"deployment_id":"test","allow":{"customer_code":false,"comms_secrets":false},"accounts":{"acme":{"credential_mode":"shared"}}}' > "$SHARED_DEP"
+chmod 644 "$SHARED_DEP"
+resp="$(frame2 "" "" "hallo" "op=launch" "agent_uid=acme-dev" "timeout=3600" \
+        | AIBOBNET_REGISTRY="$FIXTURE_REG" AIB_EVENT_ROOT="$WORK/event-root" \
+          AIB_DEPLOYMENT_CONFIG="$SHARED_DEP" AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$(id -u)" \
+          "$SRC_ROOT/bin/aib-broker-handler" 2>/dev/null)"
+has "deployment credential_mode=shared clamps the broker verdict timeout" "$resp" "effective_timeout=900"
+has "…and exposes the shared-login clamp in the launch record" "$resp" "reasons=timeout '3600' exceeds shared login turn bound '900'; clamped to '900'"
 
 # ADDED (not in the original RED spec): a deny is `end=denied`, never `end=ok` — the
 # earlier assertion only pins the allow path, and a handler that always said `end=ok`
