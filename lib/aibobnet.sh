@@ -2132,6 +2132,13 @@ aib_enact_launch__run_confined() {
         ;;
     esac
   fi
+  if [ "$_preflight_rc" -eq 0 ] && [ -n "$_role_uid" ]; then
+    if [ -z "$_python_bin" ] ||
+       ! "$_python_bin" -I "$_engine_root/lib/aib_broker_security.py" groups-safe "$_role_groups" "$_role_gid"; then
+      _preflight_rc=1
+      _s1c_preflight_diag=shared_group
+    fi
+  fi
   if [ "$_preflight_rc" -eq 0 ] && [ "$_s1c_enabled" -eq 1 ]; then
     case "$_credential_mode" in
       file|shared) ;;

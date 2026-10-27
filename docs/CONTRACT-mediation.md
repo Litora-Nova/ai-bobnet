@@ -119,19 +119,18 @@ be defended:
 
 That reduction is the substantive gain of putting the boundary in the right place.
 
-## 4. The single-uid limit
+## 4. Peer-bound agent identity
 
-All agents run under one unix account. Peer credentials therefore tell the broker that *an* agent is
-asking, never *which* one. `agent_uid` is an assertion the broker cannot refute: an agent presenting
-the identifier of a higher-clearance agent receives that clearance.
+DP supersedes the former single-uid limitation. Durable agents use distinct role uids. The broker
+reads `SO_PEERCRED` from the accepted AF_UNIX connection and binds a `role:` peer to the one prepared
+agent state directory it uniquely owns; the requested `agent_uid` is not sufficient. Root and the
+existing `human:` operator class retain cross-agent launch authority, while `gateway:` and `unknown:`
+do not. Peer denials are durable `attempt.decided` records.
 
-This is a limitation of the account model, not of the interface, and it cannot be designed away at
-this layer. It is stated in the security-status box above and repeated here because it also governs
-how the audit stream may be read: **the recorded `agent_uid` is that same unverified assertion, and the
-stream must not be treated as proof of identity between agents.**
-
-Per-agent uids are the change that turns the assertion into a fact. They are a separate step with
-their own cost, and they are not part of this contract.
+This depends on provisioning maintaining unique per-agent directory ownership. A duplicated owner is
+ambiguous and fails closed. Confined provider children additionally receive neither `aib-shared` as
+their primary gid nor in their supplementary group list, so DAC prevents them from reaching the
+mode-0660 broker socket before peer binding is needed as defense in depth.
 
 ## 5. `high_water` — a self-check, not a boundary
 

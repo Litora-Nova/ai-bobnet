@@ -249,6 +249,31 @@ _home="${_resolve_out%%$'\n'*}"
 _home="${_home#home=}"
 _snapshot="${_resolve_out#*$'\n'}"
 
+# Bind the caller-supplied agent label to the kernel-authenticated AF_UNIX peer.
+# systemd's Accept=yes instance leaves the accepted connection on fd 0, so
+# SO_PEERCRED remains available after the frame has been read. Root is the
+# supervisor path; current human operators retain their launch authority. A role
+# uid is accepted only when it uniquely owns this target's prepared state dir.
+_peer_denied=0
+_peer_result="$(python3 -I "$REPO_ROOT/lib/aib_broker_security.py" peer-agent "${AIB_REQ_AGENT_UID:-}" 2>/dev/null)"
+_peer_rc=$?
+if [ "$_peer_rc" -ne 0 ]; then
+  _peer_result=$'authorization=deny\nreason=peer_credentials_unavailable\ncaller=unknown:peer\npeer_uid=-1'
+fi
+_peer_authorization="$(_aib_record_field "$_peer_result" authorization)" || _peer_authorization=deny
+_peer_reason="$(_aib_record_field "$_peer_result" reason)" || _peer_reason=peer_credentials_unavailable
+_peer_caller="$(_aib_record_field "$_peer_result" caller)" || _peer_caller=unknown:peer
+_peer_uid="$(_aib_record_field "$_peer_result" peer_uid)" || _peer_uid=-1
+_target_role_uid="$(_aib_record_field "$_peer_result" target_uid)" || _target_role_uid=-1
+_target_role_gid="$(_aib_record_field "$_peer_result" target_gid)" || _target_role_gid=-1
+if [ "$_peer_authorization" != allow ]; then
+  _peer_denied=1
+fi
+if [ "$_peer_denied" -eq 0 ] && [ -n "${AIB_SUP_STATE_ROOT+x}" ]; then
+  AIB_ROLE_UID="$_target_role_uid"
+  AIB_ROLE_GID="$_target_role_gid"
+fi
+
 # --- cwd containment: the registry-derived root, never the caller's choice ----------
 # The Landlock positive list (slice 3) is derived from the registry, never the
 # request (SPEC-wire-format). cwd only selects where inside that fixed area the child
@@ -260,27 +285,41 @@ _snapshot="${_resolve_out#*$'\n'}"
 # A cwd that simply does not exist is a distinct, nameable outcome from one that
 # exists but sits outside the root — collapsing them into one reason would hide which
 # problem the caller actually has.
-if ! aib_contain_cwd "$_home" "${AIB_REQ_CWD:-}"; then
-  case "${AIB_CONTAIN_CWD_REASON:-}" in
-    not_found) aib_wire_write_response denied "reason=cwd_not_found" ;;
-    *)         aib_wire_write_response denied "reason=cwd_outside_root" ;;
-  esac
-  exit 3
+if [ "$_peer_denied" -eq 1 ]; then
+  # Use the ordinary durable deny path below. The fixed reason token remains
+  # machine-readable; caller/uid are kernel-derived audit context, never request data.
+  AIB_VERDICT_DECISION=deny
+  AIB_VERDICT_CODE=3
+  AIB_VERDICT_REASONS="$_peer_reason caller=$_peer_caller peer_uid=$_peer_uid"
+  AIB_VERDICT_EFFECTIVE_CLEARANCE=""
+  AIB_VERDICT_EFFECTIVE_SANDBOX=""
+  AIB_VERDICT_EFFECTIVE_EFFORT=""
+  AIB_VERDICT_EFFECTIVE_TIMEOUT=""
+  AIB_VERDICT_ADAPTER_PATH=""
+  _verdict_allow=0
+else
+  if ! aib_contain_cwd "$_home" "${AIB_REQ_CWD:-}"; then
+    case "${AIB_CONTAIN_CWD_REASON:-}" in
+      not_found) aib_wire_write_response denied "reason=cwd_not_found" ;;
+      *)         aib_wire_write_response denied "reason=cwd_outside_root" ;;
+    esac
+    exit 3
+  fi
+
+  # Build the request record exactly like the PEP does (bin/launch-agent), via the
+  # shared helper: same field order and shape, one definition. cwd goes in RESOLVED —
+  # containment already ran, and the PDP itself does not decide cwd (§3: "partly").
+  #
+  # An absent sandbox defaults to "read-only", mirroring bin/launch-agent's own
+  # `sandbox="read-only"` default (SPEC-wire-format does not fix this; the PDP has no
+  # "absent means use the cap" fallback for sandbox the way it does for timeout, and an
+  # unrecognised value is a form deny — an absent one must not silently become that).
+  _request="$(aib_build_pdp_request_record "${AIB_REQ_AGENT_UID:-}" "${AIB_REQ_SANDBOX:-read-only}" \
+    "$AIB_CWD_RESOLVED" "${AIB_REQ_TIMEOUT:-}" "${AIB_REQ_LABEL:-}")"
+
+  _verdict_allow=1
+  aib_authorize_launch "$_request" "$_snapshot" || _verdict_allow=0
 fi
-
-# Build the request record exactly like the PEP does (bin/launch-agent), via the
-# shared helper: same field order and shape, one definition. cwd goes in RESOLVED —
-# containment already ran, and the PDP itself does not decide cwd (§3: "partly").
-#
-# An absent sandbox defaults to "read-only", mirroring bin/launch-agent's own
-# `sandbox="read-only"` default (SPEC-wire-format does not fix this; the PDP has no
-# "absent means use the cap" fallback for sandbox the way it does for timeout, and an
-# unrecognised value is a form deny — an absent one must not silently become that).
-_request="$(aib_build_pdp_request_record "${AIB_REQ_AGENT_UID:-}" "${AIB_REQ_SANDBOX:-read-only}" \
-  "$AIB_CWD_RESOLVED" "${AIB_REQ_TIMEOUT:-}" "${AIB_REQ_LABEL:-}")"
-
-_verdict_allow=1
-aib_authorize_launch "$_request" "$_snapshot" || _verdict_allow=0
 
 # --- re-resolve OUTSIDE a subshell -------------------------------------------
 # _aib_broker_resolve_snapshot above ran inside `$( )` (so its exit status could
@@ -367,11 +406,16 @@ if [ "$_verdict_allow" -ne 1 ]; then
   # codex-run.md §4 item 1 / SPEC-wire-format "Deny": decided-only, no
   # enactment, no chunk section — closes the RM-1 hole where a deny left no
   # trace at all.
-  aib_wire_write_response denied \
-    "decision=$AIB_VERDICT_DECISION" \
-    "code=$AIB_VERDICT_CODE" \
-    "reasons=$AIB_VERDICT_REASONS" \
+  _deny_fields=(
+    "decision=$AIB_VERDICT_DECISION"
+    "code=$AIB_VERDICT_CODE"
+    "reasons=$AIB_VERDICT_REASONS"
     "decided_event_id=$_decided_event_id"
+  )
+  if [ "$_peer_denied" -eq 1 ]; then
+    _deny_fields+=("stage=peer" "reason=unauthorized")
+  fi
+  aib_wire_write_response denied "${_deny_fields[@]}"
   exit 3
 fi
 

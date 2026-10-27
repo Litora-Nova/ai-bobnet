@@ -482,10 +482,11 @@ components. All guarantees in §7 and §8 therefore assume a cooperating agent t
 monitor: the policy-gate assumption applies to integrity as well as invocation. Integrity precedes
 non-bypassability. Separating those accounts is RM-3's precondition, not optional hardening.
 
-Separating those accounts does not by itself make the recorded actor trustworthy. Where a deployment
-runs every agent under one shared agent account, the `agent_uid` in these records is an assertion the
-launcher accepts rather than a fact it verifies, so the stream must not be read as proof of identity
-*between* agents. `CONTRACT-mediation.md` §4 states that limit and its remedy.
+DP makes the broker-side recorded agent identity trustworthy across durable agents: each uses a
+distinct role uid, and `SO_PEERCRED` must match the target's uniquely owned state directory before the
+broker commits a launch decision. Direct in-process launches that bypass the broker do not gain that
+peer attestation; callers must not generalize the broker guarantee to those legacy records.
+`CONTRACT-mediation.md` §4 defines the boundary.
 
 ### 8.7 Operational — redact before publication
 
