@@ -145,6 +145,8 @@ class Supervisor:
         self.brake_tripped_at: str | None = None
         self.message_failures: dict[str, int] = {}
         self.session_loss_counts: dict[str, int] = {}
+        self.persistence_failure_streak = 0
+        self.persistence_episode: str | None = None
         self.off_duty = False
         self.consumed: set[int] = set()
 
@@ -517,12 +519,26 @@ class Supervisor:
                 self.brake_consecutive = 0
                 self.brake_tripped_at = None
                 self.message_failures.clear()
+                self.session_loss_counts.clear()
+                self.persistence_failure_streak = 0
+                self.persistence_episode = None
             elif event == "session.rotated" and record.get("reason") == "fresh":
                 self.session_id = None
                 self.session_cwd = None
                 self.turns_in_session = 0
                 self.session_new = False
             elif event == "session.persistence_failed":
+                streak = record.get("streak")
+                self.persistence_failure_streak = (
+                    streak
+                    if isinstance(streak, int) and not isinstance(streak, bool) and streak > 0
+                    else self.persistence_failure_streak + 1
+                )
+                episode = record.get("episode")
+                if isinstance(episode, str) and episode:
+                    self.persistence_episode = episode
+                elif self.persistence_episode is None:
+                    self.persistence_episode = str(record.get("ts", "legacy"))
                 msg_id = record.get("msg_id")
                 if isinstance(msg_id, str):
                     self.message_failures.pop(msg_id, None)
@@ -532,6 +548,9 @@ class Supervisor:
                     self.session_cwd = None
                     self.turns_in_session = 0
                     self.session_new = False
+            elif event == "session.persistence_restored":
+                self.persistence_failure_streak = 0
+                self.persistence_episode = None
             elif event == "ctl.consumed" and isinstance(record.get("req"), int):
                 self.consumed.add(record["req"])
         if self.brake_consecutive >= self.brake_burst and self.brake_tripped_at is None:
@@ -540,12 +559,19 @@ class Supervisor:
 
     def write_alarm(self, kind: str, **details: Any) -> None:
         tripped_at = self.brake_tripped_at if kind == "brake_tripped" else None
-        episode = self.infra_episode if kind == "infra_blocked" else None
+        episode = (
+            self.infra_episode
+            if kind == "infra_blocked"
+            else self.persistence_episode
+            if kind == "session_persistence_failed"
+            else None
+        )
         if any(
             record.get("event") == "alarm.sent"
             and record.get("kind") == kind
             and (kind != "brake_tripped" or record.get("tripped_at") == tripped_at)
             and (kind != "infra_blocked" or record.get("episode") == episode)
+            and (kind != "session_persistence_failed" or record.get("episode") == episode)
             for record in self.records
         ):
             return
@@ -603,11 +629,20 @@ class Supervisor:
         return False
 
     def clear_brake(self) -> None:
-        if self.brake_consecutive or self.brake_tripped_at:
+        if (
+            self.brake_consecutive
+            or self.brake_tripped_at
+            or self.message_failures
+            or self.session_loss_counts
+            or self.persistence_failure_streak
+        ):
             self.journal("brake.reset", previous=self.brake_consecutive)
         self.brake_consecutive = 0
         self.brake_tripped_at = None
         self.message_failures.clear()
+        self.session_loss_counts.clear()
+        self.persistence_failure_streak = 0
+        self.persistence_episode = None
         self.retry_at = time.monotonic()
 
     def cancel_turn(self) -> None:
@@ -867,6 +902,19 @@ class Supervisor:
         self.journal("session.rotated", reason=reason, prev_sid=previous)
         self.bind_session()
 
+    def begin_session_loss_handover(self, queued: dict[str, Any]) -> None:
+        previous = self.session_id
+        self.journal("session.rotated", reason="unknown_sid", prev_sid=previous)
+        self.bind_session()
+        self.work = {
+            "id": f"handover-session-loss-{uuid.uuid4().hex[:8]}",
+            "from": self.uid,
+            "body": "Re-establish context after the provider lost the previous session before retrying the control routine.",
+            "retry": False,
+            "synthetic": True,
+            "resume_after_handover": queued,
+        }
+
     def check_cwd_binding(self) -> None:
         if self.session_id and self.session_cwd != self.project_home:
             previous = self.session_id
@@ -920,7 +968,10 @@ class Supervisor:
             attempt_id=unfinished.get("attempt_id", unfinished.get("attempt")),
             **{"class": "orphan_gone", "rc": 0, "brake": self.brake_consecutive},
         )
-        self.set_state("READY")
+        self.set_state(
+            "READY",
+            "session_persistence_unavailable" if self.persistence_failure_streak else "",
+        )
         return True
 
     def start_turn(self, work: dict[str, Any]) -> None:
@@ -931,7 +982,11 @@ class Supervisor:
         attempt_id = str(uuid.uuid4())
         started_at = utc_now()
         self.current_turn = {"msg_id": work["id"], "started_at": started_at, "attempt_id": attempt_id}
-        self.set_state("WORKING", "infra" if self.infra_since is not None else "")
+        if self.persistence_failure_streak:
+            state_reason = "session_persistence_unavailable"
+        else:
+            state_reason = "infra" if self.infra_since is not None else ""
+        self.set_state("WORKING", state_reason)
         if self.last_heartbeat != "blocked":
             self.heartbeat("busy", f"supervised turn {work['id']}")
         self.journal("turn.started", msg_id=work["id"], sid=self.session_id, attempt_id=attempt_id)
@@ -1068,6 +1123,9 @@ class Supervisor:
                 self.infra_since = None
                 self.infra_episode = None
                 self.infra_login_hint = False
+                self.persistence_failure_streak += 1
+                if self.persistence_episode is None:
+                    self.persistence_episode = attempt_id
                 self.brake_consecutive += 1
                 if self.brake_consecutive >= self.brake_burst:
                     self.brake_tripped_at = utc_now()
@@ -1081,16 +1139,24 @@ class Supervisor:
                     reason=reason,
                     brake=self.brake_consecutive,
                     tripped_at=self.brake_tripped_at,
+                    streak=self.persistence_failure_streak,
+                    episode=self.persistence_episode,
                 )
                 self.session_loss_counts.pop(work["id"], None)
                 self.session_id = None
                 self.session_cwd = None
                 self.turns_in_session = 0
                 self.session_new = False
-                if not work.get("synthetic"):
+                if work.get("control"):
+                    self.done_control(work["control"], reason)
+                elif not work.get("synthetic"):
                     self.message_command("fail", work["id"], reason)
                 self.work = None
                 now = time.monotonic()
+                self.write_alarm(
+                    "session_persistence_failed",
+                    consecutive=self.persistence_failure_streak,
+                )
                 if self.brake_tripped_at is not None:
                     self.set_state("FAILED", "brake")
                     self.heartbeat("blocked", "supervisor provider-failure brake tripped")
@@ -1098,12 +1164,15 @@ class Supervisor:
                     self.retry_at = float("inf")
                 else:
                     delay = min(self.backoff_cap, self.backoff_base * (2 ** (self.brake_consecutive - 1)))
-                    self.set_state("WAITING", "infra")
+                    self.set_state("WAITING", reason)
                     self.retry_at = now + delay
                 return
             self.end_turn(work, attempt_id, "session_lost", rc)
-            self.rotate_with_note("unknown_sid")
-            self.work = None
+            if work.get("control"):
+                self.begin_session_loss_handover(work)
+            else:
+                self.rotate_with_note("unknown_sid")
+                self.work = None
             self.retry_at = time.monotonic()
             return
 
@@ -1118,13 +1187,28 @@ class Supervisor:
 
         now = time.monotonic()
         if result_class == "ok":
-            self.brake_consecutive = 0
-            self.brake_tripped_at = None
+            successful_resume = not session_arg.startswith("new:")
+            restored_streak = 0
+            if self.persistence_failure_streak and successful_resume:
+                restored_streak = self.persistence_failure_streak
+                self.brake_consecutive = 0
+                self.brake_tripped_at = None
+                self.persistence_failure_streak = 0
+                self.persistence_episode = None
+            elif not self.persistence_failure_streak:
+                self.brake_consecutive = 0
+                self.brake_tripped_at = None
             self.infra_since = None
             self.infra_episode = None
             self.infra_login_hint = False
             self.turns_in_session += 1
             self.end_turn(work, attempt_id, result_class, rc)
+            if restored_streak:
+                self.journal(
+                    "session.persistence_restored",
+                    sid=self.session_id,
+                    previous=restored_streak,
+                )
             control_action = work.get("control_action")
             if control_action == "feierabend":
                 self.off_duty = True
@@ -1137,8 +1221,19 @@ class Supervisor:
             if control_action == "standup":
                 self.off_duty = False
                 self.work = None
-                self.set_state("READY")
+                self.set_state(
+                    "READY",
+                    "session_persistence_unavailable" if self.persistence_failure_streak else "",
+                )
                 self.done_control(work["control"], "ready")
+                self.retry_at = now
+                return
+            if work.get("resume_after_handover"):
+                self.work = work["resume_after_handover"]
+                self.set_state(
+                    "READY",
+                    "session_persistence_unavailable" if self.persistence_failure_streak else "",
+                )
                 self.retry_at = now
                 return
             if work.get("rotate_after") == "max_turns":
@@ -1150,7 +1245,10 @@ class Supervisor:
                 if not work.get("synthetic"):
                     self.message_command("done", work["id"])
                 self.work = None
-                self.set_state("READY")
+                self.set_state(
+                    "READY",
+                    "session_persistence_unavailable" if self.persistence_failure_streak else "",
+                )
                 self.heartbeat("idle", "supervisor ready")
             self.retry_at = now
             return
@@ -1241,8 +1339,16 @@ class Supervisor:
             self.set_state("WAITING", "off_duty")
             self.heartbeat("done", "supervisor off duty")
         else:
-            self.set_state("READY")
+            self.set_state(
+                "READY",
+                "session_persistence_unavailable" if self.persistence_failure_streak else "",
+            )
             self.heartbeat("idle", "supervisor ready")
+        if self.persistence_failure_streak:
+            self.write_alarm(
+                "session_persistence_failed",
+                consecutive=self.persistence_failure_streak,
+            )
         self.write_live()
         self.next_tick = time.monotonic() + self.tick_s
         self.notify("READY=1")
