@@ -89,6 +89,9 @@ entire scalar value. Cross-level bindings are intentional; one scalar is never c
 levels. Only absence falls through. A present empty, non-string, undecodable, or syntactically invalid
 value fails closed at that level rather than revealing a lower default.
 
+The supervisor uses this same `agent -> direct team -> project` provider result when it selects
+`providers.<name>.cap_timeout`; it does not skip the direct team and fall straight from agent to project.
+
 The example above resolves exactly:
 
 ```text

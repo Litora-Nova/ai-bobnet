@@ -21,7 +21,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aib_control import append_record, identity_for, registry_path, requested_record
-from aib_deployment import deployment_allows
+from aib_deployment import deployment_allows, load_deployment
+from aib_login import login_max_turn_seconds
 
 
 class JournalCorruptError(ValueError):
@@ -302,18 +303,38 @@ class Supervisor:
         try:
             project_uid = agent["project"]
             project = registry["projects"][project_uid]
-            provider_uid = agent.get("provider", project.get("provider"))
+            team_uid = agent["team_uid"]
+            team = registry["teams"][team_uid]
+            if "provider" in agent:
+                provider_uid = agent["provider"]
+            elif "provider" in team:
+                provider_uid = team["provider"]
+            else:
+                provider_uid = project["provider"]
             provider = registry["providers"][provider_uid]
             self.project_home = project["home"]
             self.standup = Path(project["standup_dir"])
             self.project_uid = project_uid
             self.provider_uid = provider_uid
-            self.team_uid = agent["team_uid"]
+            self.team_uid = team_uid
             self.data_class = project.get("data_class", "customer")
             self.protected = agent.get("protected", "")
             if not all(isinstance(v, str) and v for v in (project_uid, self.project_home, str(self.standup), provider_uid)):
                 raise ValueError
             self.cap_timeout = positive_int(provider.get("cap_timeout"), 900)
+            deployment_path = Path(os.environ.get("AIB_DEPLOYMENT_CONFIG", "/etc/aib/deployment.json"))
+            deployment = load_deployment(deployment_path, self.root)
+            account = (
+                deployment.get("accounts", {}).get(provider_uid, {}) if deployment is not None else {}
+            )
+            credential_mode = account.get("credential_mode", "file") if isinstance(account, dict) else "file"
+            credential_source = (
+                account.get("credential_source", "login") if isinstance(account, dict) else "login"
+            )
+            if credential_mode == "shared" or (
+                credential_mode == "fd" and credential_source == "login"
+            ):
+                self.cap_timeout = min(self.cap_timeout, login_max_turn_seconds())
             self.session_max_turns = positive_int(agent.get("session_max_turns"), 200)
             self.brake_burst = positive_int(agent.get("restart_burst"), 5)
             positive_int(agent.get("restart_interval_s"), 900)

@@ -21,6 +21,10 @@ PROVIDERS = {
     "codex": "auth.json",
 }
 
+DEFAULT_ACCESS_LIFETIME_S = 3600
+DEFAULT_LOGIN_MARGIN_S = 300
+DEFAULT_LOGIN_SLACK_S = 600
+
 
 def engine_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -59,6 +63,28 @@ def integer(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value >= 0 else default
+
+
+def login_margin_seconds() -> int:
+    return integer("AIB_LOGIN_MARGIN_S", DEFAULT_LOGIN_MARGIN_S)
+
+
+def login_slack_seconds() -> int:
+    return integer("AIB_LOGIN_SLACK_S", DEFAULT_LOGIN_SLACK_S)
+
+
+def refresh_cadence_seconds() -> int:
+    return max(1, integer("AIB_LOGIN_ACCESS_LIFETIME_S", DEFAULT_ACCESS_LIFETIME_S) // 2 - 1)
+
+
+def login_max_turn_seconds() -> int:
+    """Longest turn that fits between worst-case refresh polls and token margins."""
+    lifetime = integer("AIB_LOGIN_ACCESS_LIFETIME_S", DEFAULT_ACCESS_LIFETIME_S)
+    derived = max(
+        1,
+        lifetime - refresh_cadence_seconds() - login_margin_seconds() - login_slack_seconds() - 1,
+    )
+    return integer("AIB_LOGIN_MAX_TURN_S", derived)
 
 
 def now() -> int:
