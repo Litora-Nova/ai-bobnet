@@ -114,7 +114,9 @@ For provider exits `65` and `78`, the existing `_aib_enact_map_status` (`lib/aib
 ### Per-role `CODEX_HOME`, shared subscription credential
 
 Each role process now receives its own role-owned private home under `/var/lib/aib-sup/<agent>/` (prepared
-0700 before the named search ACL produces the effective 0710 mode), so Codex history,
+0700 before the broker's named search ACL produces the effective 0710 mode). The broker cannot list or
+write the home; a separate default read-only ACL lets it read newly created supervisor state files such
+as `live.json` and `journal.jsonl`. Codex history,
 sqlite state, caches, helpers and `config.toml` are isolated per role. `--ephemeral` remains fixed to
 reduce session persistence. The exception is subscription authentication: provisioning creates
 `$HOME/.codex/auth.json` as a pinned symlink to `/var/lib/aib/login/codex/auth.json`, a regular

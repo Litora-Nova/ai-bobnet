@@ -147,12 +147,14 @@ def main(argv: list[str]) -> int:
         ["-m", f"g:{group}:--x", str(state)],
         ["-m", f"g:{broker_group}:--x", str(state)],
         ["-d", "-m", f"g:{group}:r-x", str(state)],
+        ["-d", "-m", f"g:{broker_group}:r--", str(state)],
         ["-m", f"g:{group}:--x", str(transcripts)],
         ["-d", "-m", f"g:{group}:r-x", str(transcripts)],
     ]
     live = state / "live.json"
     if live.exists() and not live.is_symlink():
         calls.append(["-m", f"g:{group}:r--", str(live)])
+        calls.append(["-m", f"g:{broker_group}:r--", str(live)])
     try:
         for args in calls:
             if subprocess.run([setfacl, *args], check=False).returncode != 0:
