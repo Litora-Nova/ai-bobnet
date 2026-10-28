@@ -241,7 +241,7 @@ has "terminal heartbeat records success" "$(<"$HBLOG")" "| done | codex-run OK â
 # every other inherited variable is gone. Nothing scrubbed-by-denylist can survive.
 fullenv="$(<"$FULLENV_OUT")"
 has "child env passes through allow-listed HOME"        "$fullenv" "HOME=$AIB_TEST_HOME"
-has "child env passes through allow-listed PATH"         "$fullenv" "PATH=$STUB_BIN:"
+has "child env prepends the engine CLI path before the allow-listed PATH" "$fullenv" "PATH=$SRC_ROOT/bin:$STUB_BIN:"
 has "child env keeps the explicit managed export"        "$fullenv" "AIBOBNET_AGENT_UID=acme-core"
 hasnt "child env drops non-allow-listed inherited vars"  "$fullenv" "LEAKME_SENTINEL"
 hasnt "child env never inherits ambient provenance"      "$fullenv" "ambient-provider"

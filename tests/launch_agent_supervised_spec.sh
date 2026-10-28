@@ -111,6 +111,22 @@ resp "non-UTF-8 line" 69 '\377\376\nend=ok\nexit_class=ok\n'
 reset; printf 'chunk_bytes=11\n\nhello world\nchunk_bytes=0\n\nexit_class=ok\nend=ok\n' > "$WORK/response.bin"
 run "${base[@]}" --supervised --session "$UU"
 eq "chunks are relayed to stdout verbatim" "$RC|$OUT" "0|hello world"
+# Internal supervisor hand-off: the mapper copies only a strict broker attempt
+# token from the terminal frame into the root-created metadata file.
+reset; printf 'chunk_bytes=0\n\nexit_class=ok\nattempt_id=acme-main-17\nended_event_id=acme-main-18\nend=ok\n' > "$WORK/response.bin"
+META="$WORK/attempt.meta"; : > "$META"; chmod 600 "$META"
+RC=0; env -i PATH="$PATH" HOME="$WORK" AIB_BROKER_CLIENT="$WORK/client" AIB_ATTEMPT_META_PATH="$META" \
+  "$LA" "${base[@]}" --supervised --session "$UU" >/dev/null 2>"$WORK/stderr" || RC=$?
+eq "terminal attempt id is handed to the supervisor metadata path" "$RC|$(cat "$META")" "0|acme-main-17"
+reset; printf 'chunk_bytes=0\n\nexit_class=ok\nattempt_id=../forged\nend=ok\n' > "$WORK/response.bin"
+: > "$META"; RC=0; env -i PATH="$PATH" HOME="$WORK" AIB_BROKER_CLIENT="$WORK/client" AIB_ATTEMPT_META_PATH="$META" \
+  "$LA" "${base[@]}" --supervised --session "$UU" >/dev/null 2>&1 || RC=$?
+eq "invalid terminal attempt identity fails closed and is not persisted" "$RC|$(wc -c < "$META" | tr -d ' ')" "69|0"
+reset; printf 'chunk_bytes=0\n\nexit_class=ok\nattempt_id=acme-main-19\nend=ok\n' > "$WORK/response.bin"
+printf 'keep\n' > "$WORK/meta-target"; chmod 600 "$WORK/meta-target"; rm -f "$META"; ln "$WORK/meta-target" "$META"
+RC=0; env -i PATH="$PATH" HOME="$WORK" AIB_BROKER_CLIENT="$WORK/client" AIB_ATTEMPT_META_PATH="$META" \
+  "$LA" "${base[@]}" --supervised --session "$UU" >/dev/null 2>&1 || RC=$?
+eq "a hardlinked metadata handoff is refused before truncation" "$RC|$(cat "$WORK/meta-target")" "69|keep"
 rc=0; python3 -I "$MAP" >/dev/null 2>&1 || rc=$?
 eq "mapper with no argument => 69" "$rc" 69
 rc=0; python3 -I "$MAP" "$WORK/does-not-exist" >/dev/null 2>&1 || rc=$?

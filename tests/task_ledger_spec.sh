@@ -421,8 +421,20 @@ print(open(sys.argv[1], "rb").read().count("Prüfung".encode("utf-8")))
 PY
 )
 eq 'valid non-ASCII titles round-trip and are stored as raw UTF-8 bytes' "$(json_field title "$OUT")|$(json_field deadline_at "$OUT")|$raw_utf8_count" 'Prüfung|2026-10-28T00:00:00Z|1'
+eq 'show on a ledger without invalid records prints no warning' "$RC|$ERR" '0|'
+unicode_table_independent=$(python3 - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'lib'))
+import task_ledger
+if hasattr(task_ledger, "unicodedata"):
+    task_ledger.unicodedata.category = lambda _char: "Cc"
+print(task_ledger.safe_display_text("Prüfung") and not task_ledger.safe_display_text("bad\u2066text"))
+PY
+)
+eq 'the display filter does not consult interpreter Unicode categories' "$unicode_table_independent" True
 deadline_before=$(wc -l < "$EVENTS"); deadline_refused=1
-for invalid_deadline in '2026-1-2T3:4:5Z' '٢٠٢٦-10-28T00:00:00Z'; do
+for invalid_deadline in '2026-1-2T3:4:5Z' '٢٠٢٦-10-28T00:00:00Z' '2026-02-30T00:00:00Z' '2026-10-28T24:00:00Z'; do
   write create human operator invalid-deadline --run-id r-200000000001 --intent-n 1 --source-msg-id msg-invalid-deadline --assignee acme-dev1 --title Deadline --body-ref msg:invalid-deadline --body-file "$BODY" --deadline-at "$invalid_deadline"
   [ "$RC" -eq 64 ] || deadline_refused=0
 done
@@ -775,6 +787,10 @@ python3 -I "$FX" inject "$EVENTS" task.cancelled human operator acme acme-engine
 python3 -I "$FX" inject "$EVENTS" task.cancelled human operator acme acme-engine r-400000000002 "$POISON_TASK2" forged-int-reason '{"caller":"root:root","via":"ctl:41","requester":"human:operator","reason":5}'
 run list --project acme --all
 eq 'fold rejects overlong and non-string reasons' "$(state "$POISON_TASK2")|$(json_field invalid "$OUT")|$(json_field invalid_events "$OUT" | grep -o invalid_reason | wc -l)" 'ASSIGNED|2|2'
+eq 'list reports invalid records in JSON only, without a stderr warning' "$ERR" ''
+python3 -I "$FX" inject "$EVENTS" task.created human operator acme acme-engine r-400000000002 t-eeeeeeeeeeee forged-null-deadline '{"caller":"root:root","via":"ctl:42","requester":"human:operator","parent":"r-400000000002","depth":1,"source_msg_id":"msg-null-deadline","owner":"human:operator","assignee":"acme-dev1","title":"Null deadline","body_ref":"msg:null-deadline","deadline_at":null,"budget":{"max_turns":8,"max_attempts":3},"gate":"none","context_refs":[]}'
+run list --project acme --all
+eq 'fold rejects a stored null deadline' "$(json_field invalid "$OUT")|$(json_field invalid_events "$OUT" | grep -o invalid_deadline_at | wc -l)" '3|1'
 
 # Directory/file modes are a provisioning responsibility; the commit primitive
 # merely requires them to exist.
