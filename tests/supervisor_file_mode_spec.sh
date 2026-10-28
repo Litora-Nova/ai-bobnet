@@ -2,6 +2,7 @@
 # ai-bobnet — supervisor state files stay readable under a restrictive service umask.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supmode.XXXXXX")"
 trap sup_cleanup EXIT
 

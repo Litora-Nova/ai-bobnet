@@ -23,6 +23,7 @@
 #   deployment config, `lead` lane, role accounts.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-suploop.XXXXXX")"
 trap sup_cleanup EXIT
 

@@ -19,6 +19,7 @@
 #   Expected on the unbuilt tree: bin/aib-supervisor does not exist -> every assertion fails.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-suporph.XXXXXX")"
 trap sup_cleanup EXIT
 SID="3f2b8c1e-9d4a-4e6b-8a7c-1b2d3e4f5a6b"

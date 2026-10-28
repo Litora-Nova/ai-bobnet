@@ -243,7 +243,9 @@ fullenv="$(<"$FULLENV_OUT")"
 has "child env passes through allow-listed HOME"        "$fullenv" "HOME=$AIB_TEST_HOME"
 has "child env prepends only the dedicated worker CLI path" "$fullenv" "PATH=$SRC_ROOT/bin/child:$STUB_BIN:"
 eq "the dedicated worker CLI directory contains exactly task-intent" "$(find "$SRC_ROOT/bin/child" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')" "task-intent "
-has "the broker-minted terminal attempt id reaches the child" "$fullenv" "AIB_ATTEMPT_ID="
+child_attempt=$(printf '%s\n' "$fullenv" | sed -n 's/^AIB_ATTEMPT_ID=//p')
+binding_attempt=$(AIBOBNET_REGISTRY="$REG" AIB_ATTEMPTS_BINDINGS=1 "$SRC_ROOT/bin/attempts" acme-core 2>/dev/null | python3 -c 'import json,sys; print(json.loads(next(line for line in sys.stdin if line.strip()))["attempt_id"])')
+eq "the child receives the terminal broker attempt id value" "$child_attempt" "$binding_attempt"
 has "child env keeps the explicit managed export"        "$fullenv" "AIBOBNET_AGENT_UID=acme-core"
 hasnt "child env drops non-allow-listed inherited vars"  "$fullenv" "LEAKME_SENTINEL"
 hasnt "child env never inherits ambient provenance"      "$fullenv" "ambient-provider"

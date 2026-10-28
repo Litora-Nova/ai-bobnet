@@ -24,6 +24,7 @@
 #   Expected on the unbuilt tree: bin/aib-supervisor does not exist -> every assertion fails.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supsess.XXXXXX")"
 trap sup_cleanup EXIT
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -169,6 +170,7 @@ fail_resumes
 m_send m-1 "first persistence failure"; wait_for 10 state_is m-1 FAILED
 wait_for 10 obn_is session_persistence_failed 1
 eq "T4e: the first persistence failure raises one operator alarm" "$(obn session_persistence_failed)" 1
+wait_for 10 lj_is state_reason session_persistence_unavailable
 eq "T4e: live state exposes the persistence failure" "$(lj state_reason)" session_persistence_unavailable
 m_send m-2 "opens the next session"; wait_for 10 state_is m-2 PROCESSED
 m_send m-3 "second persistence failure"; wait_for 10 state_is m-3 FAILED

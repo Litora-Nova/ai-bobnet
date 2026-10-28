@@ -74,7 +74,7 @@ eq "payload accessor maps JSON null to empty" \
 aib_event_stream_paths "$STANDUP"
 EVENTS="$AIB_EVENT_FILE"
 LOCK="$AIB_EVENT_LOCK"
-ENVELOPE=$'project_uid=acme\nactor_type=service\nactor_id=launch-agent\nagent_uid=acme-core'
+ENVELOPE=$'project_uid=acme\nactor_type=service\nactor_id=launch-agent\nagent_uid=acme-core\nsession_id=acme'
 LAST_ID=""
 
 reset_stream() {
@@ -150,6 +150,17 @@ has "provider failure carries its exit code" "$RUN_OUT" "attempt_id:$provider_id
 has "live allow without ended remains open" "$RUN_OUT" "attempt_id:$open_id | state:open | decision:allow"
 has "missing PID is classified presumed-dead" "$RUN_OUT" "attempt_id:$dead_id | state:presumed-dead | decision:allow"
 eq "reader never mutates the event stream" "$after_cksum" "$before_cksum"
+
+BINDINGS=$(AIBOBNET_REGISTRY="$REG" AIB_ATTEMPTS_BINDINGS=1 "$ATTEMPTS" acme-core 2>"$WORK/bindings.err")
+printf '%s\n' "$BINDINGS" > "$WORK/bindings.jsonl"
+binding_shape=$(python3 -I - "$WORK/bindings.jsonl" "$ok_id" "$open_id" <<'PY'
+import json,sys
+path,ok_id,open_id=sys.argv[1:]
+rows={row["attempt_id"]:row for row in map(json.loads, open(path, encoding="utf-8"))}
+print(f"{rows[ok_id]['session_id']}|{rows[ok_id]['running']}|{rows[open_id]['running']}")
+PY
+)
+eq "real attempts bindings expose mux session and terminal running state" "$binding_shape" 'acme|False|True'
 
 # Critical corrupt gate: scanner may have emitted the first record, but the reader
 # must inspect status before consuming it and therefore print no partial verdict.

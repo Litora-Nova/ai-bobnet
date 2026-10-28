@@ -17,6 +17,7 @@
 #   repairing, and no lock file exists.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supjrn.XXXXXX")"
 trap sup_cleanup EXIT
 ts="2026-01-01T00:00:00Z"

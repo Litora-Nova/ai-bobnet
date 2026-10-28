@@ -73,6 +73,8 @@ check("task branch SHA is accepted", sup.validate_result_ref(valid, task), True)
 check("wrong branch is rejected", sup.validate_result_ref(f"git:aib/acme-engine/t-111111111111@{sha}", task), False)
 old_sha=subprocess.check_output(["git","-C",str(repo),"rev-parse","aib/acme-engine/t-111111111111"], text=True).strip()
 check("a reachable SHA on another task branch is rejected by branch binding", sup.validate_result_ref(f"git:aib/acme-engine/t-222222222222@{old_sha}", task), False)
+subprocess.run(["git", "-C", str(repo), "branch", "-f", "aib/acme-engine/t-111111111111", sha], check=True)
+check("a wrong branch string is rejected even when that branch contains the SHA", sup.validate_result_ref(f"git:aib/acme-engine/t-111111111111@{sha}", task), False)
 
 subprocess.run(["git","-C",str(repo),"checkout","-q","-b","foreign","main"], check=True)
 (repo/"foreign.txt").write_text("foreign\n", encoding="utf-8")
@@ -129,10 +131,11 @@ git_argv=[]
 for node in __import__("ast").walk(tree):
     if isinstance(node, (__import__("ast").List, __import__("ast").Tuple)):
         for item in node.elts:
-            if isinstance(item, __import__("ast").Constant) and item.value == "git":
+            if isinstance(item, __import__("ast").Constant) and isinstance(item.value, str) and __import__("os").path.basename(item.value) == "git":
                 owner=next((parent for parent in __import__("ast").walk(tree) if isinstance(parent, (__import__("ast").FunctionDef, __import__("ast").AsyncFunctionDef)) and node in list(__import__("ast").walk(parent))), None)
                 git_argv.append(owner.name if owner else "<module>")
-check("literal git argv is confined to _git_as_role", set(git_argv), {"_git_as_role"})
+check("every constant git argv, including an absolute path, is confined to _git_as_role", set(git_argv), {"_git_as_role"})
+check("git operations have an independent 120 second timeout budget", getattr(sup, "git_timeout", None), 120.0)
 check(
     "root project-home metadata access uses a verified directory-fd chain",
     "def _open_project_home" in source

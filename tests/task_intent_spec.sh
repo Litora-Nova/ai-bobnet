@@ -47,6 +47,8 @@ bad=[
     {"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"safe","reason":[]},
     {"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"bad\0text"},
     {"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"safe","actor_id":"acme-core"},
+    {"attempt_id":"acme-main-foreign","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"safe"},
+    {"attempt_id":"acme-main-17","verb":"report","task_id":"t-bbbbbbbbbbbb","state":"done","summary":"safe"},
 ]
 ok=True
 try:
@@ -97,6 +99,21 @@ eq 'aib-agent-dirs creates role-owned private .aib/intents' "$RC|$(stat -c '%a:%
 eq 'aib-agent-dirs creates only the root-owned quarantine beside .aib' \
   "$([ -d "$STATE_ROOT/acme-dev1/.aib-quarantine" ] && stat -c '%a:%u' "$STATE_ROOT/acme-dev1/.aib-quarantine")|$([ -e "$STATE_ROOT/acme-dev1/.aib/intents/done" ] || [ -e "$STATE_ROOT/acme-dev1/.aib/intents/tainted" ] && echo legacy || echo clean)" \
   "700:$(id -u)|clean"
+
+mkdir "$STATE_ROOT/acme-dev1/.aib/intents/done" "$STATE_ROOT/acme-dev1/.aib/intents/tainted"
+RC=0; env AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_STANDUP_DIR="$STANDUP" \
+  AIB_ROLE_UID="$(id -u)" AIB_ROLE_GID="$(id -g)" AIB_SETFACL=/bin/true \
+  "$ROOT/bin/aib-agent-dirs" acme-dev1 >"$WORK/legacy-empty.out" 2>&1 || RC=$?
+eq 'aib-agent-dirs removes empty legacy intent directories' \
+  "$RC|$({ if [ -e "$STATE_ROOT/acme-dev1/.aib/intents/done" ] || [ -e "$STATE_ROOT/acme-dev1/.aib/intents/tainted" ]; then echo present; else echo removed; fi; })" \
+  '0|removed'
+
+mkdir "$STATE_ROOT/acme-dev1/.aib/intents/done"; printf 'evidence\n' > "$STATE_ROOT/acme-dev1/.aib/intents/done/item"
+RC=0; env AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_STANDUP_DIR="$STANDUP" \
+  AIB_ROLE_UID="$(id -u)" AIB_ROLE_GID="$(id -g)" AIB_SETFACL=/bin/true \
+  "$ROOT/bin/aib-agent-dirs" acme-dev1 >"$WORK/legacy-nonempty.out" 2>&1 || RC=$?
+eq 'aib-agent-dirs refuses non-empty legacy intent directories' "$RC" 78
+has 'legacy refusal names the operator action' "$(<"$WORK/legacy-nonempty.out")" 'legacy intent directory is not empty'
 
 SWAP_ROOT="$WORK/swapped-state"; SWAP_STANDUP="$WORK/swapped-standup"; SWAP_TARGET="$WORK/swap-target"
 mkdir -p "$SWAP_ROOT/acme-dev1/.aib" "$SWAP_STANDUP" "$SWAP_TARGET"

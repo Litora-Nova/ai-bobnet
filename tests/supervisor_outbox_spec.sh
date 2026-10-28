@@ -23,9 +23,14 @@ trap sup_cleanup EXIT
 OB() { cat "$OUTBOX/acme-engine/outbox.md" 2>/dev/null; }
 obn() { OB | grep -c "alarm:$1"; }
 ob_has() { [ "$(obn "$1")" -ge "$2" ]; }
+provision_intents() {
+  mkdir -p "$W/state/acme-core/.aib/intents"
+  chmod 700 "$W/state/acme-core" "$W/state/acme-core/.aib" "$W/state/acme-core/.aib/intents"
+}
 
 # --- T1 healthy run: silent -------------------------------------------------------------------------------
 ctl_world quiet
+provision_intents
 plan "0||fine"; m_send m-1 x; start_sup acme-core "${CTLENV[@]}"
 wait_for 10 state_is m-1 PROCESSED
 sleep 0.5
@@ -34,6 +39,7 @@ stop_sup
 
 # --- T2 brake_tripped: one line, right format, not repeated by a restart ------------------------------------------
 ctl_world brake
+provision_intents
 default "1||E:boom"; m_send m-1 a; m_send m-2 b; m_send m-3 c; start_sup acme-core "${CTLENV[@]}"
 wait_for 15 lj_is brake.consecutive 5
 wait_for 10 ob_has brake_tripped 1
@@ -53,6 +59,7 @@ stop_sup
 
 # --- T3 infra_blocked: no brake, one alarm, heals ----------------------------------------------------------------------
 ctl_world infra
+provision_intents
 default "78||E:credential missing"; m_send m-1 x
 start_sup acme-core "${CTLENV[@]}" AIB_SUP_BLOCKED_AFTER_S=0.6
 wait_for 15 ob_has infra_blocked 1
@@ -67,6 +74,7 @@ stop_sup
 
 # --- T4 an unusable outbox does not stop the supervisor ------------------------------------------------------------------------
 ctl_world broken
+provision_intents
 printf 'a file where the team directory should be' > "$OUTBOX/acme-engine"
 default "1||E:boom"; m_send m-1 a; m_send m-2 b; m_send m-3 c; start_sup acme-core "${CTLENV[@]}"
 wait_for 15 lj_is brake.consecutive 5
@@ -77,6 +85,7 @@ stop_sup
 
 # --- T5 the alarm is per EPISODE: reset-brake, then a second trip alarms again ---------------------------------------------------
 ctl_world episode; as human:operator
+provision_intents
 default "1||E:boom"; for i in 1 2 3 4 5 6; do m_send m-$i x; done; start_sup acme-core "${CTLENV[@]}"
 wait_for 15 ob_has brake_tripped 1
 eq "T5: first trip, one alarm" "$(obn brake_tripped)" 1
@@ -90,6 +99,7 @@ stop_sup
 
 # --- T6 a failed outbox write leaves a trace ------------------------------------------------------------------------------------
 ctl_world trace
+provision_intents
 printf 'a file where the team directory should be' > "$OUTBOX/acme-engine"
 default "1||E:boom"; m_send m-1 a; m_send m-2 b; m_send m-3 c; start_sup acme-core "${CTLENV[@]}"
 wait_for 15 lj_is brake.consecutive 5

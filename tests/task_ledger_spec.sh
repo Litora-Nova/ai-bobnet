@@ -429,9 +429,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'lib'))
 import task_ledger
-if hasattr(task_ledger, "unicodedata"):
-    task_ledger.unicodedata.category = lambda _char: "Cc"
-print(task_ledger.safe_display_text("Prüfung") and not task_ledger.safe_display_text("bad\u2066text"))
+print(not hasattr(task_ledger, "unicodedata") and task_ledger.safe_display_text("Prüfung") and not task_ledger.safe_display_text("bad\u2066text"))
 PY
 )
 eq 'the display filter does not consult interpreter Unicode categories' "$unicode_table_independent" True

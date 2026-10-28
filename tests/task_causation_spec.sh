@@ -39,5 +39,12 @@ eq 'a rejected causation replay returns the same rc and reason without a second 
 task report "${service[@]}" --causation-id start-task-a1 --state failed --reason turn_failed
 eq 'reusing a causation for another event type is rejected without append' "$RC|$ERR|$(wc -l < "$TASK_ROOT/acme/tasks.events")" "77|ai-bobnet: task request rejected: causation_conflict|$rejected_lines"
 
+task reject "${service[@]}" --causation-id explicit-reject-a1 --requested-type task.reported --reason invalid_result_ref
+explicit_rc=$RC; explicit_err=$ERR; explicit_lines=$(wc -l < "$TASK_ROOT/acme/tasks.events")
+task reject "${service[@]}" --causation-id explicit-reject-a1 --requested-type task.reported --reason invalid_result_ref
+eq 'an explicit service rejection replay returns its original reason without append' \
+  "$explicit_rc|$RC|$ERR|$(wc -l < "$TASK_ROOT/acme/tasks.events")" \
+  "77|77|$explicit_err|$explicit_lines"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
