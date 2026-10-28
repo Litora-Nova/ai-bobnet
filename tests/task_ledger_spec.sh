@@ -97,6 +97,16 @@ eq 'task id is the documented token form' "$(expr "$T1" : 't-[0-9a-f]\{12\}$')" 
 eq 'sidecar is stable content with safe mode' "$(cat "$TASK_ROOT/acme/bodies/$T1.md")|$(stat -c %a "$TASK_ROOT/acme/bodies/$T1.md")" "$(cat "$BODY")|640"
 eq 'payload records root caller, intent relay, and claimed actor' "$(field task.created 0 payload.caller)|$(field task.created 0 payload.via)|$(field task.created 0 actor_id)" 'root:root|intent:attempt-11|acme-lead'
 
+created_before=$(count task.created)
+run create --project acme --team acme-engine --actor-type agent --actor-id acme-lead --causation-id relay-agent --run-id r-000000000001 --intent-n 2 --source-msg-id msg-relay-agent --assignee acme-dev2 --title Relay --body-ref msg:relay-agent --body-file "$BODY"
+eq 'an agent claim without an intent relay is refused without creating a task' "$RC|$(field task.rejected -1 payload.reason)|$(count task.created)" "77|caller_actor_mismatch|$created_before"
+run cancel --project acme --team acme-engine --actor-type human --actor-id operator --requester human:operator --causation-id relay-human --run-id r-000000000001 --task-id "$T1" --reason forged
+eq 'a human claim without a control relay is refused without changing task state' "$RC|$(field task.rejected -1 payload.reason)|$(state "$T1")" '77|caller_actor_mismatch|ASSIGNED'
+run start --project acme --team acme-engine --actor-type service --actor-id supervisor:acme-dev1 --via ctl:3 --causation-id relay-service --run-id r-000000000001 --task-id "$T1"
+eq 'a service claim carrying relay fields is refused without changing task state' "$RC|$(field task.rejected -1 payload.reason)|$(state "$T1")" '77|caller_actor_mismatch|ASSIGNED'
+run cancel --project acme --team acme-engine --actor-type human --actor-id gateway:gw --via ctl:4 --requester gateway:other --causation-id relay-gateway --run-id r-000000000001 --task-id "$T1" --reason forged
+eq 'a gateway claim with a foreign requester is refused without changing task state' "$RC|$(field task.rejected -1 payload.reason)|$(state "$T1")" '77|caller_actor_mismatch|ASSIGNED'
+
 write create agent acme-lead attempt-11 --run-id r-000000000001 --intent-n 1 --source-msg-id msg-source-1 --assignee acme-dev1 --title 'Parser' --body-ref msg:delivery-1 --body-file "$BODY"
 eq 'same attempt and intent derives the same id and dedupes source+assignee visibly' "$RC|${OUT#task_id=}|$(field task.rejected -1 payload.reason)" "77|$T1|duplicate"
 
@@ -332,12 +342,24 @@ write create agent acme-lead dedupe-after-terminal --run-id r-200000000001 --int
 eq 'source dedupe expires after the matching task is terminal' "$RC" 0
 
 # Boundary files are opened no-follow/nonblocking, required to be regular, and
-# bounded to one byte beyond the public cap. Display text and file refs reject
-# Unicode separators, bidi controls, and path traversal before any commit.
+# bounded to one byte beyond the public cap. Keep adversarial values in their own
+# ledger so a vulnerable build cannot pollute later transition scenarios.
+BOUNDARY_ROOT="$WORK/boundary/tasks"; mkdir -p "$BOUNDARY_ROOT/acme/bodies"; : > "$BOUNDARY_ROOT/acme/tasks.events"; : > "$BOUNDARY_ROOT/acme/tasks.events.lock"
+chmod 2750 "$BOUNDARY_ROOT/acme" "$BOUNDARY_ROOT/acme/bodies"; chmod 640 "$BOUNDARY_ROOT/acme/tasks.events" "$BOUNDARY_ROOT/acme/tasks.events.lock"
+export AIB_TASK_ROOT="$BOUNDARY_ROOT"; EVENTS="$BOUNDARY_ROOT/acme/tasks.events"
+python3 - "$REG" <<'PY'
+import json,sys
+p=sys.argv[1]; r=json.load(open(p)); r['teams']['acme-engine']['delegation']['max_open']='100'
+with open(p,'w') as f: json.dump(r,f,separators=(',',':'))
+PY
+write run-create human operator boundary-run --run-id r-200000000001
 BODY_LINK="$WORK/body-link"; ln -s "$BODY" "$BODY_LINK"
 before=$(count task.created)
 run_timeout create --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:2 --requester human:operator --causation-id body-link --run-id r-200000000001 --intent-n 1 --source-msg-id msg-body-link --assignee acme-dev1 --title Body --body-ref msg:body-link --body-file "$BODY_LINK"
 eq 'body-file symlinks are refused before commit' "$RC|$(count task.created)" "64|$before"
+mkdir "$WORK/body-real-dir"; cp "$BODY" "$WORK/body-real-dir/body.md"; ln -s "$WORK/body-real-dir" "$WORK/body-mid-link"
+run_timeout create --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:22 --requester human:operator --causation-id body-mid-link --run-id r-200000000001 --intent-n 1 --source-msg-id msg-body-mid-link --assignee acme-dev1 --title Body --body-ref msg:body-mid-link --body-file "$WORK/body-mid-link/body.md"
+eq 'body-file intermediate symlinks are refused before commit' "$RC|$(count task.created)" "64|$before"
 mkfifo "$WORK/body-fifo"
 run_timeout create --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:3 --requester human:operator --causation-id body-fifo --run-id r-200000000001 --intent-n 1 --source-msg-id msg-body-fifo --assignee acme-dev1 --title Body --body-ref msg:body-fifo --body-file "$WORK/body-fifo"
 eq 'body-file FIFOs are refused without blocking' "$RC" 64
@@ -351,8 +373,46 @@ write create human operator unicode-title --run-id r-200000000001 --intent-n 1 -
 eq 'Unicode line separators are rejected in titles' "$RC" 64
 write create human operator bidi-title --run-id r-200000000001 --intent-n 1 --source-msg-id msg-bidi --assignee acme-dev1 --title $'bad\u2066title' --body-ref msg:bidi --body-file "$BODY"
 eq 'bidi controls are rejected in titles' "$RC" 64
+display_case=0; display_refused=1
+for unsafe_title in $'bad\ttitle' $'bad\x7ftitle' $'bad\u009btitle' $'bad\u200btitle' $'bad\u200ftitle' $'bad\u202etitle' $'bad\u2060title' $'bad\u2064title' $'bad\u2069title' $'bad\ufefftitle' $'bad\U000e0000title' $'bad\U000e007ftitle'; do
+  display_case=$((display_case+1))
+  write create human operator "display-$display_case" --run-id r-200000000001 --intent-n 1 --source-msg-id "msg-display-$display_case" --assignee acme-dev1 --title "$unsafe_title" --body-ref "msg:display-$display_case" --body-file "$BODY"
+  [ "$RC" -eq 64 ] || display_refused=0
+done
+eq 'C0, DEL, C1, format/zero-width, and tag characters are rejected in titles' "$display_refused" 1
+display_range_check=$(python3 - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'lib'))
+from task_ledger import safe_display_text
+points = [*range(0x00, 0x20), *range(0x7f, 0xa0), *range(0x200b, 0x2010), *range(0x2028, 0x202f), *range(0x2060, 0x2065), *range(0x2066, 0x206a), 0xfeff, *range(0xe0000, 0xe0080)]
+print(all(not safe_display_text(chr(point)) for point in points))
+PY
+)
+eq 'the display filter rejects every required control/format/tag code point' "$display_range_check" True
 write create human operator unsafe-ref --run-id r-200000000001 --intent-n 1 --source-msg-id msg-ref --assignee acme-dev1 --title Ref --body-ref msg:ref --body-file "$BODY" --context-ref file:../../outside
 eq 'file context refs cannot traverse above their root' "$RC" 64
+ref_case=0; refs_refused=1
+for unsafe_ref in 'git:--upload-pack=x' 'git:refs/heads/a..b' 'git:refs/heads/.hidden' 'git:refs/heads/x.lock' 'git:@{bad' 'file:-option' $'file:a\x1bb' $'file:a\u202eb' "file:$(printf '%0256d' 0)"; do
+  ref_case=$((ref_case+1))
+  write create human operator "unsafe-ref-$ref_case" --run-id r-200000000001 --intent-n 1 --source-msg-id "msg-unsafe-ref-$ref_case" --assignee acme-dev1 --title Ref --body-ref "msg:unsafe-ref-$ref_case" --body-file "$BODY" --context-ref "$unsafe_ref"
+  [ "$RC" -eq 64 ] || refs_refused=0
+done
+eq 'refs reject option-like, control, non-ASCII, overlong, and invalid git forms' "$refs_refused" 1
+long_msg_ref="msg:$(printf '%0256d' 0)"
+write create human operator long-body-ref --run-id r-200000000001 --intent-n 1 --source-msg-id msg-long-body-ref --assignee acme-dev1 --title Ref --body-ref "$long_msg_ref" --body-file "$BODY"
+eq 'body_ref uses the same sane reference length bound' "$RC" 64
+run run-create --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:23 --requester human:operator --causation-id unsafe-ticket --run-id r-200000000010 --ticket-ref 'git:--upload-pack=x'
+eq 'ticket_ref uses the common reference validator' "$RC" 64
+run run-close --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:24 --requester human:operator --causation-id unsafe-summary --run-id r-200000000001 --outcome completed --summary-ref $'file:a\x1bb'
+eq 'summary_ref uses the common reference validator' "$RC" 64
+
+export AIB_TASK_ROOT="$AUDIT_ROOT"; EVENTS="$AUDIT_ROOT/acme/tasks.events"
+python3 - "$REG" <<'PY'
+import json,sys
+p=sys.argv[1]; r=json.load(open(p)); r['teams']['acme-engine']['delegation']['max_open']='20'
+with open(p,'w') as f: json.dump(r,f,separators=(',',':'))
+PY
 
 # Only progress consumes the current-attempt turn budget. Final agent reports and
 # the engine turn-budget report remain available; reassignment resets current
@@ -375,6 +435,19 @@ eq 'reassignment resets turns and increments total attempts' "$(json_field turns
 write start service supervisor:acme-dev2 budget-start-2 --run-id r-200000000002 --task-id "$BT"
 write report agent acme-dev2 budget-done --run-id r-200000000002 --task-id "$BT" --state done --result-ref msg:budget-done
 eq 'final agent report remains allowed after a prior exhausted attempt' "$RC|$(state "$BT")" '0|DONE'
+
+# Optimistic tokens bind state_seq, not last_seq: a progress event between read
+# and write is harmless, while a token from before start remains stale.
+write run-create human operator ctl-state-seq-run --run-id r-200000000009
+write create human operator state-seq-create --run-id r-200000000009 --intent-n 1 --source-msg-id msg-state-seq --assignee acme-dev1 --title Token --body-ref msg:state-seq --body-file "$BODY"; ST=${OUT#task_id=}
+run show --project acme "$ST"; created_state_seq=$(json_field state_seq "$OUT")
+write start service supervisor:acme-dev1 state-seq-start --run-id r-200000000009 --task-id "$ST"
+run show --project acme "$ST"; started_state_seq=$(json_field state_seq "$OUT")
+write report agent acme-dev1 state-seq-progress --run-id r-200000000009 --task-id "$ST" --state progress --reason working
+write cancel agent acme-lead state-seq-stale --run-id r-200000000009 --task-id "$ST" --expect-seq "$created_state_seq" --reason stale
+eq 'a token from before a state transition remains stale after progress' "$RC|$(field task.rejected -1 payload.reason)|$(state "$ST")" '76|concurrent_update|IN_PROGRESS'
+write cancel agent acme-lead state-seq-current --run-id r-200000000009 --task-id "$ST" --expect-seq "$started_state_seq" --reason current
+eq 'progress between read and write does not invalidate a state_seq token' "$RC|$(state "$ST")" '0|CANCELLED'
 
 # Reassign/reopen allocations count against the per-run total, not only initial
 # task creation.
@@ -404,11 +477,14 @@ PY
 write run-create human operator ctl-close-run --run-id r-200000000003
 write create human operator close-create-1 --run-id r-200000000003 --intent-n 1 --source-msg-id msg-close-1 --assignee acme-dev1 --title Close --body-ref msg:close-1 --body-file "$BODY"; C1=${OUT#task_id=}
 write create human operator close-create-2 --run-id r-200000000003 --intent-n 2 --source-msg-id msg-close-2 --assignee acme-dev2 --title Close --body-ref msg:close-2 --body-file "$BODY"; C2=${OUT#task_id=}
+write run-close agent acme-dev1 close-worker --run-id r-200000000003 --outcome cancelled
+eq 'a worker cannot close a run or cascade its tasks' "$RC|$(field task.rejected -1 payload.reason)|$(state "$C1")|$(state "$C2")|$(state r-200000000003)" '77|not_lead|ASSIGNED|ASSIGNED|RUNNING'
 write run-close agent acme-lead close-completed-open --run-id r-200000000003 --outcome completed --summary-ref msg:summary
 eq 'completed run closure refuses open tasks' "$RC|$(field task.rejected -1 payload.reason)" '77|open_tasks'
 cancel_before=$(count task.cancelled)
+close_lines_before=$(wc -l < "$EVENTS")
 write run-close human operator close-cancelled --run-id r-200000000003 --outcome cancelled --summary-ref msg:summary
-eq 'cancelled run closure cascades every open task before closing' "$RC|$(state "$C1")|$(state "$C2")|$(( $(count task.cancelled) - cancel_before ))|$(field task.cancelled -1 payload.reason)|$(state r-200000000003)" '0|CANCELLED|CANCELLED|2|run_closed|CANCELLED'
+eq 'one run.closed atomically derives cancellation of every open task' "$RC|$(state "$C1")|$(state "$C2")|$(( $(count task.cancelled) - cancel_before ))|$(( $(wc -l < "$EVENTS") - close_lines_before ))|$(state r-200000000003)" '0|CANCELLED|CANCELLED|0|1|CANCELLED'
 write run-close human operator close-again --run-id r-200000000003 --outcome cancelled
 eq 'a terminal run cannot be closed twice' "$RC|$(field task.rejected -1 payload.reason)" '77|run_closed'
 
@@ -479,6 +555,10 @@ write cancel human operator bad-reason-1 --run-id r-200000000006 --task-id "$AV"
 eq 'Unicode next-line is rejected in reasons' "$RC" 64
 write cancel human operator bad-reason-2 --run-id r-200000000006 --task-id "$AV" --reason $'bad\u202ereason'
 eq 'bidi controls are rejected in reasons' "$RC" 64
+write cancel human operator bad-reason-3 --run-id r-200000000006 --task-id "$AV" --reason $'bad\x1breason'
+eq 'C0 controls are rejected in reasons' "$RC" 64
+write cancel human operator bad-reason-4 --run-id r-200000000006 --task-id "$AV" --reason $'bad\U000e0001reason'
+eq 'tag characters are rejected in reasons' "$RC" 64
 write report agent acme-dev1 bad-result-ref --run-id r-200000000006 --task-id "$AV" --state done --result-ref file:../../outside
 eq 'file result refs cannot traverse above their root' "$RC" 64
 
@@ -522,10 +602,14 @@ write create human operator bodies-symlink --run-id r-200000000001 --intent-n 1 
 eq 'runtime bodies directory symlinks are visibly refused' "$RC|$(field task.rejected -1 payload.reason)|$(find "$WORK/body-target-dir" -mindepth 1 -print -quit)" '77|unsafe_body_sidecar|'
 rm "$AUDIT_ROOT/acme/bodies"; mv "$AUDIT_ROOT/acme/bodies-real" "$AUDIT_ROOT/acme/bodies"
 HARD_CAUSE=hard-sidecar; HARD_ID="t-$(printf '%s' "$HARD_CAUSE:1" | sha256sum | cut -c1-12)"
-printf '%s' "$(cat "$BODY")" > "$WORK/hard-source"; chmod 640 "$WORK/hard-source"
+cp "$BODY" "$WORK/hard-source"; chmod 640 "$WORK/hard-source"
 ln "$WORK/hard-source" "$AUDIT_ROOT/acme/bodies/$HARD_ID.md"
 write create human operator "$HARD_CAUSE" --run-id r-200000000001 --intent-n 1 --source-msg-id msg-hard --assignee acme-dev1 --title Hard --body-ref msg:hard --body-file "$BODY"
 eq 'hardlinked existing sidecars are visibly refused' "$RC|$(field task.rejected -1 payload.reason)|$(stat -c %h "$WORK/hard-source")" '77|unsafe_body_sidecar|2'
+MODE_CAUSE=mode-sidecar; MODE_ID="t-$(printf '%s' "$MODE_CAUSE:1" | sha256sum | cut -c1-12)"
+cp "$BODY" "$AUDIT_ROOT/acme/bodies/$MODE_ID.md"; chmod 644 "$AUDIT_ROOT/acme/bodies/$MODE_ID.md"
+write create human operator "$MODE_CAUSE" --run-id r-200000000001 --intent-n 1 --source-msg-id msg-mode --assignee acme-dev1 --title Mode --body-ref msg:mode --body-file "$BODY"
+eq 'existing sidecars with a permissive mode are visibly refused' "$RC|$(field task.rejected -1 payload.reason)|$(stat -c %a "$AUDIT_ROOT/acme/bodies/$MODE_ID.md")" '77|unsafe_body_sidecar|644'
 OWNER_ID=t-ffffffffffff; cp "$BODY" "$AUDIT_ROOT/acme/bodies/$OWNER_ID.md"; chmod 640 "$AUDIT_ROOT/acme/bodies/$OWNER_ID.md"
 owner_check=$(python3 - "$ROOT" "$AUDIT_ROOT/acme/bodies" "$OWNER_ID" "$BODY" <<'PY'
 import os, stat, sys
@@ -545,6 +629,25 @@ print(task_ledger._write_body(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]).
 PY
 )
 eq 'existing sidecars with a non-writer owner are refused' "$owner_check" False
+GID_ID=t-eeeeeeeeeeee; cp "$BODY" "$AUDIT_ROOT/acme/bodies/$GID_ID.md"; chmod 640 "$AUDIT_ROOT/acme/bodies/$GID_ID.md"
+gid_check=$(python3 - "$ROOT" "$AUDIT_ROOT/acme/bodies" "$GID_ID" "$BODY" <<'PY'
+import os, stat, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'lib'))
+import task_ledger
+real_fstat = os.fstat
+sidecar = Path(sys.argv[2], f'{sys.argv[3]}.md').stat()
+def wrong_gid(fd):
+    info = real_fstat(fd)
+    if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == (sidecar.st_dev, sidecar.st_ino):
+        values = list(info); values[5] = info.st_gid + 1
+        return os.stat_result(values)
+    return info
+task_ledger.os.fstat = wrong_gid
+print(task_ledger._write_body(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]).read_bytes()))
+PY
+)
+eq 'existing sidecars with a foreign group are refused' "$gid_check" False
 
 # Fold defence-in-depth independently rejects actor-class, team, caller, terminal,
 # and closed-run violations even if a forged framed record reaches the stream.
@@ -566,17 +669,23 @@ python3 -I "$FX" inject "$EVENTS" run.closed service supervisor:acme-lead acme a
 python3 -I "$FX" inject "$EVENTS" task.cancelled agent acme-lead acme acme-other r-300000000001 "$F1" forged-team '{"caller":"root:root","via":"intent:forged-team","reason":"forged"}'
 python3 -I "$FX" inject "$EVENTS" task.cancelled agent acme-lead acme acme-engine r-300000000001 "$F1" forged-role '{"caller":"role:acme-lead","via":"intent:forged-role","reason":"forged"}'
 python3 -I "$FX" inject "$EVENTS" task.cancelled human operator acme acme-engine r-300000000001 "$F2" forged-terminal '{"caller":"root:root","via":"ctl:1","requester":"human:operator","reason":"forged"}'
+python3 -I "$FX" inject "$EVENTS" run.closed human operator acme acme-engine r-300000000001 - forged-open-close '{"caller":"root:root","via":"ctl:2","requester":"human:operator","outcome":"completed","summary_ref":null}'
+python3 -I "$FX" inject "$EVENTS" task.rejected human operator acme acme-engine r-300000000001 - forged-rejection '{"caller":"role:acme-dev1","requested_type":"task.cancelled","reason":"forged"}'
+python3 -I "$FX" inject "$EVENTS" task.created human operator acme acme-engine r-300000000001 t-bbbbbbbbbbbb forged-title '{"caller":"root:root","via":"ctl:3","requester":"human:operator","parent":"r-300000000001","depth":1,"source_msg_id":"msg-forged-title","owner":"human:operator","assignee":"acme-dev1","title":"bad\u001btitle","body_ref":"msg:forged-title","deadline_at":"2026-10-28T00:00:00Z","budget":{"max_turns":8,"max_attempts":3},"gate":"none","context_refs":[]}'
 run list --project acme --all
-eq 'fold rejects all forged actor/team/caller/terminal records exactly' "$(json_field invalid "$OUT")|$(state "$F1")|$(state "$F2")" '7|BLOCKED|DONE'
-for fold_reason in invalid_cancel_actor invalid_reassignment_actor invalid_run_close_actor cross_team caller_actor_mismatch invalid_cancel; do
+eq 'fold rejects all forged actor/team/caller/terminal/display records exactly' "$(json_field invalid "$OUT")|$(state "$F1")|$(state "$F2")" '10|BLOCKED|DONE'
+for fold_reason in invalid_cancel_actor invalid_reassignment_actor invalid_run_close_actor cross_team caller_actor_mismatch invalid_cancel open_tasks invalid_rejection invalid_title; do
   has "fold reports $fold_reason" "$(json_field invalid_events "$OUT")" "\"reason\":\"$fold_reason\""
 done
 
 write run-close human operator fold-close --run-id r-300000000001 --outcome cancelled
 python3 -I "$FX" inject "$EVENTS" task.started service supervisor:acme-dev1 acme acme-engine r-300000000001 "$F1" forged-after-close '{"caller":"root:root"}'
+python3 -I "$FX" inject "$EVENTS" task.created human operator acme acme-engine r-300000000001 t-cccccccccccc forged-created-after-close '{"caller":"root:root","via":"ctl:4","requester":"human:operator","parent":"r-300000000001","depth":1,"source_msg_id":"msg-after-close","owner":"human:operator","assignee":"acme-dev1","title":"Late","body_ref":"msg:late","deadline_at":"2026-10-28T00:00:00Z","budget":{"max_turns":8,"max_attempts":3},"gate":"none","context_refs":[]}'
+python3 -I "$FX" inject "$EVENTS" run.closed human operator acme acme-engine r-300000000001 - forged-second-close '{"caller":"root:root","via":"ctl:5","requester":"human:operator","outcome":"cancelled","summary_ref":null}'
 run list --project acme --all
-eq 'fold counts the injected post-close event as invalid' "$(json_field invalid "$OUT")" 8
+eq 'fold counts every injected post-close event as invalid' "$(json_field invalid "$OUT")" 13
 has 'fold labels the injected post-close event run_closed' "$(json_field invalid_events "$OUT")" '"reason":"run_closed"'
+has 'fold labels a second close invalid_run_close' "$(json_field invalid_events "$OUT")" '"reason":"invalid_run_close"'
 
 # Directory/file modes are a provisioning responsibility; the commit primitive
 # merely requires them to exist.
@@ -608,6 +717,36 @@ print(f'{directory_ok}|{file_ok}|{calls}')
 PY
 )
 eq 'directory and file provisioning apply the requested group by fd' "$group_call_check" 'True|True|[4242, 4242]'
+owner_takeover_check=$(python3 - "$ROOT/bin/aib-task-dirs" "$WORK/provision-owner" <<'PY'
+import importlib.machinery, importlib.util, os, stat, sys
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader('task_dirs_owner_test', sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec); loader.exec_module(module)
+base = Path(sys.argv[2]); base.mkdir(); root = base / 'root'; root.mkdir(); child = root / 'child'; child.mkdir(); stream = root / 'stream'; stream.write_text('sentinel')
+targets = {(p.stat().st_dev, p.stat().st_ino) for p in (root, child, stream)}
+real_fstat = os.fstat; calls = []
+def wrong_owner(fd):
+    info = real_fstat(fd)
+    if (info.st_dev, info.st_ino) in targets:
+        values = list(info); values[4] = info.st_uid + 1
+        return os.stat_result(values)
+    return info
+module.os.fstat = wrong_owner
+module.os.fchown = lambda fd, uid, gid: calls.append((uid, gid))
+root_result = module.root_dir(root, 0o755, os.getgid())
+if root_result >= 0: os.close(root_result)
+parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    dir_result = module.real_dir(parent_fd, 'child', 0o2750, os.getgid())
+    if dir_result >= 0: os.close(dir_result)
+    file_result = module.real_file(parent_fd, 'stream', os.getgid())
+finally:
+    os.close(parent_fd)
+print(f'{root_result}|{dir_result}|{file_result}|{calls}')
+PY
+)
+eq 're-provisioning refuses to take over existing foreign-owned dirs and files' "$owner_takeover_check" '-1|-1|False|[]'
 rm -rf "$PROV/acme/bodies"; printf sentinel > "$WORK/prov-target"; ln -s "$WORK/prov-target" "$PROV/acme/bodies"
 RC=0; AIB_TASK_ROOT="$PROV" AIB_TASK_GROUP="$TASK_TEST_GROUP" "$ROOT/bin/aib-task-dirs" acme || RC=$?
 eq 'task provisioning refuses a planted directory symlink' "$RC|$(cat "$WORK/prov-target")" '78|sentinel'
@@ -619,11 +758,18 @@ RC=0; (cd "$EMPTY_CWD" && AIB_TASK_ROOT=relative AIB_TASK_GROUP="$TASK_TEST_GROU
 eq 'task provisioning refuses a relative task root' "$RC|$(find "$EMPTY_CWD" -mindepth 1 -print -quit)" '78|'
 RC=0; AIB_TASK_ROOT="$WORK/prov-invalid" AIB_TASK_GROUP="$TASK_TEST_GROUP" "$ROOT/bin/aib-task-dirs" ../x || RC=$?
 eq 'task provisioning refuses path traversal project ids' "$RC" 64
+mkdir "$WORK/prov-elsewhere"; ln -s "$WORK/prov-elsewhere" "$WORK/prov-link"
+RC=0; AIB_TASK_ROOT="$WORK/prov-link/tasks" AIB_TASK_GROUP="$TASK_TEST_GROUP" "$ROOT/bin/aib-task-dirs" acme || RC=$?
+eq 'task provisioning refuses an intermediate symlink in the task root walk' "$RC|$(find "$WORK/prov-elsewhere" -mindepth 1 -print -quit)" '78|'
 
 PROV_FILES="$WORK/provisioned-files"
 AIB_TASK_ROOT="$PROV_FILES" AIB_TASK_GROUP="$TASK_TEST_GROUP" "$ROOT/bin/aib-task-dirs" acme
 eq 'task provisioning leaves the shared root non-writable' "$(stat -c %a "$PROV_FILES")" 755
 printf sentinel > "$WORK/prov-file-target"; chmod 600 "$WORK/prov-file-target"
+rm "$PROV_FILES/acme/tasks.events"; ln "$WORK/prov-file-target" "$PROV_FILES/acme/tasks.events"
+RC=0; AIB_TASK_ROOT="$PROV_FILES" AIB_TASK_GROUP="$TASK_TEST_GROUP" "$ROOT/bin/aib-task-dirs" acme || RC=$?
+eq 'task provisioning refuses a hardlinked stream without changing its target' "$RC|$(stat -c %a "$WORK/prov-file-target")|$(cat "$WORK/prov-file-target")" '78|600|sentinel'
+rm "$PROV_FILES/acme/tasks.events"; : > "$PROV_FILES/acme/tasks.events"; chmod 640 "$PROV_FILES/acme/tasks.events"
 rm "$PROV_FILES/acme/tasks.events"; ln -s "$WORK/prov-file-target" "$PROV_FILES/acme/tasks.events"
 RC=0; AIB_TASK_ROOT="$PROV_FILES" AIB_TASK_GROUP="$TASK_TEST_GROUP" "$ROOT/bin/aib-task-dirs" acme || RC=$?
 eq 'task provisioning refuses a tasks.events symlink without changing its target' "$RC|$(stat -c %a "$WORK/prov-file-target")|$(cat "$WORK/prov-file-target")" '78|600|sentinel'

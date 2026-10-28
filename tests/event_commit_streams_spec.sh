@@ -159,10 +159,13 @@ eq 'refused main held-lock call appends nothing' "$(test -e "$MAIN_HELD" && wc -
 flock -u "$mainheldfd"; exec {mainheldfd}>&-
 
 WRONG_HELD="$WORK/wrong-held.events"; : > "$WORK/unrelated.lock"
+exec {rightfd}>>"$WRONG_HELD.lock"; flock -x "$rightfd"
 exec {wrongfd}>>"$WORK/unrelated.lock"; flock -x "$wrongfd"
 ( AIB_EVENT_HELD_LOCK_FD="$wrongfd" aib_event_commit "$WRONG_HELD" "$WRONG_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
 eq 'held-lock seam refuses a descriptor for another inode' "$?" 2
+eq 'wrong-inode inherited descriptor appends nothing' "$(test -e "$WRONG_HELD" && wc -l < "$WRONG_HELD" || printf 0)" 0
 flock -u "$wrongfd"; exec {wrongfd}>&-
+flock -u "$rightfd"; exec {rightfd}>&-
 
 UNHELD="$WORK/unheld-tasks.events"
 exec {unheldfd}>>"$UNHELD.lock"
@@ -170,6 +173,15 @@ exec {unheldfd}>>"$UNHELD.lock"
 eq 'held-lock seam refuses an unlocked matching descriptor' "$?" 2
 eq 'unlocked inherited descriptor appends nothing' "$(test -e "$UNHELD" && wc -l < "$UNHELD" || printf 0)" 0
 exec {unheldfd}>&-
+
+FOREIGN_HELD="$WORK/foreign-held-tasks.events"
+exec {foreignfd}>>"$FOREIGN_HELD.lock"; flock -x "$foreignfd"
+exec {foreign_unheldfd}>>"$FOREIGN_HELD.lock"
+( AIB_EVENT_HELD_LOCK_FD="$foreign_unheldfd" aib_event_commit "$FOREIGN_HELD" "$FOREIGN_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock seam refuses an unlocked descriptor while another OFD holds the lock' "$?" 2
+eq 'foreign-held unlocked descriptor appends nothing' "$(test -e "$FOREIGN_HELD" && wc -l < "$FOREIGN_HELD" || printf 0)" 0
+exec {foreign_unheldfd}>&-
+flock -u "$foreignfd"; exec {foreignfd}>&-
 
 for bad_fd in nope 99999; do
   BAD_HELD="$WORK/bad-held-$bad_fd.events"
