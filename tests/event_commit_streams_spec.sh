@@ -80,6 +80,12 @@ eq 'tasks correlation_id is its run_id' "$(aib_event_field "$task_json" correlat
 eq 'tasks record has no attempt identity' "$(aib_event_field "$task_json" attempt_id)" ''
 has 'tasks record encodes attempt_id as raw JSON null' "$(sed -n '1p' "$TASKS")" '"attempt_id":null'
 
+INVALID_UTF8_TASKS="$WORK/invalid-utf8-tasks.events"
+invalid_utf8_payload='{"reason":"bad-'$(printf '\377')'"}'
+( aib_event_commit "$INVALID_UTF8_TASKS" "$INVALID_UTF8_TASKS.lock" tasks task.created "$TASK_ENV" "$invalid_utf8_payload" ) >/dev/null 2>&1
+eq 'tasks commit rejects a non-UTF-8 payload with rc 64' "$?" 64
+eq 'a refused non-UTF-8 tasks payload appends nothing' "$(test -e "$INVALID_UTF8_TASKS" && wc -l < "$INVALID_UTF8_TASKS" || printf 0)" 0
+
 RUN_ENV="$(printf '%s\n' "$TASK_ENV" | sed '/^task_id=/d')"
 aib_event_commit "$WORK/run.events" "$WORK/run.events.lock" tasks run.requested "$RUN_ENV" '{}'
 run_json="$(sed -n '1s/^[0-9]* [0-9]* [0-9]* //p' "$WORK/run.events")"
@@ -138,6 +144,69 @@ exec {holdfd}>&-
 eq 'tasks lock timeout returns the transient rc 75' "$lock_rc" '75'
 if [ -e "$LOCKED" ]; then locked_lines="$(wc -l < "$LOCKED")"; else locked_lines=0; fi
 eq 'tasks lock timeout writes no event' "$locked_lines" '0'
+
+# The inherited-lock seam is internal to the task transaction writer. It accepts
+# only the tasks stream, the exact lock inode, and a descriptor whose exclusive
+# lock was already held before the commit primitive was entered.
+HELD="$WORK/held-tasks.events"
+exec {heldfd}>>"$HELD.lock"
+flock -x "$heldfd"
+AIB_EVENT_HELD_LOCK_FD="$heldfd" aib_event_commit "$HELD" "$HELD.lock" tasks task.created "$TASK_ENV" '{}'
+eq 'held-lock task commit succeeds' "$AIB_EVENT_COMMIT_SEQ" 1
+( flock -n "$HELD.lock" -c true ) >/dev/null 2>&1
+eq 'held-lock commit leaves the caller lock held' "$?" 1
+flock -u "$heldfd"; exec {heldfd}>&-
+
+MAIN_HELD="$WORK/main-held.events"
+exec {mainheldfd}>>"$MAIN_HELD.lock"; flock -x "$mainheldfd"
+( AIB_EVENT_HELD_LOCK_FD="$mainheldfd" aib_event_commit "$MAIN_HELD" "$MAIN_HELD.lock" main attempt.decided "$MAIN_ENV" "$DECIDED_PAYLOAD" ) >/dev/null 2>&1
+eq 'held-lock seam is refused for the main stream' "$?" 2
+eq 'refused main held-lock call appends nothing' "$(test -e "$MAIN_HELD" && wc -l < "$MAIN_HELD" || printf 0)" 0
+flock -u "$mainheldfd"; exec {mainheldfd}>&-
+
+WRONG_HELD="$WORK/wrong-held.events"; : > "$WORK/unrelated.lock"
+exec {rightfd}>>"$WRONG_HELD.lock"; flock -x "$rightfd"
+exec {wrongfd}>>"$WORK/unrelated.lock"; flock -x "$wrongfd"
+( AIB_EVENT_HELD_LOCK_FD="$wrongfd" aib_event_commit "$WRONG_HELD" "$WRONG_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock seam refuses a descriptor for another inode' "$?" 2
+eq 'wrong-inode inherited descriptor appends nothing' "$(test -e "$WRONG_HELD" && wc -l < "$WRONG_HELD" || printf 0)" 0
+flock -u "$wrongfd"; exec {wrongfd}>&-
+flock -u "$rightfd"; exec {rightfd}>&-
+
+UNHELD="$WORK/unheld-tasks.events"
+exec {unheldfd}>>"$UNHELD.lock"
+( AIB_EVENT_HELD_LOCK_FD="$unheldfd" aib_event_commit "$UNHELD" "$UNHELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock seam refuses an unlocked matching descriptor' "$?" 2
+eq 'unlocked inherited descriptor appends nothing' "$(test -e "$UNHELD" && wc -l < "$UNHELD" || printf 0)" 0
+exec {unheldfd}>&-
+SHARED_HELD="$WORK/shared-held-tasks.events"
+exec {sharedfd}>>"$SHARED_HELD.lock"; flock -s "$sharedfd"
+( AIB_EVENT_HELD_LOCK_FD="$sharedfd" aib_event_commit "$SHARED_HELD" "$SHARED_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock seam refuses a shared flock' "$?" 2
+eq 'shared-locked descriptor appends nothing' "$(test -e "$SHARED_HELD" && wc -l < "$SHARED_HELD" || printf 0)" 0
+flock -u "$sharedfd"; exec {sharedfd}>&-
+
+SHELL_PROBE="$WORK/shell-probe-tasks.events"
+exec {shellprobefd}>>"$SHELL_PROBE.lock"
+( SHELL=/bin/false AIB_EVENT_HELD_LOCK_FD="$shellprobefd" aib_event_commit "$SHELL_PROBE" "$SHELL_PROBE.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock proof does not accept an unlocked fd via a failing SHELL probe' "$?" 2
+eq 'the failing-SHELL lock probe appends nothing' "$(test -e "$SHELL_PROBE" && wc -l < "$SHELL_PROBE" || printf 0)" 0
+exec {shellprobefd}>&-
+
+FOREIGN_HELD="$WORK/foreign-held-tasks.events"
+exec {foreignfd}>>"$FOREIGN_HELD.lock"; flock -x "$foreignfd"
+exec {foreign_unheldfd}>>"$FOREIGN_HELD.lock"
+( AIB_EVENT_HELD_LOCK_FD="$foreign_unheldfd" aib_event_commit "$FOREIGN_HELD" "$FOREIGN_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock seam refuses an unlocked descriptor while another OFD holds the lock' "$?" 2
+eq 'foreign-held unlocked descriptor appends nothing' "$(test -e "$FOREIGN_HELD" && wc -l < "$FOREIGN_HELD" || printf 0)" 0
+exec {foreign_unheldfd}>&-
+flock -u "$foreignfd"; exec {foreignfd}>&-
+
+for bad_fd in nope 99999; do
+  BAD_HELD="$WORK/bad-held-$bad_fd.events"
+  ( AIB_EVENT_HELD_LOCK_FD="$bad_fd" aib_event_commit "$BAD_HELD" "$BAD_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+  eq "held-lock seam refuses descriptor '$bad_fd'" "$?" 2
+done
 
 total=$((pass+fail))
 printf '\n%d checks: %d ok / %d fail\n' "$total" "$pass" "$fail"

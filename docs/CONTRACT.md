@@ -27,7 +27,7 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 - The word `task` is reserved for the *Project → Run → Task → Attempt* work unit. It is **never** an
   identity token — not in an env var, not in output.
 
-### Registry versions (`schema_version: 2 | 3 | 4`)
+### Registry versions (`schema_version: 2 | 3 | 4 | 5`)
 
 ```json
 {
@@ -39,7 +39,7 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
 
 - The **object key IS the `agent_uid`**. `project`, `profile` and `clearance` are mandatory;
   `project` is authoritative and is never guessed from the prefix.
-- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2`, `3`, or `4`.
+- `schema_version` is a required compatibility gate: it MUST be the top-level JSON number `2`, `3`, `4`, or `5`.
   Missing, mistyped, nested-only, or unsupported versions fail closed before any identity resolves.
 - **Schema 2 is the legacy identity/context shape above.** Its existing commands remain supported, but it
   cannot start a managed provider because it has no authoritative execution binding.
@@ -53,6 +53,12 @@ Authority: `docs/DOMAIN.md` §2 (normative). Lookup is the authority; **parsing 
   schema 4 is the shipped default (`registry.json`); a schema-3 registry still resolves identity and
   binding but fails closed at the missing-adapter path. Normative in
   `docs/CONTRACT-execution-binding.md` §7.
+- **Schema 5 adds supervised-agent and delegation data.** Exactly one agent per delegated team
+  carries `lead: "true"`; agents carry `mode`, and a team may carry
+  `delegation: {max_open, max_new_per_turn, max_tasks_per_run, max_assignments_per_task, max_depth,
+  task_deadline_s, max_turns_per_task}`. The task writer consumes that object as one registry snapshot
+  under the tasks-stream lock. `teams.<team>.parent_team` is reserved for later sub-team leads and grants
+  currently grants no authority.
 - `display_name` is optional and free text (may contain spaces/unicode); it never routes.
 - Unknown extra fields are ignored (forward-compatible) and never load-bearing. Schema-3 binding and team
   fields are known and load-bearing, so they are validated when consumed.
@@ -200,6 +206,49 @@ or is launched must exist in `agents`** — `bin/run-agent`, `scripts/log.sh`, `
 Schema-3 acceptance additionally proves deterministic field-wise fallback/provenance, flat direct-team
 validation, a single snapshot across identity and binding, and schema-2 refusal before managed provider
 execution. It does not claim policy or T4 enforcement.
+
+## 7. Task ledger
+
+The reserved `tasks` stream is now written only by `bin/task`. Its closed committed event list is:
+
+```
+run.requested  run.started  run.closed
+task.created   task.started task.reported task.cancelled task.reassigned
+task.reopened  task.overdue task.rejected task.review_passed task.review_failed
+```
+
+`task.review_passed` and `task.review_failed` are reserved vocabulary only. `run.started` is foldable but
+has no public verb; the first Task derives a Run as running. Every other write is available through
+`run-create`, `run-close`, `create`, `start`, `assign`, `report`, `cancel`, `reopen`, or `overdue`.
+`list` and `show` are read-only folds. Confined intents, supervisor apply, worktrees, agentctl verbs, and
+projection are deliberately outside this slice.
+
+Task payloads use raw UTF-8. Every free-text/reference CLI argument is strictly UTF-8 encoded before the
+lock, and the tasks commit primitive independently refuses a non-UTF-8 payload with rc 64. Titles and
+reasons reject control, format/zero-width, line/paragraph-separator, surrogate, private-use, and tag
+characters; references use the printable-ASCII `msg:`/`git:`/`file:` rules in DOMAIN §3.8. Explicit
+deadlines must be valid canonical UTC seconds in `YYYY-MM-DDTHH:MM:SSZ` form.
+
+Replay skips and counts framing-valid records that contain invalid UTF-8, invalid or duplicate-key JSON,
+a non-object shape, or invalid domain fields. `list` exposes the `invalid` counter and `invalid_events`;
+`show` prints one warning line with the same counter. These record-level anomalies do not stop the fold.
+Structural frame corruption still fails closed.
+
+Failed/cancelled Run closure is one `run.closed` append. Replay derives every open child as
+`CANCELLED {reason: run_closed}` from that event, so the cascade and terminal Run state are atomic rather
+than a sequence of independently committed cancellations.
+
+Installed writes require euid 0 and record `caller: root:root`; agent and human claims require the relay
+fields defined in DOMAIN §3.8. Unauthorized non-root callers receive rc 77 `caller_unauthorized` without
+an append. Other domain refusals return 77 after a durable `task.rejected`; `concurrent_update` is the
+retryable exception and returns rc 76 with guidance to re-read state. Lock timeout remains transient rc 75
+and produces no rejection. The stream path is derived
+only by `aib_task_event_stream_paths`. `AIB_TASK_ROOT` is unit-environment-only in installed engines, in
+parallel with `AIB_EVENT_ROOT`; it is never a request or registry field. `bin/aib-task-dirs` provisions the
+project and `bodies` directories as `root:aib-tasks 2750` and the stream/lock files as root-owned `0640`.
+The commit path does not create task directories. `AIB_EVENT_HELD_LOCK_FD` is an internal handoff from
+`bin/task` only: it is accepted only for the `tasks` stream, must name the task lock inode, and must already
+be exclusively locked before commit. External callers must never set it.
 
 ---
 White-label: example project id `acme`; no real names, infrastructure, or hosts anywhere in this repo.
