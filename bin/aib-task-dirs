@@ -21,6 +21,15 @@ TOKEN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
+def expected_owner() -> int:
+    test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (ROOT / ".aib-installed").exists()
+    return os.geteuid() if test_seam else 0
+
+
+def existing_owner_ok(fd: int) -> bool:
+    return os.fstat(fd).st_uid == expected_owner()
+
+
 def set_dir(fd: int, mode: int, gid: int) -> bool:
     try:
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
@@ -44,14 +53,19 @@ def root_dir(path: Path, mode: int, gid: int) -> int:
         parts = path.parts[1:]
         if not parts:
             return -1
+        final_created = False
         for index, name in enumerate(parts):
             try:
                 next_fd = os.open(name, DIR_FLAGS, dir_fd=current_fd)
             except FileNotFoundError:
                 os.mkdir(name, mode if index == len(parts) - 1 else 0o755, dir_fd=current_fd)
                 next_fd = os.open(name, DIR_FLAGS, dir_fd=current_fd)
+                if index == len(parts) - 1:
+                    final_created = True
             os.close(current_fd)
             current_fd = next_fd
+        if not final_created and not existing_owner_ok(current_fd):
+            return -1
         if not set_dir(current_fd, mode, gid):
             return -1
         result, current_fd = current_fd, -1
@@ -65,12 +79,16 @@ def root_dir(path: Path, mode: int, gid: int) -> int:
 
 def real_dir(parent_fd: int, name: str, mode: int, gid: int) -> int:
     child_fd = -1
+    created = False
     try:
         try:
             os.mkdir(name, mode, dir_fd=parent_fd)
+            created = True
         except FileExistsError:
             pass
         child_fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+        if not created and not existing_owner_ok(child_fd):
+            return -1
         if not set_dir(child_fd, mode, gid):
             return -1
         result, child_fd = child_fd, -1
@@ -84,14 +102,18 @@ def real_dir(parent_fd: int, name: str, mode: int, gid: int) -> int:
 
 def real_file(directory_fd: int, name: str, gid: int) -> bool:
     file_fd = -1
+    created = False
     try:
         flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
             file_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=directory_fd)
+            created = True
         except FileExistsError:
             file_fd = os.open(name, flags, dir_fd=directory_fd)
         info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return False
+        if not created and info.st_uid != expected_owner():
             return False
         if os.geteuid() == 0:
             os.fchown(file_fd, 0, gid)

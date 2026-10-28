@@ -223,6 +223,10 @@ has no public verb; the first Task derives a Run as running. Every other write i
 `list` and `show` are read-only folds. Confined intents, supervisor apply, worktrees, agentctl verbs, and
 projection are deliberately outside this slice.
 
+Failed/cancelled Run closure is one `run.closed` append. Replay derives every open child as
+`CANCELLED {reason: run_closed}` from that event, so the cascade and terminal Run state are atomic rather
+than a sequence of independently committed cancellations.
+
 Installed writes require euid 0 and record `caller: root:root`; agent and human claims require the relay
 fields defined in DOMAIN §3.8. Unauthorized non-root callers receive rc 77 `caller_unauthorized` without
 an append. Other domain refusals return 77 after a durable `task.rejected`; `concurrent_update` is the

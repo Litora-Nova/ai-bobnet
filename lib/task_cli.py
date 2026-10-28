@@ -25,13 +25,12 @@ from task_ledger import (  # noqa: E402
     RUN_RE,
     TASK_RE,
     TOKEN_RE,
-    FORBIDDEN_DISPLAY,
-    NONTERMINAL,
     LedgerError,
     decide,
     fold,
     list_view,
     load_json,
+    safe_display_text,
     task_id as derive_task_id,
     validate_registry_scope,
 )
@@ -47,27 +46,49 @@ COMMAND_EVENT = {
     "reopen": "task.reopened",
     "overdue": "task.overdue",
 }
-REF_RE = re.compile(r"(?:msg:[a-z0-9]+(?:-[a-z0-9]+)*|git:[^\s]+|file:[^\s]+)\Z", re.ASCII)
+REF_TEXT_RE = re.compile(r"[A-Za-z0-9._/@:+~^-]{1,255}\Z", re.ASCII)
 
 
 def valid_ref(value: str) -> bool:
-    if REF_RE.fullmatch(value) is None:
+    prefix, separator, ref = value.partition(":")
+    if not separator or prefix not in {"msg", "git", "file"} or REF_TEXT_RE.fullmatch(ref) is None or ref.startswith("-"):
         return False
-    if value.startswith("file:"):
-        path = value[5:]
-        if not path or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/")):
+    if prefix == "msg":
+        return TOKEN_RE.fullmatch(ref) is not None
+    if prefix == "file":
+        if ref.startswith("/") or any(part in {"", ".", ".."} for part in ref.split("/")):
+            return False
+    if prefix == "git":
+        components = ref.split("/")
+        if (
+            ref == "@"
+            or ref.startswith(("/", "."))
+            or ref.endswith(("/", "."))
+            or ".." in ref
+            or "@{" in ref
+            or "//" in ref
+            or any(char in ref for char in "~^:?*[\\")
+            or any(not part or part.startswith(".") or part.endswith(".lock") for part in components)
+        ):
             return False
     return True
 
 
-def safe_display_text(value: str) -> bool:
-    return not any(char in FORBIDDEN_DISPLAY or char in "\x00\r\n" for char in value)
-
-
 def read_body_file(path: str) -> bytes:
-    fd = -1
+    current_fd = fd = -1
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        candidate = Path(path)
+        parts = candidate.parts
+        if not parts or (candidate.is_absolute() and len(parts) == 1):
+            raise LedgerError("task body file path has no file component")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        current_fd = os.open("/" if candidate.is_absolute() else ".", directory_flags)
+        components = parts[1:] if candidate.is_absolute() else parts
+        for component in components[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        fd = os.open(components[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current_fd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise LedgerError("task body file must be a regular file")
@@ -85,6 +106,8 @@ def read_body_file(path: str) -> bytes:
     finally:
         if fd >= 0:
             os.close(fd)
+        if current_fd >= 0:
+            os.close(current_fd)
 
 
 def fail(code: int, message: str) -> int:
@@ -210,8 +233,12 @@ def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object
     ident = getattr(args, "task_id", None)
     body = None
     if args.command == "run-create":
+        if args.ticket_ref is not None and not valid_ref(args.ticket_ref):
+            raise LedgerError("invalid ticket_ref")
         payload: dict[str, object] = {"ticket_ref": args.ticket_ref}
     elif args.command == "run-close":
+        if args.summary_ref is not None and not valid_ref(args.summary_ref):
+            raise LedgerError("invalid summary_ref")
         payload = {"outcome": args.outcome, "summary_ref": args.summary_ref}
     elif args.command == "create":
         if args.intent_n < 1 or args.intent_n > 10:
@@ -221,7 +248,7 @@ def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object
             raise LedgerError("invalid source_msg_id token")
         if len(args.title) > 120 or not args.title or not safe_display_text(args.title):
             raise LedgerError("title must be one line of 1..120 characters")
-        if re.fullmatch(r"msg:[a-z0-9]+(?:-[a-z0-9]+)*", args.body_ref) is None:
+        if not args.body_ref.startswith("msg:") or not valid_ref(args.body_ref):
             raise LedgerError("invalid body_ref")
         if len(args.context_ref) > 5 or any(not valid_ref(ref) for ref in args.context_ref):
             raise LedgerError("invalid context_refs")
@@ -345,18 +372,6 @@ def main(argv: list[str]) -> int:
             validate_registry_scope(registry, args.project, args.team)
             current = fold(events)
             actual_kind, actual_payload, accepted, reason = decide(request, current, registry, directory / "bodies", body)
-            if accepted and actual_kind == "run.closed" and actual_payload.get("outcome") in {"cancelled", "failed"}:
-                for task in sorted(current["tasks"].values(), key=lambda value: value["task_id"]):
-                    if task["run_id"] != args.run_id or task["state"] not in NONTERMINAL:
-                        continue
-                    cancel_request = dict(request)
-                    cancel_request["event_type"] = "task.cancelled"
-                    cancel_request["task_id"] = task["task_id"]
-                    cancel_payload: dict[str, object] = {"caller": caller, "reason": "run_closed"}
-                    for key in ("via", "requester"):
-                        if key in actual_payload:
-                            cancel_payload[key] = actual_payload[key]
-                    commit(events, lock, lock_fd, cancel_request, "task.cancelled", cancel_payload)
             event_id, _ = commit(events, lock, lock_fd, request, actual_kind, actual_payload)
         finally:
             os.close(lock_fd)

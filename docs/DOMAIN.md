@@ -152,6 +152,16 @@ precedence ladder, and every displayed state MUST be traceable to a causing even
 6. **Health** — `healthy | warning | idle | unhealthy`
 7. **Grant** — `ISSUED → EXPIRED | REVOKED | ROTATED`
 
+### 3.7 Grant — notes that are load-bearing
+- There is **no `ACTIVE` state.** It conflated *in force* (time-derived) with *has been used* (observable
+  only in the proxy case, and **repeatable** — a grant may be used many times). Usage emits a repeatable
+  **`grant.used`** event; it is not a transition.
+- **`EXPIRED` is derived, not emitted.** Effectiveness is computed at read time, so expiry holds across
+  restarts and downtime with no process running to emit it. Projections MUST NOT cache grant status timelessly.
+- **Revocation has two steps:** `REVOCATION_REQUESTED` and `REVOCATION_CONFIRMED`. Until confirmed (or until
+  natural expiry) access counts as still effective — an unconfirmed revoke MUST NOT release a safety block
+  while the downstream system may still honour the credential.
+
 ### 3.8 Task and Run ledger
 
 `bin/task` is the only task-stream writer. Installed writers must run as root; the project directory and
@@ -163,10 +173,12 @@ current registry authority, validate the closed transition and ledger limits, th
 state. A malformed `run_id`, `task_id`, or `causation_id` is rejected before commit because these values
 are fold keys and, for tasks, sidecar filenames.
 
-A Run begins at `QUEUED`; its first Task makes it `RUNNING`. `run.closed completed` is accepted only when
-no task is open. `run.closed failed|cancelled` first appends `task.cancelled {reason: run_closed}` for every
-open child under the same lock, then closes the Run. A second close and every later `task.*` request are
-rejected as `run_closed`; Runs are never reopened. A created Task is assigned immediately and follows:
+An open Run is derived as `QUEUED` when it has no Tasks, `BLOCKED` when its whole active frontier is
+blocked, and `RUNNING` otherwise once it has a Task. `run.closed completed` is accepted only when no Task
+is open. Failed/cancelled closure appends one `run.closed` event; the fold atomically derives
+`CANCELLED {reason: run_closed}` for every open child from that same event. A second close and every later
+`task.*` request are rejected as `run_closed`; Runs are never reopened. A created Task is assigned
+immediately and follows:
 
 ```
 ASSIGNED -> IN_PROGRESS
@@ -197,10 +209,11 @@ body is refused.
 Authority is evaluated from the registry snapshot at commit time and every Run/Task verb is bound to its
 recorded `team_uid`. The writer records `caller: root:root`. An agent claim requires `via: intent:<attempt_id>`;
 a human or gateway claim requires `via: ctl:<seq>` plus a matching kernel-attested `requester`. Direct
-`role:*`, `human:*`, and `gateway:*` writers are refused. Authority is checked against the relayed
-requester: team leads and humans may create, reassign, cancel, reopen, and close; only the assignee may
-report; assignee supervisors may start and emit the closed engine failure/delivery reasons; the lead
-supervisor may mark overdue. The reserved sub-team-lead row is not implemented.
+`role:*`, `human:*`, and `gateway:*` writers are refused. Only human and gateway requesters may create a
+Run. Human requesters and team leads may create Tasks and cancel them; they may also reassign, reopen, and
+close, while gateway requesters may cancel Tasks but may not create Tasks, reassign, reopen, or close Runs.
+Only the assignee may report; assignee supervisors may start and emit the closed engine failure/delivery
+reasons; the lead supervisor may mark overdue. The reserved sub-team-lead row is not implemented.
 
 `state_seq` is the sequence of the last event that changed state or assignee. Human/lead cancel, reassign,
 and reopen may supply `--expect-seq`; a mismatch is the retryable `concurrent_update` outcome with rc 76.
@@ -220,19 +233,10 @@ The normative rejection reasons are `caller_unauthorized`, `caller_actor_mismatc
 `unknown_task`, `unknown_assignee`, `invalid_assignee`, `cross_team`, `duplicate`, `run_closed`,
 `open_tasks`, `invalid_transition`, `concurrent_update`, `gate_not_available`, `max_depth`, `max_open`,
 `max_tasks_per_run`, `max_assignments_per_task`, `max_turns_per_task`, `unsafe_body_sidecar`, and
-`unsupported_event`. Titles/reasons reject Unicode line/paragraph separators, NEXT LINE, and bidi
-controls. `file:` references must be relative normalized paths: absolute paths and `.`/`..` segments are
-invalid.
-
-### 3.7 Grant — notes that are load-bearing
-- There is **no `ACTIVE` state.** It conflated *in force* (time-derived) with *has been used* (observable
-  only in the proxy case, and **repeatable** — a grant may be used many times). Usage emits a repeatable
-  **`grant.used`** event; it is not a transition.
-- **`EXPIRED` is derived, not emitted.** Effectiveness is computed at read time, so expiry holds across
-  restarts and downtime with no process running to emit it. Projections MUST NOT cache grant status timelessly.
-- **Revocation has two steps:** `REVOCATION_REQUESTED` and `REVOCATION_CONFIRMED`. Until confirmed (or until
-  natural expiry) access counts as still effective — an unconfirmed revoke MUST NOT release a safety block
-  while the downstream system may still honour the credential.
+`unsupported_event`. Titles/reasons reject C0, DEL, C1, Unicode line/paragraph separators, format and
+zero-width characters, and tag characters. References are printable ASCII without whitespace or a
+leading `-`, with a 255-character payload limit; `git:` references also obey Git ref-name basics and
+`file:` references must be relative normalized paths without empty, `.` or `..` segments.
 
 ---
 

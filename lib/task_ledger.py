@@ -14,6 +14,7 @@ import re
 import stat
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,6 @@ NONTERMINAL = {"QUEUED", "ASSIGNED", "IN_PROGRESS", "BLOCKED", "REVIEW"}
 OPEN_LIMIT = {"QUEUED", "ASSIGNED"}
 ENGINE_REASONS = {"turn_failed", "turn_budget", "no_report"}
 CLOSED_RUN = {"COMPLETED", "FAILED", "CANCELLED"}
-FORBIDDEN_DISPLAY = {
-    "\u0085", "\u061c", "\u200e", "\u200f", "\u2028", "\u2029",
-    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
-    "\u2066", "\u2067", "\u2068", "\u2069",
-}
 EVENT_TYPES = {
     "run.requested", "run.started", "run.closed", "task.created", "task.started",
     "task.reported", "task.cancelled", "task.reassigned", "task.reopened",
@@ -66,6 +62,15 @@ def load_json(path: Path) -> dict[str, Any]:
 def task_id(causation_id: str, intent_n: int) -> str:
     digest = hashlib.sha256(f"{causation_id}:{intent_n}".encode()).hexdigest()[:12]
     return f"t-{digest}"
+
+
+def safe_display_text(value: str) -> bool:
+    """Return whether single-line display text contains no control/format chars."""
+    return not any(
+        unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"}
+        or 0xE0000 <= ord(char) <= 0xE007F
+        for char in value
+    )
 
 
 def _text(value: Any, name: str, *, optional: bool = False) -> str | None:
@@ -121,10 +126,13 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
     assignee = _text(payload.get("assignee"), "assignee")
     source = _text(payload.get("source_msg_id"), "source_msg_id")
     gate = _text(payload.get("gate"), "gate")
+    title = _text(payload.get("title"), "title")
     if not UID_RE.fullmatch(assignee or "") or not TOKEN_RE.fullmatch(source or ""):
         raise LedgerError("invalid task assignee/source")
     if gate not in {"none", "code", "compliance", "gatekeeper"}:
         raise LedgerError("invalid task gate")
+    if not title or len(title) > 120 or not safe_display_text(title):
+        raise LedgerError("invalid_title")
     return {
         "task_id": ident,
         "run_id": run_id,
@@ -134,7 +142,7 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
         "source_msg_id": source,
         "owner": payload.get("owner"),
         "assignee": assignee,
-        "title": payload.get("title"),
+        "title": title,
         "body_ref": payload.get("body_ref"),
         "deadline_at": payload.get("deadline_at"),
         "budget": payload.get("budget"),
@@ -229,8 +237,17 @@ def fold(path: Path) -> dict[str, Any]:
                 outcome = payload.get("outcome")
                 if outcome not in {"completed", "failed", "cancelled"}:
                     raise LedgerError("invalid_run_outcome")
-                if any(task["run_id"] == run_id and task["state"] in NONTERMINAL for task in tasks.values()):
+                open_tasks = [task for task in tasks.values() if task["run_id"] == run_id and task["state"] in NONTERMINAL]
+                if open_tasks and outcome == "completed":
                     raise LedgerError("open_tasks")
+                # failed/cancelled run closure is one durable event. The fold
+                # derives its child cancellation cascade from that event so a
+                # crash can never expose a partially-cancelled open run.
+                for task in open_tasks:
+                    task["state"] = "CANCELLED"
+                    task["last_reason"] = "run_closed"
+                    task["last_seq"] = seq
+                    task["state_seq"] = seq
                 runs[run_id]["state"] = outcome.upper()
                 runs[run_id]["outcome"] = outcome
             elif kind == "task.created":
@@ -432,9 +449,10 @@ def _write_body(body_dir: Path, ident: str, body: bytes) -> bool:
         except FileExistsError:
             file_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=bodies_fd)
             info = os.fstat(file_fd)
+            bodies_info = os.fstat(bodies_fd)
             test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (Path(__file__).resolve().parent.parent / ".aib-installed").exists()
             expected_uid = os.geteuid() if test_seam else 0
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_gid != bodies_info.st_gid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o640:
                 return False
             chunks: list[bytes] = []
             total = 0
