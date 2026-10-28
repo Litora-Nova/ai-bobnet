@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# D1b worker boundary: per-attempt intents, board snapshot, broker confinement,
+# Worker boundary: per-attempt intents, board snapshot, broker confinement,
 # terminal attempt identity, and provider-neutral adapter environment.
 set -uo pipefail
 
@@ -33,6 +33,50 @@ PY
 eq 'each record carries the broker attempt and closed worker shape' "$shape" 'acme-main-17:report:done:t-aaaaaaaaaaaa|acme-main-17:continue::t-aaaaaaaaaaaa|acme-main-17:report:progress:t-aaaaaaaaaaaa'
 eq 'intent file stays private' "$(stat -c %a "$INTENTS")" 600
 
+validator=$(python3 -I - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "lib"))
+try:
+    from task_intent import validate_intent_records
+except ImportError:
+    print("missing")
+    raise SystemExit
+good=[{"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"safe","reason":"complete"}]
+bad=[
+    {"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"safe","reason":[]},
+    {"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"bad\0text"},
+    {"attempt_id":"acme-main-17","verb":"report","task_id":"t-aaaaaaaaaaaa","state":"done","summary":"safe","actor_id":"acme-core"},
+]
+ok=True
+try:
+    validate_intent_records(good, "acme-main-17", "t-aaaaaaaaaaaa")
+except Exception:
+    ok=False
+for rows in bad:
+    try:
+        validate_intent_records([rows], "acme-main-17", "t-aaaaaaaaaaaa")
+        ok=False
+    except (TypeError, ValueError, UnicodeError):
+        pass
+print("shared" if ok else "unsafe")
+PY
+)
+eq 'the shared intent validator accepts client shape and rejects bad types, controls, and extra authority keys' "$validator" shared
+has 'the supervisor imports the shared intent validator' "$(sed -n '1,80p' "$ROOT/lib/aib_supervisor.py")" 'from task_intent import'
+
+BOUND_ATTEMPT=acme-main-bound
+for n in $(seq 1 10); do
+  RC=0
+  env -i HOME="$HOME_DIR" PATH="$ROOT/bin:$PATH" AIB_ATTEMPT_ID="$BOUND_ATTEMPT" \
+    "$ROOT/bin/task-intent" continue t-aaaaaaaaaaaa -- "bounded-$n" >/dev/null 2>"$WORK/bound.err" || RC=$?
+  [ "$RC" -eq 0 ] || break
+done
+RC=0
+env -i HOME="$HOME_DIR" PATH="$ROOT/bin:$PATH" AIB_ATTEMPT_ID="$BOUND_ATTEMPT" \
+  "$ROOT/bin/task-intent" continue t-aaaaaaaaaaaa -- overflow >/dev/null 2>"$WORK/bound.err" || RC=$?
+eq 'an eleventh client intent is refused with EX_CONFIG' "$RC" 78
+
 printf '%s\n' '{"highest_seq":4,"tasks":[{"task_id":"t-aaaaaaaaaaaa","state":"IN_PROGRESS"}]}' > "$HOME_DIR/.aib/board.json"
 chmod 600 "$HOME_DIR/.aib/board.json"
 call list
@@ -43,13 +87,27 @@ ln -s "$WORK/escape" "$HOME_DIR/.aib/intents/evil-main-1.jsonl"
 RC=0; env -i HOME="$HOME_DIR" PATH="$ROOT/bin:$PATH" AIB_ATTEMPT_ID=evil-main-1 "$ROOT/bin/task-intent" continue t-aaaaaaaaaaaa -- x >/dev/null 2>&1 || RC=$?
 eq 'the client refuses a planted intent symlink' "$RC|$([ -e "$WORK/escape" ] && echo escaped || echo contained)" '78|contained'
 
-# Provisioning owns the path; no aib-tasks ACL is requested by D1b carryover.
+# Provisioning owns the path; board.json replaces an aib-tasks ACL for confined roles.
 STATE_ROOT="$WORK/state"; STANDUP="$WORK/standup"; mkdir -p "$STATE_ROOT" "$STANDUP"
 RC=0; env AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_STANDUP_DIR="$STANDUP" \
   AIB_ROLE_UID="$(id -u)" AIB_ROLE_GID="$(id -g)" AIB_SETFACL=/bin/true \
   "$ROOT/bin/aib-agent-dirs" acme-dev1 || RC=$?
 eq 'aib-agent-dirs creates role-owned private .aib/intents' "$RC|$(stat -c '%a:%u:%g' "$STATE_ROOT/acme-dev1/.aib" "$STATE_ROOT/acme-dev1/.aib/intents" | tr '\n' ' ')" \
   "0|700:$(id -u):$(id -g) 700:$(id -u):$(id -g) "
+eq 'aib-agent-dirs creates only the root-owned quarantine beside .aib' \
+  "$([ -d "$STATE_ROOT/acme-dev1/.aib-quarantine" ] && stat -c '%a:%u' "$STATE_ROOT/acme-dev1/.aib-quarantine")|$([ -e "$STATE_ROOT/acme-dev1/.aib/intents/done" ] || [ -e "$STATE_ROOT/acme-dev1/.aib/intents/tainted" ] && echo legacy || echo clean)" \
+  "700:$(id -u)|clean"
+
+SWAP_ROOT="$WORK/swapped-state"; SWAP_STANDUP="$WORK/swapped-standup"; SWAP_TARGET="$WORK/swap-target"
+mkdir -p "$SWAP_ROOT/acme-dev1/.aib" "$SWAP_STANDUP" "$SWAP_TARGET"
+chmod 700 "$SWAP_ROOT/acme-dev1" "$SWAP_ROOT/acme-dev1/.aib"; chmod 755 "$SWAP_TARGET"
+ln -s "$SWAP_TARGET" "$SWAP_ROOT/acme-dev1/.aib/intents"
+RC=0
+env AIB_TEST_SEAMS=1 AIB_SUP_STATE_ROOT="$SWAP_ROOT" AIB_STANDUP_DIR="$SWAP_STANDUP" \
+  AIB_ROLE_UID="$(id -u)" AIB_ROLE_GID="$(id -g)" AIB_SETFACL=/bin/true \
+  "$ROOT/bin/aib-agent-dirs" acme-dev1 >/dev/null 2>&1 || RC=$?
+eq 'aib-agent-dirs refuses a swapped intents link without chmod or chown through it' \
+  "$RC|$(stat -c '%a:%u:%g' "$SWAP_TARGET")" "78|755:$(id -u):$(id -g)"
 
 # Both adapters must preserve the broker-minted env and resolve the worker CLI.
 mkdir -p "$HOME_DIR/.claude" "$HOME_DIR/.codex" "$WORK/fake"
@@ -95,7 +153,6 @@ RESP=$(env HOME="$WORK/broker" PATH="$ROOT/bin:$PATH" AIB_TEST_SEAMS=1 AIB_SUP_S
   bash -c '. "$1/lib/aibobnet.sh"; aib_enact_launch "$2" x "$3" "$4" "$5" "$6"' _ "$ROOT" "$REC" "$EVENTS" "$LOCK" "$ENV_KV" "$DECIDED")
 LL_RW=$(<"$STUB/ll-rw")
 has 'real LL_RW includes the private .aib path' "$LL_RW" "$STATE_ROOT/acme-dev1/.aib"
-has 'read-only still permits intents independent of provider sandbox flags' "$LL_RW" "$STATE_ROOT/acme-dev1/.aib"
 hasnt 'read-only omits the project write grant' "$LL_RW" "$PROJ"
 has 'terminal frame returns the broker attempt id' "$RESP" "attempt_id=$DECIDED"
 
@@ -108,12 +165,12 @@ if command -v cc >/dev/null 2>&1 && cc -O2 -Wall -Wextra -o "$WORK/landlock-exec
   if [ -e "$WORK/ll-home/.aib/allowed" ] && [ ! -e "$WORK/ll-project/denied" ]; then
     ok 'SANDBOX-DEPENDENT: Landlock bounds read-only work while leaving task intents writable'
   elif [ "$ll_rc" -eq 3 ] || [ "$ll_rc" -eq 78 ] || [ "$ll_rc" -eq 126 ]; then
-    printf 'ok   - SANDBOX-DEPENDENT SKIP: Landlock unavailable on this kernel (rc %s)\n' "$ll_rc"
+    printf '# SKIP SANDBOX-DEPENDENT: Landlock unavailable on this kernel (rc %s)\n' "$ll_rc"
   else
     no "SANDBOX-DEPENDENT: Landlock boundary (rc $ll_rc)"
   fi
 else
-  printf 'ok   - SANDBOX-DEPENDENT SKIP: compiler unavailable\n'
+  printf '# SKIP SANDBOX-DEPENDENT: compiler unavailable\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

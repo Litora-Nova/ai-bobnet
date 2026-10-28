@@ -241,7 +241,9 @@ has "terminal heartbeat records success" "$(<"$HBLOG")" "| done | codex-run OK â
 # every other inherited variable is gone. Nothing scrubbed-by-denylist can survive.
 fullenv="$(<"$FULLENV_OUT")"
 has "child env passes through allow-listed HOME"        "$fullenv" "HOME=$AIB_TEST_HOME"
-has "child env prepends the engine CLI path before the allow-listed PATH" "$fullenv" "PATH=$SRC_ROOT/bin:$STUB_BIN:"
+has "child env prepends only the dedicated worker CLI path" "$fullenv" "PATH=$SRC_ROOT/bin/child:$STUB_BIN:"
+eq "the dedicated worker CLI directory contains exactly task-intent" "$(find "$SRC_ROOT/bin/child" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')" "task-intent "
+has "the broker-minted terminal attempt id reaches the child" "$fullenv" "AIB_ATTEMPT_ID="
 has "child env keeps the explicit managed export"        "$fullenv" "AIBOBNET_AGENT_UID=acme-core"
 hasnt "child env drops non-allow-listed inherited vars"  "$fullenv" "LEAKME_SENTINEL"
 hasnt "child env never inherits ambient provenance"      "$fullenv" "ambient-provider"

@@ -24,6 +24,7 @@ cat > "$ENGINE/registry.json" <<JSON
 JSON
 
 observed="$(env -i PATH="$PATH" HOME="$W" LANG=C TZ=UTC \
+  AIB_TEST_SEAMS=1 \
   STATE_DIRECTORY="$STATE" AIBOBNET_REGISTRY="$ENGINE/registry.json" \
   python3 -I - "$ENGINE" <<'PY'
 import sys

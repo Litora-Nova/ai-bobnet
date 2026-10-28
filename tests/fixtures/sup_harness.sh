@@ -172,6 +172,7 @@ start_sup() {
   local uid="acme-core"; case "${1:-}" in *=*|"") ;; *) uid="$1"; shift;; esac
   local sd="$W/state/$uid"; mkdir -p "$sd"; chmod 700 "$sd"
   env -i PATH="$W/fakebin:$PATH" HOME="$W/home-sup" LANG=C TZ=UTC \
+    AIB_TEST_SEAMS=1 \
     STATE_DIRECTORY="$sd" AIBOBNET_REGISTRY="$ENGINE/registry.json" \
     AIB_LAUNCH_AGENT="$W/fakes/launch-agent" AIB_BROKER_CLIENT="$W/fakes/broker-client" \
     NOTIFY_SOCKET="$W/notify.sock" \
