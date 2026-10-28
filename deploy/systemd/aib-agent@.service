@@ -14,6 +14,7 @@ EnvironmentFile=-/etc/aib/role.env
 ExecStartPre=+/opt/aib/engine/bin/aib-agent-dirs %i
 ExecStart=/opt/aib/engine/bin/aib-supervisor %i
 Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
+Environment=AIB_TASK_ROOT=/var/lib/aib/tasks
 WatchdogSec=90
 Restart=on-failure
 RestartSec=5

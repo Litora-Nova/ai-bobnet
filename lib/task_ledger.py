@@ -14,7 +14,6 @@ import re
 import stat
 import subprocess
 import sys
-import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -65,13 +64,28 @@ def task_id(causation_id: str, intent_n: int) -> str:
     return f"t-{digest}"
 
 
+DISPLAY_BLOCK_RANGES = (
+    (0x0000, 0x001F), (0x007F, 0x009F), (0x00AD, 0x00AD),
+    (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),
+    (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2),
+    (0x180E, 0x180E), (0x200B, 0x200F), (0x2028, 0x202E),
+    (0x2060, 0x2064), (0x2066, 0x206F), (0xD800, 0xDFFF),
+    (0xE000, 0xF8FF), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB), (0x1BCA0, 0x1BCAF), (0x1D173, 0x1D17A),
+    (0xF0000, 0xFFFFD), (0x100000, 0x10FFFD),
+    (0xE0000, 0xE007F), (0xE0100, 0xE01EF),
+)
+
+
 def safe_display_text(value: str) -> bool:
-    """Return whether single-line display text contains no control/format chars."""
-    return not any(
-        unicodedata.category(char) in {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}
-        or 0xE0000 <= ord(char) <= 0xE007F
-        for char in value
-    )
+    """Apply a fixed code-point filter independent of Python's Unicode tables."""
+    for char in value:
+        point = ord(char)
+        if any(start <= point <= end for start, end in DISPLAY_BLOCK_RANGES):
+            return False
+        if 0xFDD0 <= point <= 0xFDEF or point & 0xFFFF in {0xFFFE, 0xFFFF}:
+            return False
+    return True
 
 
 def valid_deadline(value: Any) -> bool:
@@ -524,6 +538,21 @@ def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str,
     lead_uid = team_lead(registry, team)
     is_lead = actor_type == "agent" and actor_id == lead_uid
     is_service = actor_type == "service"
+
+    if kind == "task.rejected":
+        requested, reason = payload.get("requested_type"), payload.get("reason")
+        service_uid = actor_id.removeprefix("supervisor:") if is_service and isinstance(actor_id, str) else ""
+        service_agent = _agent(registry, service_uid)
+        if (
+            not is_service
+            or not service_agent
+            or service_agent.get("team_uid") != team
+            or requested not in EVENT_TYPES - {"task.rejected"}
+            or not isinstance(reason, str)
+            or re.fullmatch(r"[a-z_]{1,64}", reason, re.ASCII) is None
+        ):
+            return rejection(request, "unauthorized")
+        return kind, payload, False, reason
 
     if kind == "run.requested":
         if not (is_human or is_gateway):

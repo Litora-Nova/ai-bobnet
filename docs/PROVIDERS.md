@@ -124,6 +124,26 @@ reduce session persistence. The exception is subscription authentication: provis
 shared subscription login". API-key proxy mode is reserved, fail-closed, and is the later path that
 restores the stronger "agent never sees the shared credential" property.
 
+Provisioning must also run `bin/aib-agent-dirs` before any one-shot or supervised turn so the role-owned
+`.aib/intents/{done,tainted}` path exists at mode 0700. Do not add the role to `aib-tasks` or restore a
+shared-state group as a shortcut: the root supervisor publishes `.aib/board.json`, and the confined child
+has no direct ledger or peer-state access. The supervisor creates `<project>/.aib/wt/<agent_uid>` and uses
+the project directory group for the task worktree.
+
+Deployments may set the identity used only for automatic WIP commits:
+
+```json
+{
+  "commit_identity": {
+    "name_template": "{display_name} ({team})",
+    "email": "agents@example.invalid"
+  }
+}
+```
+
+Both keys are required when the object is present. The only template fields are `display_name` and
+`team`; this configuration never supplies task authority.
+
 Codex does not publish a refresh-token expiry. Consequently `login_expires_at` in the broker-owned
 metadata is an operator-configured lifetime estimate (`AIB_LOGIN_LIFETIME_S`, 56 days by default),
 not a provider assertion. Expiry monitoring and status output preserve that distinction; access-token

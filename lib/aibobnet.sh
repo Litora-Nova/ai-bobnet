@@ -1716,7 +1716,11 @@ aib_enact_launch() {
   local _child_env=() _n
   for _n in ${AIB_VERDICT_ENV_ALLOW:-}; do
     [ "$_s1c_enabled" -eq 0 ] || [ "$_n" != HOME ] || continue
-    [ -n "${!_n+x}" ] && _child_env+=("$_n=${!_n}")
+    if [ "$_n" = PATH ] && [ -n "${!_n+x}" ]; then
+      _child_env+=("PATH=$_engine_root/bin:${!_n}")
+    elif [ -n "${!_n+x}" ]; then
+      _child_env+=("$_n=${!_n}")
+    fi
   done
   if declare -p AIB_ENACT_CHILD_ENV_EXTRA >/dev/null 2>&1; then
     local -n _extra_ref=AIB_ENACT_CHILD_ENV_EXTRA
@@ -1729,7 +1733,7 @@ aib_enact_launch() {
       fd) _child_env+=("AIB_CREDENTIAL_FD=3") ;;
     esac
   fi
-  _child_env+=("AIBOBNET_ATTEMPT_ID=$decided_id")
+  _child_env+=("AIBOBNET_ATTEMPT_ID=$decided_id" "AIB_ATTEMPT_ID=$decided_id")
 
   local _terminal_written=0
 
@@ -2226,6 +2230,7 @@ aib_enact_launch__run_confined() {
   # --- D-B2: effective verdict, registry root, unit HOME, constants; no request path ---
   local ll_ro="/" ll_rw="/tmp:/var/tmp:/dev"
   [ -z "$state_path" ] || ll_rw="${ll_rw}:${state_path}"
+  [ "$_s1c_enabled" -eq 0 ] || ll_rw="${ll_rw}:${_agent_home}/.aib"
   # The PDP already validated/clamped sandbox. HOME is the manager's unit env;
   # only read-only omits the project grant. Direct enactment never uses this list.
   [ "$sandbox" = read-only ] || ll_rw="${ll_rw}:${resolved_root}"
@@ -2684,6 +2689,7 @@ aib_enact_launch__write_terminal() {
   if [ -n "$AIB_ENACT_REASON" ]; then
     printf 'reason=%s\n' "$AIB_ENACT_REASON"
   fi
+  printf 'attempt_id=%s\n' "$decided_id"
   printf 'ended_event_id=%s\n' "$AIB_ENACT_ENDED_EVENT_ID"
   printf 'end=ok\n'
 }

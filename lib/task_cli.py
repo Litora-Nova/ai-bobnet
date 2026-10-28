@@ -46,6 +46,7 @@ COMMAND_EVENT = {
     "cancel": "task.cancelled",
     "reopen": "task.reopened",
     "overdue": "task.overdue",
+    "reject": "task.rejected",
 }
 REF_TEXT_RE = re.compile(r"[A-Za-z0-9._/@:+~^-]{1,255}\Z", re.ASCII)
 
@@ -149,8 +150,10 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("--run-id", required=True)
         sub.add_argument("--via")
         sub.add_argument("--requester")
-        if name not in {"run-create", "run-close", "create"}:
+        if name not in {"run-create", "run-close", "create", "reject"}:
             sub.add_argument("--task-id", required=True)
+        elif name == "reject":
+            sub.add_argument("--task-id")
         if name == "run-create":
             sub.add_argument("--ticket-ref")
         elif name == "run-close":
@@ -175,6 +178,9 @@ def parser() -> argparse.ArgumentParser:
             sub.add_argument("--reason")
         elif name == "cancel":
             sub.add_argument("--reason")
+        elif name == "reject":
+            sub.add_argument("--requested-type", required=True)
+            sub.add_argument("--reason", required=True)
         if name in {"assign", "reopen", "cancel"}:
             sub.add_argument("--expect-seq", type=int)
     listing = subs.add_parser("list")
@@ -204,7 +210,7 @@ def validate_common(args: argparse.Namespace) -> None:
         raise LedgerError("invalid project/team id")
     if RUN_RE.fullmatch(args.run_id) is None:
         raise LedgerError("invalid run_id (expected r-<12 hex>)")
-    if hasattr(args, "task_id") and TASK_RE.fullmatch(args.task_id) is None:
+    if getattr(args, "task_id", None) is not None and TASK_RE.fullmatch(args.task_id) is None:
         raise LedgerError("invalid task_id (expected t-<12 hex>)")
     if TOKEN_RE.fullmatch(args.causation_id) is None:
         raise LedgerError("invalid causation_id token")
@@ -284,6 +290,12 @@ def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object
         if args.reason is not None and (len(args.reason) > 512 or not safe_display_text(args.reason)):
             raise LedgerError("reason must be one line of at most 512 characters")
         payload = {"reason": args.reason}
+    elif args.command == "reject":
+        if args.requested_type not in set(COMMAND_EVENT.values()) - {"task.rejected"}:
+            raise LedgerError("invalid requested event type")
+        if not re.fullmatch(r"[a-z_]{1,64}", args.reason, re.ASCII):
+            raise LedgerError("invalid rejection reason")
+        payload = {"requested_type": args.requested_type, "reason": args.reason}
     else:
         payload = {}
     payload["caller"] = caller

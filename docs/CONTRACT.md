@@ -220,14 +220,27 @@ task.reopened  task.overdue task.rejected task.review_passed task.review_failed
 `task.review_passed` and `task.review_failed` are reserved vocabulary only. `run.started` is foldable but
 has no public verb; the first Task derives a Run as running. Every other write is available through
 `run-create`, `run-close`, `create`, `start`, `assign`, `report`, `cancel`, `reopen`, or `overdue`.
-`list` and `show` are read-only folds. Confined intents, supervisor apply, worktrees, agentctl verbs, and
-projection are deliberately outside this slice.
+`reject` is the supervisor-only durable refusal seam. `list` and `show` are read-only folds. Agentctl task
+verbs, lead-side delegation, and projection remain outside this slice.
+
+The worker-facing command is `bin/task-intent`, not `bin/task`. `report`, `progress`, and `continue`
+append only to the current broker attempt's private JSONL file; `list` reads only the supervisor-rendered
+board snapshot. The child has no task-ledger or cross-agent state ACL. The root supervisor applies each
+file through `bin/task` using its own agent/attempt context, journals the ledger/send split for crash
+replay, and quarantines foreign attempts. The terminal response's `attempt_id` is handed back through a
+pre-opened 0600 metadata file, binding worker output to the broker's actual attempt rather than a
+supervisor-generated guess.
+
+Task pickup emits `task.started` once and binds the provider session to the agent task worktree/branch.
+Reports and continuations use idempotent message ids. Missing reports, turn budget, provider DLQ, and
+assignment-delivery DLQ close through the service-authority rows in DOMAIN §3.8–3.9. A task stream lock
+timeout remains transient: the intent file stays pending and startup/poll scanning retries it.
 
 Task payloads use raw UTF-8. Every free-text/reference CLI argument is strictly UTF-8 encoded before the
 lock, and the tasks commit primitive independently refuses a non-UTF-8 payload with rc 64. Titles and
-reasons reject control, format/zero-width, line/paragraph-separator, surrogate, private-use, and tag
-characters; references use the printable-ASCII `msg:`/`git:`/`file:` rules in DOMAIN §3.8. Explicit
-deadlines must be valid canonical UTC seconds in `YYYY-MM-DDTHH:MM:SSZ` form.
+reasons use the fixed code-point filter in DOMAIN §3.8 rather than runtime Unicode categories; references
+use the printable-ASCII `msg:`/`git:`/`file:` rules there. Explicit deadlines must be canonical UTC seconds
+in `YYYY-MM-DDTHH:MM:SSZ` form, and omitted deadlines are materialized before storage.
 
 Replay skips and counts framing-valid records that contain invalid UTF-8, invalid or duplicate-key JSON,
 a non-object shape, or invalid domain fields. `list` exposes the `invalid` counter and `invalid_events`;

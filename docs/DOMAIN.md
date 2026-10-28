@@ -10,8 +10,9 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > and the RM-2 durable attempt audit (`attempt.decided`/`attempt.ended` per managed launch) are built
 > and tested. The same framed commit primitive now reserves the per-project `tasks` stream and its
 > run/task event vocabulary; the authoritative task ledger writer now implements fold, authority
-> checks, and task body sidecars. Confined-turn intents, supervisor application, worker pickup,
-> agentctl task verbs, and projection remain later slices. The **rest**
+> checks, and task body sidecars. The worker-side slice implements confined-turn intents, root
+> supervisor application, worker pickup, task worktrees, reports, bounded continuation, and failure
+> closure. Agentctl task verbs, lead delegation, and projection remain later slices. The **rest**
 > of the serialized event spine (cursors, projections, rebuild tooling), the provider-wide reference monitor, the
 > provider-change audit event, Gate/Grant/Effect state machines, profile provisioning, full runtime
 > lifecycle, external adapters, and dashboard projection remain specified but unimplemented. Until the
@@ -241,11 +242,36 @@ The normative rejection reasons are `caller_unauthorized`, `caller_actor_mismatc
 `unsupported_event`. Free-text and reference arguments must encode as strict UTF-8 before the stream lock;
 invalid bytes are rc 64 and never append. Titles/reasons reject controls, Unicode line/paragraph
 separators, surrogate and private-use code points, format and zero-width characters, and tag characters.
-Unassigned (`Cn`) code points remain valid so replay does not depend on the interpreter's Unicode version.
+This is a fixed explicit code-point allow/block policy; it never consults the interpreter's Unicode
+category database. Code points outside the fixed block table remain valid, including code points an
+older interpreter considers unassigned, so replay is byte-stable across Unicode database versions.
 References are printable ASCII without whitespace or a leading `-`, with a 255-character payload limit;
 `git:` references also obey Git ref-name basics and `file:` references must be relative normalized paths
-without empty, `.` or `..` segments. `deadline_at` is either omitted or the exact valid UTC form
-`YYYY-MM-DDTHH:MM:SSZ`; the fold rejects non-canonical stored values.
+without empty, `.` or `..` segments. The create CLI may omit `deadline_at`, in which case the writer
+materializes the team default before append; every stored Task record therefore carries the exact UTC
+form `YYYY-MM-DDTHH:MM:SSZ`, and the fold rejects null or non-canonical stored values.
+
+### 3.9 Worker intent application
+
+The confined worker never writes or reads the task stream. Before each turn, the root supervisor writes
+a private `$HOME/.aib/board.json` snapshot; `task-intent list` reads only that snapshot. Worker verbs append
+at most ten bounded JSON records to `$HOME/.aib/intents/$AIB_ATTEMPT_ID.jsonl`. The file carries proposed
+work only: the supervisor derives `actor_id`, task/run/requester binding, and `via:intent:<attempt_id>` from
+its own turn journal and the authoritative ledger, never from worker-supplied authority fields.
+
+After the turn (and on startup/orphan recovery), the supervisor matches the broker terminal attempt id,
+validates the intent file and result ref, calls root-only `bin/task`, delivers the idempotent result, then
+records `intents.applied`. An unknown/foreign attempt is moved to `intents/tainted` and alarms. A crash after
+the ledger append is resumed from `intent.ledger`, so notification can be retried without a second task
+event. `continue` is one `progress` plus a durable self-message; only accepted progress increments `turns`.
+Two reportless turns become service-owned `blocked/no_report`, the ninth continuation becomes
+`blocked/turn_budget`, three provider failures become `failed/turn_failed`, and an assignment in the
+message DLQ becomes `cancelled/delivery_failed`.
+
+Each task executes in `<project>/.aib/wt/<agent_uid>` on the closed branch
+`aib/<team_uid>/<task_id>`. Switching tasks WIP-commits dirty work with the deployment commit identity.
+`git:` results must name that branch and an ancestor SHA; `file:` results must resolve to a regular file
+inside the task worktree (maximum 1 MiB); `msg:` results use the closed token grammar.
 
 ---
 

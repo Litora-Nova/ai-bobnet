@@ -24,7 +24,7 @@
 #                                   <hook> <target_agent_uid> <mux_session> <msg_id>
 #                                 exit 0 = ping delivered; non-zero = ping failed.
 #                                 Default: a best-effort tmux send (see _default_hook).
-#   AIBOBNET_WAKEUP_MAX_ATTEMPTS  failed-ping budget before dead-letter (default 3).
+#   AIBOBNET_WAKEUP_MAX_ATTEMPTS  failed-ping budget before dead-letter (default 5).
 set -euo pipefail
 
 # --- locate engine root (symlink-safe) ---------------------------------------
@@ -92,7 +92,7 @@ aib_split_agent "$target"                                   # -> AIB_PROJECT_UID
 mux_session="$(aib_project_field "$AIB_PROJECT_UID" mux_session)"
 to_path="$("$REPO_ROOT/bin/inbox" "$target")"               # recipient journal (fail-closed)
 
-max="${AIBOBNET_WAKEUP_MAX_ATTEMPTS:-3}"
+max="${AIBOBNET_WAKEUP_MAX_ATTEMPTS:-5}"
 case "$max" in ''|*[!0-9]*) aib_die 64 "AIBOBNET_WAKEUP_MAX_ATTEMPTS must be a positive integer";; esac
 [ "$max" -ge 1 ] || aib_die 64 "AIBOBNET_WAKEUP_MAX_ATTEMPTS must be >= 1"
 
