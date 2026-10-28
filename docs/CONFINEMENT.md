@@ -286,11 +286,18 @@ the configured gid is broker-controlled and is not an independent user input.
 The private home also contains `.aib/` (0700, role-owned). The broker's Landlock write allowlist always
 adds exactly that agent's `$HOME/.aib`, independently of the provider sandbox flag; read-only work still
 needs to emit intents. It does not add the root-owned task ledger, another agent home, or shared state.
-`bin/aib-agent-dirs` pre-creates `.aib/intents/{done,tainted}` so the root supervisor and confined child
-agree on a real path before the turn. The child receives the broker-selected `AIB_ATTEMPT_ID` and an
-engine-bin-prefixed `PATH`, making `bin/task-intent` reachable in both supported adapters. The supervisor
+`bin/aib-agent-dirs` pre-creates role-owned `.aib/intents` and root-owned `.aib-quarantine` so the root
+supervisor and confined child agree on verified paths before the turn. The child receives the
+broker-selected `AIB_ATTEMPT_ID` and a `PATH` containing only the dedicated `bin/child` directory, whose
+only command is `task-intent`. The supervisor
 writes `.aib/board.json` before each turn; this snapshot replaces any task-ledger or cross-agent live-state
 ACL for the child.
+
+The supervisor's Git helper switches to the role uid/gid and the provisioned project group, then applies
+Landlock with `LL_RO=/` and `LL_RW=<project_home>`. It runs `git` through `env -i`, a root-owned global
+config containing only the required safe directories, and command-line hook/fsmonitor/protocol hardening.
+Without Landlock the production path fails closed. Main-stream peer-taint detection is intentionally not
+claimed here: the deployment-provisioning gate rejects and alarms on role-peer launches before a turn.
 
 The root supervisor opens this home with `O_DIRECTORY|O_NOFOLLOW`; descriptor-relative writable state opens use `O_NOFOLLOW` and regular-file checks, with a single-link requirement for `journal.jsonl`.
 An unsafe state object makes the supervisor exit 78, which stops the unit permanently via `RestartPreventExitStatus=78` and triggers the `OnFailure=` alarm.

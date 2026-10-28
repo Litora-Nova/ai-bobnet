@@ -211,7 +211,8 @@ def fold_records(records, legacy=False):
             if int(pid) <= 0:
                 raise ValueError(f"attempt '{ident}' has non-positive pid '{pid}'")
             attempts[ident] = dict(id=ident, agent=record.get('agent_uid'),
-                decided_at=record.get('occurred_at'), decision=decision, pid=pid,
+                session=record.get('session_id'), decided_at=record.get('occurred_at'),
+                decision=decision, pid=pid,
                 state='open' if decision == 'allow' else 'deny', exit_code='null',
                 open=decision == 'allow', last={'class':None, 'stage':None, 'ended_at':None})
             if not legacy:
@@ -283,6 +284,16 @@ def main():
         print(f"stream_status:{result['status']} | integrity:{integrity} | highest_seq:{result['highest_text']} | next_seq:{result['next']} | uncommitted_tail:{int(result['torn'])}")
         for a in result['legacy_attempts']:
             print(f"attempt_id:{a['id']} | state:{a['state']} | decision:{a['decision']} | pid:{a['pid']} | exit_code:{a['exit_code']}")
+    elif sys.argv[1:] == ['--bindings']:
+        result = json.load(sys.stdin)
+        for attempt in result['attempts']:
+            print(json.dumps({
+                'attempt_id': attempt['id'],
+                'agent_uid': attempt['agent'],
+                'session_id': attempt['session'],
+                'decided_at': attempt['decided_at'],
+                'decision': attempt['decision'],
+            }, ensure_ascii=True, separators=(',', ':')))
     else:
         result = fold(*sys.argv[1:])
         print(result['status'], result['highest_text'], result['next'], int(result['torn']), result['scan_status'], result['truncate_at'], sep='\t')

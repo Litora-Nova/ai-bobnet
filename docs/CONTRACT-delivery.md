@@ -52,9 +52,11 @@ Sender/recipient are real fields — **never a free-text signature to parse.**
   recycle.** Power-loss durability is outside this contract.
 
 ## 7. Dead-letter
-- A message that FAILs (or exceeds the wakeup retry bound, default five attempts) is retained in
+- A message that FAILs (or exceeds the wakeup retry bound, default three attempts) is retained in
   `bin/message dlq` — visible, never silently dropped, never infinitely re-notified. A task assignment
-  reaching this DLQ is translated by its root supervisor to `task.cancelled delivery_failed`.
+  reaching this DLQ is currently translated by its assignee-side root supervisor to
+  `task.cancelled delivery_failed`. This is an interim bridge; sender-side delivery ownership replaces it
+  in D2. Processed DLQ message ids are journaled so historical entries do not trigger repeated task folds.
 
 ## 8. Watcher = wakeup only
 - The notify/wakeup mechanism only pings ("check your inbox"). It does **not** prove delivery via heartbeat-line-count or re-nudges — proof lives in the state events (§3). (The heuristic watcher is dismantled in P2 after parity; P1 provides the receipts that replace it.)

@@ -24,16 +24,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aib_control import append_record, identity_for, registry_path, requested_record
 from aib_deployment import deployment_allows, load_deployment
 from aib_login import login_max_turn_seconds
-from task_ledger import TASK_RE, TOKEN_RE
+from task_intent import MAX_FILE as MAX_INTENT_BYTES, validate_intent_records
+from task_ledger import LedgerError, TASK_RE, TOKEN_RE, read_body_sidecar, safe_display_text
 
 
 MAX_LIVE_STATE_BYTES = 64 * 1024
 MAX_TURN_OUTPUT_BYTES = 8 * 1024 * 1024
-MAX_INTENT_BYTES = 64 * 1024
 TASK_MESSAGE_RE = re.compile(
-    r"\[task (t-[0-9a-f]{12}) run (r-[0-9a-f]{12}) requester "
+    r"^\[task (t-[0-9a-f]{12}) run (r-[0-9a-f]{12}) requester "
     r"((?:human|gateway):[a-z0-9][a-z0-9_-]*|[a-z0-9]+(?:-[a-z0-9]+)+)\]"
 )
+RESULT_FILE_CHECK = """\
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+fd = os.open(sys.argv[1], flags)
+parts = sys.argv[2].split("/")
+for component in parts[:-1]:
+    child = os.open(component, flags, dir_fd=fd)
+    os.close(fd)
+    fd = child
+info = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+raise SystemExit(0 if stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024 else 1)
+"""
+
+
+def neutralize_task_text(value: str) -> str:
+    return value.replace("[task", "(task")
 
 
 class JournalCorruptError(ValueError):
@@ -120,6 +139,7 @@ class Supervisor:
         self.run_agent = root / "bin/run-agent"
         self.message = root / "bin/message"
         self.task_cli = root / "bin/task"
+        self.attempts_cli = root / "bin/attempts"
 
         self.project_home = ""
         self.standup = Path("/")
@@ -142,6 +162,9 @@ class Supervisor:
         self.ctl_dir = Path(os.environ.get("AIB_CTL_DIR", "/run/aib/ctl"))
         self.control_log = Path(os.environ.get("AIB_CONTROL_LOG", "/srv/aib/standup/_control.jsonl"))
         self.outbox_root = Path(os.environ.get("AIB_OUTBOX_ROOT", "/srv/aib/outbox"))
+        self.role_uid = -1
+        self.role_gid = -1
+        self.role_groups: set[int] = set()
         self.cancel_grace = self._configured_interval("AIB_SUP_CANCEL_GRACE_S", 30.0)
 
         self.state = "STARTING"
@@ -426,6 +449,22 @@ class Supervisor:
         if mode != "supervised":
             return "not_supervised" if mode in ("oneshot", None) else "config_invalid"
         try:
+            test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists()
+            role_uid_raw = os.environ.get("AIB_ROLE_UID")
+            role_gid_raw = os.environ.get("AIB_ROLE_GID")
+            if role_uid_raw is None or role_gid_raw is None:
+                if not test_seam:
+                    raise ValueError
+                self.role_uid, self.role_gid = os.geteuid(), os.getegid()
+            elif not role_uid_raw.isdecimal() or not role_gid_raw.isdecimal():
+                raise ValueError
+            else:
+                self.role_uid, self.role_gid = int(role_uid_raw), int(role_gid_raw)
+            raw_groups = os.environ.get("AIB_ROLE_GROUPS", "")
+            if raw_groups:
+                if any(not part.isdecimal() for part in raw_groups.split(",")):
+                    raise ValueError
+                self.role_groups = {int(part) for part in raw_groups.split(",")}
             project_uid = agent["project"]
             project = registry["projects"][project_uid]
             team_uid = agent["team_uid"]
@@ -803,8 +842,12 @@ class Supervisor:
             pass
 
     def run_helper(
-        self, command: list[str], *, input_text: str | None = None, capture: bool = False
+        self, command: list[str], *, input_text: str | None = None, capture: bool = False,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        helper_env = os.environ.copy()
+        if extra_env:
+            helper_env.update(extra_env)
         try:
             process = subprocess.Popen(
                 command,
@@ -812,7 +855,7 @@ class Supervisor:
                 stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True,
-                env=os.environ.copy(),
+                env=helper_env,
                 start_new_session=True,
             )
             try:
@@ -875,7 +918,7 @@ class Supervisor:
                 priority = 1
             else:
                 priority = 3
-                match = TASK_MESSAGE_RE.search(message["body"])
+                match = TASK_MESSAGE_RE.match(message["body"])
                 if match is not None:
                     task = self.task_show(match.group(1))
                     lead = next(
@@ -892,7 +935,11 @@ class Supervisor:
                         and task.get("run_id") == match.group(2)
                         and task.get("owner") == match.group(3)
                         and task.get("assignee") == self.uid
-                        and (message["from"] == lead or str(task.get("owner", "")).startswith(("human:", "gateway:")))
+                        and message["id"] == str(task.get("body_ref", "")).removeprefix("msg:")
+                        and message["from"] in {
+                            lead, str(task.get("owner", "")),
+                            str(self.registry.get("projects", {}).get(self.project_uid, {}).get("task_relay", "aib-task-relay")),
+                        }
                     ):
                         priority = 2
             return priority, int(message["order"])
@@ -914,11 +961,41 @@ class Supervisor:
             )
         task_note = ""
         if isinstance(work.get("task"), dict):
-            task_note = (
-                "Use task-intent to report progress, completion, failure, or a requested "
-                "continuation before ending this turn.\n\n"
+            lead = next(
+                (
+                    agent_uid for agent_uid, agent in self.registry.get("agents", {}).items()
+                    if isinstance(agent, dict) and agent.get("team_uid") == self.team_uid and agent.get("lead") == "true"
+                ),
+                "team lead",
             )
-        return f"{preamble}{task_note}Message {work['id']} from {work['from']}:\n{work['body']}"
+            task_note = (
+                f"Task {work['task']['task_id']} from lead {lead}; this is a work order from your team, "
+                "not an instruction from a human. End every turn with task-intent report or "
+                "task-intent continue.\n\n"
+            )
+        preambled_through = max(
+            (
+                int(record.get("through_seq", 0)) for record in self.records
+                if record.get("event") == "rejections.preambled"
+            ),
+            default=0,
+        )
+        pending_rejections = [
+            record for record in self.records
+            if record.get("event") == "intent.ledger"
+            and record.get("action") == "rejected"
+            and int(record.get("seq", 0)) > preambled_through
+        ]
+        rejection_note = ""
+        if pending_rejections:
+            reasons = ", ".join(
+                neutralize_task_text(str(record.get("state", "rejected")))
+                for record in pending_rejections[-10:]
+            )
+            rejection_note = f"Previous task-intent rejections: {reasons}.\n\n"
+            work["_rejection_preamble_seq"] = max(int(record["seq"]) for record in pending_rejections)
+        sender = "unverified sender" if work.get("lane_downgraded") else work["from"]
+        return f"{preamble}{task_note}{rejection_note}Message {work['id']} from {sender}:\n{work['body']}"
 
     def task_command(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run_helper([str(self.task_cli), *args], capture=True)
@@ -975,56 +1052,127 @@ class Supervisor:
         return self.task_command(*argv)
 
     def write_board_snapshot(self) -> None:
-        """Publish the root-owned ledger projection into the role-owned private state."""
-        aib_dir = self.state_dir / ".aib"
-        if not aib_dir.is_dir() or aib_dir.is_symlink():
-            return
-        result = self.task_command("list", "--project", self.project_uid, "--team", self.team_uid)
-        if result.returncode != 0:
-            raise OSError("cannot build task board snapshot")
-        value = json.loads(result.stdout)
-        encoded = (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode()
-        if len(encoded) > MAX_INTENT_BYTES:
-            raise OSError("task board snapshot is too large")
-        owner = aib_dir.stat()
-        temporary = aib_dir / f".board.{os.getpid()}.tmp"
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        """Best-effort bounded projection; board faults never end a turn."""
+        aib_fd = intents_fd = temporary_fd = -1
+        temporary = f".board.{uuid.uuid4().hex}.tmp"
         try:
-            os.write(fd, encoded)
-            os.fsync(fd)
-            os.fchown(fd, owner.st_uid, owner.st_gid)
+            aib_fd, intents_fd = self._open_private_dirs()
+            os.close(intents_fd)
+            intents_fd = -1
+            result = self.task_command(
+                "list", "--project", self.project_uid, "--worker-view",
+                "--team", self.team_uid, "--agent", self.uid,
+            )
+            if result.returncode != 0:
+                raise OSError("list failed")
+            value = json.loads(result.stdout)
+            encoded = (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode()
+            if len(encoded) > 32 * 1024:
+                raise OSError("worker board exceeds 32 KiB")
+            temporary_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=aib_fd,
+            )
+            os.write(temporary_fd, encoded)
+            os.fsync(temporary_fd)
+            expected_uid = self.role_uid if self.role_uid >= 0 else os.geteuid()
+            expected_gid = self.role_gid if self.role_gid >= 0 else os.getegid()
+            os.fchown(temporary_fd, expected_uid, expected_gid)
+            os.close(temporary_fd)
+            temporary_fd = -1
+            os.replace(temporary, "board.json", src_dir_fd=aib_fd, dst_dir_fd=aib_fd)
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+            self.journal("board.stale")
+            self.journal("attention", reason="board_stale")
         finally:
-            os.close(fd)
-        os.replace(temporary, aib_dir / "board.json")
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
+            if aib_fd >= 0:
+                try:
+                    os.unlink(temporary, dir_fd=aib_fd)
+                except OSError:
+                    pass
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
 
-    def prepare_task_work(self, work: dict[str, Any]) -> None:
+    def prepare_task_work(self, work: dict[str, Any]) -> bool:
         if work.get("synthetic") or isinstance(work.get("task"), dict):
-            return
-        match = TASK_MESSAGE_RE.search(str(work.get("body", "")))
+            return True
+        body = str(work.get("body", ""))
+        match = TASK_MESSAGE_RE.match(body)
         if match is None:
-            return
+            if "[task" in body:
+                work["body"] = neutralize_task_text(body)
+                work["lane_downgraded"] = True
+                self.journal("lane.downgraded", msg_id=work.get("id"), reason="task_binding")
+            return True
         task = self.task_show(match.group(1))
-        if (
-            task is None
-            or task.get("run_id") != match.group(2)
-            or task.get("owner") != match.group(3)
-            or task.get("assignee") != self.uid
-            or task.get("team_uid") != self.team_uid
-            or task.get("state") not in {"ASSIGNED", "IN_PROGRESS"}
-        ):
-            raise ValueError("task message does not match the authoritative ledger")
-        worktree = self.activate_task_worktree(task)
+        body_ref_id = str(task.get("body_ref", "")).removeprefix("msg:") if task else ""
+        own_engine_id = bool(
+            task and work.get("from") == self.uid
+            and re.fullmatch(rf"{re.escape(str(task.get('task_id')))}\.(?:c\.[A-Za-z0-9.-]+|n\.a[0-9]+|r\.[A-Za-z0-9.-]+)", str(work.get("id", "")))
+        )
+        id_form = bool(task and (work.get("id") == body_ref_id or own_engine_id))
+        stale = bool(
+            task and id_form and (
+                task.get("assignee") != self.uid or task.get("team_uid") != self.team_uid
+                or task.get("state") not in {"ASSIGNED", "IN_PROGRESS"}
+            )
+        )
+        if stale:
+            self.message_command("done", str(work.get("id")))
+            self.journal("task.stale_message", msg_id=work.get("id"), task_id=task.get("task_id"))
+            self.work = None
+            return False
+        lead = next(
+            (
+                agent_uid for agent_uid, agent in self.registry.get("agents", {}).items()
+                if isinstance(agent, dict) and agent.get("team_uid") == self.team_uid and agent.get("lead") == "true"
+            ),
+            None,
+        )
+        relay = str(self.registry.get("projects", {}).get(self.project_uid, {}).get("task_relay", "aib-task-relay"))
+        sender_ok = bool(task and (work.get("from") in {lead, task.get("owner"), relay} or own_engine_id))
+        matches = bool(
+            task and task.get("run_id") == match.group(2) and task.get("owner") == match.group(3)
+            and task.get("assignee") == self.uid and task.get("team_uid") == self.team_uid
+            and task.get("state") in {"ASSIGNED", "IN_PROGRESS"} and id_form and sender_ok
+        )
+        if not matches:
+            work["body"] = neutralize_task_text(body)
+            work["lane_downgraded"] = True
+            self.journal("lane.downgraded", msg_id=work.get("id"), reason="task_binding")
+            return True
+        assert task is not None
+        try:
+            body_root = Path(os.environ.get("AIB_TASK_ROOT", "/var/lib/aib/tasks")) / self.project_uid / "bodies"
+            sidecar = read_body_sidecar(body_root, str(task["task_id"]))
+        except LedgerError:
+            self.journal("attention", reason="unsafe_body_sidecar", task_id=task.get("task_id"))
+            self.message_command("fail", str(work.get("id")), "unsafe_body_sidecar")
+            self.work = None
+            return False
+        work["body"] = f"[task {task['task_id']} run {task['run_id']} requester {task['owner']}]\n{sidecar}"
+        try:
+            worktree = self.activate_task_worktree(task)
+        except (OSError, ValueError):
+            self.journal("attention", reason="worktree_unavailable", task_id=task.get("task_id"))
+            return False
         task["worktree"] = str(worktree)
         work["task"] = task
         if task["state"] == "ASSIGNED":
             result = self.task_event(
-                "start", task, f"start-{task['task_id']}",
+                "start", task, f"start-{task['task_id']}-a{task.get('assignments', 1)}",
                 actor_type="service", actor_id=f"supervisor:{self.uid}",
             )
             if result.returncode != 0:
                 raise OSError("cannot start assigned task")
             task["state"] = "IN_PROGRESS"
         self.check_cwd_binding()
+        return True
 
     @staticmethod
     def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1059,25 +1207,153 @@ class Supervisor:
             None,
         )
 
-    def _quarantine_intent(self, path: Path, reason: str) -> None:
-        attempt_id = path.name.removesuffix(".jsonl")
-        if any(record.get("event") == "intents.tainted" and record.get("attempt_id") == attempt_id for record in self.records):
-            return
-        target_dir = self.intent_dir / "tainted"
-        target_dir.mkdir(mode=0o700, exist_ok=True)
-        target = target_dir / path.name
+    def _open_private_dirs(self) -> tuple[int, int]:
+        """Open role-owned .aib/intents from the verified supervisor state fd."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        aib_fd = intents_fd = -1
         try:
-            os.replace(path, target)
+            aib_fd = os.open(".aib", flags, dir_fd=self.state_dir_fd)
+            intents_fd = os.open("intents", flags, dir_fd=aib_fd)
+            expected_uid = self.role_uid if self.role_uid >= 0 else os.geteuid()
+            expected_gid = self.role_gid if self.role_gid >= 0 else os.getegid()
+            for fd in (aib_fd, intents_fd):
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != expected_uid
+                    or info.st_gid != expected_gid
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                ):
+                    raise OSError("role_mismatch")
+            return aib_fd, intents_fd
+        except Exception:
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
+            raise
+
+    def _unlink_intent(self, name: str) -> None:
+        aib_fd = intents_fd = -1
+        try:
+            aib_fd, intents_fd = self._open_private_dirs()
+            os.unlink(name, dir_fd=intents_fd)
         except OSError:
             pass
+        finally:
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
+
+    def _quarantine_intent(self, path: Path, reason: str, alarm: str = "security") -> None:
+        attempt_id = path.name.removesuffix(".jsonl")
+        if any(record.get("event") == "intents.tainted" and record.get("attempt_id") == attempt_id for record in self.records):
+            self._unlink_intent(path.name)
+            self.journal("intents.tainted_replay", attempt_id=attempt_id)
+            return
+        aib_fd = intents_fd = quarantine_fd = source_fd = target_fd = -1
+        data = b""
+        stored = False
+        try:
+            aib_fd, intents_fd = self._open_private_dirs()
+            source_fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=intents_fd,
+            )
+            info = os.fstat(source_fd)
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                data = os.read(source_fd, MAX_INTENT_BYTES + 1)
+            quarantine_fd = os.open(
+                ".aib-quarantine",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=self.state_dir_fd,
+            )
+            quarantine_info = os.fstat(quarantine_fd)
+            if (
+                not stat.S_ISDIR(quarantine_info.st_mode)
+                or quarantine_info.st_uid != os.geteuid()
+                or quarantine_info.st_gid != os.getegid()
+                or stat.S_IMODE(quarantine_info.st_mode) != 0o700
+            ):
+                raise OSError("unsafe quarantine directory")
+            entries = os.listdir(quarantine_fd)
+            total = 0
+            for name in entries:
+                try:
+                    item = os.stat(name, dir_fd=quarantine_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(item.st_mode):
+                    total += item.st_size
+            if len(entries) < 100 and total + len(data) <= 10 * 1024 * 1024:
+                target_name = f"{path.name}-{uuid.uuid4().hex}.jsonl"
+                target_fd = os.open(
+                    target_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=quarantine_fd,
+                )
+                os.write(target_fd, data)
+                os.fsync(target_fd)
+                stored = True
+        except OSError:
+            pass
+        finally:
+            for fd in (target_fd, source_fd, quarantine_fd):
+                if fd >= 0:
+                    os.close(fd)
+            if intents_fd >= 0:
+                try:
+                    os.unlink(path.name, dir_fd=intents_fd)
+                except OSError:
+                    pass
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
         self.journal("intents.tainted", attempt_id=attempt_id, reason=reason)
-        self.write_alarm("intents_tainted", attempt_id=attempt_id)
+        if not stored:
+            self.journal("attention", reason="quarantine_capacity", attempt_id=attempt_id, size=len(data))
+        if alarm == "security":
+            self.write_alarm("intents_tainted", attempt_id=attempt_id)
+        elif alarm == "engine":
+            self.write_alarm("intent_apply_exhausted", attempt_id=attempt_id)
+        else:
+            self.journal("attention", reason=reason, attempt_id=attempt_id)
+
+    def _intent_retry(self, path: Path, attempt_id: str, reason: str) -> bool:
+        count = 1 + sum(
+            record.get("event") == "intent.retry" and record.get("attempt_id") == attempt_id
+            for record in self.records
+        )
+        self.journal("intent.retry", attempt_id=attempt_id, n=count, reason=reason)
+        if count >= 5:
+            self._quarantine_intent(path, "apply_exhausted", alarm="engine")
+            return False
+        return True
+
+    def _latest_rejection_reason(self, task_id: str) -> str:
+        result = self.task_command("list", "--project", self.project_uid, "--all")
+        if result.returncode == 0:
+            try:
+                value = json.loads(result.stdout)
+                for row in reversed(value.get("rejections", [])):
+                    if isinstance(row, dict) and row.get("task_id") == task_id and isinstance(row.get("reason"), str):
+                        return row["reason"]
+            except (AttributeError, ValueError, json.JSONDecodeError):
+                pass
+        return "rejected"
 
     def _read_intents(self, path: Path, attempt_id: str) -> list[dict[str, Any]]:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        aib_fd = intents_fd = fd = -1
         try:
+            aib_fd, intents_fd = self._open_private_dirs()
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=intents_fd,
+            )
             info = os.fstat(fd)
-            directory = self.intent_dir.stat()
+            directory = os.fstat(intents_fd)
             if (
                 not stat.S_ISREG(info.st_mode)
                 or info.st_nlink != 1
@@ -1089,12 +1365,17 @@ class Supervisor:
                 raise ValueError("unsafe intent file")
             data = os.read(fd, MAX_INTENT_BYTES + 1)
         finally:
-            os.close(fd)
+            for item in (fd, intents_fd, aib_fd):
+                if item >= 0:
+                    os.close(item)
         records: list[dict[str, Any]] = []
         for raw in data.splitlines():
             if not raw or len(raw) > 8192 or len(records) >= 10:
                 raise ValueError("invalid intent bounds")
-            value = json.loads(raw, object_pairs_hook=self._strict_object)
+            try:
+                value = json.loads(raw, object_pairs_hook=self._strict_object)
+            except RecursionError as error:
+                raise ValueError("deep intent JSON") from error
             if not isinstance(value, dict) or value.get("attempt_id") != attempt_id:
                 raise ValueError("foreign attempt id")
             records.append(value)
@@ -1102,16 +1383,39 @@ class Supervisor:
             raise ValueError("empty intent file")
         return records
 
-    def _persist_self_task_message(self, task: dict[str, Any], suffix: str, summary: str) -> None:
-        ident = f"{task['task_id']}.{suffix}"
+    def _apply_pending_intent(self, attempt_id: str, context: dict[str, Any]) -> bool:
+        """Discover and apply one intent file through the verified intents dirfd."""
+        if TOKEN_RE.fullmatch(attempt_id) is None:
+            return False
+        name = f"{attempt_id}.jsonl"
+        aib_fd = intents_fd = -1
+        try:
+            aib_fd, intents_fd = self._open_private_dirs()
+            try:
+                os.stat(name, dir_fd=intents_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+        finally:
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
+        return self.apply_intent_file(self.intent_dir / name, context)
+
+    def _persist_self_task_message(self, task: dict[str, Any], ident: str, summary: str) -> bool:
         requester = str(task["owner"])
+        if not isinstance(summary, str) or not safe_display_text(summary):
+            self.journal("attention", reason="unsafe_self_message", message_id=ident)
+            return False
+        summary = neutralize_task_text(summary)
         body = (
             f"[task {task['task_id']} run {task['run_id']} requester {requester}] "
             f"continue task; previous worker summary: {summary or 'none'}"
         )
         result = self.message_command("send", self.uid, body, "--id", ident)
         if result.returncode != 0:
-            raise OSError("cannot persist task continuation")
+            self.journal("attention", reason="self_message_failed", message_id=ident)
+            return False
+        return True
 
     def _deliver_task_report(
         self,
@@ -1122,6 +1426,15 @@ class Supervisor:
         result_ref: str | None,
     ) -> None:
         message_id = f"task-report-{task['task_id']}-{attempt_id}"
+        if any(
+            record.get("event") == "report.delivered" and record.get("message_id") == message_id
+            for record in self.records
+        ):
+            return
+        if not isinstance(summary, str) or not safe_display_text(summary):
+            self.journal("attention", reason="unsafe_report_text", message_id=message_id)
+            return
+        summary = neutralize_task_text(summary)
         body = f"task-report {task['task_id']} state {state}"
         if result_ref:
             body += f" result {result_ref}"
@@ -1130,41 +1443,106 @@ class Supervisor:
         body = body.replace("\r", " ").replace("\n", " ").replace("|", "%7C")
         requester = str(task.get("owner", ""))
         if requester.startswith(("human:", "gateway:")):
-            destination = self.outbox_root / self.team_uid / "outbox.md"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            existing = destination.read_text(encoding="utf-8") if destination.exists() else ""
-            if f"id:{message_id} |" not in existing:
-                with destination.open("a", encoding="utf-8") as stream:
-                    stream.write(
-                        f"{utc_now()} | id:{message_id} | from:{self.uid} | to:{requester} | "
-                        f"state:PERSISTED | {body}\n"
-                    )
-                    stream.flush()
-                    os.fsync(stream.fileno())
+            root_fd = team_fd = file_fd = -1
+            try:
+                test_seam = (
+                    os.environ.get("AIB_TEST_SEAMS") == "1"
+                    and not (self.root / ".aib-installed").exists()
+                )
+                if test_seam:
+                    self.outbox_root.mkdir(parents=True, exist_ok=True)
+                root_fd = os.open(
+                    self.outbox_root,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                root_info = os.fstat(root_fd)
+                expected_owner = os.geteuid()
+                if (
+                    not stat.S_ISDIR(root_info.st_mode)
+                    or root_info.st_uid != expected_owner
+                    or stat.S_IMODE(root_info.st_mode) & 0o002
+                ):
+                    raise OSError("unsafe outbox root")
+                try:
+                    os.mkdir(self.team_uid, 0o770, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+                team_fd = os.open(
+                    self.team_uid,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=root_fd,
+                )
+                if test_seam:
+                    os.fchmod(team_fd, 0o770)
+                team_info = os.fstat(team_fd)
+                if (
+                    not stat.S_ISDIR(team_info.st_mode)
+                    or team_info.st_uid != expected_owner
+                    or stat.S_IMODE(team_info.st_mode) != 0o770
+                ):
+                    raise OSError("unsafe team outbox")
+                file_fd = os.open(
+                    "outbox.md",
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o660,
+                    dir_fd=team_fd,
+                )
+                info = os.fstat(file_fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise OSError("unsafe outbox")
+                line = (
+                    f"{utc_now()} | id:{message_id} | from:{self.uid} | to:{requester} | "
+                    f"state:PERSISTED | {body}\n"
+                ).encode("utf-8")
+                os.write(file_fd, line)
+                os.fsync(file_fd)
+            except (OSError, UnicodeError):
+                self.journal("attention", reason="outbox_unsafe", message_id=message_id)
+                return
+            finally:
+                for fd in (file_fd, team_fd, root_fd):
+                    if fd >= 0:
+                        os.close(fd)
         else:
             result = self.message_command("send", requester, body, "--id", message_id)
             if result.returncode != 0:
-                raise OSError("cannot deliver task report")
+                self.journal("attention", reason="report_delivery_failed", message_id=message_id)
+                return
+        self.journal("report.delivered", message_id=message_id, task_id=task["task_id"])
 
-    def _service_block(self, task: dict[str, Any], attempt_id: str, reason: str) -> None:
+    def _service_block(
+        self, task: dict[str, Any], attempt_id: str, reason: str, causation: str | None = None
+    ) -> bool:
         result = self.task_event(
-            "report", task, f"block-{attempt_id}-{reason.replace('_', '-')}",
+            "report", task, causation or f"block-{attempt_id}-{reason.replace('_', '-')}",
             actor_type="service", actor_id=f"supervisor:{self.uid}",
             state="blocked", reason=reason,
         )
+        if result.returncode == 77:
+            self.journal("service.terminal", task_id=task["task_id"], action="block", reason=reason)
+            return True
         if result.returncode != 0:
-            raise OSError(f"cannot block task: {reason}")
+            self.journal("service.retry", task_id=task["task_id"], action="block", reason=reason, rc=result.returncode)
+            self.journal("attention", reason="service_apply_failed", task_id=task["task_id"])
+            return False
         self._deliver_task_report(task, attempt_id, "blocked", reason, None)
+        return True
 
-    def _service_fail(self, task: dict[str, Any], attempt_id: str, reason: str) -> None:
+    def _service_fail(self, task: dict[str, Any], attempt_id: str, reason: str) -> bool:
         result = self.task_event(
             "report", task, f"fail-{attempt_id}-{reason.replace('_', '-')}",
             actor_type="service", actor_id=f"supervisor:{self.uid}",
             state="failed", reason=reason,
         )
+        if result.returncode == 77:
+            self.journal("service.terminal", task_id=task["task_id"], action="fail", reason=reason)
+            return True
         if result.returncode != 0:
-            raise OSError(f"cannot fail task: {reason}")
+            self.journal("service.retry", task_id=task["task_id"], action="fail", reason=reason, rc=result.returncode)
+            self.journal("attention", reason="service_apply_failed", task_id=task["task_id"])
+            return False
         self._deliver_task_report(task, attempt_id, "failed", reason, None)
+        return True
 
     def apply_intent_file(self, path: Path, context: dict[str, Any]) -> bool:
         attempt_id = str(context["attempt_id"])
@@ -1175,10 +1553,14 @@ class Supervisor:
             return False
         try:
             intents = self._read_intents(path, attempt_id)
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            validate_intent_records(intents, attempt_id, str(task["task_id"]))
+        except (OSError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
             self._quarantine_intent(path, "invalid_intent")
             return False
         handled = False
+        rejections: list[str] = []
+        continuation: tuple[str, str] | None = None
+        final_reports: list[tuple[str, str, str | None]] = []
         for index, intent in enumerate(intents, 1):
             verb = intent.get("verb")
             if verb != "delegate" and intent.get("task_id") != task["task_id"]:
@@ -1190,6 +1572,10 @@ class Supervisor:
             result_ref = intent.get("result_ref")
             reason = intent.get("reason")
             if verb == "delegate":
+                if prior is not None:
+                    if prior.get("action") == "rejected":
+                        rejections.append(str(prior.get("state", "not_lead")))
+                    continue
                 allowed = {"attempt_id", "verb", "run_id", "to", "title", "body", "source_msg_id"}
                 if set(intent) != allowed or intent.get("run_id") != task["run_id"]:
                     self._quarantine_intent(path, "invalid_delegate")
@@ -1199,10 +1585,20 @@ class Supervisor:
                     actor_type="service", actor_id=f"supervisor:{self.uid}",
                     requested_type="task.created", reason="not_lead",
                 )
+                if result.returncode == 75:
+                    return self._intent_retry(path, attempt_id, "stream_lock")
                 if result.returncode not in {0, 77}:
-                    raise OSError("cannot persist delegation rejection")
-                self.journal("intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"], action="rejected", state="not_lead")
-                handled = True
+                    return self._intent_retry(path, attempt_id, f"delegate_reject_rc_{result.returncode}")
+                if os.environ.get("AIB_TEST_PAUSE_AFTER_LEDGER") and os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists():
+                    marker = Path(os.environ["AIB_TEST_PAUSE_AFTER_LEDGER"])
+                    marker.touch()
+                    while marker.exists():
+                        time.sleep(0.05)
+                self.journal(
+                    "intent.ledger", attempt_id=attempt_id, index=index,
+                    task_id=task["task_id"], action="rejected", state="not_lead",
+                )
+                rejections.append("not_lead")
                 continue
             allowed = {"attempt_id", "verb", "task_id", "summary"}
             if verb == "report":
@@ -1225,12 +1621,11 @@ class Supervisor:
                         requested_type="task.reported", reason="invalid_result_ref",
                     )
                     if result.returncode == 75:
-                        self.journal("intent.retry", attempt_id=attempt_id, index=index, reason="stream_lock")
-                        return True
+                        return self._intent_retry(path, attempt_id, "stream_lock")
                     if result.returncode not in {0, 77}:
-                        raise OSError("cannot persist result-ref rejection")
+                        return self._intent_retry(path, attempt_id, f"reject_ref_rc_{result.returncode}")
                     self.journal("intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"], action="rejected", state="invalid_result_ref")
-                    handled = True
+                    rejections.append("invalid_result_ref")
                     continue
                 result = self.task_event(
                     "report", task, f"intent-{attempt_id}-{index}",
@@ -1238,73 +1633,146 @@ class Supervisor:
                     state=report_state, result_ref=result_ref, reason=reason,
                 )
                 if result.returncode == 75:
-                    self.journal("intent.retry", attempt_id=attempt_id, index=index, reason="stream_lock")
-                    return True
+                    return self._intent_retry(path, attempt_id, "stream_lock")
                 if result.returncode != 0:
                     current = self.task_show(task["task_id"])
                     budget = task.get("budget", {}).get("max_turns", 8)
                     if verb == "continue" and current is not None and current.get("turns", 0) >= budget:
-                        self._service_block(task, attempt_id, "turn_budget")
+                        if not self._service_block(task, attempt_id, "turn_budget"):
+                            return self._intent_retry(path, attempt_id, "service_block")
                         self.journal("intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"], action="blocked", state="turn_budget")
                         handled = True
                         continue
-                    raise OSError("task intent ledger apply failed")
-                self.journal("intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"], action=verb, state=report_state, summary=summary, result_ref=result_ref)
-                prior = self.records[-1]
-                if os.environ.get("AIB_TEST_D1B_PAUSE_AFTER_LEDGER") and os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists():
-                    marker = Path(os.environ["AIB_TEST_D1B_PAUSE_AFTER_LEDGER"])
+                    if result.returncode in {76, 77, 64}:
+                        rejection_reason = (
+                            "concurrent_update" if result.returncode == 76
+                            else "invalid_argument" if result.returncode == 64
+                            else self._latest_rejection_reason(str(task["task_id"]))
+                        )
+                        self.journal(
+                            "intent.ledger", attempt_id=attempt_id, index=index,
+                            task_id=task["task_id"], action="rejected", state=rejection_reason,
+                        )
+                        if result.returncode == 64:
+                            self.journal("attention", reason="invalid_argument", attempt_id=attempt_id)
+                        rejections.append(rejection_reason)
+                        continue
+                    return self._intent_retry(path, attempt_id, f"apply_rc_{result.returncode}")
+                message_id = (
+                    f"{task['task_id']}.c.{attempt_id}.{index}"
+                    if verb == "continue" else f"task-report-{task['task_id']}-{attempt_id}"
+                )
+                if os.environ.get("AIB_TEST_PAUSE_AFTER_LEDGER") and os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists():
+                    marker = Path(os.environ["AIB_TEST_PAUSE_AFTER_LEDGER"])
                     marker.touch()
                     while marker.exists():
                         time.sleep(0.05)
+                self.journal(
+                    "intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"],
+                    action=verb, state=report_state, summary=summary, result_ref=result_ref,
+                    message_id=message_id,
+                )
+                prior = self.records[-1]
             action = prior.get("action") if prior else verb
             recorded_state = str(prior.get("state", state)) if prior else state
             if action == "continue":
-                fresh = self.task_show(task["task_id"]) or task
-                self._persist_self_task_message(fresh, f"c{fresh.get('turns', 0)}", str(prior.get("summary", summary)))
+                continuation = (
+                    str(prior.get("message_id", f"{task['task_id']}.c.{attempt_id}.{index}")),
+                    str(prior.get("summary", summary)),
+                )
+                handled = True
             elif action == "report" and recorded_state != "progress":
-                self._deliver_task_report(task, attempt_id, recorded_state, str(prior.get("summary", summary)), prior.get("result_ref"))
-            handled = True
-        self.journal("intents.applied", attempt_id=attempt_id, task_id=task["task_id"], count=len(intents))
-        done_dir = self.intent_dir / "done"
-        done_dir.mkdir(mode=0o700, exist_ok=True)
-        try:
-            os.replace(path, done_dir / path.name)
-        except OSError:
-            pass
+                final_reports.append((recorded_state, str(prior.get("summary", summary)), prior.get("result_ref")))
+                handled = True
+            elif action == "report":
+                handled = True
+            elif action == "rejected":
+                rejections.append(recorded_state)
+        fresh = self.task_show(task["task_id"]) or task
+        synthetic_ids: list[str] = []
+        if final_reports:
+            state, report_summary, report_ref = final_reports[-1]
+            self._deliver_task_report(fresh, attempt_id, state, report_summary, report_ref)
+        if fresh.get("state") == "IN_PROGRESS":
+            if handled and rejections:
+                receipt_id = f"{task['task_id']}.r.{attempt_id}"
+                if self._persist_self_task_message(fresh, receipt_id, "rejected: " + ", ".join(rejections)):
+                    synthetic_ids.append(receipt_id)
+            elif continuation is not None:
+                continuation_id, continuation_summary = continuation
+                if self._persist_self_task_message(fresh, continuation_id, continuation_summary):
+                    synthetic_ids.append(continuation_id)
+        self.journal(
+            "intents.applied", attempt_id=attempt_id, task_id=task["task_id"], count=len(intents),
+            message_ids=synthetic_ids,
+        )
+        self._unlink_intent(path.name)
         msg_id = context.get("msg_id")
         if isinstance(msg_id, str) and msg_id and not msg_id.startswith("handover-"):
             self.message_command("done", msg_id)
         return handled
 
     def scan_intents(self) -> None:
-        if not self.intent_dir.is_dir() or self.intent_dir.is_symlink():
+        aib_fd = intents_fd = -1
+        try:
+            aib_fd, intents_fd = self._open_private_dirs()
+            names = sorted(os.listdir(intents_fd))
+        except OSError as error:
+            self.journal("fs.unsafe", path=".aib/intents", reason=str(error))
             return
+        finally:
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
         contexts = self._attempt_contexts()
-        for path in sorted(self.intent_dir.glob("*.jsonl")):
-            attempt_id = path.name.removesuffix(".jsonl")
+        for name in names:
+            if not name.endswith(".jsonl") or TOKEN_RE.fullmatch(name[:-6]) is None:
+                self._quarantine_intent(self.intent_dir / name, "invalid_name")
+                continue
+            path = self.intent_dir / name
+            attempt_id = name.removesuffix(".jsonl")
             context = contexts.get(attempt_id)
             if context is None:
                 self._quarantine_intent(path, "foreign_attempt")
+            elif not isinstance(context.get("task_id"), str):
+                self._quarantine_intent(path, "intent_without_task", alarm="attention")
             elif self._intent_applied(attempt_id):
-                done_dir = self.intent_dir / "done"
-                done_dir.mkdir(mode=0o700, exist_ok=True)
-                try:
-                    os.replace(path, done_dir / path.name)
-                except OSError:
-                    pass
+                self._unlink_intent(name)
             else:
-                self.apply_intent_file(path, context)
+                try:
+                    self._apply_pending_intent(attempt_id, context)
+                except Exception as error:
+                    self._intent_retry(path, attempt_id, type(error).__name__)
 
     def scan_task_dlq(self) -> None:
         """Translate exhausted assignment delivery into the service-owned terminal event."""
-        if not self.intent_dir.is_dir():
+        aib_fd = intents_fd = -1
+        try:
+            aib_fd, intents_fd = self._open_private_dirs()
+        except OSError:
             return
+        finally:
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
         result = self.message_command("dlq", capture=True)
         if result.returncode != 0:
             return
         for line in result.stdout.splitlines():
-            match = TASK_MESSAGE_RE.search(line)
+            id_match = re.match(r"^id:([A-Za-z0-9._-]+) ", line)
+            if id_match is None:
+                continue
+            message_id = id_match.group(1)
+            if any(
+                record.get("event") == "task.dlq_processed"
+                and record.get("message_id") == message_id
+                for record in self.records
+            ):
+                continue
+            body = line.split(" | ", 4)[-1]
+            match = TASK_MESSAGE_RE.match(body)
             if match is None:
+                self.journal("task.dlq_processed", message_id=message_id, outcome="not_task")
                 continue
             task = self.task_show(match.group(1))
             if (
@@ -1314,6 +1782,7 @@ class Supervisor:
                 or task.get("assignee") != self.uid
                 or task.get("state") != "ASSIGNED"
             ):
+                self.journal("task.dlq_processed", message_id=message_id, outcome="stale")
                 continue
             event = self.task_event(
                 "cancel", task, f"delivery-{task['task_id']}",
@@ -1321,34 +1790,226 @@ class Supervisor:
                 reason="delivery_failed",
             )
             if event.returncode == 0:
-                self.journal("task.delivery_failed", task_id=task["task_id"])
-                self._deliver_task_report(task, "delivery-failed", "cancelled", "delivery failed after five wakeup attempts", None)
+                self.journal("task.delivery_failed", task_id=task["task_id"], message_id=message_id)
+                self._deliver_task_report(task, "delivery-failed", "cancelled", "delivery attempts exhausted", None)
                 self.write_alarm("task_delivery_failed", task_id=task["task_id"])
+                outcome = "cancelled"
+            else:
+                outcome = f"task_rc_{event.returncode}"
+            self.journal("task.dlq_processed", message_id=message_id, outcome=outcome)
 
     def handle_missing_report(self, task: dict[str, Any], attempt_id: str) -> None:
+        assignment = int(task.get("assignments", 1))
         count = sum(
-            record.get("event") == "task.no_report" and record.get("task_id") == task["task_id"]
+            record.get("event") == "task.no_report"
+            and record.get("task_id") == task["task_id"]
+            and record.get("assignment") == assignment
             for record in self.records
         ) + 1
-        self.journal("task.no_report", task_id=task["task_id"], attempt_id=attempt_id, count=count)
         if count >= 2:
-            self._service_block(task, attempt_id, "no_report")
+            self._service_block(
+                task, attempt_id, "no_report",
+                causation=f"noreport-{task['task_id']}-a{assignment}",
+            )
         else:
-            self._persist_self_task_message(task, "n1", "no report received")
+            nudge_id = f"{task['task_id']}.n.a{assignment}"
+            rejected = [
+                str(record.get("state")) for record in self.records
+                if record.get("event") == "intent.ledger"
+                and record.get("attempt_id") == attempt_id
+                and record.get("action") == "rejected"
+            ]
+            detail = "no report received"
+            if rejected:
+                detail += "; rejected: " + ", ".join(rejected)
+            self._persist_self_task_message(task, nudge_id, detail)
+        self.journal(
+            "task.no_report", task_id=task["task_id"], attempt_id=attempt_id,
+            assignment=assignment, count=count,
+        )
 
-    def _git(self, cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def sweep_missing_reports(self) -> None:
+        result = self.task_command("list", "--project", self.project_uid, "--team", self.team_uid, "--all")
+        if result.returncode != 0:
+            return
+        try:
+            tasks = json.loads(result.stdout).get("tasks", [])
+        except (AttributeError, ValueError, json.JSONDecodeError):
+            return
+        messages = self.open_messages()
+        for task in tasks:
+            if (
+                not isinstance(task, dict) or task.get("assignee") != self.uid
+                or task.get("state") != "IN_PROGRESS"
+            ):
+                continue
+            task_id = str(task.get("task_id", ""))
+            if any(
+                message.get("id", "").startswith(f"{task_id}.")
+                or TASK_MESSAGE_RE.match(str(message.get("body", ""))) is not None
+                and TASK_MESSAGE_RE.match(str(message.get("body", ""))).group(1) == task_id
+                for message in messages
+            ):
+                continue
+            assignment = int(task.get("assignments", 1))
+            prior = [
+                record for record in self.records
+                if record.get("event") == "task.no_report"
+                and record.get("task_id") == task_id
+                and record.get("assignment") == assignment
+            ]
+            attempt_id = str(prior[-1].get("attempt_id", f"startup-{task_id}")) if prior else f"startup-{task_id}"
+            self.handle_missing_report(task, attempt_id)
+
+    def _open_project_home(self) -> tuple[Path, int]:
+        """Verify the absolute project-home chain without following child-controlled links."""
+        repo = Path(self.project_home)
+        if not repo.is_absolute() or any(part in {"", ".", ".."} for part in repo.parts[1:]):
+            raise OSError("unsafe project home")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open("/", flags)
+        try:
+            for component in repo.parts[1:]:
+                child = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            info = os.fstat(fd)
+            test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists()
+            if not test_seam and (
+                info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o2770
+            ):
+                raise OSError("unsafe project home ownership or mode")
+            return repo, info.st_gid
+        except OSError as error:
+            self.journal("fs.unsafe", path="project_home", reason=str(error))
+            raise
+        finally:
+            os.close(fd)
+
+    def _write_git_config(self, repo: Path) -> Path:
+        test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists()
+        if test_seam:
+            config_root = self.state_dir / ".git-config"
+            config_root.mkdir(mode=0o700, exist_ok=True)
+        else:
+            config_root = Path("/run/aib/git")
+        root_fd = os.open(config_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            root_info = os.fstat(root_fd)
+            if not test_seam and (root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) != 0o755):
+                raise OSError("unsafe git config directory")
+            name = f"{self.uid}.gitconfig"
+            temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o644,
+                dir_fd=root_fd,
+            )
+            try:
+                safe_paths = [repo, self._worktree_path()]
+                body = "".join(f"[safe]\n\tdirectory = {path}\n" for path in safe_paths).encode("utf-8")
+                os.write(fd, body)
+                os.fsync(fd)
+                os.fchmod(fd, 0o644)
+                if os.geteuid() == 0:
+                    os.fchown(fd, 0, 0)
+            finally:
+                os.close(fd)
+            os.replace(temporary, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+            return config_root / name
+        finally:
+            os.close(root_fd)
+
+    def _run_as_role(
+        self,
+        repo: Path,
+        project_gid: int,
+        argv: list[str],
+        *,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists()
+        config = self._write_git_config(repo)
+        inner_env = [
+            "PATH=/usr/bin:/bin", "HOME=/nonexistent", "LANG=C",
+            "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0",
+            f"GIT_CONFIG_GLOBAL={config}",
+        ]
+        if env:
+            for key in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+                if key in env:
+                    inner_env.append(f"{key}={env[key]}")
+        confine = os.environ.get("AIB_CONFINE_BIN", "")
+        if test_seam and not confine:
+            command = ["/usr/bin/env", "-i", *inner_env, "/bin/sh", "-c", 'umask 002; exec "$@"', "sh", *argv]
+            process_env = None
+        else:
+            if not confine or not Path(confine).is_file():
+                raise OSError("worktree_unavailable")
+            if project_gid not in self.role_groups:
+                raise OSError("worktree_unavailable")
+            command = [
+                confine, "--uid", str(self.role_uid), "--gid", str(self.role_gid),
+                "--groups", str(project_gid), "/usr/bin/env", "-i", *inner_env,
+                "/bin/sh", "-c", 'umask 002; exec "$@"', "sh", *argv,
+            ]
+            process_env = {
+                "PATH": "/usr/bin:/bin",
+                "LL_RO": "/",
+                "LL_RW": f"/tmp:/var/tmp:/dev:{repo}",
+                "AIB_ROLE_UIDS": str(self.role_uid),
+                "AIB_ROLE_GROUPS": str(project_gid),
+            }
         result = subprocess.run(
-            ["git", "-C", str(cwd), *args],
+            command,
             check=False,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=env,
+            env=process_env,
             timeout=self.call_timeout,
         )
         if check and result.returncode != 0:
             raise OSError(result.stderr.strip() or "git command failed")
         return result
+
+    def _git_as_role(
+        self, cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        repo, project_gid = self._open_project_home()
+        lexical_cwd = Path(os.path.normpath(str(cwd)))
+        try:
+            lexical_cwd.relative_to(repo)
+        except ValueError as error:
+            raise OSError("worktree_unavailable") from error
+        hardening = [
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "core.pager=cat",
+            "-c", "commit.gpgSign=false",
+            "-c", "credential.helper=",
+            "-c", "protocol.allow=never",
+            "-c", "gc.auto=0",
+            "-c", "maintenance.auto=false",
+            "--no-replace-objects",
+        ]
+        git_argv = ["git", *hardening, "-C", str(lexical_cwd), *args]
+        return self._run_as_role(repo, project_gid, git_argv, check=check, env=env)
+
+    def _validate_file_ref_as_role(self, worktree: Path, relative: str) -> bool:
+        repo, project_gid = self._open_project_home()
+        if Path(os.path.normpath(str(worktree))) != self._worktree_path():
+            return False
+        result = self._run_as_role(
+            repo,
+            project_gid,
+            ["/usr/bin/python3", "-I", "-c", RESULT_FILE_CHECK, str(worktree), relative],
+            check=False,
+        )
+        return result.returncode == 0
 
     def _commit_identity(self) -> tuple[str, str]:
         configured = self.deployment.get("commit_identity", {})
@@ -1367,27 +2028,31 @@ class Supervisor:
         task_id, team = task.get("task_id"), task.get("team_uid")
         if not isinstance(task_id, str) or TASK_RE.fullmatch(task_id) is None or team != self.team_uid:
             raise ValueError("invalid task worktree binding")
-        repo = Path(self.project_home).resolve(strict=True)
-        if self._git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+        repo, _project_gid = self._open_project_home()
+        if self._git_as_role(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
             raise OSError("project home is not a git worktree")
-        if self._git(repo, "check-ref-format", "--branch", self.base_branch, check=False).returncode != 0:
+        if self._git_as_role(repo, "check-ref-format", "--branch", self.base_branch, check=False).returncode != 0:
             raise ValueError("invalid base branch")
-        self._git(repo, "config", "core.sharedRepository", "group")
-        aib_dir, parent, worktree = repo / ".aib", repo / ".aib" / "wt", self._worktree_path()
-        for directory in (aib_dir, parent):
-            if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
-                raise OSError("unsafe worktree directory")
-            directory.mkdir(mode=0o2770, exist_ok=True)
-            directory.chmod(0o2770)
-        if not worktree.exists():
-            self._git(repo, "worktree", "add", "--detach", str(worktree), self.base_branch)
-        elif worktree.is_symlink() or not worktree.is_dir():
-            raise OSError("unsafe agent worktree")
+        shared = self._git_as_role(repo, "config", "--get", "core.sharedRepository", check=False)
+        if shared.returncode != 0 or shared.stdout.strip() != "group":
+            self.journal("attention", reason="shared_repository_unprovisioned")
+        parent, worktree = repo / ".aib" / "wt", self._worktree_path()
+        test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists()
+        if test_seam:
+            parent.mkdir(mode=0o2770, parents=True, exist_ok=True)
+            parent.chmod(0o2770)
+        registered = {
+            os.path.normpath(line.removeprefix("worktree "))
+            for line in self._git_as_role(repo, "worktree", "list", "--porcelain").stdout.splitlines()
+            if line.startswith("worktree ")
+        }
+        if os.path.normpath(str(worktree)) not in registered:
+            self._git_as_role(repo, "worktree", "add", "--detach", str(worktree), self.base_branch)
         desired = f"aib/{team}/{task_id}"
-        current = self._git(worktree, "branch", "--show-current").stdout.strip()
+        current = self._git_as_role(worktree, "branch", "--show-current").stdout.strip()
         if current != desired:
-            if self._git(worktree, "status", "--porcelain").stdout:
-                self._git(worktree, "add", "-A")
+            if self._git_as_role(worktree, "status", "--porcelain").stdout:
+                self._git_as_role(worktree, "add", "-A", "--", ".", ":(exclude).aib")
                 name, email = self._commit_identity()
                 commit_env = dict(os.environ)
                 commit_env.update(
@@ -1396,20 +2061,12 @@ class Supervisor:
                     GIT_AUTHOR_EMAIL=email,
                     GIT_COMMITTER_EMAIL=email,
                 )
-                self._git(worktree, "commit", "-m", f"WIP before {task_id}", env=commit_env)
-            exists = self._git(repo, "show-ref", "--verify", f"refs/heads/{desired}", check=False).returncode == 0
+                self._git_as_role(worktree, "commit", "--no-verify", "--no-gpg-sign", "-m", f"WIP before {task_id}", env=commit_env)
+            exists = self._git_as_role(repo, "show-ref", "--verify", f"refs/heads/{desired}", check=False).returncode == 0
             if exists:
-                self._git(worktree, "switch", desired)
+                self._git_as_role(worktree, "switch", desired)
             else:
-                self._git(worktree, "switch", "-c", desired, self.base_branch)
-        role_home = self.state_dir / ".aib"
-        if os.geteuid() == 0 and role_home.is_dir() and not role_home.is_symlink():
-            role_uid = role_home.stat().st_uid
-            project_gid = repo.stat().st_gid
-            for directory, names, files in os.walk(worktree, followlinks=False):
-                os.chown(directory, role_uid, project_gid, follow_symlinks=False)
-                for name in (*names, *files):
-                    os.chown(Path(directory) / name, role_uid, project_gid, follow_symlinks=False)
+                self._git_as_role(worktree, "switch", "-c", desired, self.base_branch)
         self.active_cwd = str(worktree)
         return worktree
 
@@ -1424,21 +2081,19 @@ class Supervisor:
             return TOKEN_RE.fullmatch(value[4:]) is not None
         if value.startswith("git:"):
             match = re.fullmatch(r"git:(aib/[a-z0-9]+(?:-[a-z0-9]+)+/(t-[0-9a-f]{12}))@([0-9a-f]{40})", value, re.ASCII)
-            if match is None or match.group(1) != f"aib/{team}/{task_id}" or not worktree.is_dir():
+            if match is None or match.group(1) != f"aib/{team}/{task_id}":
                 return False
-            return self._git(worktree, "merge-base", "--is-ancestor", match.group(3), match.group(1), check=False).returncode == 0
+            on_task = self._git_as_role(worktree, "merge-base", "--is-ancestor", match.group(3), match.group(1), check=False).returncode == 0
+            on_base = self._git_as_role(worktree, "merge-base", "--is-ancestor", match.group(3), self.base_branch, check=False).returncode == 0
+            return on_task and not on_base
         if value.startswith("file:"):
             relative = value[5:]
             if not relative or relative.startswith(("/", "-")) or any(part in {"", ".", ".."} for part in relative.split("/")):
                 return False
             try:
-                root = worktree.resolve(strict=True)
-                target = (root / relative).resolve(strict=True)
-                target.relative_to(root)
-                info = target.stat()
-            except (OSError, ValueError):
+                return self._validate_file_ref_as_role(worktree, relative)
+            except OSError:
                 return False
-            return stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024
         return False
 
     def bind_session(self, rebound_from: str | None = None, rebound: bool = False) -> None:
@@ -1529,21 +2184,7 @@ class Supervisor:
             return False
         local_attempt = unfinished.get("attempt_id", unfinished.get("attempt"))
         if isinstance(local_attempt, str) and TOKEN_RE.fullmatch(local_attempt):
-            task = None
-            if isinstance(unfinished.get("task_id"), str):
-                task = {
-                    "task_id": unfinished.get("task_id"),
-                    "run_id": unfinished.get("run_id"),
-                    "owner": unfinished.get("requester"),
-                }
-            orphan_work: dict[str, Any] = {"id": unfinished.get("msg_id")}
-            if task is not None:
-                orphan_work["task"] = task
-            self._record_turn_attempt(
-                orphan_work,
-                local_attempt,
-                f".turn-{local_attempt}.attempt",
-            )
+            self._adopt_orphan_attempt(unfinished, local_attempt)
         self.journal(
             "turn.ended",
             msg_id=unfinished.get("msg_id"),
@@ -1557,8 +2198,88 @@ class Supervisor:
         )
         return True
 
+    def _pending_orphan_intents(self) -> list[str]:
+        aib_fd = intents_fd = -1
+        try:
+            aib_fd, intents_fd = self._open_private_dirs()
+            return [
+                name[:-6] for name in sorted(os.listdir(intents_fd))
+                if name.endswith(".jsonl")
+                and TOKEN_RE.fullmatch(name[:-6])
+                and not self._intent_applied(name[:-6])
+                and self._intent_ledger_record(name[:-6], 0) is None
+            ]
+        except OSError as error:
+            self.journal("fs.unsafe", path=".aib/intents", reason=str(error))
+            return []
+        finally:
+            for fd in (intents_fd, aib_fd):
+                if fd >= 0:
+                    os.close(fd)
+
+    def _attempt_bindings(self) -> list[dict[str, Any]]:
+        result = self.run_helper(
+            [str(self.attempts_cli), self.uid], capture=True,
+            extra_env={"AIB_ATTEMPTS_BINDINGS": "1"},
+        )
+        if result.returncode != 0:
+            return []
+        bindings: list[dict[str, Any]] = []
+        try:
+            for line in result.stdout.splitlines():
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    bindings.append(value)
+        except (json.JSONDecodeError, RecursionError):
+            return []
+        return bindings
+
+    def _adopt_orphan_attempt(self, unfinished: dict[str, Any], local_attempt: str) -> None:
+        if any(
+            record.get("event") == "turn.attempt"
+            and record.get("local_attempt_id") == local_attempt
+            for record in self.records
+        ):
+            return
+        pending = set(self._pending_orphan_intents())
+        claimed = {
+            record.get("attempt_id") for record in self.records
+            if record.get("event") == "turn.attempt"
+        }
+        started_at = unfinished.get("ts")
+        sid = unfinished.get("sid")
+        matches = [
+            binding for binding in self._attempt_bindings()
+            if binding.get("attempt_id") in pending
+            and binding.get("attempt_id") not in claimed
+            and binding.get("agent_uid") == self.uid
+            and binding.get("decision") == "allow"
+            and (not isinstance(sid, str) or binding.get("session_id") == sid)
+            and isinstance(binding.get("decided_at"), str)
+            and isinstance(started_at, str)
+            and binding["decided_at"] >= started_at
+        ]
+        try:
+            os.unlink(f".turn-{local_attempt}.attempt", dir_fd=self.state_dir_fd)
+        except OSError:
+            pass
+        if len(matches) == 1:
+            broker_attempt = str(matches[0]["attempt_id"])
+            self.journal(
+                "turn.attempt", attempt_id=broker_attempt,
+                local_attempt_id=local_attempt, msg_id=unfinished.get("msg_id"),
+                task_id=unfinished.get("task_id"), run_id=unfinished.get("run_id"),
+                requester=unfinished.get("requester"), adopted=True,
+            )
+            return
+        reason = "unbound_attempt" if len(matches) == 0 else "ambiguous_attempt"
+        alarm = "attention" if len(matches) == 0 else "security"
+        for attempt_id in pending:
+            self._quarantine_intent(self.intent_dir / f"{attempt_id}.jsonl", reason, alarm=alarm)
+
     def start_turn(self, work: dict[str, Any]) -> None:
-        self.prepare_task_work(work)
+        if not self.prepare_task_work(work):
+            return
         self.write_board_snapshot()
         if self.session_id is None:
             self.bind_session()
@@ -1616,6 +2337,9 @@ class Supervisor:
             assert self.process.stdin is not None
             self.process.stdin.write(prompt.encode())
             self.process.stdin.close()
+            rejection_seq = work.pop("_rejection_preamble_seq", None)
+            if isinstance(rejection_seq, int):
+                self.journal("rejections.preambled", through_seq=rejection_seq, msg_id=work.get("id"))
         except (OSError, ValueError) as error:
             if self.process is not None:
                 self.terminate_group(self.process, signal.SIGTERM)
@@ -1660,6 +2384,31 @@ class Supervisor:
         )
         work["broker_attempt_id"] = broker_attempt
         return broker_attempt
+
+    def _message_engine_error(self, work: dict[str, Any], error: Exception) -> None:
+        message_id = str(work.get("id", "unknown"))
+        count = 1 + sum(
+            record.get("event") == "message.engine_error" and record.get("msg_id") == message_id
+            for record in self.records
+        )
+        self.journal(
+            "message.engine_error", msg_id=message_id, n=count,
+            detail=type(error).__name__,
+        )
+        if count >= 3:
+            if not work.get("synthetic"):
+                self.message_command("fail", message_id, "engine_error")
+            self.journal("attention", reason="message_engine_error", msg_id=message_id)
+            self.work = None
+        else:
+            self.work = work
+            self.retry_at = time.monotonic() + self.backoff_base
+
+    def guarded_start_turn(self, work: dict[str, Any]) -> None:
+        try:
+            self.start_turn(work)
+        except Exception as error:
+            self._message_engine_error(work, error)
 
     def _read_turn_output(self) -> tuple[str, str | None]:
         assert self.output_path is not None
@@ -1741,6 +2490,23 @@ class Supervisor:
     ) -> None:
         self.append_transcript(output)
         self.current_turn = None
+        intents_handled = False
+        if isinstance(work.get("task"), dict):
+            task = work["task"]
+            broker_attempt = str(work.get("broker_attempt_id", attempt_id))
+            context = {
+                "attempt_id": broker_attempt,
+                "msg_id": work.get("id"),
+                "task_id": task.get("task_id"),
+                "run_id": task.get("run_id"),
+                "requester": task.get("owner"),
+            }
+            intents_handled = self._apply_pending_intent(broker_attempt, context)
+            current_task = self.task_show(str(task["task_id"])) or task
+            if intents_handled and current_task.get("state") not in {"ASSIGNED", "IN_PROGRESS"}:
+                rc = 0
+                if not output:
+                    output = "task intent applied"
         lowered = output.lower()
         login_hint = rc == 78 and "hint:login" in lowered
         if refusal_reason is None and rc != 0 and session_arg.startswith("new:") and "already in use" in lowered:
@@ -1837,17 +2603,7 @@ class Supervisor:
             if isinstance(work.get("task"), dict):
                 task = work["task"]
                 broker_attempt = str(work.get("broker_attempt_id", attempt_id))
-                intent_path = self.intent_dir / f"{broker_attempt}.jsonl"
-                handled = False
-                if intent_path.exists() or intent_path.is_symlink():
-                    context = {
-                        "attempt_id": broker_attempt,
-                        "msg_id": work.get("id"),
-                        "task_id": task.get("task_id"),
-                        "run_id": task.get("run_id"),
-                        "requester": task.get("owner"),
-                    }
-                    handled = self.apply_intent_file(intent_path, context)
+                handled = intents_handled
                 if not handled:
                     current_task = self.task_show(str(task["task_id"])) or task
                     if current_task.get("state") == "IN_PROGRESS":
@@ -1962,7 +2718,7 @@ class Supervisor:
             "queued": queued,
         }
         self.work = synthetic
-        self.start_turn(synthetic)
+        self.guarded_start_turn(synthetic)
 
     def install_signals(self) -> None:
         signal.signal(signal.SIGTERM, lambda _s, _f: setattr(self, "stop_requested", True))
@@ -2008,6 +2764,7 @@ class Supervisor:
         if unfinished is not None:
             self.handle_orphan(unfinished)
         self.scan_intents()
+        self.sweep_missing_reports()
         self.scan_task_dlq()
 
         while not self.stop_requested:
@@ -2018,7 +2775,13 @@ class Supervisor:
             if self.stop_requested:
                 break
             if self.process is not None:
-                self.collect_turn()
+                active_work = self.attempt["work"] if self.attempt is not None else (self.work or {"id": "unknown"})
+                try:
+                    self.collect_turn()
+                except Exception as error:
+                    self.process = None
+                    self.attempt = None
+                    self._message_engine_error(active_work, error)
             elif self.reexec_requested:
                 self.reexec()
             elif not self.off_duty and self.brake_tripped_at is None and now >= self.retry_at and now >= self.next_poll:
@@ -2031,7 +2794,7 @@ class Supervisor:
                     if self.session_id is not None and self.turns_in_session >= self.session_max_turns:
                         self.begin_policy_handover(self.work)
                     else:
-                        self.start_turn(self.work)
+                        self.guarded_start_turn(self.work)
             time.sleep(0.02)
 
         if self.process is not None:

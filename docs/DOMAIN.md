@@ -241,7 +241,9 @@ The normative rejection reasons are `caller_unauthorized`, `caller_actor_mismatc
 `max_tasks_per_run`, `max_assignments_per_task`, `max_turns_per_task`, `unsafe_body_sidecar`, and
 `unsupported_event`. Free-text and reference arguments must encode as strict UTF-8 before the stream lock;
 invalid bytes are rc 64 and never append. Titles/reasons reject controls, Unicode line/paragraph
-separators, surrogate and private-use code points, format and zero-width characters, and tag characters.
+separators, surrogate and private-use code points, tag characters, noncharacters, and the fixed
+default-ignorable set U+034F, U+115F–U+1160, U+17B4–U+17B5, U+3164, U+FFA0, U+110BD, U+110CD, and
+U+13430–U+1343F.
 This is a fixed explicit code-point allow/block policy; it never consults the interpreter's Unicode
 category database. Code points outside the fixed block table remain valid, including code points an
 older interpreter considers unassigned, so replay is byte-stable across Unicode database versions.
@@ -260,10 +262,13 @@ work only: the supervisor derives `actor_id`, task/run/requester binding, and `v
 its own turn journal and the authoritative ledger, never from worker-supplied authority fields.
 
 After the turn (and on startup/orphan recovery), the supervisor matches the broker terminal attempt id,
-validates the intent file and result ref, calls root-only `bin/task`, delivers the idempotent result, then
-records `intents.applied`. An unknown/foreign attempt is moved to `intents/tainted` and alarms. A crash after
-the ledger append is resumed from `intent.ledger`, so notification can be retried without a second task
-event. `continue` is one `progress` plus a durable self-message; only accepted progress increments `turns`.
+pre-validates the complete intent file and result ref with the client validator, calls root-only `bin/task`,
+delivers the idempotent result, then records `intents.applied`. Applied files are unlinked. Tainted bytes
+are copied to the bounded root-owned `.aib-quarantine` and the child-owned file is unlinked; there are no
+child-owned `done` or `tainted` directories. A crash after the ledger append is resumed from
+`intent.ledger`, so notification can be retried without a second task event. Causation deduplication is
+performed under the task-stream lock before transition validation. `continue` is one `progress` plus a
+durable self-message; only accepted progress increments `turns`.
 Two reportless turns become service-owned `blocked/no_report`, the ninth continuation becomes
 `blocked/turn_budget`, three provider failures become `failed/turn_failed`, and an assignment in the
 message DLQ becomes `cancelled/delivery_failed`.

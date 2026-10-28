@@ -30,10 +30,12 @@ from task_ledger import (  # noqa: E402
     fold,
     list_view,
     load_json,
+    read_events,
     safe_display_text,
     task_id as derive_task_id,
     valid_deadline,
     validate_registry_scope,
+    worker_view,
 )
 
 COMMAND_EVENT = {
@@ -188,6 +190,8 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("--team")
     listing.add_argument("--run")
     listing.add_argument("--all", action="store_true")
+    listing.add_argument("--worker-view", action="store_true")
+    listing.add_argument("--agent")
     show = subs.add_parser("show")
     show.add_argument("--project", required=True)
     show.add_argument("id")
@@ -351,6 +355,27 @@ def commit(events: Path, lock: Path, lock_fd: int, request: dict[str, object], k
     return event_id, seq
 
 
+def causation_replay(events: Path, request: dict[str, object]) -> tuple[str, str, str] | None:
+    """Return (outcome, event_id, reason) for an already-decided causation."""
+    _, rows, _ = read_events(events)
+    causation = request["causation_id"]
+    requested_type = request["event_type"]
+    requested_task = request.get("task_id")
+    for _, record in rows:
+        if record.get("causation_id") != causation:
+            continue
+        kind = record.get("event_type")
+        payload = record.get("payload", {})
+        prior_type = payload.get("requested_type") if kind == "task.rejected" and isinstance(payload, dict) else kind
+        if prior_type != requested_type or record.get("task_id") != requested_task:
+            return "rejected", str(record.get("event_id", "")), "causation_conflict"
+        if kind == "task.rejected":
+            reason = payload.get("reason") if isinstance(payload, dict) else "rejected"
+            return "rejected", str(record.get("event_id", "")), str(reason)
+        return "accepted", str(record.get("event_id", "")), "accepted"
+    return None
+
+
 def main(argv: list[str]) -> int:
     try:
         args = parser().parse_args(argv)
@@ -360,7 +385,12 @@ def main(argv: list[str]) -> int:
             if args.command == "list":
                 if args.run and RUN_RE.fullmatch(args.run) is None:
                     return fail(64, "invalid run id")
-                output = list_view(current, team=args.team, run_id=args.run, include_all=args.all)
+                if args.worker_view:
+                    if args.run or args.all or not args.team or not args.agent or TOKEN_RE.fullmatch(args.agent) is None:
+                        return fail(64, "worker-view requires --team and --agent only")
+                    output = worker_view(current, team=args.team, agent=args.agent)
+                else:
+                    output = list_view(current, team=args.team, run_id=args.run, include_all=args.all)
             elif RUN_RE.fullmatch(args.id):
                 output = current["runs"].get(args.id)
             elif TASK_RE.fullmatch(args.id):
@@ -395,6 +425,15 @@ def main(argv: list[str]) -> int:
             registry = load_json(registry_path(ROOT))
             validate_registry_scope(registry, args.project, args.team)
             current = fold(events)
+            replay = causation_replay(events, request)
+            if replay is not None:
+                outcome, event_id, reason = replay
+                if outcome == "accepted":
+                    print(f"event_id={event_id}")
+                    print("duplicate=true")
+                    return 0
+                print(f"ai-bobnet: task request rejected: {reason}", file=sys.stderr)
+                return 77
             actual_kind, actual_payload, accepted, reason = decide(request, current, registry, directory / "bodies", body)
             event_id, _ = commit(events, lock, lock_fd, request, actual_kind, actual_payload)
         finally:

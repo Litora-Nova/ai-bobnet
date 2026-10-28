@@ -21,6 +21,9 @@ MAX_LINE = 8 * 1024
 MAX_FILE = 64 * 1024
 MAX_INTENTS = 10
 REF_RE = re.compile(r"(?:msg|git|file):[!-~]{1,255}\Z", re.ASCII)
+REPORT_KEYS = {"attempt_id", "verb", "task_id", "state", "summary", "result_ref", "reason"}
+CONTINUE_KEYS = {"attempt_id", "verb", "task_id", "summary"}
+DELEGATE_KEYS = {"attempt_id", "verb", "run_id", "to", "title", "body", "source_msg_id"}
 
 
 def fail(code: int, message: str) -> int:
@@ -69,6 +72,57 @@ def _directory(home: Path) -> tuple[int, int, int]:
 def _validate_summary(value: str) -> None:
     if len(value.encode("utf-8")) > 2048 or not safe_display_text(value):
         raise ValueError("summary must be safe single-line UTF-8 of at most 2048 bytes")
+
+
+def _safe_text(value: Any, name: str, limit: int) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if len(value.encode("utf-8")) > limit or not safe_display_text(value):
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def validate_intent_records(
+    records: list[dict[str, Any]], attempt: str, task_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Validate a complete intent file before the supervisor applies any row."""
+    if not records or len(records) > MAX_INTENTS:
+        raise ValueError("invalid intent count")
+    if TOKEN_RE.fullmatch(attempt) is None:
+        raise ValueError("invalid attempt id")
+    for record in records:
+        if not isinstance(record, dict) or record.get("attempt_id") != attempt:
+            raise ValueError("foreign attempt id")
+        verb = record.get("verb")
+        if verb == "delegate":
+            if set(record) != DELEGATE_KEYS:
+                raise ValueError("invalid delegate schema")
+            for name in ("run_id", "to", "title", "body", "source_msg_id"):
+                _safe_text(record.get(name), name, MAX_LINE)
+            continue
+        if verb == "continue":
+            if set(record) != CONTINUE_KEYS:
+                raise ValueError("invalid continue schema")
+        elif verb == "report":
+            if not CONTINUE_KEYS <= set(record) or set(record) - REPORT_KEYS:
+                raise ValueError("invalid report schema")
+            if record.get("state") not in {"progress", "done", "failed", "blocked"}:
+                raise ValueError("invalid report state")
+            result_ref = record.get("result_ref")
+            if result_ref is not None and (not isinstance(result_ref, str) or REF_RE.fullmatch(result_ref) is None):
+                raise ValueError("invalid result ref")
+            reason = record.get("reason")
+            if reason is not None:
+                _safe_text(reason, "reason", 512)
+        else:
+            raise ValueError("invalid intent verb")
+        record_task = record.get("task_id")
+        if not isinstance(record_task, str) or TASK_RE.fullmatch(record_task) is None:
+            raise ValueError("invalid task id")
+        if task_id is not None and record_task != task_id:
+            raise ValueError("task mismatch")
+        _safe_text(record.get("summary"), "summary", 2048)
+    return records
 
 
 def append_intent(home: Path, attempt: str, record: dict[str, Any]) -> None:
@@ -155,6 +209,7 @@ def main(argv: list[str]) -> int:
                 record["result_ref"] = args.result
             if args.reason is not None:
                 record["reason"] = args.reason
+        validate_intent_records([record], attempt, args.task_id)
         append_intent(home, attempt, record)
         print("intent queued for supervisor apply")
         return 0

@@ -125,10 +125,12 @@ shared subscription login". API-key proxy mode is reserved, fail-closed, and is 
 restores the stronger "agent never sees the shared credential" property.
 
 Provisioning must also run `bin/aib-agent-dirs` before any one-shot or supervised turn so the role-owned
-`.aib/intents/{done,tainted}` path exists at mode 0700. Do not add the role to `aib-tasks` or restore a
+`.aib/intents` path exists at mode 0700 and the root-owned `.aib-quarantine` exists at mode 0700. Do not add the role to `aib-tasks` or restore a
 shared-state group as a shortcut: the root supervisor publishes `.aib/board.json`, and the confined child
-has no direct ledger or peer-state access. The supervisor creates `<project>/.aib/wt/<agent_uid>` and uses
-the project directory group for the task worktree.
+has no direct ledger or peer-state access. Project homes should live under `/srv/aib/projects`, not
+`/home`, because the shipped unit uses `ProtectHome=yes`. Provisioning creates the setgid project home,
+default ACL, `.aib/wt`, and `core.sharedRepository=group`; the supervisor never creates or changes those
+objects as root. Add every project-home root to the agent unit's `ReadWritePaths` drop-in.
 
 Deployments may set the identity used only for automatic WIP commits:
 
@@ -141,8 +143,11 @@ Deployments may set the identity used only for automatic WIP commits:
 }
 ```
 
-Both keys are required when the object is present. The only template fields are `display_name` and
-`team`; this configuration never supplies task authority.
+Both keys are required when the object is present. An invalid or partial `commit_identity` fails the
+entire deployment configuration closed. The only template fields are `display_name` and `team`; this
+configuration never supplies task authority. Automatic WIP commits intentionally include untracked
+files (except `.aib`); deployments must maintain an appropriate `.gitignore`. The engine never pushes
+these commits.
 
 Codex does not publish a refresh-token expiry. Consequently `login_expires_at` in the broker-owned
 metadata is an operator-configured lifetime estimate (`AIB_LOGIN_LIFETIME_S`, 56 days by default),

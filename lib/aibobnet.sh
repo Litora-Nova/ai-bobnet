@@ -1717,7 +1717,7 @@ aib_enact_launch() {
   for _n in ${AIB_VERDICT_ENV_ALLOW:-}; do
     [ "$_s1c_enabled" -eq 0 ] || [ "$_n" != HOME ] || continue
     if [ "$_n" = PATH ] && [ -n "${!_n+x}" ]; then
-      _child_env+=("PATH=$_engine_root/bin:${!_n}")
+      _child_env+=("PATH=$_engine_root/bin/child:${!_n}")
     elif [ -n "${!_n+x}" ]; then
       _child_env+=("$_n=${!_n}")
     fi

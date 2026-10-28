@@ -66,12 +66,16 @@ def task_id(causation_id: str, intent_n: int) -> str:
 
 DISPLAY_BLOCK_RANGES = (
     (0x0000, 0x001F), (0x007F, 0x009F), (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
     (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),
     (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2),
-    (0x180E, 0x180E), (0x200B, 0x200F), (0x2028, 0x202E),
+    (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180E, 0x180E),
+    (0x200B, 0x200F), (0x2028, 0x202E),
     (0x2060, 0x2064), (0x2066, 0x206F), (0xD800, 0xDFFF),
     (0xE000, 0xF8FF), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
-    (0xFFF9, 0xFFFB), (0x1BCA0, 0x1BCAF), (0x1D173, 0x1D17A),
+    (0x3164, 0x3164), (0xFFA0, 0xFFA0), (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD), (0x110CD, 0x110CD), (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCAF), (0x1D173, 0x1D17A),
     (0xF0000, 0xFFFFD), (0x100000, 0x10FFFD),
     (0xE0000, 0xE007F), (0xE0100, 0xE01EF),
 )
@@ -191,6 +195,9 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
         "turns_total": 0,
         "result_ref": None,
         "last_reason": None,
+        "last_summary": "",
+        "created_at": record.get("occurred_at"),
+        "last_at": record.get("occurred_at"),
         "created_seq": None,
         "last_seq": None,
         "state_seq": None,
@@ -243,7 +250,7 @@ def fold(path: Path) -> dict[str, Any]:
             requested = payload.get("requested_type")
             caller = payload.get("caller")
             if isinstance(reason, str) and isinstance(requested, str) and caller == "root:root":
-                rejections.append({"seq": seq, "task_id": record.get("task_id"), "run_id": record.get("run_id"), "requested_type": requested, "reason": reason})
+                rejections.append({"seq": seq, "team_uid": team_uid, "task_id": record.get("task_id"), "run_id": record.get("run_id"), "requested_type": requested, "reason": reason})
             else:
                 invalid(seq, "invalid_rejection")
             continue
@@ -254,7 +261,7 @@ def fold(path: Path) -> dict[str, Any]:
             if kind == "run.requested":
                 if run_id in runs or record.get("actor_type") != "human":
                     raise LedgerError("invalid_run_request")
-                runs[run_id] = {"run_id": run_id, "team_uid": record.get("team_uid"), "state": "QUEUED", "created_seq": seq, "outcome": None}
+                runs[run_id] = {"run_id": run_id, "team_uid": record.get("team_uid"), "state": "QUEUED", "created_seq": seq, "outcome": None, "created_at": record.get("occurred_at"), "last_at": record.get("occurred_at")}
             elif kind == "run.started":
                 if run_id not in runs or runs[run_id]["state"] != "QUEUED":
                     raise LedgerError("invalid_run_start")
@@ -286,6 +293,7 @@ def fold(path: Path) -> dict[str, Any]:
                     task["state_seq"] = seq
                 runs[run_id]["state"] = outcome.upper()
                 runs[run_id]["outcome"] = outcome
+                runs[run_id]["last_at"] = record.get("occurred_at")
             elif kind == "task.created":
                 if run_id not in runs or ident in tasks:
                     raise LedgerError("invalid_task_create")
@@ -371,6 +379,7 @@ def fold(path: Path) -> dict[str, Any]:
                 else:
                     raise LedgerError("unknown_event")
                 task["last_seq"] = seq
+                task["last_at"] = record.get("occurred_at")
                 if task["state"] != old_state or task["assignee"] != old_assignee:
                     task["state_seq"] = seq
         except LedgerError as error:
@@ -517,8 +526,48 @@ def _write_body(body_dir: Path, ident: str, body: bytes) -> bool:
                 os.close(fd)
 
 
+def read_body_sidecar(body_dir: Path, ident: str) -> str:
+    """Read one root-held task body without following any path component."""
+    if TASK_RE.fullmatch(ident) is None:
+        raise LedgerError("invalid task body id")
+    parent_fd = bodies_fd = file_fd = -1
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        parent_fd = os.open(body_dir.parent, flags)
+        bodies_fd = os.open(body_dir.name, flags, dir_fd=parent_fd)
+        file_fd = os.open(
+            f"{ident}.md", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=bodies_fd,
+        )
+        info = os.fstat(file_fd)
+        parent = os.fstat(bodies_fd)
+        test_seam = os.environ.get("AIB_TEST_SEAMS") == "1" and not (Path(__file__).resolve().parent.parent / ".aib-installed").exists()
+        expected_uid = os.geteuid() if test_seam else 0
+        if (
+            not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid
+            or info.st_gid != parent.st_gid or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o640 or info.st_size > 8192
+        ):
+            raise LedgerError("unsafe task body sidecar")
+        data = os.read(file_fd, 8193)
+        if len(data) > 8192 or b"\0" in data:
+            raise LedgerError("unsafe task body sidecar")
+        return data.decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        raise LedgerError("unsafe task body sidecar") from error
+    finally:
+        for fd in (file_fd, bodies_fd, parent_fd):
+            if fd >= 0:
+                os.close(fd)
+
+
 def rejection(request: dict[str, Any], reason: str) -> tuple[str, dict[str, Any], bool, str]:
-    return "task.rejected", {"caller": request["caller"], "requested_type": request["event_type"], "reason": reason}, False, reason
+    return "task.rejected", {
+        "caller": request["caller"],
+        "requested_type": request["event_type"],
+        "reason": reason,
+        "causation_id": request["causation_id"],
+    }, False, reason
 
 
 def decide(request: dict[str, Any], current: dict[str, Any], registry: dict[str, Any], body_dir: Path, body: bytes | None) -> tuple[str, dict[str, Any], bool, str]:
@@ -669,11 +718,98 @@ def list_view(current: dict[str, Any], *, team: str | None = None, run_id: str |
         "highest_seq": current["highest_seq"],
         "invalid": current["invalid"],
         "invalid_events": current["invalid_events"],
-        "rejections": current["rejections"],
+        "rejections": [row for row in current["rejections"] if team is None or row.get("team_uid") == team],
         "runs": sorted(runs, key=lambda row: row["run_id"]),
         "stream_status": current["stream_status"],
         "tasks": sorted(tasks, key=lambda row: row["task_id"]),
     }
+
+
+def worker_view(current: dict[str, Any], *, team: str, agent: str) -> dict[str, Any]:
+    """Return the bounded projection a confined worker may read."""
+    now = datetime.now(timezone.utc)
+
+    def when(value: Any) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def age(value: Any) -> int | None:
+        parsed = when(value)
+        return max(0, int((now - parsed).total_seconds())) if parsed is not None else None
+
+    terminal_cutoff = now - timedelta(hours=24)
+    selected = []
+    for task in current["tasks"].values():
+        if task.get("team_uid") != team:
+            continue
+        terminal = task.get("state") in TERMINAL
+        last_at = when(task.get("last_at"))
+        if terminal and (task.get("assignee") != agent or last_at is None or last_at < terminal_cutoff):
+            continue
+        selected.append({
+            "id": task.get("task_id"),
+            "run_id": task.get("run_id"),
+            "assignee": task.get("assignee"),
+            "state": task.get("state"),
+            "age": age(task.get("created_at")),
+            "deadline_at": task.get("deadline_at"),
+            "turns": task.get("turns", 0),
+            "assignments": task.get("assignments", 0),
+            "title": str(task.get("title", ""))[:200],
+            "last_summary": str(task.get("last_summary", ""))[:200],
+            "_sort": task.get("last_seq", task.get("created_seq", 0)),
+        })
+    selected.sort(key=lambda row: row["_sort"], reverse=True)
+    task_dropped = max(0, len(selected) - 50)
+    selected = selected[:50]
+    for row in selected:
+        row.pop("_sort", None)
+
+    runs = [
+        {"id": run.get("run_id"), "state": run.get("state"), "age": age(run.get("created_at")),
+         "_sort": run.get("last_seq", run.get("created_seq", 0))}
+        for run in current["runs"].values()
+        if run.get("team_uid") == team and run.get("state") not in CLOSED_RUN
+    ]
+    runs.sort(key=lambda row: row["_sort"], reverse=True)
+    run_dropped = max(0, len(runs) - 20)
+    runs = runs[:20]
+    for row in runs:
+        row.pop("_sort", None)
+    all_rejections = [
+        {key: row.get(key) for key in ("task_id", "requested_type", "reason")}
+        for row in current["rejections"]
+        if row.get("team_uid") == team
+    ]
+    rejection_dropped = max(0, len(all_rejections) - 20)
+    rejections = all_rejections[-20:]
+    view: dict[str, Any] = {
+        "highest_seq": current["highest_seq"],
+        "invalid": current["invalid"],
+        "tasks": selected,
+        "runs": runs,
+        "own_rejections": rejections,
+        "truncated": bool(task_dropped or run_dropped or rejection_dropped),
+        "dropped": {"tasks": task_dropped, "runs": run_dropped, "rejections": rejection_dropped},
+    }
+    while len(json.dumps(view, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 32 * 1024:
+        if view["tasks"]:
+            view["tasks"].pop()
+            view["dropped"]["tasks"] += 1
+        elif view["runs"]:
+            view["runs"].pop()
+            view["dropped"]["runs"] += 1
+        elif view["own_rejections"]:
+            view["own_rejections"].pop(0)
+            view["dropped"]["rejections"] += 1
+        else:
+            break
+        view["truncated"] = True
+    return view
 
 
 def _fixture_gated(path: Path) -> None:

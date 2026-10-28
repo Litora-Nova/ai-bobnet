@@ -38,6 +38,22 @@ def real_directory(path: Path, mode: int | None = None) -> bool:
         return False
 
 
+def directory_at(parent_fd: int, name: str, uid: int, gid: int, mode: int) -> int:
+    """Create/open one directory without following a child-planted link."""
+    try:
+        os.mkdir(name, mode, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise OSError("unsafe directory entry")
+    os.fchown(fd, uid, gid)
+    os.fchmod(fd, mode)
+    return fd
+
+
 def prepare_heartbeat(standup: Path, name: str) -> bool:
     """Create or repair a shared heartbeat without following a planted link."""
     directory_fd = -1
@@ -124,21 +140,13 @@ def main(argv: list[str]) -> int:
     if not prepare_heartbeat(standup, f"{uid}.log"):
         return 78
     if role_enabled:
+        state_fd = aib_fd = intents_fd = quarantine_fd = -1
         try:
             os.chown(state, role_uid, role_gid)
-            aib_dir = state / ".aib"
-            intents_dir = aib_dir / "intents"
-            done_dir = intents_dir / "done"
-            tainted_dir = intents_dir / "tainted"
-            if (
-                not real_directory(aib_dir, 0o700)
-                or not real_directory(intents_dir, 0o700)
-                or not real_directory(done_dir, 0o700)
-                or not real_directory(tainted_dir, 0o700)
-            ):
-                return 78
-            for directory in (aib_dir, intents_dir, done_dir, tainted_dir):
-                os.chown(directory, role_uid, role_gid)
+            state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            aib_fd = directory_at(state_fd, ".aib", role_uid, role_gid, 0o700)
+            intents_fd = directory_at(aib_fd, "intents", role_uid, role_gid, 0o700)
+            quarantine_fd = directory_at(state_fd, ".aib-quarantine", os.geteuid(), os.getegid(), 0o700)
             for name in (".claude", ".codex"):
                 provider_dir = state / name
                 if not real_directory(provider_dir, 0o700):
@@ -156,6 +164,10 @@ def main(argv: list[str]) -> int:
                 os.lchown(auth, role_uid, role_gid)
         except OSError:
             return 78
+        finally:
+            for fd in (quarantine_fd, intents_fd, aib_fd, state_fd):
+                if fd >= 0:
+                    os.close(fd)
     calls = [
         ["-m", f"g:{group}:--x", str(state)],
         ["-m", f"g:{broker_group}:--x", str(state)],

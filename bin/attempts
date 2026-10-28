@@ -35,4 +35,8 @@ aib_attempts_fold "$AIB_EVENT_FILE" > "$scan_output" || aib_die $? "event stream
 if [ "$AIB_ATTEMPTS_FOLD_STATUS" = corrupt ]; then
   aib_die 2 "$AIB_ATTEMPTS_FOLD_REASON"
 fi
-python3 -I "$REPO_ROOT/lib/attempts_fold.py" --text < "$scan_output"
+if [ "${AIB_ATTEMPTS_BINDINGS:-}" = 1 ]; then
+  python3 -I "$REPO_ROOT/lib/attempts_fold.py" --bindings < "$scan_output"
+else
+  python3 -I "$REPO_ROOT/lib/attempts_fold.py" --text < "$scan_output"
+fi

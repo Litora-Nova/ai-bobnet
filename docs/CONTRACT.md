@@ -223,16 +223,23 @@ has no public verb; the first Task derives a Run as running. Every other write i
 `reject` is the supervisor-only durable refusal seam. `list` and `show` are read-only folds. Agentctl task
 verbs, lead-side delegation, and projection remain outside this slice.
 
-The worker-facing command is `bin/task-intent`, not `bin/task`. `report`, `progress`, and `continue`
+The worker-facing command is `bin/child/task-intent`, not `bin/task`. `report`, `progress`, and `continue`
 append only to the current broker attempt's private JSONL file; `list` reads only the supervisor-rendered
 board snapshot. The child has no task-ledger or cross-agent state ACL. The root supervisor applies each
 file through `bin/task` using its own agent/attempt context, journals the ledger/send split for crash
 replay, and quarantines foreign attempts. The terminal response's `attempt_id` is handed back through a
-pre-opened 0600 metadata file, binding worker output to the broker's actual attempt rather than a
-supervisor-generated guess.
+pre-opened 0600 metadata file. If a supervisor and launcher die before that file is populated, recovery
+may adopt exactly one unclaimed `bin/attempts <agent>` decision only when its agent, session, and decision
+time bind it to the unfinished turn; unmatched intent files are quarantined as `unbound_attempt`.
 
 Task pickup emits `task.started` once and binds the provider session to the agent task worktree/branch.
-Reports and continuations use idempotent message ids. Missing reports, turn budget, provider DLQ, and
+Task-stream causation ids are unique under the stream lock. A retry of the same event type and task
+returns the original event id without appending; a prior rejection returns its original reason, while a
+different event or task is `causation_conflict`. Synthetic message ids are fold-independent:
+`<task>.c.<attempt>.<index>` for a continuation, `<task>.r.<attempt>` for a rejection receipt, and
+`<task>.n.a<assignment>` for a missing-report nudge. The journaled id wins during replay.
+
+Missing reports, turn budget, provider DLQ, and
 assignment-delivery DLQ close through the service-authority rows in DOMAIN §3.8–3.9. A task stream lock
 timeout remains transient: the intent file stays pending and startup/poll scanning retries it.
 

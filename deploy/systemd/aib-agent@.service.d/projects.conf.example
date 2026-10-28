@@ -1,0 +1,4 @@
+# Site-specific project-home write grants for the role-switched, Landlock-confined Git helper.
+# Keep project homes outside /home while ProtectHome=yes remains enabled.
+[Service]
+ReadWritePaths=/srv/aib/projects
