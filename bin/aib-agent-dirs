@@ -146,6 +146,24 @@ def main(argv: list[str]) -> int:
             state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             aib_fd = directory_at(state_fd, ".aib", role_uid, role_gid, 0o700)
             intents_fd = directory_at(aib_fd, "intents", role_uid, role_gid, 0o700)
+            for legacy in ("done", "tainted"):
+                try:
+                    info = os.stat(legacy, dir_fd=intents_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    print(f"aib-agent-dirs: unsafe legacy intent entry: {legacy}", file=sys.stderr)
+                    return 78
+                try:
+                    os.rmdir(legacy, dir_fd=intents_fd)
+                except OSError as error:
+                    if error.errno in (getattr(os, "ENOTEMPTY", 39), getattr(os, "EEXIST", 17)):
+                        print(
+                            f"aib-agent-dirs: legacy intent directory is not empty: {legacy}",
+                            file=sys.stderr,
+                        )
+                        return 78
+                    raise
             quarantine_fd = directory_at(state_fd, ".aib-quarantine", os.geteuid(), os.getegid(), 0o700)
             for name in (".claude", ".codex"):
                 provider_dir = state / name

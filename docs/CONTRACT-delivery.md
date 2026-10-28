@@ -56,7 +56,7 @@ Sender/recipient are real fields — **never a free-text signature to parse.**
   `bin/message dlq` — visible, never silently dropped, never infinitely re-notified. A task assignment
   reaching this DLQ is currently translated by its assignee-side root supervisor to
   `task.cancelled delivery_failed`. This is an interim bridge; sender-side delivery ownership replaces it
-  in D2. Processed DLQ message ids are journaled so historical entries do not trigger repeated task folds.
+  in a later release. Processed DLQ message ids are journaled so historical entries do not trigger repeated task folds.
 
 ## 8. Watcher = wakeup only
 - The notify/wakeup mechanism only pings ("check your inbox"). It does **not** prove delivery via heartbeat-line-count or re-nudges — proof lives in the state events (§3). (The heuristic watcher is dismantled in P2 after parity; P1 provides the receipts that replace it.)

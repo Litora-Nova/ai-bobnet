@@ -128,7 +128,12 @@ Provisioning must also run `bin/aib-agent-dirs` before any one-shot or supervise
 `.aib/intents` path exists at mode 0700 and the root-owned `.aib-quarantine` exists at mode 0700. Do not add the role to `aib-tasks` or restore a
 shared-state group as a shortcut: the root supervisor publishes `.aib/board.json`, and the confined child
 has no direct ledger or peer-state access. Project homes should live under `/srv/aib/projects`, not
-`/home`, because the shipped unit uses `ProtectHome=yes`. Provisioning creates the setgid project home,
+`/home`, because the shipped unit uses `ProtectHome=yes`. Provisioning creates each project home as
+`root:<project-group>` mode 02770, creates `/run/aib/git` as `root:root` mode 0755, and installs the
+confinement helper at the `AIB_CONFINE_BIN` path configured by the agent unit. Team outbox directories
+under `/srv/aib/outbox` must have permission bits 0770 (setgid is allowed). `bin/aib-agent-dirs` removes
+empty legacy `.aib/intents/done` and `.aib/intents/tainted` directories and refuses non-empty ones for
+operator review. Provisioning also creates the setgid project home,
 default ACL, `.aib/wt`, and `core.sharedRepository=group`; the supervisor never creates or changes those
 objects as root. Add every project-home root to the agent unit's `ReadWritePaths` drop-in.
 

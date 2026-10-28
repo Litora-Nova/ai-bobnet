@@ -15,6 +15,7 @@ ExecStartPre=+/opt/aib/engine/bin/aib-agent-dirs %i
 ExecStart=/opt/aib/engine/bin/aib-supervisor %i
 Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
 Environment=AIB_TASK_ROOT=/var/lib/aib/tasks
+Environment=AIB_CONFINE_BIN=/opt/aib/engine/libexec/landlock-exec
 WatchdogSec=90
 Restart=on-failure
 RestartSec=5

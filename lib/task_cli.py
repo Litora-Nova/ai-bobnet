@@ -366,8 +366,18 @@ def causation_replay(events: Path, request: dict[str, object]) -> tuple[str, str
             continue
         kind = record.get("event_type")
         payload = record.get("payload", {})
-        prior_type = payload.get("requested_type") if kind == "task.rejected" and isinstance(payload, dict) else kind
-        if prior_type != requested_type or record.get("task_id") != requested_task:
+        request_payload = request.get("payload", {})
+        if requested_type == "task.rejected" and kind == "task.rejected":
+            same_request = (
+                isinstance(payload, dict)
+                and isinstance(request_payload, dict)
+                and payload.get("requested_type") == request_payload.get("requested_type")
+                and payload.get("reason") == request_payload.get("reason")
+            )
+        else:
+            prior_type = payload.get("requested_type") if kind == "task.rejected" and isinstance(payload, dict) else kind
+            same_request = prior_type == requested_type
+        if not same_request or record.get("task_id") != requested_task:
             return "rejected", str(record.get("event_id", "")), "causation_conflict"
         if kind == "task.rejected":
             reason = payload.get("reason") if isinstance(payload, dict) else "rejected"

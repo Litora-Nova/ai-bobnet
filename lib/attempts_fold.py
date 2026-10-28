@@ -293,6 +293,7 @@ def main():
                 'session_id': attempt['session'],
                 'decided_at': attempt['decided_at'],
                 'decision': attempt['decision'],
+                'running': attempt['state'] == 'open',
             }, ensure_ascii=True, separators=(',', ':')))
     else:
         result = fold(*sys.argv[1:])

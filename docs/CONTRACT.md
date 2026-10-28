@@ -241,7 +241,9 @@ different event or task is `causation_conflict`. Synthetic message ids are fold-
 
 Missing reports, turn budget, provider DLQ, and
 assignment-delivery DLQ close through the service-authority rows in DOMAIN §3.8–3.9. A task stream lock
-timeout remains transient: the intent file stays pending and startup/poll scanning retries it.
+timeout remains transient: the intent file stays pending and startup/poll scanning retries it. The fifth
+failed apply quarantines the file as `apply_exhausted` and raises an `intent_apply_exhausted` engine
+alarm. A durable `intent.ledger` rejection carries its domain reason in the `reason` field.
 
 Task payloads use raw UTF-8. Every free-text/reference CLI argument is strictly UTF-8 encoded before the
 lock, and the tasks commit primitive independently refuses a non-UTF-8 payload with rc 64. Titles and

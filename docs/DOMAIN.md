@@ -198,7 +198,11 @@ writer currently accepts only `1`; `parent` is the Run id. The reserved sub-team
 `teams.<team>.parent_team` remain model seams only.
 
 Task ids are deterministic: `t-` plus the first 12 hex digits of SHA-256 over
-`<causation_id>:<intent_n>`. Retry dedupe is separately keyed by `(source_msg_id, assignee)` for an open
+`<causation_id>:<intent_n>`. A causation id names one request in the tasks stream, so a caller creating
+several Tasks uses a distinct id for each intent (for example `intent-<attempt>-<n>`); `intent_n` remains
+part of deterministic id composition, not a license to reuse the causation id. A replay with the same
+event type and Task returns the first decision even if other payload fields differ. Retry dedupe is
+separately keyed by `(source_msg_id, assignee)` for an open
 Task. This deliberately permits at most one open Task per worker for one source message; fan-out to the
 same worker must be bundled, while a different assignee remains valid. State is never stored outside the
 events. `list` and `show` replay the same fold used by writers. A framing-valid record with invalid UTF-8,
@@ -342,6 +346,8 @@ gate_id? · grant_id? · effect_id? · correlation_id · causation_id · schema_
   run-level request has no `task_id`), and `causation_id`; the commit
   primitive derives `correlation_id = run_id`, leaves `attempt_id` null, and assigns
   `event_id = <project_uid>-tasks-<seq>` under the lock.
+  Within that stream, `causation_id` is unique to one requested event and Task. Multi-intent callers use
+  `intent-<attempt>-<n>` rather than reusing the terminal attempt id.
 - Each stream has **one serializing append broker**. Encoding is: *encode → enforce byte cap → one checked
   append*. A record that exceeds the cap becomes an **Artifact by reference**; it is never inlined.
 - A stream-lock timeout returns **75**. It is transient and MUST be retried by the caller; it is never a
