@@ -11,6 +11,10 @@ from pathlib import Path
 
 def frame(record: dict, seq: int) -> bytes:
     data = json.dumps(record, separators=(",", ":"), sort_keys=False).encode()
+    return frame_bytes(data, seq)
+
+
+def frame_bytes(data: bytes, seq: int) -> bytes:
     crc, length, *_ = subprocess.check_output(["cksum"], input=data).split()
     return str(seq).encode() + b" " + crc + b" " + length + b" " + data + b"\n"
 
@@ -75,7 +79,36 @@ def main() -> int:
         with path.open("ab") as stream:
             stream.write(frame(record, seq))
         return 0
-    raise SystemExit("usage: task_events.py <count|field|append|inject> ...")
+    if command == "inject-invalid-utf8":
+        project, team, run_id, task_id = sys.argv[3:7]
+        seq = len(records(path)) + 1
+        record = {
+            "event_id": f"{project}-tasks-{seq}",
+            "event_type": "task.cancelled",
+            "occurred_at": "2026-10-27T12:00:00Z",
+            "actor_type": "human",
+            "actor_id": "operator",
+            "project_uid": project,
+            "team_uid": team,
+            "agent_uid": None,
+            "session_id": None,
+            "run_id": run_id,
+            "task_id": task_id,
+            "gate_id": None,
+            "grant_id": None,
+            "effect_id": None,
+            "attempt_id": None,
+            "correlation_id": run_id,
+            "causation_id": "invalid-utf8",
+            "schema_version": 2,
+            "payload": {"caller": "root:root", "via": "ctl:99", "requester": "human:operator", "reason": "INVALID_UTF8_SENTINEL"},
+        }
+        data = json.dumps(record, separators=(",", ":"), sort_keys=False).encode()
+        data = data.replace(b"INVALID_UTF8_SENTINEL", b"bad-\xff-reason")
+        with path.open("ab") as stream:
+            stream.write(frame_bytes(data, seq))
+        return 0
+    raise SystemExit("usage: task_events.py <count|field|append|inject|inject-invalid-utf8> ...")
 
 
 if __name__ == "__main__":

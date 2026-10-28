@@ -72,6 +72,8 @@ json_field(){ python3 -c 'import json,sys; value=json.load(sys.stdin); exec("\n"
 
 # The installed writer is root-only. Human and gateway authority is relayed from
 # a kernel-attested control request; agent authority is relayed from an intent.
+RC=0; ERR=$(env -u AIB_TEST_SEAMS "$ROOT/bin/task" run-create --project acme --team acme-engine --actor-type human --actor-id operator --causation-id euid-gate --run-id malformed 2>&1) || RC=$?
+eq 'the production euid gate runs before malformed request validation' "$RC|$ERR" '77|ai-bobnet: caller_unauthorized'
 write run-create human operator ctl-run-1 --run-id r-000000000001
 eq 'root relays a human control request that creates a queued run' "$RC|$(count run.requested)|$(state r-000000000001)" '0|1|QUEUED'
 
@@ -390,10 +392,26 @@ print(all(not safe_display_text(chr(point)) for point in points))
 PY
 )
 eq 'the display filter rejects every required control/format/tag code point' "$display_range_check" True
+category_range_check=$(python3 - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'lib'))
+from task_ledger import safe_display_text
+print(all(not safe_display_text(chr(point)) for point in (0xd800, 0xe000, 0x0378)))
+PY
+)
+eq 'the display filter rejects surrogate, private-use, and unassigned code points' "$category_range_check" True
+before=$(wc -l < "$EVENTS")
+write create human operator invalid-byte-title --run-id r-200000000001 --intent-n 1 --source-msg-id msg-invalid-byte-title --assignee acme-dev1 --title $'bad\xfftitle' --body-ref msg:invalid-byte-title --body-file "$BODY"
+eq 'an invalid UTF-8 title is rc 64 and appends nothing' "$RC|$(wc -l < "$EVENTS")" "64|$before"
+write cancel human operator invalid-byte-reason --run-id r-200000000001 --task-id "$D2" --reason $'bad\xfcreason'
+eq 'an invalid UTF-8 reason is rc 64 and appends nothing' "$RC|$(wc -l < "$EVENTS")" "64|$before"
+run list --project acme --all
+eq 'the ledger remains readable after invalid argv bytes are refused' "$RC" 0
 write create human operator unsafe-ref --run-id r-200000000001 --intent-n 1 --source-msg-id msg-ref --assignee acme-dev1 --title Ref --body-ref msg:ref --body-file "$BODY" --context-ref file:../../outside
 eq 'file context refs cannot traverse above their root' "$RC" 64
 ref_case=0; refs_refused=1
-for unsafe_ref in 'git:--upload-pack=x' 'git:refs/heads/a..b' 'git:refs/heads/.hidden' 'git:refs/heads/x.lock' 'git:@{bad' 'file:-option' $'file:a\x1bb' $'file:a\u202eb' "file:$(printf '%0256d' 0)"; do
+for unsafe_ref in 'git:--upload-pack=x' 'git:refs/heads/a..b' 'git:refs/heads/.hidden' 'git:refs/heads/x.lock' 'git:@' 'git:refs/heads/x.' 'git:@{bad' 'file:-option' $'file:a\x1bb' $'file:a\u202eb' "file:$(printf '%0256d' 0)"; do
   ref_case=$((ref_case+1))
   write create human operator "unsafe-ref-$ref_case" --run-id r-200000000001 --intent-n 1 --source-msg-id "msg-unsafe-ref-$ref_case" --assignee acme-dev1 --title Ref --body-ref "msg:unsafe-ref-$ref_case" --body-file "$BODY" --context-ref "$unsafe_ref"
   [ "$RC" -eq 64 ] || refs_refused=0
@@ -402,6 +420,10 @@ eq 'refs reject option-like, control, non-ASCII, overlong, and invalid git forms
 long_msg_ref="msg:$(printf '%0256d' 0)"
 write create human operator long-body-ref --run-id r-200000000001 --intent-n 1 --source-msg-id msg-long-body-ref --assignee acme-dev1 --title Ref --body-ref "$long_msg_ref" --body-file "$BODY"
 eq 'body_ref uses the same sane reference length bound' "$RC" 64
+write create human operator wrong-body-ref-prefix --run-id r-200000000001 --intent-n 1 --source-msg-id msg-wrong-body-ref --assignee acme-dev1 --title Ref --body-ref git:main --body-file "$BODY"
+eq 'body_ref requires the msg prefix' "$RC" 64
+write create human operator bad-msg-token --run-id r-200000000001 --intent-n 1 --source-msg-id msg-bad-token --assignee acme-dev1 --title Ref --body-ref msg:bad-token --body-file "$BODY" --context-ref msg:Bad.Ref
+eq 'msg context refs require TOKEN form' "$RC" 64
 run run-create --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:23 --requester human:operator --causation-id unsafe-ticket --run-id r-200000000010 --ticket-ref 'git:--upload-pack=x'
 eq 'ticket_ref uses the common reference validator' "$RC" 64
 run run-close --project acme --team acme-engine --actor-type human --actor-id operator --via ctl:24 --requester human:operator --causation-id unsafe-summary --run-id r-200000000001 --outcome completed --summary-ref $'file:a\x1bb'
@@ -485,6 +507,8 @@ cancel_before=$(count task.cancelled)
 close_lines_before=$(wc -l < "$EVENTS")
 write run-close human operator close-cancelled --run-id r-200000000003 --outcome cancelled --summary-ref msg:summary
 eq 'one run.closed atomically derives cancellation of every open task' "$RC|$(state "$C1")|$(state "$C2")|$(( $(count task.cancelled) - cancel_before ))|$(( $(wc -l < "$EVENTS") - close_lines_before ))|$(state r-200000000003)" '0|CANCELLED|CANCELLED|0|1|CANCELLED'
+run show --project acme "$C1"; cascade_last_reason=$(json_field last_reason "$OUT"); cascade_state_seq=$(json_field state_seq "$OUT")
+eq 'the run-close cascade records run_closed and the close sequence as state_seq' "$cascade_last_reason|$cascade_state_seq" "run_closed|$(field run.closed -1 event_id | sed 's/.*-//')"
 write run-close human operator close-again --run-id r-200000000003 --outcome cancelled
 eq 'a terminal run cannot be closed twice' "$RC|$(field task.rejected -1 payload.reason)" '77|run_closed'
 
@@ -662,6 +686,8 @@ write report agent acme-dev1 fold-block-1 --run-id r-300000000001 --task-id "$F1
 write create human operator fold-task-2 --run-id r-300000000001 --intent-n 2 --source-msg-id msg-fold-2 --assignee acme-dev2 --title Fold --body-ref msg:fold-2 --body-file "$BODY"; F2=${OUT#task_id=}
 write start service supervisor:acme-dev2 fold-start-2 --run-id r-300000000001 --task-id "$F2"
 write report agent acme-dev2 fold-done-2 --run-id r-300000000001 --task-id "$F2" --state done --result-ref msg:done
+write create human operator fold-task-3 --run-id r-300000000001 --intent-n 3 --source-msg-id msg-fold-3 --assignee acme-dev2 --title Fold --body-ref msg:fold-3 --body-file "$BODY"; F3=${OUT#task_id=}
+write start service supervisor:acme-dev2 fold-start-3 --run-id r-300000000001 --task-id "$F3"
 python3 -I "$FX" inject "$EVENTS" task.cancelled service supervisor:acme-dev1 acme acme-engine r-300000000001 "$F1" forged-cancel '{"caller":"root:root","reason":"forged"}'
 python3 -I "$FX" inject "$EVENTS" task.reassigned service supervisor:acme-dev1 acme acme-engine r-300000000001 "$F1" forged-assign '{"caller":"root:root","assignee":"acme-dev2"}'
 python3 -I "$FX" inject "$EVENTS" task.reopened service supervisor:acme-dev1 acme acme-engine r-300000000001 "$F1" forged-reopen '{"caller":"root:root","assignee":"acme-dev2"}'
@@ -672,9 +698,11 @@ python3 -I "$FX" inject "$EVENTS" task.cancelled human operator acme acme-engine
 python3 -I "$FX" inject "$EVENTS" run.closed human operator acme acme-engine r-300000000001 - forged-open-close '{"caller":"root:root","via":"ctl:2","requester":"human:operator","outcome":"completed","summary_ref":null}'
 python3 -I "$FX" inject "$EVENTS" task.rejected human operator acme acme-engine r-300000000001 - forged-rejection '{"caller":"role:acme-dev1","requested_type":"task.cancelled","reason":"forged"}'
 python3 -I "$FX" inject "$EVENTS" task.created human operator acme acme-engine r-300000000001 t-bbbbbbbbbbbb forged-title '{"caller":"root:root","via":"ctl:3","requester":"human:operator","parent":"r-300000000001","depth":1,"source_msg_id":"msg-forged-title","owner":"human:operator","assignee":"acme-dev1","title":"bad\u001btitle","body_ref":"msg:forged-title","deadline_at":"2026-10-28T00:00:00Z","budget":{"max_turns":8,"max_attempts":3},"gate":"none","context_refs":[]}'
+python3 -I "$FX" inject "$EVENTS" task.cancelled human operator acme acme-engine r-300000000001 "$F1" forged-reason-cancel '{"caller":"root:root","via":"ctl:30","requester":"human:operator","reason":"bad\u202ereason"}'
+python3 -I "$FX" inject "$EVENTS" task.reported agent acme-dev2 acme acme-engine r-300000000001 "$F3" forged-reason-report '{"caller":"root:root","via":"intent:forged-reason-report","state":"failed","result_ref":null,"reason":"bad\u202ereason"}'
 run list --project acme --all
-eq 'fold rejects all forged actor/team/caller/terminal/display records exactly' "$(json_field invalid "$OUT")|$(state "$F1")|$(state "$F2")" '10|BLOCKED|DONE'
-for fold_reason in invalid_cancel_actor invalid_reassignment_actor invalid_run_close_actor cross_team caller_actor_mismatch invalid_cancel open_tasks invalid_rejection invalid_title; do
+eq 'fold rejects all forged actor/team/caller/terminal/display records exactly' "$(json_field invalid "$OUT")|$(state "$F1")|$(state "$F2")|$(state "$F3")" '12|BLOCKED|DONE|IN_PROGRESS'
+for fold_reason in invalid_cancel_actor invalid_reassignment_actor invalid_run_close_actor cross_team caller_actor_mismatch invalid_cancel open_tasks invalid_rejection invalid_title invalid_reason; do
   has "fold reports $fold_reason" "$(json_field invalid_events "$OUT")" "\"reason\":\"$fold_reason\""
 done
 
@@ -683,9 +711,25 @@ python3 -I "$FX" inject "$EVENTS" task.started service supervisor:acme-dev1 acme
 python3 -I "$FX" inject "$EVENTS" task.created human operator acme acme-engine r-300000000001 t-cccccccccccc forged-created-after-close '{"caller":"root:root","via":"ctl:4","requester":"human:operator","parent":"r-300000000001","depth":1,"source_msg_id":"msg-after-close","owner":"human:operator","assignee":"acme-dev1","title":"Late","body_ref":"msg:late","deadline_at":"2026-10-28T00:00:00Z","budget":{"max_turns":8,"max_attempts":3},"gate":"none","context_refs":[]}'
 python3 -I "$FX" inject "$EVENTS" run.closed human operator acme acme-engine r-300000000001 - forged-second-close '{"caller":"root:root","via":"ctl:5","requester":"human:operator","outcome":"cancelled","summary_ref":null}'
 run list --project acme --all
-eq 'fold counts every injected post-close event as invalid' "$(json_field invalid "$OUT")" 13
+eq 'fold counts every injected post-close event as invalid' "$(json_field invalid "$OUT")" 15
 has 'fold labels the injected post-close event run_closed' "$(json_field invalid_events "$OUT")" '"reason":"run_closed"'
 has 'fold labels a second close invalid_run_close' "$(json_field invalid_events "$OUT")" '"reason":"invalid_run_close"'
+
+# A correctly framed legacy poison record is a record-level anomaly, not a
+# permanent availability failure. The fold skips it and the stop lever can append.
+POISON_ROOT="$WORK/poison/tasks"
+mkdir -p "$POISON_ROOT/acme/bodies"; chmod 2750 "$POISON_ROOT/acme" "$POISON_ROOT/acme/bodies"
+: > "$POISON_ROOT/acme/tasks.events"; : > "$POISON_ROOT/acme/tasks.events.lock"; chmod 640 "$POISON_ROOT/acme/tasks.events" "$POISON_ROOT/acme/tasks.events.lock"
+export AIB_TASK_ROOT="$POISON_ROOT"; EVENTS="$POISON_ROOT/acme/tasks.events"
+write run-create human operator poison-run --run-id r-400000000001
+write create human operator poison-task --run-id r-400000000001 --intent-n 1 --source-msg-id msg-poison --assignee acme-dev1 --title Poison --body-ref msg:poison --body-file "$BODY"; POISON_TASK=${OUT#task_id=}
+python3 -I "$FX" inject-invalid-utf8 "$EVENTS" acme acme-engine r-400000000001 "$POISON_TASK"
+run list --project acme --all
+eq 'a pre-existing invalid UTF-8 record is counted while the fold continues' "$RC|$(json_field invalid "$OUT")|$(json_field invalid_events "$OUT")" '0|1|[{"reason":"invalid_utf8","seq":3}]'
+write run-close human operator poison-close --run-id r-400000000001 --outcome cancelled
+poison_close_rc=$RC
+run list --project acme --all; poison_invalid=$(json_field invalid "$OUT")
+eq 'run-close still works after a pre-existing invalid UTF-8 record' "$poison_close_rc|$poison_invalid|$(state "$POISON_TASK")|$(state r-400000000001)|$(wc -l < "$EVENTS")" '0|1|CANCELLED|CANCELLED|4'
 
 # Directory/file modes are a provisioning responsibility; the commit primitive
 # merely requires them to exist.

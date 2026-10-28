@@ -80,6 +80,12 @@ eq 'tasks correlation_id is its run_id' "$(aib_event_field "$task_json" correlat
 eq 'tasks record has no attempt identity' "$(aib_event_field "$task_json" attempt_id)" ''
 has 'tasks record encodes attempt_id as raw JSON null' "$(sed -n '1p' "$TASKS")" '"attempt_id":null'
 
+INVALID_UTF8_TASKS="$WORK/invalid-utf8-tasks.events"
+invalid_utf8_payload='{"reason":"bad-'$(printf '\377')'"}'
+( aib_event_commit "$INVALID_UTF8_TASKS" "$INVALID_UTF8_TASKS.lock" tasks task.created "$TASK_ENV" "$invalid_utf8_payload" ) >/dev/null 2>&1
+eq 'tasks commit rejects a non-UTF-8 payload with rc 64' "$?" 64
+eq 'a refused non-UTF-8 tasks payload appends nothing' "$(test -e "$INVALID_UTF8_TASKS" && wc -l < "$INVALID_UTF8_TASKS" || printf 0)" 0
+
 RUN_ENV="$(printf '%s\n' "$TASK_ENV" | sed '/^task_id=/d')"
 aib_event_commit "$WORK/run.events" "$WORK/run.events.lock" tasks run.requested "$RUN_ENV" '{}'
 run_json="$(sed -n '1s/^[0-9]* [0-9]* [0-9]* //p' "$WORK/run.events")"
@@ -173,6 +179,13 @@ exec {unheldfd}>>"$UNHELD.lock"
 eq 'held-lock seam refuses an unlocked matching descriptor' "$?" 2
 eq 'unlocked inherited descriptor appends nothing' "$(test -e "$UNHELD" && wc -l < "$UNHELD" || printf 0)" 0
 exec {unheldfd}>&-
+
+SHELL_PROBE="$WORK/shell-probe-tasks.events"
+exec {shellprobefd}>>"$SHELL_PROBE.lock"
+( SHELL=/bin/false AIB_EVENT_HELD_LOCK_FD="$shellprobefd" aib_event_commit "$SHELL_PROBE" "$SHELL_PROBE.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock proof does not accept an unlocked fd via a failing SHELL probe' "$?" 2
+eq 'the failing-SHELL lock probe appends nothing' "$(test -e "$SHELL_PROBE" && wc -l < "$SHELL_PROBE" || printf 0)" 0
+exec {shellprobefd}>&-
 
 FOREIGN_HELD="$WORK/foreign-held-tasks.events"
 exec {foreignfd}>>"$FOREIGN_HELD.lock"; flock -x "$foreignfd"
