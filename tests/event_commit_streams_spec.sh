@@ -179,6 +179,12 @@ exec {unheldfd}>>"$UNHELD.lock"
 eq 'held-lock seam refuses an unlocked matching descriptor' "$?" 2
 eq 'unlocked inherited descriptor appends nothing' "$(test -e "$UNHELD" && wc -l < "$UNHELD" || printf 0)" 0
 exec {unheldfd}>&-
+SHARED_HELD="$WORK/shared-held-tasks.events"
+exec {sharedfd}>>"$SHARED_HELD.lock"; flock -s "$sharedfd"
+( AIB_EVENT_HELD_LOCK_FD="$sharedfd" aib_event_commit "$SHARED_HELD" "$SHARED_HELD.lock" tasks task.created "$TASK_ENV" '{}' ) >/dev/null 2>&1
+eq 'held-lock seam refuses a shared flock' "$?" 2
+eq 'shared-locked descriptor appends nothing' "$(test -e "$SHARED_HELD" && wc -l < "$SHARED_HELD" || printf 0)" 0
+flock -u "$sharedfd"; exec {sharedfd}>&-
 
 SHELL_PROBE="$WORK/shell-probe-tasks.events"
 exec {shellprobefd}>>"$SHELL_PROBE.lock"
