@@ -32,6 +32,7 @@ from task_ledger import (  # noqa: E402
     load_json,
     safe_display_text,
     task_id as derive_task_id,
+    valid_deadline,
     validate_registry_scope,
 )
 
@@ -267,12 +268,8 @@ def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object
             raise LedgerError("invalid context_refs")
         body = read_body_file(args.body_file)
         deadline = args.deadline_at
-        if deadline is not None:
-            try:
-                from datetime import datetime
-                datetime.strptime(deadline, "%Y-%m-%dT%H:%M:%SZ")
-            except ValueError as error:
-                raise LedgerError("invalid deadline_at (expected UTC YYYY-MM-DDTHH:MM:SSZ)") from error
+        if deadline is not None and not valid_deadline(deadline):
+            raise LedgerError("invalid deadline_at (expected UTC YYYY-MM-DDTHH:MM:SSZ)")
         owner = args.actor_id if args.actor_type == "agent" else f"human:{args.actor_id}"
         payload = {"parent": args.run_id, "depth": args.depth, "source_msg_id": args.source_msg_id, "owner": owner, "assignee": args.assignee, "title": args.title, "body_ref": args.body_ref, "deadline_at": deadline, "budget": {"max_turns": 8, "max_attempts": 3}, "gate": args.gate, "context_refs": args.context_ref}
     elif args.command in {"assign", "reopen"}:
@@ -333,7 +330,7 @@ def commit(events: Path, lock: Path, lock_fd: int, request: dict[str, object], k
     script = '. "$1/lib/aibobnet.sh"; aib_event_commit "$2" "$3" tasks "$4" "$5" "$6"; printf "%s\\t%s\\n" "$AIB_EVENT_COMMIT_EVENT_ID" "$AIB_EVENT_COMMIT_SEQ"'
     env = dict(os.environ)
     env["AIB_EVENT_HELD_LOCK_FD"] = str(lock_fd)
-    result = subprocess.run(["bash", "-c", script, "_", str(ROOT), str(events), str(lock), kind, envelope, json.dumps(payload, separators=(",", ":"), ensure_ascii=True)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, pass_fds=(lock_fd,), check=False)
+    result = subprocess.run(["bash", "-c", script, "_", str(ROOT), str(events), str(lock), kind, envelope, json.dumps(payload, separators=(",", ":"), ensure_ascii=False)], encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, pass_fds=(lock_fd,), check=False)
     if result.returncode:
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)
@@ -360,6 +357,8 @@ def main(argv: list[str]) -> int:
                 return fail(64, "show expects r-<12 hex> or t-<12 hex>")
             if output is None:
                 return fail(66, "ledger object not found")
+            if args.command == "show" and current["invalid"]:
+                print(f"ai-bobnet: warning: {current['invalid']} invalid task events (see list)", file=sys.stderr)
             print(json.dumps(output, separators=(",", ":"), sort_keys=True))
             return 0
 

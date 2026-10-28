@@ -223,6 +223,17 @@ has no public verb; the first Task derives a Run as running. Every other write i
 `list` and `show` are read-only folds. Confined intents, supervisor apply, worktrees, agentctl verbs, and
 projection are deliberately outside this slice.
 
+Task payloads use raw UTF-8. Every free-text/reference CLI argument is strictly UTF-8 encoded before the
+lock, and the tasks commit primitive independently refuses a non-UTF-8 payload with rc 64. Titles and
+reasons reject control, format/zero-width, line/paragraph-separator, surrogate, private-use, and tag
+characters; references use the printable-ASCII `msg:`/`git:`/`file:` rules in DOMAIN §3.8. Explicit
+deadlines must be valid canonical UTC seconds in `YYYY-MM-DDTHH:MM:SSZ` form.
+
+Replay skips and counts framing-valid records that contain invalid UTF-8, invalid or duplicate-key JSON,
+a non-object shape, or invalid domain fields. `list` exposes the `invalid` counter and `invalid_events`;
+`show` prints one warning line with the same counter. These record-level anomalies do not stop the fold.
+Structural frame corruption still fails closed.
+
 Failed/cancelled Run closure is one `run.closed` append. Replay derives every open child as
 `CANCELLED {reason: run_closed}` from that event, so the cascade and terminal Run state are atomic rather
 than a sequence of independently committed cancellations.

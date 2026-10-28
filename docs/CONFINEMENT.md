@@ -432,6 +432,10 @@ a compiler).
 
 ### Runtime dependencies of the commit path this confinement sits behind (ADR-0006)
 
+The root-only task ledger has an additional deployment precondition: every existing ancestor of
+`AIB_TASK_ROOT` must be owned by uid 0. `bin/aib-task-dirs` safely provisions the task root and its leaf
+objects, but it cannot prevent a non-root owner of an ancestor from replacing the whole tree by rename.
+
 Every confined launch is preceded by a `commit(attempt.decided)` (`docs/CONTRACT-mediation.md` §2 step
 2) and followed by a `commit(attempt.ended)` (step 4) — neither is optional, and both now carry the
 `high_water` anchor's own dependencies on the broker's always-anchored path (§8.8,

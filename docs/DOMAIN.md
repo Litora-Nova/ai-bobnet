@@ -166,7 +166,9 @@ precedence ladder, and every displayed state MUST be traceable to a causing even
 
 `bin/task` is the only task-stream writer. Installed writers must run as root; the project directory and
 `bodies` directory are `root:aib-tasks 2750`, while the stream, lock, and sidecars are root-owned `0640`.
-The group is read-only. Non-root writes fail with `caller_unauthorized` and do not append a rejection.
+The group is read-only. As a deployment precondition, every existing ancestor of `AIB_TASK_ROOT` must
+also be root-owned; leaf provisioning cannot make a tree safe when a non-root owner can replace an
+ancestor. Non-root writes fail with `caller_unauthorized` and do not append a rejection.
 Every mutation is one locked transaction: replay the stream, read the
 current registry authority, validate the closed transition and ledger limits, then append through
 `aib_event_commit(stream=tasks)`. A domain refusal appends `task.rejected` and changes no Run or Task
@@ -198,7 +200,10 @@ Task ids are deterministic: `t-` plus the first 12 hex digits of SHA-256 over
 `<causation_id>:<intent_n>`. Retry dedupe is separately keyed by `(source_msg_id, assignee)` for an open
 Task. This deliberately permits at most one open Task per worker for one source message; fan-out to the
 same worker must be bundled, while a different assignee remains valid. State is never stored outside the
-events. `list` and `show` replay the same fold used by writers.
+events. `list` and `show` replay the same fold used by writers. A framing-valid record with invalid UTF-8,
+invalid JSON (including duplicate keys), a non-object shape, or invalid domain fields is skipped rather
+than aborting replay and increments `invalid`; `list` exposes `invalid_events`, and `show` emits a one-line
+warning with the count. Frame corruption remains fatal and fails closed.
 The body is a stable 0640 sidecar at
 `$AIB_TASK_ROOT/<project_uid>/bodies/<task_id>.md`; creation refuses symlinks and hard links. Directory,
 ownership, setgid, stream-file, and lock-file modes are provisioned by `bin/aib-task-dirs` with dirfd and
@@ -233,10 +238,14 @@ The normative rejection reasons are `caller_unauthorized`, `caller_actor_mismatc
 `unknown_task`, `unknown_assignee`, `invalid_assignee`, `cross_team`, `duplicate`, `run_closed`,
 `open_tasks`, `invalid_transition`, `concurrent_update`, `gate_not_available`, `max_depth`, `max_open`,
 `max_tasks_per_run`, `max_assignments_per_task`, `max_turns_per_task`, `unsafe_body_sidecar`, and
-`unsupported_event`. Titles/reasons reject C0, DEL, C1, Unicode line/paragraph separators, format and
-zero-width characters, and tag characters. References are printable ASCII without whitespace or a
-leading `-`, with a 255-character payload limit; `git:` references also obey Git ref-name basics and
-`file:` references must be relative normalized paths without empty, `.` or `..` segments.
+`unsupported_event`. Free-text and reference arguments must encode as strict UTF-8 before the stream lock;
+invalid bytes are rc 64 and never append. Titles/reasons reject controls, Unicode line/paragraph
+separators, surrogate and private-use code points, format and zero-width characters, and tag characters.
+Unassigned (`Cn`) code points remain valid so replay does not depend on the interpreter's Unicode version.
+References are printable ASCII without whitespace or a leading `-`, with a 255-character payload limit;
+`git:` references also obey Git ref-name basics and `file:` references must be relative normalized paths
+without empty, `.` or `..` segments. `deadline_at` is either omitted or the exact valid UTC form
+`YYYY-MM-DDTHH:MM:SSZ`; the fold rejects non-canonical stored values.
 
 ---
 

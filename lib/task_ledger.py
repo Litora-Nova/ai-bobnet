@@ -26,6 +26,7 @@ RUN_RE = re.compile(r"r-[0-9a-f]{12}\Z", re.ASCII)
 TASK_RE = re.compile(r"t-[0-9a-f]{12}\Z", re.ASCII)
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
 UID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z", re.ASCII)
+DEADLINE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z", re.ASCII)
 TERMINAL = {"DONE", "FAILED", "CANCELLED"}
 NONTERMINAL = {"QUEUED", "ASSIGNED", "IN_PROGRESS", "BLOCKED", "REVIEW"}
 OPEN_LIMIT = {"QUEUED", "ASSIGNED"}
@@ -67,10 +68,21 @@ def task_id(causation_id: str, intent_n: int) -> str:
 def safe_display_text(value: str) -> bool:
     """Return whether single-line display text contains no control/format chars."""
     return not any(
-        unicodedata.category(char) in {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}
+        unicodedata.category(char) in {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}
         or 0xE0000 <= ord(char) <= 0xE007F
         for char in value
     )
+
+
+def valid_deadline(value: Any) -> bool:
+    """Return whether a deadline is a real canonical UTC second."""
+    if not isinstance(value, str) or DEADLINE_RE.fullmatch(value) is None:
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def _text(value: Any, name: str, *, optional: bool = False) -> str | None:
@@ -134,12 +146,15 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
     source = _text(payload.get("source_msg_id"), "source_msg_id")
     gate = _text(payload.get("gate"), "gate")
     title = _text(payload.get("title"), "title")
+    deadline = payload.get("deadline_at")
     if not UID_RE.fullmatch(assignee or "") or not TOKEN_RE.fullmatch(source or ""):
         raise LedgerError("invalid task assignee/source")
     if gate not in {"none", "code", "compliance", "gatekeeper"}:
         raise LedgerError("invalid task gate")
     if not title or len(title) > 120 or not safe_display_text(title):
         raise LedgerError("invalid_title")
+    if not valid_deadline(deadline):
+        raise LedgerError("invalid_deadline_at")
     return {
         "task_id": ident,
         "run_id": run_id,
@@ -151,7 +166,7 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
         "assignee": assignee,
         "title": title,
         "body_ref": payload.get("body_ref"),
-        "deadline_at": payload.get("deadline_at"),
+        "deadline_at": deadline,
         "budget": payload.get("budget"),
         "gate": gate,
         "context_refs": payload.get("context_refs", []),
