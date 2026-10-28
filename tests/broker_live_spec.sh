@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # The advisory sample is emitted for admitted/refused requests, never a gate.
 set -uo pipefail
+export AIB_TEST_SEAMS=1
+export AIB_TEST_PEER_UID=0
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HANDLER="$ROOT/bin/aib-broker-handler"
 WORK=$(mktemp -d)

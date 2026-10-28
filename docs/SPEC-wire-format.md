@@ -319,15 +319,37 @@ decided_event_id=acme-main-44
 end=denied
 ```
 
+A peer-binding denial uses the same deny frame and existing `unauthorized` vocabulary, with the
+additive discriminator `stage=peer`:
+
+```
+decision=deny
+code=3
+reasons=peer_unauthorized caller=role:aib-worker peer_uid=20002
+decided_event_id=acme-main-45
+stage=peer
+reason=unauthorized
+end=denied
+```
+
+The detailed `reasons` value is durable audit context derived from `SO_PEERCRED` and the local
+identity classifier; the fixed wire reason is safe for callers to branch on.
+
+Root and `human:` peers are the only authorized launch peers. `role:`, `gateway:`, and `unknown:`
+peers always receive the denial above. For an authorized peer, the prepared state-directory owner
+is checked against the configured `AIB_ROLE_UID` without replacing it. A mismatch is also a durable
+deny, with `reasons=target_role_mismatch ...`, `stage=confine`, and the existing fixed wire
+`reason=confinement_unavailable`; no child is started.
+
 Wire-level errors (malformed request, registry unavailable, registry misconfigured) keep the
 slice-1/2 shape unchanged — a flat set of `reason=`/`detail=` lines and `end=error`, with no prologue
 and no `decided_event_id`, because no verdict was ever reached.
 
 **`reason=over_capacity` (RM-3 slice 5) is one of these wire-level errors, not a sibling of the Deny
 shape above.** ADR-0006 adds one capacity ceiling for the whole broker — every project, every agent,
-one pool — checked before `agent_uid` is resolved and before the registry is ever read for a
-connection. It is deliberately not scoped per project: `project_uid` is derived from `agent_uid`, which
-§4 already treats as a caller-chosen, unverified assertion, so a per-project pool would let a caller
+one pool — checked before `agent_uid` is resolved, peer-bound, or read from the registry for a
+connection. It is deliberately not scoped per project: at this admission point, `project_uid` is
+derived from the still-unverified request `agent_uid`, so a per-project pool would let a caller
 target one project's budget the same way a per-agent cap would target one agent's (ADR-0006 part B).
 Over capacity, the response is:
 

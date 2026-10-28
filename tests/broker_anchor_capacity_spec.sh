@@ -75,6 +75,8 @@
 #   `over_capacity` fails, and some "should still work" assertions (e.g. stale leases not
 #   blocking admission) trivially pass — noted inline where that happens.
 set -uo pipefail
+export AIB_TEST_SEAMS=1
+export AIB_TEST_PEER_UID=0
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh

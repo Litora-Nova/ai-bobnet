@@ -204,6 +204,21 @@ static int group_allowed(gid_t gid){
   return allowed;
 }
 
+static int shared_group_gid(gid_t *gid){
+  struct group *shared = getgrnam("aib-shared");
+  if (shared){ *gid = shared->gr_gid; return 1; }
+  /* Pure policy specs compile a synthetic gid into their throwaway helper.
+   * Production builds have no runtime switch that can replace this identity. */
+#ifdef AIB_TEST_SHARED_GID
+  if ((unsigned long)(gid_t)AIB_TEST_SHARED_GID == (unsigned long)AIB_TEST_SHARED_GID &&
+      AIB_TEST_SHARED_GID != 0){
+    *gid = (gid_t)AIB_TEST_SHARED_GID;
+    return 1;
+  }
+#endif
+  return -1;
+}
+
 static int role_refuse(const char *message){
   fprintf(stderr, "landlock-exec: %s\n", message);
   char status[256];
@@ -308,9 +323,17 @@ int main(int argc, char **argv){
     if (uid_value < 1000) return role_refuse("uid below 1000 is never an allowed role uid");
     if (gid_value == 0) return role_refuse("gid 0 is refused for a role uid");
     if (!uid_allowed((uid_t)uid_value)) return role_refuse("uid is not present in AIB_ROLE_UIDS");
+    gid_t forbidden_group = 0;
+    int has_forbidden_group = shared_group_gid(&forbidden_group);
+    if (has_forbidden_group < 0)
+      return role_refuse("confinement_unavailable: cannot resolve the aib-shared group");
+    if (has_forbidden_group && (gid_t)gid_value == forbidden_group)
+      return role_refuse("aib-shared is forbidden as the confined primary group");
     for (size_t i = 0; i < group_count; ++i){
       if (groups[i] == 0) return role_refuse("supplementary group 0 is never allowed");
       if (!group_allowed(groups[i])) return role_refuse("supplementary group is not present in AIB_ROLE_GROUPS");
+      if (has_forbidden_group && groups[i] == forbidden_group)
+        return role_refuse("aib-shared is forbidden in confined supplementary groups");
     }
   }
   /* Reserve the journal channel before Landlock work. Descriptor failures

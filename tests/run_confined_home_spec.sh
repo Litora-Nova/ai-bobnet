@@ -38,6 +38,7 @@ eq(){ if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (got '$2' want '$3')"; fi; }
 has(){ case "$2" in *"$3"*) ok "$1";; *) no "$1 (missing '$3' in: ${2:0:300})";; esac; }
 hasnt(){ case "$2" in *"$3"*) no "$1 (unexpected '$3')";; *) ok "$1";; esac; }
 SENT="SECRET-TOKEN-0123456789abcdef"
+TEST_SHARED_GID=424242
 
 BROKER_HOME="$WORK/broker-home"; STATE_ROOT="$WORK/sup"; LROOT="$WORK/login"; PROJ="$WORK/project"; EV="$WORK/events"; STUB="$WORK/stub"
 mkdir -p "$BROKER_HOME/.codex" "$STATE_ROOT/acme-core/.codex" "$STATE_ROOT/acme-core/.claude" "$LROOT/codex" "$LROOT/claude-code" "$PROJ" "$EV" "$STUB"
@@ -80,7 +81,7 @@ launch() { # launch <agent_uid> <record-extra-lines> [VAR=val...]  -> RESP
   payload="$(aib_event_compose_decided_payload "$kv")"
   aib_event_commit "$EVF" "$EVL" attempt.decided "$(KV "$uid")" "$payload" >/dev/null 2>&1; decided="$AIB_EVENT_COMMIT_EVENT_ID"
   rec="$(printf 'adapter=%s\nroot=%s\ncwd=%s\nsandbox=workspace-write\neffort=high\nmodel=team/model-v2\ntimeout=5%s' "$STUB/provider" "$PROJ" "$PROJ" "${extra:+$'\n'$extra}")"
-  RESP="$(env HOME="$BROKER_HOME" AIB_VERDICT_ENV_ALLOW="HOME PATH" AIB_CONFINE_BIN="$STUB/landlock-exec" AIB_TEST_SEAMS=1 AIB_DEPLOYMENT_OWNER_UID="$(id -u)" AIB_DEPLOYMENT_CONFIG="$DEP" "$@" \
+  RESP="$(env HOME="$BROKER_HOME" AIB_VERDICT_ENV_ALLOW="HOME PATH" AIB_CONFINE_BIN="$STUB/landlock-exec" AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID="$TEST_SHARED_GID" AIB_DEPLOYMENT_OWNER_UID="$(id -u)" AIB_DEPLOYMENT_CONFIG="$DEP" "$@" \
       bash -c '. "$1/lib/aibobnet.sh"; shift; aib_enact_launch "$@"' _ "$SRC_ROOT" "$rec" hello "$EVF" "$EVL" "$(KV "$uid")" "$decided" 2>"$WORK/err")"
 }
 ll_field() { grep "^$1=" "$LOG" | tail -1 | sed "s/^$1=//"; }
@@ -121,6 +122,13 @@ launch acme-core "" AIB_SUP_STATE_ROOT="$STATE_ROOT" AIB_ROLE_UID=5001 AIB_ROLE_
 case "$(ll_field ARGV)" in "--uid 5001 --gid 5002 --groups 5004,5005 $STUB/provider exec "*) ok "T2g: helper argv is --uid 5001 --gid 5002 --groups 5004,5005, then the adapter and its normal ABI";; *) no "T2g: helper argv carries --groups from the unit env (got '$(ll_field ARGV)')";; esac
 eq "T2g: …the allow-list AIB_ROLE_GROUPS reaches the helper's env" "$(ll_field AIB_ROLE_GROUPS)" "5004,5005"
 eq "T2g: …but not the provider chain" "$(penv AIB_ROLE_GROUPS)|$(provider_ran)" "|ran"
+launch acme-core "" AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID=5005 AIB_SUP_STATE_ROOT="$STATE_ROOT" \
+  AIB_ROLE_UID=5001 AIB_ROLE_GID=5002 AIB_ROLE_UIDS=5001 AIB_ROLE_GROUPS=5004,5005
+eq "T2g: aib-shared in the requested supplementary groups refuses before provider exec" "$(provider_ran)" not-run
+has "T2g: the shared-group refusal is a confinement failure on the wire" "$RESP" "reason=confinement_unavailable"
+launch acme-core "" AIB_TEST_SEAMS=1 AIB_TEST_SHARED_GID=5005 AIB_SUP_STATE_ROOT="$STATE_ROOT" \
+  AIB_ROLE_UID=5001 AIB_ROLE_GID=5005 AIB_ROLE_UIDS=5001 AIB_ROLE_GROUPS=5004
+eq "T2g: aib-shared as the primary role gid also refuses before provider exec" "$(provider_ran)" not-run
 launch acme-core "groups=6000
 AIB_ROLE_GROUPS=6000
 role_groups=6000

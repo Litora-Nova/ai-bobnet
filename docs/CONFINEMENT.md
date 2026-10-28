@@ -18,6 +18,15 @@ whose privileged side owns the event stream, anchor, credentials and adapter map
 requires the child to be **confined before `exec`**, with two properties: the restriction is installed
 before the foreign code runs, and the restricted process cannot revoke it.
 
+The broker also authenticates the local launch peer before this confinement step. With
+`Accept=yes`, systemd places the accepted AF_UNIX connection on the handler's fd 0; the handler reads
+`SO_PEERCRED` from that socket and never treats the frame's `agent_uid` as caller identity. Root (the
+supervisor path) and identities classified as `human:` by `identity_for` may launch a prepared agent.
+`role:`, `gateway:`, and `unknown:` peers cannot launch, regardless of which prepared state directories
+their uid owns. A refusal is an audited `attempt.decided` deny and returns
+`stage=peer`, `reason=unauthorized`; the audit reason includes the kernel uid and classified caller.
+The fake-peer test seam works only with `AIB_TEST_SEAMS=1` in an uninstalled engine tree.
+
 **Minimum:** no write access to the event stream, the high-water anchor, the registry, the adapter
 map, the installed engine, or **the visibility projection root** (`AIB_PROJECTION_ROOT`,
 `docs/CONTRACT-visibility.md` §14, `docs/decisions/0007-visibility-projection.md`) — a broker-produced,
@@ -245,8 +254,15 @@ The helper applies Landlock first, sets exactly the allow-listed supplementary g
 when no `--groups` is given), switches gid and uid, clears all remaining capability sets and the
 ambient set, and then executes the adapter. Every `--groups` gid must be strict decimal, not 0, and
 listed in `AIB_ROLE_GROUPS`; there is no numeric floor, because provisioning creates the shared and
-login groups as system groups. The role, gid and group list come from
-`/etc/aib/role.env`, which provisioning must keep root-owned and not writable by others (the engine does
+login groups as system groups. The broker takes the child identity from `AIB_ROLE_UID` and
+`AIB_ROLE_GID` in `/etc/aib/role.env`, never from the request, state-directory
+ownership, or a passwd lookup. `AIB_ROLE_UID` must still appear in `AIB_ROLE_UIDS`. The real owner of
+`/var/lib/aib-sup/<agent_uid>` is a consistency check only: if it differs from `AIB_ROLE_UID`, the
+broker records an `attempt.decided` deny with `target_role_mismatch` and returns
+`stage=confine`, `reason=confinement_unavailable`. One role uid may own multiple agent state
+directories; the account model is one uid per role, not one uid per agent. The uid allow-list,
+primary gid, supplementary group list, and state-root setting all come from `/etc/aib/role.env`.
+Provisioning must keep that policy root-owned and not writable by others (the engine does
 not check its owner or mode) (template `deploy/role.env.example`) read by the broker drop-in, never from a
 request. Groups the role account has outside this list, such as the control group, do not reach the
 confined turn. `bin/aib-agent-dirs` prepares the role-owned private home beneath `/var/lib/aib-sup` before
@@ -268,6 +284,48 @@ rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
 The root supervisor opens this home with `O_DIRECTORY|O_NOFOLLOW`; descriptor-relative writable state opens use `O_NOFOLLOW` and regular-file checks, with a single-link requirement for `journal.jsonl`.
 An unsafe state object makes the supervisor exit 78, which stops the unit permanently via `RestartPreventExitStatus=78` and triggers the `OnFailure=` alarm.
+
+Neither the primary gid nor any supplementary gid of the confined child may be `aib-shared`. The
+launch pre-flight resolves that group and refuses the turn as `confinement_unavailable`; the compiled
+helper repeats the check immediately before Landlock setup and uid switching. This is independent of
+Landlock path mediation: removing socket access by DAC is what prevents a confined child from opening
+`/run/aib/broker.sock` at all.
+
+### Peer-binding provisioning hand-off
+
+Provisioning must finish **before the engine is installed or upgraded**. The old engine does not
+enforce these child-group checks, so operators can prepare and verify the new DAC layout without a
+partial cut-over:
+
+1. Create a dedicated `aib-provider-exec` group. Install adapters, and every executable reached by
+   `landlock-exec` after the uid drop, as `root:aib-provider-exec 0750`; add the role accounts to it.
+2. Create one project group per project (for example `aib-proj-example`) for the home and repository.
+   Use setgid directories, `core.sharedRepository=group`, and umask `002`; add the relevant role
+   accounts and human operators to the project group.
+   Set a default ACL of `g:aib-proj-<project>:rwX` on the project home; the confined exec path applies
+   umask `0002` only to the child, not to the broker.
+3. Update `/etc/aib/role.env`: `AIB_ROLE_GID` is the role account's own primary group;
+   `AIB_ROLE_GROUPS` contains the numeric gids for `aib-provider-exec`, `aib-login`, and the project
+   group, without `aib-shared`; `AIB_ROLE_UIDS` remains the role-account allow-list.
+4. **REQUIRED:** remove the role accounts from the `aib-shared` entry in `/etc/group`. This is an
+   identity boundary, not optional hygiene: `identity_for` classifies a non-role account in
+   `aib-shared` or `aib-ops` as `human:`, and humans have broker launch authority. The engine sets the
+   child's groups explicitly, but stale host membership can misclassify an account omitted from
+   `AIB_ROLE_UIDS`.
+5. Keep human operators (`aib-ops`) in `aib-shared` for broker-socket DAC. Keep the gateway account
+   out of that group.
+6. While the old engine is still active, run a probe turn through the normal operator path (for
+   example `agentctl say`) and verify that the adapter executes, login state is readable, and the
+   repository is writable. Then run `bin/aib-preflight /etc/aib/role.env`. It fails closed if the
+   role configuration is missing or unreadable, if `aib-shared` cannot be resolved, or if
+   `AIB_ROLE_GID` or `AIB_ROLE_GROUPS` contains the resolved `aib-shared` gid. Only after it succeeds
+   may provisioning install the new engine and create its root-owned `.aib-installed` marker.
+7. After deployment, verify a supervisor turn, a human `run-agent --as` turn, a confined child that
+   cannot connect to the broker socket, a `role:` peer launch that returns an audited
+   `stage=peer` denial, and a launch refusal when a test `role.env` carries `aib-shared`.
+
+There is **no transition switch** that disables the group check: such a switch would be a fail-open
+control. Rollback means restoring the previous engine version, not setting a compatibility flag.
 
 The helper is the sole owner of this directory contract. It creates `/var/lib/aib-sup` as root-owned
 `0755`, then prepares the per-agent home, provider directories, and named ACLs. The agent unit therefore
@@ -474,16 +532,16 @@ A broker unit missing any of these fails every anchored commit closed with exit 
 `docs/CONTRACT-execution-binding.md` §8.4 already documents for the launcher's other runtime
 dependencies, extended to anchored writes in this slice.
 
-**`python3` is the one optional runtime dependency in the enactment path**; the readers
-`bin/attempts` and `bin/project` require Python 3.9+ (see the reader runtime requirements below).
-In enactment it runs in the unconfined broker/manager
-process, never inside the sandboxed child or the Landlock helper. It sharpens disconnect detection
+**`python3` (3.9+) is a required broker dependency after peer binding.** The unconfined handler uses
+only its standard library to read `SO_PEERCRED`, classify the kernel uid, bind role peers to
+state-directory ownership, and reject the socket group from the role gid set. Missing Python
+therefore denies every launch before enactment. The readers `bin/attempts` and `bin/project` require
+the same runtime.
+During enactment Python also sharpens disconnect detection
 (the `poll(2)`-based liveness probe — see SPEC-wire-format.md, "Detecting a disconnected client
 while the provider is silent") from "next real write" latency down to one idle tick. When it is
-absent, `_aib_enact_conn_alive` returns "alive" unconditionally and enactment degrades gracefully to
-next-write-only detection — never a crash, never a hang, and the probe never writes a byte to the
-wire either way. An operator auditing this path's runtime dependencies should install `python3` if
-they want the sharper detection; its absence is a documented degradation, not a defect.
+absent, `_aib_enact_conn_alive` would return "alive" and degrade to next-write-only detection, but the
+earlier peer-binding check now makes that historical fallback unreachable in a functioning broker.
 
 **`bin/dashboard`'s own runtime dependency is `python3` (3.9+) standard library only** — `http.server`
 (`ThreadingHTTPServer`, `BaseHTTPRequestHandler`), `html`, `json`, `os`, `pathlib` — no third-party
@@ -536,8 +594,8 @@ cc -O2 -Wall -o /opt/aib/engine/libexec/landlock-exec src/landlock-exec.c
 chown root:aib-broker /opt/aib/engine/libexec/landlock-exec
 chmod 0750 /opt/aib/engine/libexec/landlock-exec
 install -d -o root -g root -m 0755 /opt/aib/adapters
-install -o root -g aib-shared -m 0750 adapters/codex /opt/aib/adapters/codex
-install -o root -g aib-shared -m 0750 adapters/claude-code /opt/aib/adapters/claude-code
+install -o root -g aib-provider-exec -m 0750 adapters/codex /opt/aib/adapters/codex
+install -o root -g aib-provider-exec -m 0750 adapters/claude-code /opt/aib/adapters/claude-code
 ```
 
 Owned `root:aib-broker 0750` (never `aib-broker:aib-broker`, the same reasoning as the TCB
@@ -550,12 +608,12 @@ a missing or non-executable helper is D-A's pre-flight failure (`io-refused`, `s
 a silent bypass.
 
 The adapters differ from the helper deliberately: the broker executes `landlock-exec`, but after the
-uid switch the role account executes the adapter. Adapter ownership is therefore
-`root:aib-shared 0750`: provisioned role accounts can execute it through their allow-listed shared
-group, while neither they nor the broker can replace it. This assumes `aib-shared` is in
-`AIB_ROLE_GROUPS`, which provisioning sets and the engine does not verify. Human members of
-`aib-shared` can read and execute the adapters too; they hold no secrets. Installed adapters are copies,
-so they must be reinstalled whenever the engine is updated.
+uid switch the role account executes the adapter. Peer binding requires adapter ownership such as
+`root:aib-provider-exec 0750`: provisioned role accounts execute through that dedicated allow-listed
+group, while neither they nor the broker can replace the files. Humans outside `aib-provider-exec`
+cannot run adapters directly; that is intentional. The former `root:aib-shared 0750` recipe is
+incompatible with peer binding because that group also opens the broker socket. Installed adapters
+are copies, so they must be reinstalled whenever the engine is updated.
 
 ### Registry and writable project paths
 

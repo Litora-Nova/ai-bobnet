@@ -2132,6 +2132,13 @@ aib_enact_launch__run_confined() {
         ;;
     esac
   fi
+  if [ "$_preflight_rc" -eq 0 ] && [ -n "$_role_uid" ]; then
+    if [ -z "$_python_bin" ] ||
+       ! "$_python_bin" -I "$_engine_root/lib/aib_broker_security.py" groups-safe "$_role_groups" "$_role_gid"; then
+      _preflight_rc=1
+      _s1c_preflight_diag=shared_group
+    fi
+  fi
   if [ "$_preflight_rc" -eq 0 ] && [ "$_s1c_enabled" -eq 1 ]; then
     case "$_credential_mode" in
       file|shared) ;;
@@ -2287,6 +2294,7 @@ aib_enact_launch__run_confined() {
       _role_env+=("AIB_ROLE_UIDS=${AIB_ROLE_UIDS:-}")
       [ -z "$_role_groups" ] || _role_env+=("AIB_ROLE_GROUPS=$_role_groups")
     fi
+    umask 0002
     exec "$_env_bin" -i "${_child_env[@]}" "${_role_env[@]}" "LL_RO=$ll_ro" "LL_RW=$ll_rw" \
       "LL_STATUS_FD=9" "LL_STDERR_FD=1" \
       "$AIB_CONFINE_BIN" "${_role_args[@]}" "$adapter" "${adapter_mode[@]}" \

@@ -73,6 +73,8 @@
 #   and the compiled helper's OWN failure path on this Landlock-less host (which
 #   needs no broker code at all — see §1).
 set -uo pipefail
+export AIB_TEST_SEAMS=1
+export AIB_TEST_PEER_UID=0
 
 SRC_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
 # shellcheck source=lib/aibobnet.sh
@@ -330,6 +332,7 @@ printf 'called\n' >> "$STUB_SENTINEL"
 for a in "$@"; do printf '[%s]\n' "$a" >> "$STUB_ARGV_OUT"; done
 case "${STUB_MODE:-ok}" in
   ok) printf 'STUB_PROVIDER_OK\n'; exit 0;;
+  report-umask) printf 'CHILD_UMASK=%s\n' "$(umask)"; exit 0;;
   err) printf 'stub failure\n' >&2; exit "${STUB_RC:-7}";;
   sleep) sleep "${STUB_SLEEP:-5}"; exit 0;;
   silent-hang)
@@ -760,6 +763,18 @@ end_count="$(count_matches_in_file '^end=' "$WORK/resp-5")"
 eq "…exactly one end= total, never a second one" "$end_count" "1"
 last_line="$(tail -1 "$WORK/resp-5" 2>/dev/null)"
 has "…end= is the LAST line of the frame" "$last_line" "end="
+
+# --- 5a. only the confined child receives the project-sharing umask ---------
+reset_run
+landlock_conf_write ok
+adapter_conf_write report-umask
+parent_umask="$(umask)"
+umask 0077
+AIB_CONFINE_BIN="$LANDLOCK_STUB" aib_enact_launch "$(base_enact_record "$FIXTURE_WS")" "$(base_prompt)" \
+  "$EVENTS_FILE" "$EVENTS_LOCK" "$ENVELOPE_KV" "$(seed_decided)" >"$WORK/resp-5a" 2>"$WORK/enact-err-5a"
+umask "$parent_umask"
+has "a confined child receives umask 0002 despite a restrictive broker umask" \
+  "$(<"$WORK/resp-5a")" "CHILD_UMASK=0002"
 
 # --- 5b. a multi-line prompt reaches the adapter byte-exact ------------------
 # The whole reason for the spec-fixture correction at the top of this file: a

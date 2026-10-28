@@ -28,9 +28,9 @@ Environment=AIBOBNET_REGISTRY=/opt/aib/registry.json
 
 # RM-3 slice 5 (ADR-0006): ONE capacity ceiling for the WHOLE BROKER — every project,
 # every agent, one shared pool, checked by flock leases in AIB_EVENT_ROOT/attempts/
-# before agent_uid is resolved and before the registry is ever read for a connection.
+# before agent_uid is resolved, peer-bound, or read from the registry for a connection.
 # Deliberately NOT scoped per project or per agent: project_uid comes from agent_uid,
-# which the caller chooses and the broker does not verify at this point (§4) — a
+# which is still unverified at this admission point (§4) — a
 # per-project or per-agent pool would let a caller target one project's or one agent's
 # budget specifically, the same denial-of-service shape ADR-0006 rejects for the cap
 # this replaces. Default if omitted is 12; MUST stay below deploy/systemd/
