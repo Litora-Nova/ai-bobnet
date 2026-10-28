@@ -67,7 +67,7 @@ def task_id(causation_id: str, intent_n: int) -> str:
 def safe_display_text(value: str) -> bool:
     """Return whether single-line display text contains no control/format chars."""
     return not any(
-        unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"}
+        unicodedata.category(char) in {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}
         or 0xE0000 <= ord(char) <= 0xE007F
         for char in value
     )
@@ -99,20 +99,27 @@ def _caller_matches(record: dict[str, Any]) -> bool:
     return False
 
 
-def read_events(path: Path) -> tuple[dict[str, Any], list[tuple[int, dict[str, Any]]]]:
+def read_events(path: Path) -> tuple[dict[str, Any], list[tuple[int, dict[str, Any]]], list[dict[str, Any]]]:
     metadata, raw_records = scan(path)
     if metadata["status"] == "corrupt":
         raise LedgerError(metadata["reason"])
     records: list[tuple[int, dict[str, Any]]] = []
+    invalid_records: list[dict[str, Any]] = []
     for raw_seq, raw in raw_records:
+        seq = int(raw_seq)
         try:
             record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
-        except (UnicodeError, ValueError) as error:
-            raise LedgerError(f"invalid task event JSON at seq {raw_seq.decode()}: {error}") from error
+        except UnicodeError:
+            invalid_records.append({"seq": seq, "reason": "invalid_utf8"})
+            continue
+        except ValueError:
+            invalid_records.append({"seq": seq, "reason": "invalid_json"})
+            continue
         if not isinstance(record, dict):
-            raise LedgerError(f"task event at seq {raw_seq.decode()} is not an object")
-        records.append((int(raw_seq), record))
-    return metadata, records
+            invalid_records.append({"seq": seq, "reason": "invalid_shape"})
+            continue
+        records.append((seq, record))
+    return metadata, records, invalid_records
 
 
 def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
@@ -162,11 +169,11 @@ def _base_task(record: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any
 
 
 def fold(path: Path) -> dict[str, Any]:
-    metadata, events = read_events(path)
+    metadata, events, invalid_records = read_events(path)
     runs: dict[str, dict[str, Any]] = {}
     tasks: dict[str, dict[str, Any]] = {}
     rejections: list[dict[str, Any]] = []
-    invalid_events: list[dict[str, Any]] = []
+    invalid_events = list(invalid_records)
     stream_project: str | None = None
 
     def invalid(seq: int, reason: str) -> None:
@@ -287,24 +294,30 @@ def fold(path: Path) -> dict[str, Any]:
                     task["state"] = "IN_PROGRESS"
                 elif kind == "task.reported":
                     report = payload.get("state")
+                    reason = payload.get("reason")
+                    if reason is not None and (not isinstance(reason, str) or len(reason) > 512 or not safe_display_text(reason)):
+                        raise LedgerError("invalid_reason")
                     actor_ok = record.get("actor_type") == "agent" and record.get("actor_id") == task["assignee"]
-                    service_ok = (record.get("actor_type") == "service" and record.get("actor_id") == f"supervisor:{task['assignee']}" and report in {"failed", "blocked"} and payload.get("reason") in ENGINE_REASONS)
+                    service_ok = (record.get("actor_type") == "service" and record.get("actor_id") == f"supervisor:{task['assignee']}" and report in {"failed", "blocked"} and reason in ENGINE_REASONS)
                     if state != "IN_PROGRESS" or not (actor_ok or service_ok) or report not in {"progress", "done", "failed", "blocked"}:
                         raise LedgerError("invalid_report")
                     if report == "progress":
                         task["turns"] += 1
                         task["turns_total"] += 1
                     task["result_ref"] = payload.get("result_ref")
-                    task["last_reason"] = payload.get("reason")
+                    task["last_reason"] = reason
                     task["state"] = {"progress": "IN_PROGRESS", "done": "REVIEW" if task["gate"] != "none" else "DONE", "failed": "FAILED", "blocked": "BLOCKED"}[report]
                 elif kind == "task.cancelled":
                     if state in TERMINAL:
                         raise LedgerError("invalid_cancel")
-                    delivery = record.get("actor_type") == "service" and record.get("actor_id") == f"supervisor:{task['assignee']}" and payload.get("reason") == "delivery_failed" and state == "ASSIGNED"
+                    reason = payload.get("reason")
+                    if reason is not None and (not isinstance(reason, str) or len(reason) > 512 or not safe_display_text(reason)):
+                        raise LedgerError("invalid_reason")
+                    delivery = record.get("actor_type") == "service" and record.get("actor_id") == f"supervisor:{task['assignee']}" and reason == "delivery_failed" and state == "ASSIGNED"
                     if record.get("actor_type") not in {"human", "agent"} and not delivery:
                         raise LedgerError("invalid_cancel_actor")
                     task["state"] = "CANCELLED"
-                    task["last_reason"] = payload.get("reason")
+                    task["last_reason"] = reason
                 elif kind in {"task.reassigned", "task.reopened"}:
                     if record.get("actor_type") not in {"human", "agent"}:
                         raise LedgerError("invalid_reassignment_actor")
@@ -349,6 +362,7 @@ def fold(path: Path) -> dict[str, Any]:
         else:
             run["state"] = "QUEUED"
 
+    invalid_events.sort(key=lambda item: item["seq"])
     return {
         "stream_status": metadata["status"],
         "highest_seq": metadata["highest"],

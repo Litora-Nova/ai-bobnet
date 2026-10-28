@@ -65,9 +65,7 @@ def valid_ref(value: str) -> bool:
             or ref.startswith(("/", "."))
             or ref.endswith(("/", "."))
             or ".." in ref
-            or "@{" in ref
-            or "//" in ref
-            or any(char in ref for char in "~^:?*[\\")
+            or any(char in ref for char in "~^:")
             or any(not part or part.startswith(".") or part.endswith(".lock") for part in components)
         ):
             return False
@@ -229,7 +227,22 @@ def validate_common(args: argparse.Namespace) -> None:
         raise LedgerError("engine events do not accept expect-seq")
 
 
+def validate_utf8_arguments(args: argparse.Namespace) -> None:
+    """Reject non-UTF-8 free text and references before taking the stream lock."""
+    for name in ("title", "reason", "ticket_ref", "summary_ref", "body_ref", "result_ref", "context_ref"):
+        value = getattr(args, name, None)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if item is None:
+                continue
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise LedgerError(f"invalid UTF-8 in {name}") from error
+
+
 def payload_for(args: argparse.Namespace, caller: str) -> tuple[dict[str, object], str | None, bytes | None]:
+    validate_utf8_arguments(args)
     ident = getattr(args, "task_id", None)
     body = None
     if args.command == "run-create":
@@ -320,7 +333,7 @@ def commit(events: Path, lock: Path, lock_fd: int, request: dict[str, object], k
     script = '. "$1/lib/aibobnet.sh"; aib_event_commit "$2" "$3" tasks "$4" "$5" "$6"; printf "%s\\t%s\\n" "$AIB_EVENT_COMMIT_EVENT_ID" "$AIB_EVENT_COMMIT_SEQ"'
     env = dict(os.environ)
     env["AIB_EVENT_HELD_LOCK_FD"] = str(lock_fd)
-    result = subprocess.run(["bash", "-c", script, "_", str(ROOT), str(events), str(lock), kind, envelope, json.dumps(payload, separators=(",", ":"), ensure_ascii=False)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, pass_fds=(lock_fd,), check=False)
+    result = subprocess.run(["bash", "-c", script, "_", str(ROOT), str(events), str(lock), kind, envelope, json.dumps(payload, separators=(",", ":"), ensure_ascii=True)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, pass_fds=(lock_fd,), check=False)
     if result.returncode:
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)

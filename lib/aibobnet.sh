@@ -3147,6 +3147,9 @@ aib_event_commit() {
   case "$payload_json" in
     *$'\n'*|*$'\r'*) aib_die 2 "event payload must be a single physical line";;
   esac
+  if [ "$stream_name" = tasks ]; then
+    _aib_utf8_is_valid "$payload_json" || aib_die 64 "tasks event payload is not valid UTF-8"
+  fi
 
   # event_id and seq are always composed under the stream lock. Main retains
   # its attempt-specific identity composition byte-for-byte; tasks supplies its
@@ -3218,19 +3221,17 @@ aib_event_commit() {
     [ -e "/proc/self/fd/$held_lock_fd" ] || aib_die 2 "inherited event lock fd is not open"
     [ "$(stat -Lc '%d:%i' "/proc/self/fd/$held_lock_fd" 2>/dev/null)" = "$(stat -Lc '%d:%i' "$lock_path" 2>/dev/null)" ] ||
       aib_die 2 "inherited event lock fd does not name the task stream lock"
-    # A fresh OFD must observe exactly a lock conflict (flock rc 1); any other
-    # failure is not evidence that the transaction lock is held. Then re-lock
-    # the inherited OFD itself: this is a no-op only when that OFD owns the lock,
-    # and fails when the conflict belongs to another process/OFD.
-    local held_probe_rc
-    if flock -n -x "$lock_path" -c true >/dev/null 2>&1; then
-      aib_die 2 "inherited task stream lock was not held before commit"
-    else
-      held_probe_rc=$?
-    fi
-    [ "$held_probe_rc" -eq 1 ] || aib_die 2 "cannot verify inherited task stream lock contention"
-    flock -n -x "$held_lock_fd" >/dev/null 2>&1 ||
-      aib_die 2 "inherited task stream lock is held by another open file description"
+    # fdinfo reports flock state for this exact open file description. Observe
+    # an existing exclusive lock without running a command or acquiring one.
+    local held_lock_proven=0 fdinfo_line
+    while IFS= read -r fdinfo_line; do
+      if [[ "$fdinfo_line" =~ ^lock:.*FLOCK[[:space:]]+ADVISORY[[:space:]]+WRITE([[:space:]]|$) ]]; then
+        held_lock_proven=1
+        break
+      fi
+    done < "/proc/self/fdinfo/$held_lock_fd"
+    [ "$held_lock_proven" -eq 1 ] ||
+      aib_die 2 "inherited task stream lock fd does not hold an exclusive flock"
     _fd="$held_lock_fd"
     own_lock=0
   else
