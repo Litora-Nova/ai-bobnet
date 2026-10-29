@@ -2376,6 +2376,23 @@ class Supervisor:
         except (AttributeError, ValueError, json.JSONDecodeError):
             return
         messages = self.open_messages()
+        resolved_attempts = {
+            record.get("attempt_id") for record in self.records
+            if record.get("event") in {"intents.applied", "intents.tainted"}
+        }
+        pending_attempts = {
+            record.get("attempt_id") for record in self.records
+            if record.get("event") == "intent.retry"
+            and record.get("attempt_id") not in resolved_attempts
+        }
+        pending_task_ids = {
+            record.get("task_id") for record in self.records
+            if record.get("event") == "turn.attempt"
+            and record.get("attempt_id") in pending_attempts
+        }
+        pending_task_ids.update(
+            record.get("task_id") for record in self._active_orphan_deferrals().values()
+        )
         for task in tasks:
             if (
                 not isinstance(task, dict) or task.get("assignee") != self.uid
@@ -2383,7 +2400,7 @@ class Supervisor:
             ):
                 continue
             task_id = str(task.get("task_id", ""))
-            if self._report_waiting_for_task(task_id):
+            if task_id in pending_task_ids or self._report_waiting_for_task(task_id):
                 continue
             if any(
                 message.get("id", "").startswith(f"{task_id}.")
@@ -2916,16 +2933,30 @@ class Supervisor:
 
     def _deferred_intent_names(self) -> set[str]:
         names: set[str] = set()
-        truncated = False
+        claimed = {
+            record.get("attempt_id") for record in self.records
+            if record.get("event") == "turn.attempt"
+        }
+        current_unclaimed: set[str] | None = None
         for record in self._active_orphan_deferrals().values():
             pending = record.get("pending")
             if isinstance(pending, list):
-                names.update(name for name in pending if isinstance(name, str))
+                names.update(
+                    name for name in pending
+                    if isinstance(name, str) and name not in claimed
+                )
                 pending_count = record.get("pending_count")
                 if isinstance(pending_count, int) and pending_count > len(pending):
-                    truncated = True
-        if truncated:
-            names.update(self._pending_orphan_intents())
+                    if current_unclaimed is None:
+                        current_unclaimed = set(self._pending_orphan_intents()) - claimed
+                    _summary, current_count, current_sha256 = self._pending_intent_summary(
+                        current_unclaimed
+                    )
+                    if (
+                        current_count == pending_count
+                        and current_sha256 == record.get("pending_sha256")
+                    ):
+                        names.update(current_unclaimed)
         return names
 
     def _retry_deferred_orphans(self) -> None:
