@@ -251,6 +251,7 @@ connection:
 ```
 exit_class=ok
 stage=provider
+attempt_id=acme-main-42
 ended_event_id=acme-main-43
 end=ok
 ```
@@ -261,6 +262,10 @@ status) or `signal=` (the forwarded signal name) follows, matching the shape
 `aib_event_compose_ended_payload` already requires for the durable record. `stage` names which phase
 of enactment the terminal status belongs to — see the "stage" field note in
 `docs/CONTRACT-execution-binding.md` §8.1.
+
+`attempt_id` is the broker-selected `attempt.decided` id for this launch. Supervised launch clients
+must validate the closed token and persist it only to their pre-opened 0600 metadata handoff path; it is
+the binding used for `$HOME/.aib/intents/<attempt_id>.jsonl`. It is never accepted from the child.
 
 For ordinary cleanup, when `stage` is anything other than `provider`, a `reason=` line follows it: the fixed machine
 reason for that stage, so a client can act on it without knowing the stage enum by heart.

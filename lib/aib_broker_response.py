@@ -4,11 +4,41 @@
 from __future__ import annotations
 
 import io
+import os
+import re
+import stat
 import sys
 from pathlib import Path
 
 
 SIGNALS = {"HUP": 129, "INT": 130, "KILL": 137, "TERM": 143}
+ATTEMPT_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z", re.ASCII)
+
+
+def persist_attempt(value: str) -> bool:
+    path = os.environ.get("AIB_ATTEMPT_META_PATH")
+    if path is None:
+        return True
+    if ATTEMPT_RE.fullmatch(value) is None:
+        return False
+    fd = -1
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+            return False
+        os.ftruncate(fd, 0)
+        encoded = (value + "\n").encode()
+        view = memoryview(encoded)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def parse(path: Path) -> int:
@@ -49,6 +79,8 @@ def parse(path: Path) -> int:
     if fields.get("reason") == "over_capacity":
         return 75
     if fields.get("end") != "ok":
+        return 69
+    if not persist_attempt(fields.get("attempt_id", "")):
         return 69
     if fields.get("exit_class") == "ok":
         return 0

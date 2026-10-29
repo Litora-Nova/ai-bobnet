@@ -16,6 +16,7 @@
 #   Expected on the unbuilt tree: the direct child dies, the grandchildren survive.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-suptmo.XXXXXX")"
 cleanup2() { local p; for p in $(cat "${W:-/nonexistent}/gc.pids" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done; sup_cleanup; }
 trap cleanup2 EXIT

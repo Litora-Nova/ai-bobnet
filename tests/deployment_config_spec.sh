@@ -149,6 +149,8 @@ has "T4b: …naming deployment_denied" "$resp" "deployment_denied"
 # --- T5 the supervisor refuses what the deployment does not allow ---------------------------------------------------
 refuse_case() { # refuse_case <label> <data_class> <agent> <config-file|""> <want: refused|runs>
   ctl_world "r$RANDOM"; ctl_registry "$2"; as human:operator
+  mkdir -p "$W/state/$3/.aib/intents"
+  chmod 700 "$W/state/$3" "$W/state/$3/.aib" "$W/state/$3/.aib/intents"
   CTLENV=("${CTLENV[@]/AIB_DEPLOYMENT_CONFIG=*/AIB_DEPLOYMENT_CONFIG=$4}")
   : > "$W/notify.log"
   start_sup "$3" "${CTLENV[@]}"; sp=$SUP_PID

@@ -102,10 +102,9 @@ expect_targeted_failure() {
   fi
 }
 
-# 68, not 67: gate delta D5 added one assertion there (stage=exec on the
-# non-executable-adapter refusal, never stage:null).
+# The managed-launch suite also pins the dedicated child PATH and broker attempt id.
 expect_baseline_green "$SRC_ROOT/tests/managed_launch_spec.sh" \
-  "68 checks: 68 ok / 0 fail" "$WORK/clean-launch.out"
+  "70 checks: 70 ok / 0 fail" "$WORK/clean-launch.out"
 expect_baseline_green "$SRC_ROOT/tests/codex_run_spec.sh" \
   "74 checks: 74 ok / 0 fail" "$WORK/clean-codex-run.out"
 

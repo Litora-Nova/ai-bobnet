@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -26,10 +27,39 @@ def ensure_dir(path: Path, mode: int) -> bool:
         path.mkdir(parents=False, exist_ok=True)
         if path.is_symlink() or not path.is_dir():
             return False
-        os.chmod(path, mode)
+        current = path.stat(follow_symlinks=False)
+        os.chmod(path, mode | (stat.S_IMODE(current.st_mode) & stat.S_ISGID))
         return True
     except OSError:
         return False
+
+
+def ensure_file(path: Path) -> bool:
+    directory_fd = file_fd = -1
+    try:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        directory = os.fstat(directory_fd)
+        file_fd = os.open(
+            path.name,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o660,
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return False
+        os.fchmod(file_fd, 0o660)
+        os.fchown(file_fd, 0 if os.geteuid() == 0 else os.geteuid(), directory.st_gid)
+        return True
+    except OSError:
+        return False
+    finally:
+        for fd in (file_fd, directory_fd):
+            if fd >= 0:
+                os.close(fd)
 
 
 def main() -> int:
@@ -49,6 +79,8 @@ def main() -> int:
     result = 0
     if not ensure_dir(outbox_root / "_server", 0o750):
         result = 78
+    elif not ensure_file(outbox_root / "_server" / "outbox.md"):
+        result = 78
     teams: set[str] = set()
     for agent in agents.values():
         if not isinstance(agent, dict) or agent.get("mode") != "supervised":
@@ -61,6 +93,8 @@ def main() -> int:
         teams.add(team)
     for team in sorted(teams):
         if not ensure_dir(outbox_root / team, 0o770):
+            result = 78
+        elif not ensure_file(outbox_root / team / "outbox.md"):
             result = 78
     return result
 

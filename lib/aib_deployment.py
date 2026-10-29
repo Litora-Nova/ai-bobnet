@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import string
 import sys
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,30 @@ def load_deployment(path: Path, root: Path) -> dict[str, Any] | None:
         if not isinstance(role_map, dict) or any(
             not isinstance(key, str) or not isinstance(item, str) for key, item in role_map.items()
         ):
+            return None
+    if "commit_identity" in value:
+        identity = value["commit_identity"]
+        if not isinstance(identity, dict) or set(identity) != {"name_template", "email"}:
+            return None
+        name_template, email = identity.get("name_template"), identity.get("email")
+        if (
+            not isinstance(name_template, str)
+            or not name_template
+            or len(name_template) > 128
+            or any(char in name_template for char in "\x00\r\n")
+            or not isinstance(email, str)
+            or not re.fullmatch(r"[^\s@]+@[^\s@]+", email, re.ASCII)
+        ):
+            return None
+        try:
+            fields = list(string.Formatter().parse(name_template))
+            if any(
+                field not in {None, "display_name", "team"} or conversion is not None or format_spec
+                for _, field, format_spec, conversion in fields
+            ):
+                return None
+            name_template.format(display_name="agent", team="team")
+        except (KeyError, ValueError):
             return None
     if "accounts" in value:
         accounts = value["accounts"]

@@ -282,6 +282,26 @@ the agent home (such as `.claude` sessions) persist. This systemd write allowanc
 root; Landlock still restricts each child to its own configured state path. The helper deliberately
 rejects uid 0 and role uids below 1000;
 the configured gid is broker-controlled and is not an independent user input.
+
+The private home also contains `.aib/` (0700, role-owned). The broker's Landlock write allowlist always
+adds exactly that agent's `$HOME/.aib`, independently of the provider sandbox flag; read-only work still
+needs to emit intents. It does not add the root-owned task ledger, another agent home, or shared state.
+`bin/aib-agent-dirs` pre-creates role-owned `.aib/intents` and root-owned `.aib-quarantine` so the root
+supervisor and confined child agree on verified paths before the turn. The child receives the
+broker-selected `AIB_ATTEMPT_ID` and a `PATH` containing only the dedicated `bin/child` directory, whose
+only command is `task-intent`. The supervisor
+writes `.aib/board.json` before each turn; this snapshot replaces any task-ledger or cross-agent live-state
+ACL for the child.
+
+The supervisor's Git helper switches to the role uid/gid and the provisioned project group, then applies
+Landlock with `LL_RO=/` and `LL_RW=/tmp:/var/tmp:/dev:<project_home>`. The temporary trees support Git's
+bounded temporary files, `/dev` supplies its device endpoints such as `/dev/null`, and the project home is
+the only project-data write grant. It runs `git` through `env -i`, a root-owned global config containing
+only the required safe directories, and command-line hook/fsmonitor/protocol hardening.
+Without Landlock the production path fails closed. Main-stream peer-taint detection is intentionally not
+claimed here: role-peer launches are denied and recorded in the audit stream before a turn; no separate
+operator alarm is currently promised for that denial.
+
 The root supervisor opens this home with `O_DIRECTORY|O_NOFOLLOW`; descriptor-relative writable state opens use `O_NOFOLLOW` and regular-file checks, with a single-link requirement for `journal.jsonl`.
 An unsafe state object makes the supervisor exit 78, which stops the unit permanently via `RestartPreventExitStatus=78` and triggers the `OnFailure=` alarm.
 
@@ -601,8 +621,8 @@ install -o root -g aib-provider-exec -m 0750 adapters/claude-code /opt/aib/adapt
 Owned `root:aib-broker 0750` (never `aib-broker:aib-broker`, the same reasoning as the TCB
 directories' metadata-gap fix above): the broker account can exec it but not overwrite it, so a
 confined child that somehow reached the broker account still cannot replace the helper it was
-launched through. `deploy/systemd/aib-broker@.service` points `AIB_CONFINE_BIN` at this exact path
-via `Environment=`, unconditionally — there is no code path in `bin/aib-broker-handler` or
+launched through. Both `deploy/systemd/aib-broker@.service` and `deploy/systemd/aib-agent@.service`
+point `AIB_CONFINE_BIN` at this exact path via `Environment=`, unconditionally — there is no code path in `bin/aib-broker-handler` or
 `aib_enact_launch` that falls back to a different location or skips the helper when it is missing;
 a missing or non-executable helper is D-A's pre-flight failure (`io-refused`, `stage=confine`), not
 a silent bypass.

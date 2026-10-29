@@ -664,13 +664,14 @@ AIB_SUP_STATE_ROOT="$WORK/missing-s1c-home" AIB_TEST_SEAMS=1 AIB_CONFINE_BIN="$L
   >"$WORK/resp-4b-s1c" 2>"$WORK/enact-err-4b-s1c"
 eq "S1c missing agent home writes one fixed diagnostic to broker stderr" \
   "$(cat "$WORK/enact-err-4b-s1c")" "aib: s1c preflight failed: agent_home"
-normalized_s1c_wire="$(sed 's/^ended_event_id=.*/ended_event_id=<id>/' "$WORK/resp-4b-s1c")"
-eq "…and its complete wire terminal frame remains unchanged" "$normalized_s1c_wire" "chunk_bytes=0
+normalized_s1c_wire="$(sed -e 's/^attempt_id=.*/attempt_id=<attempt>/' -e 's/^ended_event_id=.*/ended_event_id=<id>/' "$WORK/resp-4b-s1c")"
+eq "…and its complete wire terminal frame carries the broker attempt" "$normalized_s1c_wire" "chunk_bytes=0
 
 exit_class=io-refused
 exit_code=126
 stage=confine
 reason=confinement_unavailable
+attempt_id=<attempt>
 ended_event_id=<id>
 end=ok"
 

@@ -29,6 +29,7 @@
 #   Expected on the unbuilt tree: bin/aib-supervisor does not exist -> every assertion fails.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supbrake.XXXXXX")"
 trap sup_cleanup EXIT
 gap() { awk -v a="$(sed -n "$1p" "$W/calls.log" | tr ' ' '\n' | grep '^t=' | cut -d= -f2)" -v b="$(sed -n "$2p" "$W/calls.log" | tr ' ' '\n' | grep '^t=' | cut -d= -f2)" 'BEGIN{printf "%.3f", b-a}'; }

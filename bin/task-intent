@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Confined worker entrypoint; the supervisor remains the only ledger writer.
+set -uo pipefail
+ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)
+exec python3 -I "$ROOT/lib/task_intent.py" "$@"

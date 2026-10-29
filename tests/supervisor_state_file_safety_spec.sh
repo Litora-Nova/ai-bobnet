@@ -2,6 +2,7 @@
 # ai-bobnet — supervisor state access never follows role-account-controlled links.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/fixtures/sup_harness.sh"
+AIB_TEST_SEAMS=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/aibobnet-supstate.XXXXXX")"
 trap sup_cleanup EXIT
 

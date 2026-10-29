@@ -124,6 +124,38 @@ reduce session persistence. The exception is subscription authentication: provis
 shared subscription login". API-key proxy mode is reserved, fail-closed, and is the later path that
 restores the stronger "agent never sees the shared credential" property.
 
+Provisioning must also run `bin/aib-agent-dirs` before any one-shot or supervised turn so the role-owned
+`.aib/intents` path exists at mode 0700 and the root-owned `.aib-quarantine` exists at mode 0700. Do not add the role to `aib-tasks` or restore a
+shared-state group as a shortcut: the root supervisor publishes `.aib/board.json`, and the confined child
+has no direct ledger or peer-state access. Project homes should live under `/srv/aib/projects`, not
+`/home`, because the shipped unit uses `ProtectHome=yes`. Provisioning creates each project home as
+`root:<project-group>` mode 02770, installs the shipped `deploy/tmpfiles.d/aib-git.conf` rule, which
+recreates `/run/aib/git` as `root:root` mode 0755 at boot, and installs the confinement helper at the
+`AIB_CONFINE_BIN` path configured by the agent unit. Team outbox directories
+under `/srv/aib/outbox` must have permission bits 0770 (setgid is allowed), and `bin/aib-outbox-init`
+pre-creates each `outbox.md` as `root:<outbox-group>` mode 0660. `bin/aib-agent-dirs` removes
+empty legacy `.aib/intents/done` and `.aib/intents/tainted` directories and refuses non-empty ones for
+operator review. Each setgid project home also receives the default ACL, `.aib/wt`, and
+`core.sharedRepository=group`; the supervisor never creates or changes those objects as root. Add every
+project-home root to the agent unit's `ReadWritePaths` drop-in.
+
+Deployments may set the identity used only for automatic WIP commits:
+
+```json
+{
+  "commit_identity": {
+    "name_template": "{display_name} ({team})",
+    "email": "agents@example.invalid"
+  }
+}
+```
+
+Both keys are required when the object is present. An invalid or partial `commit_identity` fails the
+entire deployment configuration closed. The only template fields are `display_name` and `team`; this
+configuration never supplies task authority. Automatic WIP commits intentionally include untracked
+files (except `.aib`); deployments must maintain an appropriate `.gitignore`. The engine never pushes
+these commits.
+
 Codex does not publish a refresh-token expiry. Consequently `login_expires_at` in the broker-owned
 metadata is an operator-configured lifetime estimate (`AIB_LOGIN_LIFETIME_S`, 56 days by default),
 not a provider assertion. Expiry monitoring and status output preserve that distinction; access-token

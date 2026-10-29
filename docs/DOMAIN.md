@@ -10,8 +10,9 @@ still open is listed explicitly in §12 — nothing is silently undecided.
 > and the RM-2 durable attempt audit (`attempt.decided`/`attempt.ended` per managed launch) are built
 > and tested. The same framed commit primitive now reserves the per-project `tasks` stream and its
 > run/task event vocabulary; the authoritative task ledger writer now implements fold, authority
-> checks, and task body sidecars. Confined-turn intents, supervisor application, worker pickup,
-> agentctl task verbs, and projection remain later slices. The **rest**
+> checks, and task body sidecars. The worker-side slice implements confined-turn intents, root
+> supervisor application, worker pickup, task worktrees, reports, bounded continuation, and failure
+> closure. Agentctl task verbs, lead delegation, and projection remain later slices. The **rest**
 > of the serialized event spine (cursors, projections, rebuild tooling), the provider-wide reference monitor, the
 > provider-change audit event, Gate/Grant/Effect state machines, profile provisioning, full runtime
 > lifecycle, external adapters, and dashboard projection remain specified but unimplemented. Until the
@@ -197,7 +198,11 @@ writer currently accepts only `1`; `parent` is the Run id. The reserved sub-team
 `teams.<team>.parent_team` remain model seams only.
 
 Task ids are deterministic: `t-` plus the first 12 hex digits of SHA-256 over
-`<causation_id>:<intent_n>`. Retry dedupe is separately keyed by `(source_msg_id, assignee)` for an open
+`<causation_id>:<intent_n>`. A causation id names one request in the tasks stream, so a caller creating
+several Tasks uses a distinct id for each intent (for example `intent-<attempt>-<n>`); `intent_n` remains
+part of deterministic id composition, not a license to reuse the causation id. A replay with the same
+event type and Task returns the first decision even if other payload fields differ. Retry dedupe is
+separately keyed by `(source_msg_id, assignee)` for an open
 Task. This deliberately permits at most one open Task per worker for one source message; fan-out to the
 same worker must be bundled, while a different assignee remains valid. State is never stored outside the
 events. `list` and `show` replay the same fold used by writers. A framing-valid record with invalid UTF-8,
@@ -240,12 +245,42 @@ The normative rejection reasons are `caller_unauthorized`, `caller_actor_mismatc
 `max_tasks_per_run`, `max_assignments_per_task`, `max_turns_per_task`, `unsafe_body_sidecar`, and
 `unsupported_event`. Free-text and reference arguments must encode as strict UTF-8 before the stream lock;
 invalid bytes are rc 64 and never append. Titles/reasons reject controls, Unicode line/paragraph
-separators, surrogate and private-use code points, format and zero-width characters, and tag characters.
-Unassigned (`Cn`) code points remain valid so replay does not depend on the interpreter's Unicode version.
+separators, surrogate and private-use code points, tag characters, noncharacters, and the fixed
+default-ignorable set U+034F, U+115F–U+1160, U+17B4–U+17B5, U+3164, U+FFA0, U+110BD, U+110CD, and
+U+13430–U+1343F.
+This is a fixed explicit code-point allow/block policy; it never consults the interpreter's Unicode
+category database. Code points outside the fixed block table remain valid, including code points an
+older interpreter considers unassigned, so replay is byte-stable across Unicode database versions.
 References are printable ASCII without whitespace or a leading `-`, with a 255-character payload limit;
 `git:` references also obey Git ref-name basics and `file:` references must be relative normalized paths
-without empty, `.` or `..` segments. `deadline_at` is either omitted or the exact valid UTC form
-`YYYY-MM-DDTHH:MM:SSZ`; the fold rejects non-canonical stored values.
+without empty, `.` or `..` segments. The create CLI may omit `deadline_at`, in which case the writer
+materializes the team default before append; every stored Task record therefore carries the exact UTC
+form `YYYY-MM-DDTHH:MM:SSZ`, and the fold rejects null or non-canonical stored values.
+
+### 3.9 Worker intent application
+
+The confined worker never writes or reads the task stream. Before each turn, the root supervisor writes
+a private `$HOME/.aib/board.json` snapshot; `task-intent list` reads only that snapshot. Worker verbs append
+at most ten bounded JSON records to `$HOME/.aib/intents/$AIB_ATTEMPT_ID.jsonl`. The file carries proposed
+work only: the supervisor derives `actor_id`, task/run/requester binding, and `via:intent:<attempt_id>` from
+its own turn journal and the authoritative ledger, never from worker-supplied authority fields.
+
+After the turn (and on startup/orphan recovery), the supervisor matches the broker terminal attempt id,
+pre-validates the complete intent file and result ref with the client validator, calls root-only `bin/task`,
+delivers the idempotent result, then records `intents.applied`. Applied files are unlinked. Tainted bytes
+are copied to the bounded root-owned `.aib-quarantine` and the child-owned file is unlinked; there are no
+child-owned `done` or `tainted` directories. A crash after the ledger append is resumed from
+`intent.ledger`, so notification can be retried without a second task event. Causation deduplication is
+performed under the task-stream lock before transition validation. `continue` is one `progress` plus a
+durable self-message; only accepted progress increments `turns`.
+Two reportless turns become service-owned `blocked/no_report`, the ninth continuation becomes
+`blocked/turn_budget`, three provider failures become `failed/turn_failed`, and an assignment in the
+message DLQ becomes `cancelled/delivery_failed`.
+
+Each task executes in `<project>/.aib/wt/<agent_uid>` on the closed branch
+`aib/<team_uid>/<task_id>`. Switching tasks WIP-commits dirty work with the deployment commit identity.
+`git:` results must name that branch and an ancestor SHA; `file:` results must resolve to a regular file
+inside the task worktree (maximum 1 MiB); `msg:` results use the closed token grammar.
 
 ---
 
@@ -311,6 +346,8 @@ gate_id? · grant_id? · effect_id? · correlation_id · causation_id · schema_
   run-level request has no `task_id`), and `causation_id`; the commit
   primitive derives `correlation_id = run_id`, leaves `attempt_id` null, and assigns
   `event_id = <project_uid>-tasks-<seq>` under the lock.
+  Within that stream, `causation_id` is unique to one requested event and Task. Multi-intent callers use
+  `intent-<attempt>-<n>` rather than reusing the terminal attempt id.
 - Each stream has **one serializing append broker**. Encoding is: *encode → enforce byte cap → one checked
   append*. A record that exceeds the cap becomes an **Artifact by reference**; it is never inlined.
 - A stream-lock timeout returns **75**. It is transient and MUST be retried by the caller; it is never a
