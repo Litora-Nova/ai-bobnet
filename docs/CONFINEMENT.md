@@ -294,8 +294,10 @@ writes `.aib/board.json` before each turn; this snapshot replaces any task-ledge
 ACL for the child.
 
 The supervisor's Git helper switches to the role uid/gid and the provisioned project group, then applies
-Landlock with `LL_RO=/` and `LL_RW=<project_home>`. It runs `git` through `env -i`, a root-owned global
-config containing only the required safe directories, and command-line hook/fsmonitor/protocol hardening.
+Landlock with `LL_RO=/` and `LL_RW=/tmp:/var/tmp:/dev:<project_home>`. The temporary trees support Git's
+bounded temporary files, `/dev` supplies its device endpoints such as `/dev/null`, and the project home is
+the only project-data write grant. It runs `git` through `env -i`, a root-owned global config containing
+only the required safe directories, and command-line hook/fsmonitor/protocol hardening.
 Without Landlock the production path fails closed. Main-stream peer-taint detection is intentionally not
 claimed here: role-peer launches are denied and recorded in the audit stream before a turn; no separate
 operator alarm is currently promised for that denial.

@@ -50,6 +50,23 @@ for component in parts[:-1]:
 info = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
 raise SystemExit(0 if stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024 else 1)
 """
+STALE_LOCK_CLEANUP = """\
+import os
+import stat
+import sys
+import time
+
+path, minimum_age = sys.argv[1], float(sys.argv[2])
+try:
+    info = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+    raise SystemExit(1)
+if time.time() - info.st_mtime <= minimum_age:
+    raise SystemExit(0)
+os.unlink(path)
+"""
 
 
 def neutralize_task_text(value: str) -> str:
@@ -66,6 +83,14 @@ class SupervisorLockError(OSError):
 
 class SupervisorStateError(OSError):
     """The supervisor state directory contains an unsafe filesystem object."""
+
+
+class IntentReadError(ValueError):
+    """An intent candidate failed metadata or content validation."""
+
+    def __init__(self, message: str, evidence: bytes = b"") -> None:
+        super().__init__(message)
+        self.evidence = evidence
 
 
 def utc_now() -> str:
@@ -142,7 +167,9 @@ class Supervisor:
         self.blocked_after = self._configured_interval("AIB_SUP_BLOCKED_AFTER_S", 600.0)
         self.orphan_poll = self._configured_interval("AIB_SUP_ORPHAN_POLL_S", 10.0)
         self.call_timeout = self._configured_interval("AIB_SUP_CALL_TIMEOUT_S", 30.0)
-        self.git_timeout = self._configured_interval("AIB_SUP_GIT_TIMEOUT_S", 120.0)
+        self.git_timeout = self._configured_interval("AIB_SUP_GIT_TIMEOUT_S", 45.0)
+        self.activation_timeout = self._configured_interval("AIB_SUP_ACTIVATION_TIMEOUT_S", 60.0)
+        self.git_poll_interval = 1.0
         if self.infra_max < self.infra_min:
             self.config_invalid = True
 
@@ -178,6 +205,8 @@ class Supervisor:
         self.role_gid = -1
         self.role_groups: set[int] = set()
         self.cancel_grace = self._configured_interval("AIB_SUP_CANCEL_GRACE_S", 30.0)
+        self.activation_deadline: float | None = None
+        self.intent_scan_cursor = ""
 
         self.state = "STARTING"
         self.state_reason = ""
@@ -628,7 +657,7 @@ class Supervisor:
             self.brake_tripped_at = utc_now()
         return latest_start if latest_start is not None and latest_start_index > latest_end_index else None
 
-    def _append_outbox_line(self, line: bytes) -> bool:
+    def _append_outbox_line(self, line: bytes, directory: str | None = None) -> bool:
         root_fd = team_fd = file_fd = -1
         try:
             test_seam = (
@@ -649,35 +678,54 @@ class Supervisor:
                 or stat.S_IMODE(root_info.st_mode) & 0o002
             ):
                 raise OSError("unsafe outbox root")
+            destination = directory or self.team_uid
+            expected_mode = 0o750 if destination == "_server" else 0o770
             created = False
             try:
-                os.mkdir(self.team_uid, 0o770, dir_fd=root_fd)
+                os.mkdir(destination, expected_mode, dir_fd=root_fd)
                 created = True
             except FileExistsError:
                 pass
             team_fd = os.open(
-                self.team_uid,
+                destination,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=root_fd,
             )
             if created:
-                os.fchmod(team_fd, 0o770)
+                os.fchmod(team_fd, expected_mode)
             team_info = os.fstat(team_fd)
             if (
                 not stat.S_ISDIR(team_info.st_mode)
                 or team_info.st_uid != expected_owner
-                or stat.S_IMODE(team_info.st_mode) & 0o777 != 0o770
+                or stat.S_IMODE(team_info.st_mode) & 0o777 != expected_mode
             ):
                 raise OSError("unsafe team outbox")
-            file_fd = os.open(
-                "outbox.md",
-                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
-                | os.O_NONBLOCK | os.O_CLOEXEC,
-                0o660,
-                dir_fd=team_fd,
-            )
+            file_created = False
+            try:
+                file_fd = os.open(
+                    "outbox.md",
+                    os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+                    | os.O_NONBLOCK | os.O_CLOEXEC,
+                    dir_fd=team_fd,
+                )
+            except FileNotFoundError:
+                file_fd = os.open(
+                    "outbox.md",
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                    | os.O_NONBLOCK | os.O_CLOEXEC,
+                    0o660,
+                    dir_fd=team_fd,
+                )
+                file_created = True
+            if file_created:
+                os.fchmod(file_fd, 0o660)
             info = os.fstat(file_fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != expected_owner:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o777 != 0o660
+                or info.st_gid != team_info.st_gid
+            ):
                 raise OSError("unsafe outbox")
             written = 0
             while written < len(line):
@@ -699,7 +747,9 @@ class Supervisor:
         safe: dict[str, str | int] = {}
         for key, raw in details.items():
             value = str(raw)
-            if re.fullmatch(r"[A-Za-z0-9._:-]+", value, re.ASCII):
+            if re.fullmatch(r"[A-Za-z0-9._:-]+", value, re.ASCII) or (
+                key == "path" and value in {".aib/intents", "project_home"}
+            ):
                 safe[key] = value
             else:
                 safe[f"{key}_sha256"] = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
@@ -748,6 +798,13 @@ class Supervisor:
                 for record in self.records
             ):
                 self.journal("alarm.suppressed", kind=kind, limit=10, window_s=3600)
+                line = (
+                    f"{utc_now()} | id:alarm-{uuid.uuid4().hex} | from:{self.uid} | "
+                    f"to:human:{self.team_uid} | state:PERSISTED | "
+                    f"alarm:alarm_suppressed agent:{self.uid} kind:{kind}\n"
+                ).encode("utf-8")
+                if self._append_outbox_line(line):
+                    self.journal("alarm.suppression_notified", kind=kind)
             return
         body = f"alarm:{kind} agent:{self.uid}"
         for key, value in safe_details.items():
@@ -758,6 +815,8 @@ class Supervisor:
         ).encode("utf-8")
         if not self._append_outbox_line(line):
             self.journal("alarm.failed", kind=kind)
+            self.journal("attention", reason="alarm_failed", kind=kind)
+            self.notify(f"STATUS=alarm delivery failed: {kind}")
             return
         fields: dict[str, Any] = {"kind": kind, "episode": episode, **safe_details}
         if tripped_at is not None:
@@ -1265,11 +1324,21 @@ class Supervisor:
             self.work = None
             return False
         work["body"] = f"[task {task['task_id']} run {task['run_id']} requester {task['owner']}]\n{sidecar}"
+        self.journal(
+            "message.preparing", msg_id=work.get("id"), task_id=task.get("task_id")
+        )
         try:
             worktree = self.activate_task_worktree(task)
         except (OSError, ValueError) as error:
+            self.journal(
+                "message.preparation_failed", msg_id=work.get("id"),
+                task_id=task.get("task_id"),
+            )
             self.journal("attention", reason="worktree_unavailable", task_id=task.get("task_id"))
             raise OSError("worktree_unavailable") from error
+        self.journal(
+            "message.prepared", msg_id=work.get("id"), task_id=task.get("task_id")
+        )
         task["worktree"] = str(worktree)
         work["task"] = task
         if task["state"] == "ASSIGNED":
@@ -1370,7 +1439,9 @@ class Supervisor:
             for record in self.records
         )
 
-    def _quarantine_intent(self, path: Path, reason: str, alarm: str = "security") -> None:
+    def _quarantine_intent(
+        self, path: Path, reason: str, alarm: str = "security", *, evidence: bytes | None = None
+    ) -> None:
         invalid_name = reason == "invalid_name" or not path.name.endswith(".jsonl") or TOKEN_RE.fullmatch(path.name[:-6]) is None
         identity = self._intent_identity(path.name, invalid_name=invalid_name)
         if self._taint_seen(identity):
@@ -1383,18 +1454,19 @@ class Supervisor:
                 self.journal("intents.tainted_replay", **identity)
             return
         aib_fd = intents_fd = quarantine_fd = source_fd = target_fd = -1
-        data = b""
+        data = evidence if evidence is not None else b""
         stored = False
         try:
             aib_fd, intents_fd = self._open_private_dirs()
-            source_fd = os.open(
-                path.name,
-                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=intents_fd,
-            )
-            info = os.fstat(source_fd)
-            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                data = os.read(source_fd, MAX_INTENT_BYTES + 1)
+            if evidence is None:
+                source_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=intents_fd,
+                )
+                info = os.fstat(source_fd)
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    data = os.read(source_fd, MAX_INTENT_BYTES + 1)
             quarantine_fd = os.open(
                 ".aib-quarantine",
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -1467,30 +1539,39 @@ class Supervisor:
             return False
         return False
 
+    def _intent_retry_pending(self, attempt_id: str) -> bool:
+        if not any(
+            record.get("event") == "intent.retry"
+            and record.get("attempt_id") == attempt_id
+            for record in self.records
+        ):
+            return False
+        return not any(
+            record.get("attempt_id") == attempt_id
+            and record.get("event") in {"intents.applied", "intents.tainted"}
+            for record in self.records
+        )
+
     def _intent_snapshot(self, attempt_id: str) -> tuple[bool, str]:
         if TOKEN_RE.fullmatch(attempt_id) is None:
             return False, ""
         name = f"{attempt_id}.jsonl"
-        aib_fd = intents_fd = fd = -1
+        aib_fd = intents_fd = -1
         try:
             aib_fd, intents_fd = self._open_private_dirs()
             try:
-                fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=intents_fd,
-                )
+                os.stat(name, dir_fd=intents_fd, follow_symlinks=False)
             except FileNotFoundError:
                 return False, ""
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_INTENT_BYTES:
+            try:
+                _data, digest = self._read_intent_bytes(self.intent_dir / name, attempt_id)
+            except (IntentReadError, OSError, UnicodeError):
                 return True, ""
-            data = os.read(fd, MAX_INTENT_BYTES + 1)
-            return True, hashlib.sha256(data).hexdigest()
+            return True, digest
         except OSError:
             return False, ""
         finally:
-            for item in (fd, intents_fd, aib_fd):
+            for item in (intents_fd, aib_fd):
                 if item >= 0:
                     os.close(item)
 
@@ -1506,6 +1587,12 @@ class Supervisor:
     def _close_intent_attempt(self, attempt_id: str, present: bool, digest: str) -> None:
         if self._closed_intent(attempt_id) is None:
             self.journal("intents.closed", attempt_id=attempt_id, present=present, sha256=digest)
+
+    def _close_unclosed_attempts(self) -> None:
+        for attempt_id in self._attempt_contexts():
+            if self._closed_intent(attempt_id) is None:
+                present, digest = self._intent_snapshot(attempt_id)
+                self._close_intent_attempt(attempt_id, present, digest)
 
     def _journal_fs_unsafe(self, path: str, reason: str) -> None:
         last = next(
@@ -1543,7 +1630,7 @@ class Supervisor:
                 pass
         return "rejected"
 
-    def _read_intents(self, path: Path, attempt_id: str) -> list[dict[str, Any]]:
+    def _read_intent_bytes(self, path: Path, attempt_id: str) -> tuple[bytes, str]:
         aib_fd = intents_fd = fd = -1
         try:
             aib_fd, intents_fd = self._open_private_dirs()
@@ -1562,12 +1649,18 @@ class Supervisor:
                 or stat.S_IMODE(info.st_mode) != 0o600
                 or info.st_size > MAX_INTENT_BYTES
             ):
-                raise ValueError("unsafe intent file")
+                evidence = b""
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= MAX_INTENT_BYTES:
+                    evidence = os.read(fd, MAX_INTENT_BYTES + 1)
+                raise IntentReadError("unsafe intent file", evidence)
             data = os.read(fd, MAX_INTENT_BYTES + 1)
         finally:
             for item in (fd, intents_fd, aib_fd):
                 if item >= 0:
                     os.close(item)
+        return data, hashlib.sha256(data).hexdigest()
+
+    def _parse_intents(self, data: bytes, attempt_id: str) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         for raw in data.splitlines():
             if not raw or len(raw) > 8192 or len(records) >= 10:
@@ -1583,7 +1676,13 @@ class Supervisor:
             raise ValueError("empty intent file")
         return records
 
-    def _apply_pending_intent(self, attempt_id: str, context: dict[str, Any]) -> bool:
+    def _read_intents(self, path: Path, attempt_id: str) -> list[dict[str, Any]]:
+        data, _digest = self._read_intent_bytes(path, attempt_id)
+        return self._parse_intents(data, attempt_id)
+
+    def _apply_pending_intent(
+        self, attempt_id: str, context: dict[str, Any], *, close_attempt: bool = False
+    ) -> bool:
         """Discover and apply one intent file through the verified intents dirfd."""
         if TOKEN_RE.fullmatch(attempt_id) is None:
             return False
@@ -1594,12 +1693,16 @@ class Supervisor:
             try:
                 os.stat(name, dir_fd=intents_fd, follow_symlinks=False)
             except FileNotFoundError:
+                if close_attempt:
+                    self._close_intent_attempt(attempt_id, False, "")
                 return False
         finally:
             for fd in (intents_fd, aib_fd):
                 if fd >= 0:
                     os.close(fd)
-        return self.apply_intent_file(self.intent_dir / name, context)
+        return self.apply_intent_file(
+            self.intent_dir / name, context, close_attempt=close_attempt
+        )
 
     def _persist_self_task_message(self, task: dict[str, Any], ident: str, summary: str) -> bool:
         requester = str(task["owner"])
@@ -1626,16 +1729,16 @@ class Supervisor:
         result_ref: str | None,
         *,
         record_pending: bool = True,
-    ) -> None:
+    ) -> bool:
         message_id = f"task-report-{task['task_id']}-{attempt_id}"
         if any(
             record.get("event") == "report.delivered" and record.get("message_id") == message_id
             for record in self.records
         ):
-            return
+            return True
         if not isinstance(summary, str) or not safe_display_text(summary):
             self.journal("attention", reason="unsafe_report_text", message_id=message_id)
-            return
+            return False
         summary = neutralize_task_text(summary)
         body = f"task-report {task['task_id']} state {state}"
         if result_ref:
@@ -1665,19 +1768,89 @@ class Supervisor:
                 f"state:PERSISTED | {body}\n"
             ).encode("utf-8")
             if not self._append_outbox_line(line):
-                self.journal("attention", reason="outbox_unsafe", message_id=message_id)
-                return
+                self._record_report_failure(
+                    message_id, "outbox_unsafe", task_id=str(task["task_id"])
+                )
+                return False
         else:
             result = self.message_command("send", requester, body, "--id", message_id)
             if result.returncode != 0:
-                self.journal("attention", reason="report_delivery_failed", message_id=message_id)
-                return
+                self._record_report_failure(
+                    message_id, "report_delivery_failed", task_id=str(task["task_id"])
+                )
+                return False
         self.journal("report.delivered", message_id=message_id, task_id=task["task_id"])
+        return True
+
+    def _latest_report_retry(self, message_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                record for record in reversed(self.records)
+                if record.get("event") == "report.retry"
+                and record.get("message_id") == message_id
+            ),
+            None,
+        )
+
+    def _record_report_failure(self, message_id: str, reason: str, *, task_id: str) -> None:
+        previous = self._latest_report_retry(message_id)
+        count = int(previous.get("n", 0)) + 1 if previous is not None else 1
+        if previous is None or previous.get("reason") != reason:
+            self.journal("attention", reason=reason, message_id=message_id)
+        if count >= 10:
+            if not any(
+                record.get("event") == "report.undeliverable"
+                and record.get("message_id") == message_id
+                for record in self.records
+            ):
+                self.journal(
+                    "report.undeliverable", message_id=message_id,
+                    task_id=task_id, n=count, reason=reason,
+                )
+                line = (
+                    f"{utc_now()} | id:alarm-{uuid.uuid4().hex} | from:{self.uid} | "
+                    "to:human:ops | state:PERSISTED | "
+                    f"alarm:task_delivery_failed agent:{self.uid} "
+                    f"message_id:{message_id} task_id:{task_id}\n"
+                ).encode("utf-8")
+                if self._append_outbox_line(line, directory="_server"):
+                    self.journal(
+                        "alarm.sent", kind="task_delivery_failed",
+                        episode=message_id, message_id=message_id, task_id=task_id,
+                    )
+                else:
+                    self.journal("alarm.failed", kind="task_delivery_failed")
+                    self.journal(
+                        "attention", reason="alarm_failed",
+                        kind="task_delivery_failed", message_id=message_id,
+                    )
+                    self.notify("STATUS=alarm delivery failed: task_delivery_failed")
+            return
+        delay = min(300.0, self.poll_s * (2 ** (count - 1)))
+        retry_at = datetime.fromtimestamp(
+            time.time() + delay, timezone.utc
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        self.journal(
+            "report.retry", message_id=message_id, task_id=task_id,
+            n=count, reason=reason, retry_at=retry_at,
+        )
+
+    def _report_waiting_for_task(self, task_id: str) -> bool:
+        delivered = {
+            record.get("message_id") for record in self.records
+            if record.get("event") in {"report.delivered", "report.undeliverable"}
+        }
+        return any(
+            record.get("event") == "report.pending"
+            and record.get("task_id") == task_id
+            and record.get("message_id") not in delivered
+            for record in self.records
+        )
 
     def _retry_pending_reports(self) -> None:
         delivered = {
             record.get("message_id") for record in self.records
-            if record.get("event") == "report.delivered"
+            if record.get("event") in {"report.delivered", "report.undeliverable"}
         }
         pending: dict[str, dict[str, Any]] = {}
         for record in self.records:
@@ -1687,6 +1860,11 @@ class Supervisor:
         for message_id, record in pending.items():
             if message_id in delivered:
                 continue
+            retry = self._latest_report_retry(message_id)
+            if retry is not None:
+                retry_at = parse_timestamp(retry.get("retry_at"))
+                if retry_at is not None and retry_at > datetime.now(timezone.utc):
+                    continue
             values = (
                 record.get("task_id"), record.get("run_id"), record.get("requester"),
                 record.get("attempt_id"), record.get("state"), record.get("summary"),
@@ -1734,20 +1912,60 @@ class Supervisor:
         self._deliver_task_report(task, attempt_id, "failed", reason, None)
         return True
 
-    def apply_intent_file(self, path: Path, context: dict[str, Any]) -> bool:
+    def apply_intent_file(
+        self, path: Path, context: dict[str, Any], *, close_attempt: bool = False
+    ) -> bool:
         attempt_id = str(context["attempt_id"])
+        try:
+            data, digest = self._read_intent_bytes(path, attempt_id)
+        except FileNotFoundError:
+            if close_attempt:
+                self._close_intent_attempt(attempt_id, False, "")
+            return False
+        except IntentReadError as error:
+            if close_attempt:
+                self._close_intent_attempt(attempt_id, True, "")
+            self._quarantine_intent(path, "invalid_intent", evidence=error.evidence)
+            return False
+        except (OSError, UnicodeError):
+            if close_attempt:
+                self._close_intent_attempt(attempt_id, True, "")
+            self._quarantine_intent(path, "invalid_intent", evidence=b"")
+            return False
+        if close_attempt:
+            self._close_intent_attempt(attempt_id, True, digest)
+        closed = self._closed_intent(attempt_id)
+        identity = self._intent_identity(path.name)
+        if self._taint_seen(identity):
+            self._quarantine_intent(path, "tainted_replay", evidence=data)
+            return False
+        if closed is not None and (
+            closed.get("present") is not True
+            or not isinstance(closed.get("sha256"), str)
+            or not closed.get("sha256")
+            or closed.get("sha256") != digest
+        ):
+            self._quarantine_intent(path, "stale_attempt", evidence=data)
+            return False
+        if self._intent_applied(attempt_id):
+            self._unlink_intent(path.name)
+            return False
+        try:
+            intents = self._parse_intents(data, attempt_id)
+        except (UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
+            self._quarantine_intent(path, "invalid_intent", evidence=data)
+            return False
         task_id = context.get("task_id")
         task = self.task_show(str(task_id)) if isinstance(task_id, str) else None
         if task is None:
             return self._intent_retry(path, attempt_id, "task_lookup")
         if task.get("run_id") != context.get("run_id"):
-            self._quarantine_intent(path, "context_mismatch")
+            self._quarantine_intent(path, "context_mismatch", evidence=data)
             return False
         try:
-            intents = self._read_intents(path, attempt_id)
             validate_intent_records(intents, attempt_id, str(task["task_id"]))
-        except (OSError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
-            self._quarantine_intent(path, "invalid_intent")
+        except (UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
+            self._quarantine_intent(path, "invalid_intent", evidence=data)
             return False
         handled = False
         rejections: list[str] = []
@@ -1756,7 +1974,7 @@ class Supervisor:
         for index, intent in enumerate(intents, 1):
             verb = intent.get("verb")
             if verb != "delegate" and intent.get("task_id") != task["task_id"]:
-                self._quarantine_intent(path, "task_mismatch")
+                self._quarantine_intent(path, "task_mismatch", evidence=data)
                 return False
             prior = self._intent_ledger_record(attempt_id, index)
             state = str(intent.get("state", ""))
@@ -1770,7 +1988,7 @@ class Supervisor:
                     continue
                 allowed = {"attempt_id", "verb", "run_id", "to", "title", "body", "source_msg_id"}
                 if set(intent) != allowed or intent.get("run_id") != task["run_id"]:
-                    self._quarantine_intent(path, "invalid_delegate")
+                    self._quarantine_intent(path, "invalid_delegate", evidence=data)
                     return False
                 result = self.task_event(
                     "reject", task, f"reject-{attempt_id}-{index}",
@@ -1796,15 +2014,15 @@ class Supervisor:
             if verb == "report":
                 allowed |= {"state", "result_ref", "reason"}
             if set(intent) - allowed or not isinstance(summary, str) or len(summary.encode()) > 2048:
-                self._quarantine_intent(path, "invalid_schema")
+                self._quarantine_intent(path, "invalid_schema", evidence=data)
                 return False
             if prior is None:
                 if verb not in {"report", "continue"}:
-                    self._quarantine_intent(path, "invalid_verb")
+                    self._quarantine_intent(path, "invalid_verb", evidence=data)
                     return False
                 report_state = "progress" if verb == "continue" else state
                 if report_state not in {"progress", "done", "failed", "blocked"}:
-                    self._quarantine_intent(path, "invalid_state")
+                    self._quarantine_intent(path, "invalid_state", evidence=data)
                     return False
                 if not self.validate_result_ref(result_ref, {**task, "worktree": str(self._worktree_path())}):
                     result = self.task_event(
@@ -1908,11 +2126,22 @@ class Supervisor:
 
     def scan_intents(self) -> None:
         self._retry_pending_reports()
+        self._retry_deferred_orphans()
         aib_fd = intents_fd = -1
         try:
             aib_fd, intents_fd = self._open_private_dirs()
             entries: list[tuple[str, os.stat_result]] = []
-            for name in sorted(os.listdir(intents_fd)):
+            names = sorted(os.listdir(intents_fd))
+            if len(names) > 500:
+                start = next(
+                    (index for index, name in enumerate(names) if name > self.intent_scan_cursor),
+                    0,
+                )
+                names = (names[start:] + names[:start])[:500]
+                self.intent_scan_cursor = names[-1]
+            else:
+                self.intent_scan_cursor = ""
+            for name in names:
                 try:
                     entries.append((name, os.stat(name, dir_fd=intents_fd, follow_symlinks=False)))
                 except OSError:
@@ -1926,6 +2155,7 @@ class Supervisor:
                 if fd >= 0:
                     os.close(fd)
         contexts = self._attempt_contexts()
+        deferred = self._deferred_intent_names()
         for name, info in entries:
             if not stat.S_ISREG(info.st_mode):
                 identity = self._intent_identity(
@@ -1961,22 +2191,13 @@ class Supervisor:
                 continue
             path = self.intent_dir / name
             attempt_id = name.removesuffix(".jsonl")
-            closed = self._closed_intent(attempt_id)
-            if closed is not None:
-                present, digest = self._intent_snapshot(attempt_id)
-                if not closed.get("present") or not present or closed.get("sha256") != digest:
-                    self._quarantine_intent(path, "stale_attempt")
-                    continue
-                if self._intent_applied(attempt_id):
-                    self._unlink_intent(name)
-                    continue
+            if attempt_id in deferred:
+                continue
             context = contexts.get(attempt_id)
             if context is None:
                 self._quarantine_intent(path, "foreign_attempt")
             elif not isinstance(context.get("task_id"), str):
                 self._quarantine_intent(path, "intent_without_task", alarm="attention")
-            elif self._intent_applied(attempt_id):
-                self._unlink_intent(name)
             else:
                 try:
                     self._apply_pending_intent(attempt_id, context)
@@ -2105,6 +2326,8 @@ class Supervisor:
             ):
                 continue
             task_id = str(task.get("task_id", ""))
+            if self._report_waiting_for_task(task_id):
+                continue
             if any(
                 message.get("id", "").startswith(f"{task_id}.")
                 or TASK_MESSAGE_RE.match(str(message.get("body", ""))) is not None
@@ -2224,15 +2447,34 @@ class Supervisor:
                 "AIB_ROLE_UIDS": str(self.role_uid),
                 "AIB_ROLE_GROUPS": str(project_gid),
             }
-        result = subprocess.run(
+        limit = self.call_timeout if timeout is None else timeout
+        process = subprocess.Popen(
             command,
-            check=False,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=process_env,
-            timeout=self.call_timeout if timeout is None else timeout,
         )
+        deadline = time.monotonic() + limit
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(argv, limit, output=stdout, stderr=stderr)
+            self.notify("WATCHDOG=1")
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=min(self.git_poll_interval, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         if check and result.returncode != 0:
             raise OSError(result.stderr.strip() or "git command failed")
         return result
@@ -2259,9 +2501,17 @@ class Supervisor:
             "--no-replace-objects",
         ]
         git_argv = ["git", *hardening, "-C", str(lexical_cwd), *args]
-        return self._run_as_role(
-            repo, project_gid, git_argv, check=check, env=env, timeout=self.git_timeout
-        )
+        timeout = self.git_timeout
+        if self.activation_deadline is not None:
+            timeout = min(timeout, self.activation_deadline - time.monotonic())
+            if timeout <= 0:
+                raise OSError("worktree_unavailable")
+        try:
+            return self._run_as_role(
+                repo, project_gid, git_argv, check=check, env=env, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as error:
+            raise OSError("worktree_unavailable") from error
 
     def _validate_file_ref_as_role(self, worktree: Path, relative: str) -> bool:
         repo, project_gid = self._open_project_home()
@@ -2287,7 +2537,44 @@ class Supervisor:
     def _worktree_path(self) -> Path:
         return Path(self.project_home) / ".aib" / "wt" / self.uid
 
+    def _remove_stale_index_lock(self, cwd: Path) -> None:
+        result = self._git_as_role(cwd, "rev-parse", "--git-path", "index.lock", check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            return
+        candidate = Path(result.stdout.strip())
+        if not candidate.is_absolute():
+            candidate = Path(os.path.normpath(str(cwd / candidate)))
+        repo, project_gid = self._open_project_home()
+        try:
+            candidate.relative_to(repo)
+        except ValueError:
+            return
+        timeout = self.git_timeout
+        if self.activation_deadline is not None:
+            timeout = min(timeout, self.activation_deadline - time.monotonic())
+        if timeout <= 0:
+            raise OSError("worktree_unavailable")
+        try:
+            self._run_as_role(
+                repo, project_gid,
+                [
+                    "/usr/bin/python3", "-I", "-c", STALE_LOCK_CLEANUP,
+                    str(candidate), str(self.activation_timeout),
+                ],
+                check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise OSError("worktree_unavailable") from error
+
     def activate_task_worktree(self, task: dict[str, Any]) -> Path:
+        previous_deadline = self.activation_deadline
+        self.activation_deadline = time.monotonic() + self.activation_timeout
+        try:
+            return self._activate_task_worktree(task)
+        finally:
+            self.activation_deadline = previous_deadline
+
+    def _activate_task_worktree(self, task: dict[str, Any]) -> Path:
         """Create the agent worktree and switch it to the task's closed branch."""
         task_id, team = task.get("task_id"), task.get("team_uid")
         if not isinstance(task_id, str) or TASK_RE.fullmatch(task_id) is None or team != self.team_uid:
@@ -2305,6 +2592,7 @@ class Supervisor:
         if test_seam:
             parent.mkdir(mode=0o2770, parents=True, exist_ok=True)
             parent.chmod(0o2770)
+        self._remove_stale_index_lock(repo)
         registered = {
             os.path.normpath(line.removeprefix("worktree "))
             for line in self._git_as_role(repo, "worktree", "list", "--porcelain").stdout.splitlines()
@@ -2312,6 +2600,7 @@ class Supervisor:
         }
         if os.path.normpath(str(worktree)) not in registered:
             self._git_as_role(repo, "worktree", "add", "--detach", str(worktree), self.base_branch)
+        self._remove_stale_index_lock(worktree)
         desired = f"aib/{team}/{task_id}"
         current = self._git_as_role(worktree, "branch", "--show-current").stdout.strip()
         if current != desired:
@@ -2497,13 +2786,59 @@ class Supervisor:
             return None
         return bindings
 
-    def _adopt_orphan_attempt(self, unfinished: dict[str, Any], local_attempt: str) -> None:
-        if any(
-            record.get("event") == "turn.attempt"
-            and record.get("local_attempt_id") == local_attempt
-            for record in self.records
-        ):
-            return
+    def _active_orphan_deferrals(self) -> dict[str, dict[str, Any]]:
+        active: dict[str, dict[str, Any]] = {}
+        for record in self.records:
+            local_attempt = record.get("local_attempt")
+            if not isinstance(local_attempt, str):
+                continue
+            if record.get("event") == "orphan.deferred":
+                active[local_attempt] = record
+            elif record.get("event") in {"orphan.resolved", "orphan.exhausted"}:
+                active.pop(local_attempt, None)
+        return active
+
+    def _deferred_intent_names(self) -> set[str]:
+        names: set[str] = set()
+        for record in self._active_orphan_deferrals().values():
+            pending = record.get("pending")
+            if isinstance(pending, list):
+                names.update(name for name in pending if isinstance(name, str))
+        return names
+
+    def _retry_deferred_orphans(self) -> None:
+        now = datetime.now(timezone.utc)
+        for local_attempt, record in self._active_orphan_deferrals().items():
+            retry_at = parse_timestamp(record.get("retry_at"))
+            if retry_at is not None and retry_at > now:
+                continue
+            unfinished = {
+                "ts": record.get("started_at"), "sid": record.get("sid"),
+                "msg_id": record.get("msg_id"), "task_id": record.get("task_id"),
+                "run_id": record.get("run_id"), "requester": record.get("requester"),
+            }
+            self._adopt_orphan_attempt(
+                unfinished, local_attempt, retry_n=int(record.get("n", 1))
+            )
+
+    def _adopt_orphan_attempt(
+        self, unfinished: dict[str, Any], local_attempt: str, *, retry_n: int = 0
+    ) -> str:
+        existing = next(
+            (
+                record for record in reversed(self.records)
+                if record.get("event") == "turn.attempt"
+                and record.get("local_attempt_id") == local_attempt
+            ),
+            None,
+        )
+        if existing is not None:
+            attempt_id = existing.get("attempt_id")
+            if isinstance(attempt_id, str) and self._closed_intent(attempt_id) is None:
+                present, digest = self._intent_snapshot(attempt_id)
+                self._close_intent_attempt(attempt_id, present, digest)
+            self.journal("orphan.resolved", local_attempt=local_attempt)
+            return "resolved"
         pending = set(self._pending_orphan_intents())
         claimed = {
             record.get("attempt_id") for record in self.records
@@ -2511,13 +2846,40 @@ class Supervisor:
         }
         bindings = self._attempt_bindings()
         if bindings is None:
+            count = retry_n + 1
+            if count >= 5:
+                for attempt_id in pending - claimed:
+                    self._quarantine_intent(
+                        self.intent_dir / f"{attempt_id}.jsonl",
+                        "unbound_attempt", alarm="attention",
+                    )
+                self.journal(
+                    "attention", reason="unbound_attempt", local_attempt=local_attempt
+                )
+                self.journal("orphan.exhausted", local_attempt=local_attempt, n=count)
+                return "resolved"
             if not any(
                 record.get("event") == "attention"
                 and record.get("reason") == "attempt_bindings_unavailable"
+                and record.get("local_attempt") == local_attempt
                 for record in self.records
             ):
-                self.journal("attention", reason="attempt_bindings_unavailable")
-            return
+                self.journal(
+                    "attention", reason="attempt_bindings_unavailable",
+                    local_attempt=local_attempt,
+                )
+            delay = min(300.0, self.poll_s * (2 ** (count - 1)))
+            retry_at = datetime.fromtimestamp(
+                time.time() + delay, timezone.utc
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            self.journal(
+                "orphan.deferred", local_attempt=local_attempt,
+                pending=sorted(pending - claimed), n=count, retry_at=retry_at,
+                started_at=unfinished.get("ts"), sid=unfinished.get("sid"),
+                msg_id=unfinished.get("msg_id"), task_id=unfinished.get("task_id"),
+                run_id=unfinished.get("run_id"), requester=unfinished.get("requester"),
+            )
+            return "deferred"
         started_at = parse_timestamp(unfinished.get("ts"))
         restarted_at = parse_timestamp(self.started_at)
         mux_session = str(
@@ -2550,11 +2912,14 @@ class Supervisor:
             )
             present, digest = self._intent_snapshot(broker_attempt)
             self._close_intent_attempt(broker_attempt, present, digest)
-            return
+            self.journal("orphan.resolved", local_attempt=local_attempt)
+            return "resolved"
         for attempt_id in pending - claimed:
             self._quarantine_intent(
                 self.intent_dir / f"{attempt_id}.jsonl", "unbound_attempt", alarm="attention"
             )
+        self.journal("orphan.resolved", local_attempt=local_attempt)
+        return "resolved"
 
     def start_turn(self, work: dict[str, Any]) -> None:
         if not self.prepare_task_work(work):
@@ -2666,7 +3031,15 @@ class Supervisor:
 
     def _message_engine_error(self, work: dict[str, Any], error: Exception) -> None:
         message_id = str(work.get("id", "unknown"))
-        count = 1 + sum(
+        preparing = 0
+        for record in self.records:
+            if record.get("msg_id") != message_id:
+                continue
+            if record.get("event") == "message.preparing":
+                preparing += 1
+            elif record.get("event") in {"message.prepared", "message.preparation_failed"} and preparing:
+                preparing -= 1
+        count = 1 + preparing + sum(
             record.get("event") == "message.engine_error" and record.get("msg_id") == message_id
             for record in self.records
         )
@@ -2726,8 +3099,13 @@ class Supervisor:
         self.attempt = None
         self.output_file = None
         self.output_path = None
-        self._record_turn_attempt(work, attempt_id, attempt_meta_name)
-        self._finish_result(rc, output, work, session_arg, attempt_id, refusal_reason)
+        broker_attempt = self._record_turn_attempt(work, attempt_id, attempt_meta_name)
+        try:
+            self._finish_result(rc, output, work, session_arg, attempt_id, refusal_reason)
+        finally:
+            if isinstance(work.get("task"), dict) and self._closed_intent(broker_attempt) is None:
+                present, digest = self._intent_snapshot(broker_attempt)
+                self._close_intent_attempt(broker_attempt, present, digest)
 
     def append_transcript(self, output: str) -> None:
         if not output:
@@ -2780,9 +3158,10 @@ class Supervisor:
                 "run_id": task.get("run_id"),
                 "requester": task.get("owner"),
             }
-            present, digest = self._intent_snapshot(broker_attempt)
             try:
-                intents_handled = self._apply_pending_intent(broker_attempt, context)
+                intents_handled = self._apply_pending_intent(
+                    broker_attempt, context, close_attempt=True
+                )
             except Exception as error:
                 self._intent_retry(
                     self.intent_dir / f"{broker_attempt}.jsonl",
@@ -2790,8 +3169,6 @@ class Supervisor:
                     type(error).__name__,
                 )
                 intents_handled = False
-            finally:
-                self._close_intent_attempt(broker_attempt, present, digest)
             current_task = self.task_show(str(task["task_id"])) or task
             if intents_handled and current_task.get("state") not in {"ASSIGNED", "IN_PROGRESS"}:
                 rc = 0
@@ -2894,7 +3271,7 @@ class Supervisor:
                 task = work["task"]
                 broker_attempt = str(work.get("broker_attempt_id", attempt_id))
                 handled = intents_handled
-                if not handled:
+                if not handled and not self._intent_retry_pending(broker_attempt):
                     current_task = self.task_show(str(task["task_id"])) or task
                     if current_task.get("state") == "IN_PROGRESS":
                         self.handle_missing_report(current_task, broker_attempt)
@@ -3053,6 +3430,7 @@ class Supervisor:
         self.notify("READY=1")
         if unfinished is not None:
             self.handle_orphan(unfinished)
+        self._close_unclosed_attempts()
         self.scan_intents()
         self.sweep_missing_reports()
         self.scan_task_dlq()

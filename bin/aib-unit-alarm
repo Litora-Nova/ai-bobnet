@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import os
 import re
+import stat
 import sys
 import uuid
 from pathlib import Path
@@ -23,16 +24,47 @@ LOGIN_RE = re.compile(r"aib-login(?:-refresh)?@([a-z0-9]+(?:-[a-z0-9]+)*)\.servi
 
 
 def append_alarm(path: Path, recipient: str, body: str) -> int:
+    directory_fd = file_fd = -1
     try:
         if path.parent.is_symlink() or not path.parent.is_dir():
-            return 78
+            raise OSError("unsafe outbox directory")
         stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         alarm_id = f"alarm-{uuid.uuid4().hex}"
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(f"{stamp} | id:{alarm_id} | from:aib-alarm | to:human:{recipient} | state:PERSISTED | {body}\n")
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        file_fd = os.open(
+            path.name,
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o777 != 0o660
+        ):
+            raise OSError("unsafe outbox file")
+        data = (
+            f"{stamp} | id:{alarm_id} | from:aib-alarm | to:human:{recipient} | "
+            f"state:PERSISTED | {body}\n"
+        ).encode("utf-8")
+        written = 0
+        while written < len(data):
+            count = os.write(file_fd, data[written:])
+            if count <= 0:
+                raise OSError("short outbox write")
+            written += count
+        os.fsync(file_fd)
         return 0
-    except OSError:
+    except OSError as error:
+        print(f"aib-unit-alarm: outbox unavailable: {error}", file=sys.stderr)
         return 78
+    finally:
+        for fd in (file_fd, directory_fd):
+            if fd >= 0:
+                os.close(fd)
 
 
 def main(argv: list[str]) -> int:
