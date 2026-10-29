@@ -6,7 +6,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/aib-worktree.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 python3 -I - "$ROOT" "$WORK" <<'PY'
-import json, os, stat, subprocess, sys, time
+import json, os, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 root, work = map(Path, sys.argv[1:])
@@ -178,18 +178,72 @@ finally:
     sup.activation_timeout=real_activation_timeout
 check("the activation deadline stops a later git call after the total budget", (deadline_result, deadline_runner_calls), ("enforced", []))
 
+def process_exists(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+def wait_for_process_exit(pid, timeout=0.5):
+    deadline=time.monotonic()+timeout
+    while process_exists(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return not process_exists(pid)
+
+def reap_test_process(pid):
+    if process_exists(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
 watchdog=[]
+child_pidfile=work/"role-child.pid"
 started=time.monotonic()
 sup.notify=lambda value: watchdog.append(time.monotonic())
 try:
-    sup._run_as_role(repo, repo.stat().st_gid, ["/bin/sh", "-c", "sleep 30 & wait"], timeout=0.5)
+    sup._run_as_role(
+        repo, repo.stat().st_gid,
+        ["/bin/sh", "-c", 'sleep 30 & echo "$!" > "$1"; wait', "sh", str(child_pidfile)],
+        timeout=0.5,
+    )
     slow_result="completed"
 except subprocess.TimeoutExpired:
     slow_result="timed_out"
 finished=time.monotonic()
+child_pid=int(child_pidfile.read_text(encoding="utf-8"))
+child_gone=wait_for_process_exit(child_pid)
+reap_test_process(child_pid)
 ping_gap=max(b-a for a,b in zip([started, *watchdog], [*watchdog, finished]))
-check("a timed-out role process tree is reaped within three seconds", (slow_result, finished-started < 3.0), ("timed_out", True))
-check("role process-tree teardown keeps servicing the watchdog", ping_gap <= 1.5, True)
+check("a timed-out role process tree is reaped within three seconds", (slow_result, finished-started < 3.0, child_gone), ("timed_out", True, True))
+check("role process-tree teardown keeps servicing the watchdog", (len(watchdog) >= 1, ping_gap <= 1.5), (True, True))
+
+watchdog=[]
+escaped_pidfile=work/"escaped-role-child.pid"
+started=time.monotonic()
+try:
+    sup._run_as_role(
+        repo, repo.stat().st_gid,
+        [
+            "/bin/sh", "-c",
+            'setsid /bin/sh -c \'echo $$ > "$1"; exec sleep 30\' sh "$1" & wait',
+            "sh", str(escaped_pidfile),
+        ],
+        timeout=0.5,
+    )
+    escaped_result="completed"
+except subprocess.TimeoutExpired:
+    escaped_result="timed_out"
+finished=time.monotonic()
+escaped_pid=int(escaped_pidfile.read_text(encoding="utf-8"))
+reap_test_process(escaped_pid)
+escaped_ping_gap=max(b-a for a,b in zip([started, *watchdog], [*watchdog, finished]))
+check(
+    "role process-tree drain stays bounded when a descendant escapes the group",
+    (escaped_result, finished-started < 3.0, len(watchdog) >= 1, escaped_ping_gap <= 1.5),
+    ("timed_out", True, True, True),
+)
 
 source=(root/"lib"/"aib_supervisor.py").read_text(encoding="utf-8")
 tree=__import__("ast").parse(source)

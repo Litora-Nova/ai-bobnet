@@ -6,7 +6,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/aib-supervisor-gate.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 python3 -I - "$ROOT" "$WORK" <<'PY'
-import hashlib, json, os, stat, subprocess, sys
+import hashlib, json, os, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 root, work = map(Path, sys.argv[1:])
@@ -416,9 +416,19 @@ sup.apply_intent_file(retry_path, {"attempt_id":retry_attempt, "task_id":task["t
 check("the fifth transient failure across restart becomes apply_exhausted", any(r.get("event") == "intents.tainted" and r.get("attempt_id") == retry_attempt and r.get("reason") == "apply_exhausted" for r in sup.records), True)
 check("apply exhaustion raises one engine alarm", sum(r.get("event") == "alarm.sent" and r.get("kind") == "intent_apply_exhausted" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
 retry_path.write_bytes(retry_bytes); retry_path.chmod(0o600)
+sup.records.append({
+    "event":"turn.attempt", "attempt_id":retry_attempt,
+    "task_id":task["task_id"], "run_id":task["run_id"], "requester":"human:operator",
+})
+replay_task_events = []
+sup.task_event = lambda *args, **kwargs: replay_task_events.append((args, kwargs)) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 sup.scan_intents()
 check("identical re-planted tainted bytes are discarded without a second alarm", sum(r.get("event") == "alarm.sent" and r.get("kind") == "intent_apply_exhausted" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
 check("re-planted tainted bytes are journalled once as replay", sum(r.get("event") == "intents.tainted_replay" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
+check("a tainted attempt is rejected before any task event can be applied", (
+    replay_task_events,
+    sum(r.get("event") == "intents.applied" and r.get("attempt_id") == retry_attempt for r in sup.records),
+), ([], 0))
 
 os.close(sup.lock_fd); os.close(sup.state_dir_fd)
 hard_state = work / "hardening-state"; hard_state.mkdir(mode=0o700)
@@ -741,6 +751,148 @@ hard._attempt_bindings = lambda: [
 ]
 hard._adopt_orphan_attempt(unfinished, "local-foreign-session-binding")
 check("running and foreign-session orphan bindings remain unbound", sorted(negative_quarantine), [("acme-other-session", "unbound_attempt", "attention"), ("acme-running", "unbound_attempt", "attention")])
+
+restart_state = work / "restart-state"; restart_state.mkdir(mode=0o700)
+os.environ["STATE_DIRECTORY"] = str(restart_state)
+restart_aib = restart_state / ".aib"; restart_intents = restart_aib / "intents"
+restart_aib.mkdir(mode=0o700); restart_intents.mkdir(mode=0o700); (restart_state / ".aib-quarantine").mkdir(mode=0o700)
+restart_task = {
+    "task_id":"t-333333333333", "run_id":"r-333333333333", "team_uid":"acme-engine",
+    "assignee":"acme-core", "state":"IN_PROGRESS", "owner":"human:operator",
+    "budget":{"max_turns":8}, "assignments":1,
+}
+deferred_task = {**restart_task, "task_id":"t-444444444444", "run_id":"r-444444444444"}
+restart_attempt = "acme-restart-retry"
+restart_path = restart_intents / f"{restart_attempt}.jsonl"
+restart_path.write_text(json.dumps({
+    "attempt_id":restart_attempt, "verb":"report", "task_id":restart_task["task_id"],
+    "state":"done", "summary":"invalid reference", "result_ref":"file:missing",
+}) + "\n", encoding="utf-8"); restart_path.chmod(0o600)
+restart_seed = Supervisor(root, "acme-core")
+restart_seed.journal(
+    "turn.attempt", attempt_id=restart_attempt, task_id=restart_task["task_id"],
+    run_id=restart_task["run_id"], requester="human:operator",
+)
+restart_seed.journal("intent.retry", attempt_id=restart_attempt, n=1, reason="stream_lock")
+restart_seed.journal(
+    "orphan.deferred", local_attempt="local-open-deferral", pending=["acme-orphan"],
+    pending_count=1, pending_sha256=hashlib.sha256(b"acme-orphan").hexdigest(),
+    n=1, retry_at="2999-01-01T00:00:00Z", task_id=deferred_task["task_id"],
+    run_id=deferred_task["run_id"], requester="human:operator",
+)
+os.close(restart_seed.lock_fd); os.close(restart_seed.state_dir_fd)
+
+restarted = Supervisor(root, "acme-core")
+restarted.project_uid = "acme"; restarted.team_uid = "acme-engine"; restarted.uid = "acme-core"
+restart_tasks = {task["task_id"]: task for task in (restart_task, deferred_task)}
+restarted.task_show = lambda task_id: dict(restart_tasks[task_id])
+restarted.task_command = lambda *args: subprocess.CompletedProcess(
+    args, 0, stdout=json.dumps({"tasks":list(restart_tasks.values())}), stderr="",
+)
+restarted.open_messages = lambda: []
+restart_nudges = []; restart_blocks = []
+restarted._persist_self_task_message = lambda task_value, ident, summary: restart_nudges.append((task_value["task_id"], ident)) or True
+restarted._service_block = lambda *args, **kwargs: restart_blocks.append((args, kwargs)) or True
+restarted.validate_result_ref = lambda value, task_value: False
+restarted.task_event = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+restarted.sweep_missing_reports()
+restarted.scan_intents()
+check("a restart counts one missing report after a pending retry resolves", (
+    [(r.get("task_id"), r.get("count")) for r in restarted.records if r.get("event") == "task.no_report"],
+    restart_nudges, len(restart_blocks),
+), ([(restart_task["task_id"], 1)], [(restart_task["task_id"], f"{restart_task['task_id']}.n.a1")], 0))
+os.close(restarted.lock_fd); os.close(restarted.state_dir_fd)
+
+deferred_state = work / "deferred-names-state"; deferred_state.mkdir(mode=0o700)
+os.environ["STATE_DIRECTORY"] = str(deferred_state)
+deferred_sup = Supervisor(root, "acme-core")
+deferred_names = [f"acme-deferred-{n:04d}" for n in range(600)]
+claimed_retry = "acme-claimed-retry"
+_summary, deferred_count, deferred_digest = deferred_sup._pending_intent_summary(set(deferred_names))
+deferred_sup.records.extend([
+    {
+        "event":"orphan.deferred", "local_attempt":"local-truncated", "pending":deferred_names[:100],
+        "pending_count":deferred_count, "pending_sha256":deferred_digest,
+    },
+    {"event":"turn.attempt", "attempt_id":claimed_retry, "task_id":restart_task["task_id"]},
+    {"event":"intent.retry", "attempt_id":claimed_retry, "n":1, "reason":"stream_lock"},
+])
+deferred_sup._pending_orphan_intents = lambda: [*deferred_names, claimed_retry]
+names_skipped = deferred_sup._deferred_intent_names()
+check("a truncated deferral skips its full set but not a claimed retry", (
+    deferred_names[100] in names_skipped, claimed_retry in names_skipped, len(names_skipped),
+), (True, False, len(deferred_names)))
+os.close(deferred_sup.lock_fd); os.close(deferred_sup.state_dir_fd)
+
+turn_state = work / "turn-retry-state"; turn_state.mkdir(mode=0o700)
+os.environ["STATE_DIRECTORY"] = str(turn_state)
+turn_aib = turn_state / ".aib"; turn_intents = turn_aib / "intents"
+turn_aib.mkdir(mode=0o700); turn_intents.mkdir(mode=0o700); (turn_state / ".aib-quarantine").mkdir(mode=0o700)
+turn_sup = Supervisor(root, "acme-core")
+turn_sup.project_uid = "acme"; turn_sup.team_uid = "acme-engine"; turn_sup.uid = "acme-core"
+turn_sup.transcript = work / "turn-retry-transcript.log"
+turn_sup.heartbeat = lambda *args: None
+turn_sup.message_command = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+turn_task = {**restart_task, "task_id":"t-555555555555", "run_id":"r-555555555555"}
+turn_attempt = "acme-turn-retry"
+turn_sup.journal(
+    "turn.attempt", attempt_id=turn_attempt, task_id=turn_task["task_id"],
+    run_id=turn_task["run_id"], requester="human:operator",
+)
+turn_path = turn_intents / f"{turn_attempt}.jsonl"
+turn_path.write_text(json.dumps({
+    "attempt_id":turn_attempt, "verb":"report", "task_id":turn_task["task_id"],
+    "state":"done", "summary":"invalid reference", "result_ref":"file:missing",
+}) + "\n", encoding="utf-8"); turn_path.chmod(0o600)
+turn_sup.task_show = lambda task_id: dict(turn_task)
+turn_sup.validate_result_ref = lambda value, task_value: False
+turn_sup.task_event = lambda *args, **kwargs: subprocess.CompletedProcess(args, 75, stdout="", stderr="")
+turn_nudges = []; turn_blocks = []
+turn_sup._persist_self_task_message = lambda task_value, ident, summary: turn_nudges.append(ident) or True
+turn_sup._service_block = lambda *args, **kwargs: turn_blocks.append((args, kwargs)) or True
+turn_sup._finish_result(
+    0, "provider output",
+    {"id":"task-turn-retry", "task":turn_task, "broker_attempt_id":turn_attempt, "synthetic":True},
+    "new:session", "local-turn-retry",
+)
+turn_end_strikes = sum(r.get("event") == "task.no_report" for r in turn_sup.records)
+turn_sup.task_event = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+turn_sup.scan_intents()
+check("turn end waits for a pending intent retry before counting a missing report", (
+    turn_end_strikes,
+    sum(r.get("event") == "task.no_report" and r.get("task_id") == turn_task["task_id"] for r in turn_sup.records),
+    turn_nudges, len(turn_blocks),
+), (0, 1, [f"{turn_task['task_id']}.n.a1"], 0))
+os.close(turn_sup.lock_fd); os.close(turn_sup.state_dir_fd)
+
+fifo_state = work / "fifo-outbox-state"; fifo_state.mkdir(mode=0o700)
+os.environ["STATE_DIRECTORY"] = str(fifo_state)
+fifo_sup = Supervisor(root, "acme-core")
+fifo_sup.project_uid = "acme"; fifo_sup.team_uid = "acme-engine"; fifo_sup.uid = "acme-core"
+fifo_sup.outbox_root = work / "fifo-outbox"; fifo_sup.outbox_root.mkdir(mode=0o755)
+fifo_team = fifo_sup.outbox_root / fifo_sup.team_uid; fifo_team.mkdir(mode=0o770)
+fifo_path = fifo_team / "outbox.md"; os.mkfifo(fifo_path, mode=0o660); fifo_path.chmod(0o660)
+old_alarm_handler = signal.getsignal(signal.SIGALRM)
+def outbox_timeout(_signum, _frame):
+    raise TimeoutError
+signal.signal(signal.SIGALRM, outbox_timeout)
+signal.alarm(2)
+fifo_started = time.monotonic()
+try:
+    fifo_sup.write_alarm("fifo_outbox")
+    fifo_result = "bounded"
+except TimeoutError:
+    fifo_result = "timed_out"
+finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, old_alarm_handler)
+fifo_elapsed = time.monotonic() - fifo_started
+check("a FIFO at the supervisor outbox path cannot block alarm delivery", (
+    fifo_result, fifo_elapsed < 0.5,
+    sum(r.get("event") == "attention" and r.get("reason") == "alarm_failed" and r.get("kind") == "fifo_outbox" for r in fifo_sup.records),
+), ("bounded", True, 1))
+fifo_path.unlink()
+os.close(fifo_sup.lock_fd); os.close(fifo_sup.state_dir_fd)
 
 print(f"\n{passed} passed, {failed} failed")
 raise SystemExit(failed != 0)
