@@ -104,11 +104,31 @@ env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
   AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-outbox-init" >/dev/null 2>&1
 eq "aib-outbox-init seam mode reads the env-selected registry" \
   "$([ -d "$WORK/outbox/acme-engine" ] && echo yes)" "yes"
+eq "aib-outbox-init pre-creates the durable team outbox at mode 0660" \
+  "$(stat -c '%a' "$WORK/outbox/acme-engine/outbox.md" 2>/dev/null || true)" "660"
+
+rm -f "$WORK/outbox/acme-engine/outbox.md"
+set +e
+missing_alarm=$(env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
+  AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-unit-alarm" aib-agent@acme-core.service 2>&1)
+missing_rc=$?
+set -e
+eq "aib-unit-alarm refuses to create a missing outbox file" \
+  "$missing_rc|$([ -e "$WORK/outbox/acme-engine/outbox.md" ] && echo created || echo absent)" "78|absent"
+has "aib-unit-alarm leaves a journal-visible diagnostic when the file is missing" "$missing_alarm" "outbox unavailable"
+
+env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
+  AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-outbox-init" >/dev/null 2>&1
 
 env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
   AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-unit-alarm" aib-agent@acme-core.service >/dev/null 2>&1
 eq "aib-unit-alarm seam mode reads the env-selected registry" \
   "$(grep -c 'to:human:acme-engine' "$WORK/outbox/acme-engine/outbox.md" 2>/dev/null || true)" "1"
+
+git_tmpfiles="$SRC_ROOT/deploy/tmpfiles.d/aib-git.conf"
+eq "the volatile git-helper directory has a shipped tmpfiles rule" \
+  "$([ -f "$git_tmpfiles" ] && awk '$1=="d" && $2=="/run/aib/git" {print $1,$2,$3,$4,$5,$6}' "$git_tmpfiles")" \
+  "d /run/aib/git 0755 root root -"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

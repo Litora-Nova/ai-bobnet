@@ -109,10 +109,10 @@ task_state(){ task_json "$1" | python3 -c 'import json,sys; print(json.load(sys.
 task_is(){ [ "$(task_state "$1")" = "$2" ]; }
 send_task(){ m_human "$1" "[task $2 run $3 requester human:operator] $4"; }
 start_worker_sup(){ start_sup acme-core AIB_TEST_SEAMS=1 AIB_TASK_ROOT="$TASK_ROOT" AIB_IDENTITY_CMD="$W/fakes/task-identity" AIB_OUTBOX_ROOT="$W/outbox" AIB_TEST_PAUSE_AFTER_LEDGER="${1:-}"; }
-event_count(){ python3 -I - "$TASK_ROOT/acme/tasks.events" "$1" <<'PY'
+event_count(){ python3 -I - "$TASK_ROOT/acme/tasks.events" "$1" "$ENGINE4/lib" <<'PY'
 import json,sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()/"lib"))
+sys.path.insert(0, sys.argv[3])
 from attempts_fold import scan
 _, rows=scan(Path(sys.argv[1])); print(sum(json.loads(raw).get("event_type")==sys.argv[2] for _,raw in rows))
 PY
@@ -168,10 +168,10 @@ print(f"{stat.S_IMODE(p.stat().st_mode):o}|{any(t.get('id') == sys.argv[2] for t
 PY
 )
 eq 'the supervisor board is private and contains the assigned task' "$board_shape" '600|True'
-event_authority=$(python3 -I - "$TASK_ROOT/acme/tasks.events" "$TASK" <<'PY'
+event_authority=$(python3 -I - "$TASK_ROOT/acme/tasks.events" "$TASK" "$ENGINE4/lib" <<'PY'
 import json,sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()/"lib"))
+sys.path.insert(0, sys.argv[3])
 from attempts_fold import scan
 _, rows=scan(Path(sys.argv[1]))
 for _, raw in rows:
@@ -292,14 +292,15 @@ printf 'badref\nholdnone\n' > "$W/actions"; send_task task-rejectrestart "$TASK"
 start_worker_sup; wait_for 12 grep -q "id:$TASK.n.a1" "$INBOX"; wait_for 12 test -e "$W/hold.ready"; crash_sup; kill -9 "$(cat "$W/hold.pid")" 2>/dev/null || true
 start_worker_sup; wait_for 15 task_is "$TASK" BLOCKED; reject_state=$(task_state "$TASK"); reject_reason=$(task_json "$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_reason"])'); stop_sup
 eq 'a reject-only turn nudges once then blocks no_report across restart' "$reject_state|$reject_reason|$(grep "id:$TASK.n.a1" "$INBOX" | grep -c 'state:PERSISTED')" 'BLOCKED|no_report|1'
+has 'the rejection nudge names the invalid result reference' "$(grep "id:$TASK.n.a1" "$INBOX")" 'invalid_result_ref'
 
 # Persistent worktree setup failure is bounded and cannot starve the next message.
 task_world worktreefail; new_run worktreefail r-505050505050; new_task worktreefail r-505050505050
 printf 'none\n' > "$W/actions"; send_task task-worktreefail "$TASK" r-505050505050 build; m_send after-worktree 'ordinary follow-up'
 start_sup acme-core AIB_TEST_SEAMS=1 AIB_TASK_ROOT="$TASK_ROOT" AIB_IDENTITY_CMD="$W/fakes/task-identity" AIB_OUTBOX_ROOT="$W/outbox" AIB_CONFINE_BIN=/nonexistent
 wait_for 15 state_is task-worktreefail FAILED; wait_for 15 state_is after-worktree PROCESSED
-engine_errors=$(jcount message.engine_error); calls=$(cat "$W/calls.n" 2>/dev/null || echo 0); stop_sup
-eq 'persistent worktree failure stops after three engine attempts and releases the inbox' "$(m_state task-worktreefail)|$(m_state after-worktree)|$engine_errors|$calls" 'FAILED|PROCESSED|3|1'
+engine_errors=$(jcount message.engine_error); preparing=$(jcount message.preparing); calls=$(cat "$W/calls.n" 2>/dev/null || echo 0); stop_sup
+eq 'persistent worktree failure stops after three prepared engine attempts and releases the inbox' "$(m_state task-worktreefail)|$(m_state after-worktree)|$engine_errors|$preparing|$calls" 'FAILED|PROCESSED|3|3|1'
 
 # A terminal attempt is closed even when it produced no file. A later file carrying
 # that old id is stale provenance and must never reach the task stream.

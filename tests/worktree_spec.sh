@@ -125,6 +125,32 @@ sup._git_as_role(wt, "switch", "--detach", "HEAD")
 sup._git_as_role(wt, "switch", "aib/acme-engine/t-222222222222")
 check("repo fsmonitor and post-checkout code never executes in the supervisor git process", marker.exists(), False)
 
+lock_path=Path(subprocess.check_output(["git", "-C", str(wt), "rev-parse", "--git-path", "index.lock"], text=True).strip())
+lock_path.write_text("stale\n", encoding="utf-8")
+os.utime(lock_path, (lock_path.stat().st_atime, lock_path.stat().st_mtime - 120))
+t3={"task_id":"t-333333333333", "team_uid":"acme-engine"}
+try:
+    stale_result=(sup.activate_task_worktree(t3), lock_path.exists())
+except (OSError, subprocess.CalledProcessError):
+    stale_result=("activation_failed", lock_path.exists())
+check("a stale role-owned index lock is removed within the activation budget", stale_result, (expected, False))
+
+captured_timeout=[]
+real_run_as_role=sup._run_as_role
+sup._run_as_role=lambda *args, **kwargs: captured_timeout.append(kwargs.get("timeout")) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+sup._git_as_role(repo, "status", "--porcelain")
+sup._run_as_role=real_run_as_role
+check("the git gateway passes its independent timeout to the role runner", captured_timeout, [45.0])
+
+watchdog=[]
+sup.notify=lambda value: watchdog.append(value)
+try:
+    sup._run_as_role(repo, repo.stat().st_gid, ["/bin/sh", "-c", "sleep 0.2"], timeout=0.05)
+    slow_result="completed"
+except subprocess.TimeoutExpired:
+    slow_result="timed_out"
+check("a slow role command times out while the supervisor services the watchdog", (slow_result, "WATCHDOG=1" in watchdog), ("timed_out", True))
+
 source=(root/"lib"/"aib_supervisor.py").read_text(encoding="utf-8")
 tree=__import__("ast").parse(source)
 git_argv=[]
@@ -135,7 +161,16 @@ for node in __import__("ast").walk(tree):
                 owner=next((parent for parent in __import__("ast").walk(tree) if isinstance(parent, (__import__("ast").FunctionDef, __import__("ast").AsyncFunctionDef)) and node in list(__import__("ast").walk(parent))), None)
                 git_argv.append(owner.name if owner else "<module>")
 check("every constant git argv, including an absolute path, is confined to _git_as_role", set(git_argv), {"_git_as_role"})
-check("git operations have an independent 120 second timeout budget", getattr(sup, "git_timeout", None), 120.0)
+preparing_index=source.find('"message.preparing"')
+activation_index=source.find("worktree = self.activate_task_worktree(task)")
+check("task preparation is journalled before worktree activation", preparing_index >= 0 and preparing_index < activation_index, True)
+check("git operations have an independent 45 second timeout budget", getattr(sup, "git_timeout", None), 45.0)
+check("a complete worktree activation is capped at 60 seconds", getattr(sup, "activation_timeout", None), 60.0)
+unit=(root/"deploy/systemd/aib-agent@.service").read_text(encoding="utf-8")
+watchdog_seconds=float(next(line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("WatchdogSec=")))
+activation_timeout=getattr(sup, "activation_timeout", watchdog_seconds)
+git_poll_interval=getattr(sup, "git_poll_interval", watchdog_seconds)
+check("the activation cap and watchdog poll margin stay below WatchdogSec", activation_timeout + git_poll_interval < watchdog_seconds, True)
 check(
     "root project-home metadata access uses a verified directory-fd chain",
     "def _open_project_home" in source
