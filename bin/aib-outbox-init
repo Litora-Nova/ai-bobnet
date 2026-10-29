@@ -44,7 +44,7 @@ def ensure_file(path: Path) -> bool:
         directory = os.fstat(directory_fd)
         file_fd = os.open(
             path.name,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o660,
             dir_fd=directory_fd,
         )

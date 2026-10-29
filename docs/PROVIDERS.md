@@ -129,11 +129,11 @@ Provisioning must also run `bin/aib-agent-dirs` before any one-shot or supervise
 shared-state group as a shortcut: the root supervisor publishes `.aib/board.json`, and the confined child
 has no direct ledger or peer-state access. Project homes should live under `/srv/aib/projects`, not
 `/home`, because the shipped unit uses `ProtectHome=yes`. Provisioning creates each project home as
-`root:<project-group>` mode 02770, installs the tmpfiles rule for `/run/aib/git` as `root:root` mode
-0755, and installs the confinement helper at the `AIB_CONFINE_BIN` path configured by the agent unit. Team outbox directories
+`root:<project-group>` mode 02770, installs the shipped `deploy/tmpfiles.d/aib-git.conf` rule, which
+recreates `/run/aib/git` as `root:root` mode 0755 at boot, and installs the confinement helper at the
+`AIB_CONFINE_BIN` path configured by the agent unit. Team outbox directories
 under `/srv/aib/outbox` must have permission bits 0770 (setgid is allowed), and `bin/aib-outbox-init`
-pre-creates each `outbox.md` as `root:<outbox-group>` mode 0660. The shipped `aib-git.conf` tmpfiles rule
-recreates `/run/aib/git` after boot. `bin/aib-agent-dirs` removes
+pre-creates each `outbox.md` as `root:<outbox-group>` mode 0660. `bin/aib-agent-dirs` removes
 empty legacy `.aib/intents/done` and `.aib/intents/tainted` directories and refuses non-empty ones for
 operator review. Each setgid project home also receives the default ACL, `.aib/wt`, and
 `core.sharedRepository=group`; the supervisor never creates or changes those objects as root. Add every

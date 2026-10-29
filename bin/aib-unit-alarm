@@ -36,7 +36,7 @@ def append_alarm(path: Path, recipient: str, body: str) -> int:
         )
         file_fd = os.open(
             path.name,
-            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=directory_fd,
         )
         info = os.fstat(file_fd)

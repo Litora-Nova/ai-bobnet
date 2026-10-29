@@ -31,6 +31,8 @@ from task_ledger import LedgerError, TASK_RE, TOKEN_RE, read_body_sidecar, safe_
 
 MAX_LIVE_STATE_BYTES = 64 * 1024
 MAX_TURN_OUTPUT_BYTES = 8 * 1024 * 1024
+INTENT_SCAN_LIMIT = 500
+DEFERRED_PENDING_LIMIT = 100
 TASK_MESSAGE_RE = re.compile(
     r"^\[task (t-[0-9a-f]{12}) run (r-[0-9a-f]{12}) requester "
     r"((?:human|gateway):[a-z0-9][a-z0-9_-]*|[a-z0-9]+(?:-[a-z0-9]+)+)\]"
@@ -719,6 +721,7 @@ class Supervisor:
                 file_created = True
             if file_created:
                 os.fchmod(file_fd, 0o660)
+                os.fchown(file_fd, -1, team_info.st_gid)
             info = os.fstat(file_fd)
             if (
                 not stat.S_ISREG(info.st_mode)
@@ -1266,6 +1269,17 @@ class Supervisor:
                 if fd >= 0:
                     os.close(fd)
 
+    def _unmatched_preparations(self, message_id: str) -> int:
+        preparing = 0
+        for record in self.records:
+            if record.get("msg_id") != message_id:
+                continue
+            if record.get("event") == "message.preparing":
+                preparing += 1
+            elif record.get("event") in {"message.prepared", "message.preparation_failed"} and preparing:
+                preparing -= 1
+        return preparing
+
     def prepare_task_work(self, work: dict[str, Any]) -> bool:
         if work.get("synthetic") or isinstance(work.get("task"), dict):
             return True
@@ -1324,6 +1338,9 @@ class Supervisor:
             self.work = None
             return False
         work["body"] = f"[task {task['task_id']} run {task['run_id']} requester {task['owner']}]\n{sidecar}"
+        if self._unmatched_preparations(str(work.get("id", ""))) >= 2:
+            self._message_engine_error(work, OSError("worktree_unavailable"))
+            return False
         self.journal(
             "message.preparing", msg_id=work.get("id"), task_id=task.get("task_id")
         )
@@ -1432,19 +1449,33 @@ class Supervisor:
             "name_length": len(name),
         }
 
-    def _taint_seen(self, identity: dict[str, Any]) -> bool:
-        return any(
-            record.get("event") == "intents.tainted"
-            and all(record.get(key) == value for key, value in identity.items())
+    @staticmethod
+    def _taint_key(identity: dict[str, Any]) -> tuple[Any, ...]:
+        if isinstance(identity.get("attempt_id"), str):
+            return ("attempt_id", identity["attempt_id"])
+        return ("name", identity.get("name_sha256"), identity.get("name_length"))
+
+    def _tainted_intent_index(self) -> set[tuple[Any, ...]]:
+        return {
+            self._taint_key(record)
             for record in self.records
-        )
+            if record.get("event") == "intents.tainted"
+        }
+
+    def _taint_seen(
+        self, identity: dict[str, Any], tainted: set[tuple[Any, ...]] | None = None
+    ) -> bool:
+        index = self._tainted_intent_index() if tainted is None else tainted
+        return self._taint_key(identity) in index
 
     def _quarantine_intent(
-        self, path: Path, reason: str, alarm: str = "security", *, evidence: bytes | None = None
+        self, path: Path, reason: str, alarm: str = "security", *,
+        evidence: bytes | None = None,
+        tainted: set[tuple[Any, ...]] | None = None,
     ) -> None:
         invalid_name = reason == "invalid_name" or not path.name.endswith(".jsonl") or TOKEN_RE.fullmatch(path.name[:-6]) is None
         identity = self._intent_identity(path.name, invalid_name=invalid_name)
-        if self._taint_seen(identity):
+        if self._taint_seen(identity, tainted):
             self._unlink_intent(path.name)
             if not any(
                 record.get("event") == "intents.tainted_replay"
@@ -1516,6 +1547,8 @@ class Supervisor:
                 if fd >= 0:
                     os.close(fd)
         self.journal("intents.tainted", reason=reason, **identity)
+        if tainted is not None:
+            tainted.add(self._taint_key(identity))
         if not stored:
             self.journal(
                 "attention", reason="quarantine_capacity", size=len(data),
@@ -1528,14 +1561,17 @@ class Supervisor:
         else:
             self.journal("attention", reason=reason, **identity)
 
-    def _intent_retry(self, path: Path, attempt_id: str, reason: str) -> bool:
+    def _intent_retry(
+        self, path: Path, attempt_id: str, reason: str, *,
+        tainted: set[tuple[Any, ...]] | None = None,
+    ) -> bool:
         count = 1 + sum(
             record.get("event") == "intent.retry" and record.get("attempt_id") == attempt_id
             for record in self.records
         )
         self.journal("intent.retry", attempt_id=attempt_id, n=count, reason=reason)
         if count >= 5:
-            self._quarantine_intent(path, "apply_exhausted", alarm="engine")
+            self._quarantine_intent(path, "apply_exhausted", alarm="engine", tainted=tainted)
             return False
         return False
 
@@ -1681,7 +1717,8 @@ class Supervisor:
         return self._parse_intents(data, attempt_id)
 
     def _apply_pending_intent(
-        self, attempt_id: str, context: dict[str, Any], *, close_attempt: bool = False
+        self, attempt_id: str, context: dict[str, Any], *, close_attempt: bool = False,
+        tainted: set[tuple[Any, ...]] | None = None,
     ) -> bool:
         """Discover and apply one intent file through the verified intents dirfd."""
         if TOKEN_RE.fullmatch(attempt_id) is None:
@@ -1701,7 +1738,7 @@ class Supervisor:
                 if fd >= 0:
                     os.close(fd)
         return self.apply_intent_file(
-            self.intent_dir / name, context, close_attempt=close_attempt
+            self.intent_dir / name, context, close_attempt=close_attempt, tainted=tainted
         )
 
     def _persist_self_task_message(self, task: dict[str, Any], ident: str, summary: str) -> bool:
@@ -1913,7 +1950,8 @@ class Supervisor:
         return True
 
     def apply_intent_file(
-        self, path: Path, context: dict[str, Any], *, close_attempt: bool = False
+        self, path: Path, context: dict[str, Any], *, close_attempt: bool = False,
+        tainted: set[tuple[Any, ...]] | None = None,
     ) -> bool:
         attempt_id = str(context["attempt_id"])
         try:
@@ -1925,19 +1963,19 @@ class Supervisor:
         except IntentReadError as error:
             if close_attempt:
                 self._close_intent_attempt(attempt_id, True, "")
-            self._quarantine_intent(path, "invalid_intent", evidence=error.evidence)
+            self._quarantine_intent(path, "invalid_intent", evidence=error.evidence, tainted=tainted)
             return False
         except (OSError, UnicodeError):
             if close_attempt:
                 self._close_intent_attempt(attempt_id, True, "")
-            self._quarantine_intent(path, "invalid_intent", evidence=b"")
+            self._quarantine_intent(path, "invalid_intent", evidence=b"", tainted=tainted)
             return False
         if close_attempt:
             self._close_intent_attempt(attempt_id, True, digest)
         closed = self._closed_intent(attempt_id)
         identity = self._intent_identity(path.name)
-        if self._taint_seen(identity):
-            self._quarantine_intent(path, "tainted_replay", evidence=data)
+        if self._taint_seen(identity, tainted):
+            self._quarantine_intent(path, "tainted_replay", evidence=data, tainted=tainted)
             return False
         if closed is not None and (
             closed.get("present") is not True
@@ -1945,7 +1983,7 @@ class Supervisor:
             or not closed.get("sha256")
             or closed.get("sha256") != digest
         ):
-            self._quarantine_intent(path, "stale_attempt", evidence=data)
+            self._quarantine_intent(path, "stale_attempt", evidence=data, tainted=tainted)
             return False
         if self._intent_applied(attempt_id):
             self._unlink_intent(path.name)
@@ -1953,19 +1991,19 @@ class Supervisor:
         try:
             intents = self._parse_intents(data, attempt_id)
         except (UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
-            self._quarantine_intent(path, "invalid_intent", evidence=data)
+            self._quarantine_intent(path, "invalid_intent", evidence=data, tainted=tainted)
             return False
         task_id = context.get("task_id")
         task = self.task_show(str(task_id)) if isinstance(task_id, str) else None
         if task is None:
-            return self._intent_retry(path, attempt_id, "task_lookup")
+            return self._intent_retry(path, attempt_id, "task_lookup", tainted=tainted)
         if task.get("run_id") != context.get("run_id"):
-            self._quarantine_intent(path, "context_mismatch", evidence=data)
+            self._quarantine_intent(path, "context_mismatch", evidence=data, tainted=tainted)
             return False
         try:
             validate_intent_records(intents, attempt_id, str(task["task_id"]))
         except (UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
-            self._quarantine_intent(path, "invalid_intent", evidence=data)
+            self._quarantine_intent(path, "invalid_intent", evidence=data, tainted=tainted)
             return False
         handled = False
         rejections: list[str] = []
@@ -1974,7 +2012,7 @@ class Supervisor:
         for index, intent in enumerate(intents, 1):
             verb = intent.get("verb")
             if verb != "delegate" and intent.get("task_id") != task["task_id"]:
-                self._quarantine_intent(path, "task_mismatch", evidence=data)
+                self._quarantine_intent(path, "task_mismatch", evidence=data, tainted=tainted)
                 return False
             prior = self._intent_ledger_record(attempt_id, index)
             state = str(intent.get("state", ""))
@@ -1988,7 +2026,7 @@ class Supervisor:
                     continue
                 allowed = {"attempt_id", "verb", "run_id", "to", "title", "body", "source_msg_id"}
                 if set(intent) != allowed or intent.get("run_id") != task["run_id"]:
-                    self._quarantine_intent(path, "invalid_delegate", evidence=data)
+                    self._quarantine_intent(path, "invalid_delegate", evidence=data, tainted=tainted)
                     return False
                 result = self.task_event(
                     "reject", task, f"reject-{attempt_id}-{index}",
@@ -1996,9 +2034,9 @@ class Supervisor:
                     requested_type="task.created", reason="not_lead",
                 )
                 if result.returncode == 75:
-                    return self._intent_retry(path, attempt_id, "stream_lock")
+                    return self._intent_retry(path, attempt_id, "stream_lock", tainted=tainted)
                 if result.returncode not in {0, 77}:
-                    return self._intent_retry(path, attempt_id, f"delegate_reject_rc_{result.returncode}")
+                    return self._intent_retry(path, attempt_id, f"delegate_reject_rc_{result.returncode}", tainted=tainted)
                 if os.environ.get("AIB_TEST_PAUSE_AFTER_LEDGER") and os.environ.get("AIB_TEST_SEAMS") == "1" and not (self.root / ".aib-installed").exists():
                     marker = Path(os.environ["AIB_TEST_PAUSE_AFTER_LEDGER"])
                     marker.touch()
@@ -2014,15 +2052,15 @@ class Supervisor:
             if verb == "report":
                 allowed |= {"state", "result_ref", "reason"}
             if set(intent) - allowed or not isinstance(summary, str) or len(summary.encode()) > 2048:
-                self._quarantine_intent(path, "invalid_schema", evidence=data)
+                self._quarantine_intent(path, "invalid_schema", evidence=data, tainted=tainted)
                 return False
             if prior is None:
                 if verb not in {"report", "continue"}:
-                    self._quarantine_intent(path, "invalid_verb", evidence=data)
+                    self._quarantine_intent(path, "invalid_verb", evidence=data, tainted=tainted)
                     return False
                 report_state = "progress" if verb == "continue" else state
                 if report_state not in {"progress", "done", "failed", "blocked"}:
-                    self._quarantine_intent(path, "invalid_state", evidence=data)
+                    self._quarantine_intent(path, "invalid_state", evidence=data, tainted=tainted)
                     return False
                 if not self.validate_result_ref(result_ref, {**task, "worktree": str(self._worktree_path())}):
                     result = self.task_event(
@@ -2031,9 +2069,9 @@ class Supervisor:
                         requested_type="task.reported", reason="invalid_result_ref",
                     )
                     if result.returncode == 75:
-                        return self._intent_retry(path, attempt_id, "stream_lock")
+                        return self._intent_retry(path, attempt_id, "stream_lock", tainted=tainted)
                     if result.returncode not in {0, 77}:
-                        return self._intent_retry(path, attempt_id, f"reject_ref_rc_{result.returncode}")
+                        return self._intent_retry(path, attempt_id, f"reject_ref_rc_{result.returncode}", tainted=tainted)
                     self.journal("intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"], action="rejected", reason="invalid_result_ref")
                     rejections.append("invalid_result_ref")
                     continue
@@ -2043,13 +2081,13 @@ class Supervisor:
                     state=report_state, result_ref=result_ref, reason=reason,
                 )
                 if result.returncode == 75:
-                    return self._intent_retry(path, attempt_id, "stream_lock")
+                    return self._intent_retry(path, attempt_id, "stream_lock", tainted=tainted)
                 if result.returncode != 0:
                     current = self.task_show(task["task_id"])
                     budget = task.get("budget", {}).get("max_turns", 8)
                     if verb == "continue" and current is not None and current.get("turns", 0) >= budget:
                         if not self._service_block(task, attempt_id, "turn_budget"):
-                            return self._intent_retry(path, attempt_id, "service_block")
+                            return self._intent_retry(path, attempt_id, "service_block", tainted=tainted)
                         self.journal("intent.ledger", attempt_id=attempt_id, index=index, task_id=task["task_id"], action="blocked", state="turn_budget")
                         handled = True
                         continue
@@ -2067,7 +2105,7 @@ class Supervisor:
                             self.journal("attention", reason="invalid_argument", attempt_id=attempt_id)
                         rejections.append(rejection_reason)
                         continue
-                    return self._intent_retry(path, attempt_id, f"apply_rc_{result.returncode}")
+                    return self._intent_retry(path, attempt_id, f"apply_rc_{result.returncode}", tainted=tainted)
                 message_id = (
                     f"{task['task_id']}.c.{attempt_id}.{index}"
                     if verb == "continue" else f"task-report-{task['task_id']}-{attempt_id}"
@@ -2124,20 +2162,35 @@ class Supervisor:
             self.message_command("done", msg_id)
         return handled
 
+    def _recheck_missing_report_after_retry(
+        self, attempt_id: str, context: dict[str, Any], handled: bool
+    ) -> None:
+        task_id = context.get("task_id")
+        if handled or not isinstance(task_id, str):
+            return
+        task = self.task_show(task_id)
+        if (
+            task is not None
+            and task.get("state") == "IN_PROGRESS"
+            and not self._report_waiting_for_task(task_id)
+        ):
+            self.handle_missing_report(task, attempt_id)
+
     def scan_intents(self) -> None:
         self._retry_pending_reports()
         self._retry_deferred_orphans()
+        tainted = self._tainted_intent_index()
         aib_fd = intents_fd = -1
         try:
             aib_fd, intents_fd = self._open_private_dirs()
             entries: list[tuple[str, os.stat_result]] = []
             names = sorted(os.listdir(intents_fd))
-            if len(names) > 500:
+            if len(names) > INTENT_SCAN_LIMIT:
                 start = next(
                     (index for index, name in enumerate(names) if name > self.intent_scan_cursor),
                     0,
                 )
-                names = (names[start:] + names[:start])[:500]
+                names = (names[start:] + names[:start])[:INTENT_SCAN_LIMIT]
                 self.intent_scan_cursor = names[-1]
             else:
                 self.intent_scan_cursor = ""
@@ -2187,7 +2240,7 @@ class Supervisor:
                             os.close(fd)
                 continue
             if not name.endswith(".jsonl") or TOKEN_RE.fullmatch(name[:-6]) is None:
-                self._quarantine_intent(self.intent_dir / name, "invalid_name")
+                self._quarantine_intent(self.intent_dir / name, "invalid_name", tainted=tainted)
                 continue
             path = self.intent_dir / name
             attempt_id = name.removesuffix(".jsonl")
@@ -2195,14 +2248,18 @@ class Supervisor:
                 continue
             context = contexts.get(attempt_id)
             if context is None:
-                self._quarantine_intent(path, "foreign_attempt")
+                self._quarantine_intent(path, "foreign_attempt", tainted=tainted)
             elif not isinstance(context.get("task_id"), str):
-                self._quarantine_intent(path, "intent_without_task", alarm="attention")
+                self._quarantine_intent(path, "intent_without_task", alarm="attention", tainted=tainted)
             else:
+                retry_was_pending = self._intent_retry_pending(attempt_id)
+                handled = False
                 try:
-                    self._apply_pending_intent(attempt_id, context)
+                    handled = self._apply_pending_intent(attempt_id, context, tainted=tainted)
                 except Exception as error:
-                    self._intent_retry(path, attempt_id, type(error).__name__)
+                    self._intent_retry(path, attempt_id, type(error).__name__, tainted=tainted)
+                if retry_was_pending and not self._intent_retry_pending(attempt_id):
+                    self._recheck_missing_report_after_retry(attempt_id, context, handled)
 
     def scan_task_dlq(self) -> None:
         """Translate exhausted assignment delivery into the service-owned terminal event."""
@@ -2454,26 +2511,48 @@ class Supervisor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=process_env,
+            start_new_session=True,
         )
-        deadline = time.monotonic() + limit
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                process.terminate()
+
+        def communicate_until(stop_at: float) -> tuple[str, str]:
+            while True:
+                remaining = stop_at - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, limit)
+                self.notify("WATCHDOG=1")
                 try:
-                    stdout, stderr = process.communicate(timeout=1)
+                    return process.communicate(
+                        timeout=min(self.git_poll_interval, remaining)
+                    )
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                raise subprocess.TimeoutExpired(argv, limit, output=stdout, stderr=stderr)
-            self.notify("WATCHDOG=1")
+                    continue
+
+        deadline = time.monotonic() + limit
+        try:
+            stdout, stderr = communicate_until(deadline)
+        except subprocess.TimeoutExpired:
+            self.terminate_group(process, signal.SIGTERM)
+            terminate_deadline = time.monotonic() + 1.0
             try:
-                stdout, stderr = process.communicate(
-                    timeout=min(self.git_poll_interval, remaining)
-                )
-                break
+                stdout, stderr = communicate_until(terminate_deadline)
             except subprocess.TimeoutExpired:
-                continue
+                self.terminate_group(process, signal.SIGKILL)
+                kill_deadline = time.monotonic() + 1.0
+                try:
+                    stdout, stderr = communicate_until(kill_deadline)
+                except subprocess.TimeoutExpired as drain_error:
+                    stdout = drain_error.output if isinstance(drain_error.output, str) else ""
+                    stderr = drain_error.stderr if isinstance(drain_error.stderr, str) else ""
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None and not stream.closed:
+                            stream.close()
+                    if process.poll() is None:
+                        self.notify("WATCHDOG=1")
+                        try:
+                            process.wait(timeout=max(0.01, kill_deadline - time.monotonic()))
+                        except subprocess.TimeoutExpired:
+                            pass
+            raise subprocess.TimeoutExpired(argv, limit, output=stdout, stderr=stderr)
         result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         if check and result.returncode != 0:
             raise OSError(result.stderr.strip() or "git command failed")
@@ -2538,16 +2617,34 @@ class Supervisor:
         return Path(self.project_home) / ".aib" / "wt" / self.uid
 
     def _remove_stale_index_lock(self, cwd: Path) -> None:
+        repo, project_gid = self._open_project_home()
+        try:
+            if cwd.resolve(strict=True) != self._worktree_path().resolve(strict=True):
+                return
+        except OSError:
+            return
         result = self._git_as_role(cwd, "rev-parse", "--git-path", "index.lock", check=False)
         if result.returncode != 0 or not result.stdout.strip():
             return
         candidate = Path(result.stdout.strip())
         if not candidate.is_absolute():
             candidate = Path(os.path.normpath(str(cwd / candidate)))
-        repo, project_gid = self._open_project_home()
+        git_dir_result = self._git_as_role(cwd, "rev-parse", "--absolute-git-dir", check=False)
+        common_dir_result = self._git_as_role(repo, "rev-parse", "--git-common-dir", check=False)
+        if git_dir_result.returncode != 0 or common_dir_result.returncode != 0:
+            return
+        git_dir = Path(git_dir_result.stdout.strip())
+        common_dir = Path(common_dir_result.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = repo / common_dir
         try:
-            candidate.relative_to(repo)
-        except ValueError:
+            resolved_candidate = candidate.resolve(strict=False)
+            resolved_git_dir = git_dir.resolve(strict=True)
+            resolved_common_dir = common_dir.resolve(strict=True)
+            resolved_git_dir.relative_to(resolved_common_dir / "worktrees")
+            if resolved_candidate != resolved_git_dir / "index.lock":
+                return
+        except (OSError, ValueError):
             return
         timeout = self.git_timeout
         if self.activation_deadline is not None:
@@ -2559,7 +2656,7 @@ class Supervisor:
                 repo, project_gid,
                 [
                     "/usr/bin/python3", "-I", "-c", STALE_LOCK_CLEANUP,
-                    str(candidate), str(self.activation_timeout),
+                    str(resolved_candidate), str(self.activation_timeout),
                 ],
                 check=False, timeout=timeout,
             )
@@ -2592,7 +2689,6 @@ class Supervisor:
         if test_seam:
             parent.mkdir(mode=0o2770, parents=True, exist_ok=True)
             parent.chmod(0o2770)
-        self._remove_stale_index_lock(repo)
         registered = {
             os.path.normpath(line.removeprefix("worktree "))
             for line in self._git_as_role(repo, "worktree", "list", "--porcelain").stdout.splitlines()
@@ -2798,16 +2894,43 @@ class Supervisor:
                 active.pop(local_attempt, None)
         return active
 
+    @staticmethod
+    def _pending_intent_summary(pending: set[str]) -> tuple[list[str], int, str]:
+        ordered = sorted(pending)
+        digest = hashlib.sha256("\n".join(ordered).encode("utf-8")).hexdigest()
+        return ordered[:DEFERRED_PENDING_LIMIT], len(ordered), digest
+
+    def _journal_orphan_deferral(
+        self, unfinished: dict[str, Any], local_attempt: str, pending: set[str],
+        count: int, retry_at: str,
+    ) -> None:
+        names, pending_count, pending_sha256 = self._pending_intent_summary(pending)
+        self.journal(
+            "orphan.deferred", local_attempt=local_attempt,
+            pending=names, pending_count=pending_count, pending_sha256=pending_sha256,
+            n=count, retry_at=retry_at,
+            started_at=unfinished.get("ts"), sid=unfinished.get("sid"),
+            msg_id=unfinished.get("msg_id"), task_id=unfinished.get("task_id"),
+            run_id=unfinished.get("run_id"), requester=unfinished.get("requester"),
+        )
+
     def _deferred_intent_names(self) -> set[str]:
         names: set[str] = set()
+        truncated = False
         for record in self._active_orphan_deferrals().values():
             pending = record.get("pending")
             if isinstance(pending, list):
                 names.update(name for name in pending if isinstance(name, str))
+                pending_count = record.get("pending_count")
+                if isinstance(pending_count, int) and pending_count > len(pending):
+                    truncated = True
+        if truncated:
+            names.update(self._pending_orphan_intents())
         return names
 
     def _retry_deferred_orphans(self) -> None:
         now = datetime.now(timezone.utc)
+        quarantine_budget = [INTENT_SCAN_LIMIT]
         for local_attempt, record in self._active_orphan_deferrals().items():
             retry_at = parse_timestamp(record.get("retry_at"))
             if retry_at is not None and retry_at > now:
@@ -2818,11 +2941,13 @@ class Supervisor:
                 "run_id": record.get("run_id"), "requester": record.get("requester"),
             }
             self._adopt_orphan_attempt(
-                unfinished, local_attempt, retry_n=int(record.get("n", 1))
+                unfinished, local_attempt, retry_n=int(record.get("n", 1)),
+                quarantine_budget=quarantine_budget,
             )
 
     def _adopt_orphan_attempt(
-        self, unfinished: dict[str, Any], local_attempt: str, *, retry_n: int = 0
+        self, unfinished: dict[str, Any], local_attempt: str, *, retry_n: int = 0,
+        quarantine_budget: list[int] | None = None,
     ) -> str:
         existing = next(
             (
@@ -2847,12 +2972,26 @@ class Supervisor:
         bindings = self._attempt_bindings()
         if bindings is None:
             count = retry_n + 1
+            unclaimed = pending - claimed
             if count >= 5:
-                for attempt_id in pending - claimed:
+                ordered = sorted(unclaimed)
+                limit = INTENT_SCAN_LIMIT
+                if quarantine_budget is not None:
+                    limit = min(limit, max(0, quarantine_budget[0]))
+                batch = ordered[:limit]
+                for attempt_id in batch:
                     self._quarantine_intent(
                         self.intent_dir / f"{attempt_id}.jsonl",
                         "unbound_attempt", alarm="attention",
                     )
+                if quarantine_budget is not None:
+                    quarantine_budget[0] -= len(batch)
+                remaining = set(ordered[len(batch):])
+                if remaining:
+                    self._journal_orphan_deferral(
+                        unfinished, local_attempt, remaining, count, utc_now()
+                    )
+                    return "deferred"
                 self.journal(
                     "attention", reason="unbound_attempt", local_attempt=local_attempt
                 )
@@ -2872,12 +3011,8 @@ class Supervisor:
             retry_at = datetime.fromtimestamp(
                 time.time() + delay, timezone.utc
             ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            self.journal(
-                "orphan.deferred", local_attempt=local_attempt,
-                pending=sorted(pending - claimed), n=count, retry_at=retry_at,
-                started_at=unfinished.get("ts"), sid=unfinished.get("sid"),
-                msg_id=unfinished.get("msg_id"), task_id=unfinished.get("task_id"),
-                run_id=unfinished.get("run_id"), requester=unfinished.get("requester"),
+            self._journal_orphan_deferral(
+                unfinished, local_attempt, unclaimed, count, retry_at
             )
             return "deferred"
         started_at = parse_timestamp(unfinished.get("ts"))
@@ -3031,15 +3166,7 @@ class Supervisor:
 
     def _message_engine_error(self, work: dict[str, Any], error: Exception) -> None:
         message_id = str(work.get("id", "unknown"))
-        preparing = 0
-        for record in self.records:
-            if record.get("msg_id") != message_id:
-                continue
-            if record.get("event") == "message.preparing":
-                preparing += 1
-            elif record.get("event") in {"message.prepared", "message.preparation_failed"} and preparing:
-                preparing -= 1
-        count = 1 + preparing + sum(
+        count = 1 + self._unmatched_preparations(message_id) + sum(
             record.get("event") == "message.engine_error" and record.get("msg_id") == message_id
             for record in self.records
         )
