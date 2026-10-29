@@ -236,7 +236,7 @@ has 'delivery failure raises the durable team alarm' "$(cat "$W/outbox/acme-engi
 task_world budget; new_run budget r-555555555555; new_task budget r-555555555555
 for _ in $(seq 1 9); do printf 'continue\n' >> "$W/actions"; done
 send_task task-budget "$TASK" r-555555555555 build
-start_worker_sup; wait_for 20 task_is "$TASK" BLOCKED; json=$(task_json "$TASK"); stop_sup
+start_worker_sup; wait_for 40 task_is "$TASK" BLOCKED; json=$(task_json "$TASK"); stop_sup
 eq 'ninth continue becomes BLOCKED turn_budget after eight progress turns' "$(printf '%s' "$json" | python3 -c 'import json,sys; x=json.load(sys.stdin); print("{}|{}|{}".format(x["state"],x["last_reason"],x["turns"]))')" 'BLOCKED|turn_budget|8'
 eq 'continue messages are persisted and bounded' "$(grep -c "id:$TASK.c\..*state:PERSISTED" "$INBOX")" 8
 

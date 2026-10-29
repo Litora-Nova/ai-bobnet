@@ -108,6 +108,18 @@ eq "aib-outbox-init pre-creates the durable team outbox at mode 0660" \
   "$(stat -c '%a' "$WORK/outbox/acme-engine/outbox.md" 2>/dev/null || true)" "660"
 
 rm -f "$WORK/outbox/acme-engine/outbox.md"
+mkfifo "$WORK/outbox/acme-engine/outbox.md"
+set +e
+timeout 2s env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
+  AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-outbox-init" >/dev/null 2>&1
+init_fifo_rc=$?
+timeout 2s env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
+  AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-unit-alarm" aib-agent@acme-core.service >/dev/null 2>&1
+alarm_fifo_rc=$?
+set -e
+eq "outbox tools reject a FIFO without blocking" "$init_fifo_rc|$alarm_fifo_rc" "78|78"
+
+rm -f "$WORK/outbox/acme-engine/outbox.md"
 set +e
 missing_alarm=$(env -i PATH="$PATH" HOME="$WORK" AIB_TEST_SEAMS=1 AIBOBNET_REGISTRY="$fixture" \
   AIB_OUTBOX_ROOT="$WORK/outbox" "$SRC_ROOT/bin/aib-unit-alarm" aib-agent@acme-core.service 2>&1)

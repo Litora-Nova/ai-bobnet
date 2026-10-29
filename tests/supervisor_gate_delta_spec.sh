@@ -41,6 +41,19 @@ check("production outbox creation fixes the team directory to 0770", stat.S_IMOD
 check("production outbox delivery is durable without test seams", any(r.get("event") == "report.delivered" for r in sup.records), True)
 
 outbox = team_outbox / "outbox.md"
+outbox.unlink()
+fchown_calls = []
+real_fchown = aib_supervisor.os.fchown
+def recording_fchown(fd, uid, gid):
+    fchown_calls.append((uid, gid))
+    return real_fchown(fd, uid, gid)
+aib_supervisor.os.fchown = recording_fchown
+try:
+    recreated = sup._append_outbox_line(b"safe line\n")
+finally:
+    aib_supervisor.os.fchown = real_fchown
+check("a supervisor-created outbox inherits the directory group explicitly", (recreated, fchown_calls), (True, [(-1, team_outbox.stat().st_gid)]))
+
 team_outbox.chmod(0o2770)
 before_setgid = len(outbox.read_text(encoding="utf-8").splitlines())
 sup.write_alarm("setgid_outbox")
@@ -212,6 +225,14 @@ for _ in range(20):
 after_attention = sum(r.get("event") == "attention" and r.get("message_id") == "task-report-t-cccccccccccc-acme-main-bounded" for r in sup.records)
 retry_states = sum(r.get("event") == "report.retry" and r.get("message_id") == "task-report-t-cccccccccccc-acme-main-bounded" for r in sup.records)
 check("twenty polls of an unsafe outbox record one bounded delivery failure", (after_attention - before_attention, retry_states), (1, 1))
+alarm_status = []
+sup.notify = lambda value: alarm_status.append(value)
+sup.write_alarm("outbox_probe")
+check("an alarm delivery failure records attention and a status notification", (
+    sum(r.get("event") == "attention" and r.get("reason") == "alarm_failed" and r.get("kind") == "outbox_probe" for r in sup.records),
+    alarm_status,
+), (1, ["STATUS=alarm delivery failed: outbox_probe"]))
+sup.notify = Supervisor.notify.__get__(sup, Supervisor)
 team_outbox.chmod(0o770)
 
 entry = intents / "odd-entry.jsonl"
@@ -256,7 +277,7 @@ check("option-like report reasons remain one argv value", "--reason=-option-like
 
 retry_calls = []
 sup.task_show = lambda task_id: None
-sup._intent_retry = lambda path, attempt_id, reason: retry_calls.append((attempt_id, reason)) or False
+sup._intent_retry = lambda path, attempt_id, reason, **kwargs: retry_calls.append((attempt_id, reason)) or False
 lookup_path = intents / "acme-main-retry.jsonl"
 lookup_path.write_text(json.dumps({"attempt_id":"acme-main-retry","verb":"continue","task_id":task["task_id"],"summary":"retry"}) + "\n", encoding="utf-8"); lookup_path.chmod(0o600)
 check("a transient task lookup failure stays pending rather than counting as handled", sup.apply_intent_file(lookup_path, {"attempt_id":"acme-main-retry", "task_id":task["task_id"], "run_id":task["run_id"]}), False)
@@ -369,10 +390,11 @@ sup._read_intents = Supervisor._read_intents.__get__(sup, Supervisor)
 sup._unlink_intent = Supervisor._unlink_intent.__get__(sup, Supervisor)
 retry_attempt = "acme-main-exhaust"
 retry_path = intents / f"{retry_attempt}.jsonl"
-retry_path.write_text(json.dumps({
+retry_bytes = (json.dumps({
     "attempt_id":retry_attempt, "verb":"report", "task_id":task["task_id"],
     "state":"failed", "summary":"retry", "reason":"temporary",
-}) + "\n", encoding="utf-8"); retry_path.chmod(0o600)
+}) + "\n").encode()
+retry_path.write_bytes(retry_bytes); retry_path.chmod(0o600)
 retry_task = {
     **task, "team_uid":"acme-engine", "assignee":"acme-core", "state":"IN_PROGRESS",
     "owner":"human:operator", "budget":{"max_turns":8},
@@ -393,9 +415,9 @@ sup.task_event = lambda *args, **kwargs: subprocess.CompletedProcess(args, 75, s
 sup.apply_intent_file(retry_path, {"attempt_id":retry_attempt, "task_id":task["task_id"], "run_id":task["run_id"]})
 check("the fifth transient failure across restart becomes apply_exhausted", any(r.get("event") == "intents.tainted" and r.get("attempt_id") == retry_attempt and r.get("reason") == "apply_exhausted" for r in sup.records), True)
 check("apply exhaustion raises one engine alarm", sum(r.get("event") == "alarm.sent" and r.get("kind") == "intent_apply_exhausted" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
-retry_path.write_text("changed\n", encoding="utf-8"); retry_path.chmod(0o600)
+retry_path.write_bytes(retry_bytes); retry_path.chmod(0o600)
 sup.scan_intents()
-check("re-planted tainted bytes are discarded without a second alarm", sum(r.get("event") == "alarm.sent" and r.get("kind") == "intent_apply_exhausted" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
+check("identical re-planted tainted bytes are discarded without a second alarm", sum(r.get("event") == "alarm.sent" and r.get("kind") == "intent_apply_exhausted" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
 check("re-planted tainted bytes are journalled once as replay", sum(r.get("event") == "intents.tainted_replay" and r.get("attempt_id") == retry_attempt for r in sup.records), 1)
 
 os.close(sup.lock_fd); os.close(sup.state_dir_fd)
@@ -417,6 +439,92 @@ hard.validate_result_ref = lambda value, task_value: True
 hard._persist_self_task_message = lambda *args: True
 hard_events = []
 hard.task_event = lambda *args, **kwargs: hard_events.append((args, kwargs)) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+resolved_task = {**hard_task, "task_id":"t-111111111111", "run_id":"r-111111111111"}
+exhausted_task = {**hard_task, "task_id":"t-222222222222", "run_id":"r-222222222222"}
+retry_tasks = {resolved_task["task_id"]: resolved_task, exhausted_task["task_id"]: exhausted_task}
+retry_nudges = []
+hard.task_show = lambda task_id: dict(retry_tasks[task_id])
+hard._persist_self_task_message = lambda task_value, ident, summary: retry_nudges.append((task_value["task_id"], ident, summary)) or True
+
+resolved_attempt = "acme-retry-resolved"
+resolved_path = hard_intents / f"{resolved_attempt}.jsonl"
+resolved_path.write_text(json.dumps({
+    "attempt_id":resolved_attempt, "verb":"report", "task_id":resolved_task["task_id"],
+    "state":"done", "summary":"invalid reference", "result_ref":"file:missing",
+}) + "\n", encoding="utf-8"); resolved_path.chmod(0o600)
+hard.records.append({"event":"turn.attempt", "attempt_id":resolved_attempt, "task_id":resolved_task["task_id"], "run_id":resolved_task["run_id"], "requester":"human:operator"})
+hard.records.append({"event":"intent.retry", "attempt_id":resolved_attempt, "n":1, "reason":"task_lookup"})
+hard.validate_result_ref = lambda value, task_value: False
+hard.task_event = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+hard.scan_intents()
+check("a reject-only retry resolution rechecks the missing report exactly once", (
+    sum(task_id == resolved_task["task_id"] for task_id, _ident, _summary in retry_nudges),
+    any(task_id == resolved_task["task_id"] and ident.endswith(".n.a1") and "invalid_result_ref" in summary for task_id, ident, summary in retry_nudges),
+), (1, True))
+
+exhausted_attempt = "acme-retry-exhausted"
+exhausted_retry_path = hard_intents / f"{exhausted_attempt}.jsonl"
+exhausted_retry_path.write_text(json.dumps({
+    "attempt_id":exhausted_attempt, "verb":"continue", "task_id":exhausted_task["task_id"], "summary":"retry",
+}) + "\n", encoding="utf-8"); exhausted_retry_path.chmod(0o600)
+hard.records.append({"event":"turn.attempt", "attempt_id":exhausted_attempt, "task_id":exhausted_task["task_id"], "run_id":exhausted_task["run_id"], "requester":"human:operator"})
+for n in range(1, 5):
+    hard.records.append({"event":"intent.retry", "attempt_id":exhausted_attempt, "n":n, "reason":"stream_lock"})
+hard.validate_result_ref = lambda value, task_value: True
+hard.task_event = lambda *args, **kwargs: subprocess.CompletedProcess(args, 75, stdout="", stderr="")
+hard.scan_intents()
+check("an exhausted retry rechecks the missing report exactly once", sum(task_id == exhausted_task["task_id"] for task_id, _ident, _summary in retry_nudges), 1)
+
+hard.task_show = lambda task_id: dict(hard_task)
+hard.validate_result_ref = lambda value, task_value: True
+hard._persist_self_task_message = lambda *args: True
+hard.task_event = lambda *args, **kwargs: hard_events.append((args, kwargs)) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+many_pending = [f"acme-bulk-{n:04d}" for n in range(600)]
+bulk_unfinished = {
+    "ts":"2026-01-01T00:00:00Z", "sid":"provider-session", "msg_id":"task-bulk",
+    "task_id":hard_task["task_id"], "run_id":hard_task["run_id"], "requester":"human:operator",
+}
+hard._pending_orphan_intents = lambda: list(many_pending)
+hard._attempt_bindings = lambda: None
+hard._adopt_orphan_attempt(bulk_unfinished, "local-bulk-record")
+bulk_record = next(r for r in reversed(hard.records) if r.get("event") == "orphan.deferred" and r.get("local_attempt") == "local-bulk-record")
+bulk_digest = hashlib.sha256("\n".join(many_pending).encode()).hexdigest()
+check("an orphan deferral stores a bounded pending summary", (
+    bulk_record.get("pending") == many_pending[:100], len(bulk_record.get("pending", [])),
+    bulk_record.get("pending_count"), bulk_record.get("pending_sha256"),
+), (True, 100, 600, bulk_digest))
+hard.journal("orphan.exhausted", local_attempt="local-bulk-record")
+
+remaining_pending = set(many_pending)
+exhaustion_quarantine = []
+hard._pending_orphan_intents = lambda: sorted(remaining_pending)
+def bounded_quarantine(path, reason, alarm="security", **kwargs):
+    exhaustion_quarantine.append(path.stem)
+    remaining_pending.discard(path.stem)
+hard._quarantine_intent = bounded_quarantine
+hard._adopt_orphan_attempt(bulk_unfinished, "local-bulk-exhaustion", retry_n=4)
+first_exhaustion_poll = len(exhaustion_quarantine)
+hard._adopt_orphan_attempt(bulk_unfinished, "local-bulk-exhaustion", retry_n=5)
+check("orphan exhaustion quarantines no more than the scan cap per poll", (
+    first_exhaustion_poll, len(exhaustion_quarantine),
+    sum(r.get("event") == "orphan.exhausted" and r.get("local_attempt") == "local-bulk-exhaustion" for r in hard.records),
+), (500, 600, 1))
+
+remaining_pending = set(many_pending)
+exhaustion_quarantine.clear()
+budget_record_count = len(hard.records)
+hard._active_orphan_deferrals = lambda: {
+    "local-bulk-a": {**bulk_unfinished, "n": 4},
+    "local-bulk-b": {**bulk_unfinished, "n": 4},
+}
+hard._retry_deferred_orphans()
+check("orphan exhaustion shares one scan cap across due deferrals", len(exhaustion_quarantine), 500)
+del hard.records[budget_record_count:]
+hard._active_orphan_deferrals = Supervisor._active_orphan_deferrals.__get__(hard, Supervisor)
+hard._quarantine_intent = Supervisor._quarantine_intent.__get__(hard, Supervisor)
+hard._pending_orphan_intents = Supervisor._pending_orphan_intents.__get__(hard, Supervisor)
 
 deferred_attempt = "acme-deferred-one"
 deferred_path = hard_intents / f"{deferred_attempt}.jsonl"
@@ -517,6 +625,36 @@ swap_summaries = [record.get("summary") for record in hard.records[before_swap_r
 check("the bytes hashed at apply are the same bytes passed to the ledger", ("ORIGINAL" in swap_summaries, "SWAPPED" in swap_summaries), (True, False))
 hard.task_show = real_task_show
 
+close_attempt = "acme-close-before-apply"
+close_path = hard_intents / f"{close_attempt}.jsonl"
+close_path.write_text(json.dumps({
+    "attempt_id":close_attempt, "verb":"continue", "task_id":hard_task["task_id"], "summary":"close first",
+}) + "\n", encoding="utf-8"); close_path.chmod(0o600)
+close_context = {"event":"turn.attempt", "attempt_id":close_attempt, "task_id":hard_task["task_id"], "run_id":hard_task["run_id"], "requester":"human:operator"}
+hard.records.append(close_context)
+before_close_apply = len(hard.records)
+hard._apply_pending_intent(close_attempt, close_context, close_attempt=True)
+close_events = hard.records[before_close_apply:]
+closed_index = next((n for n, record in enumerate(close_events) if record.get("event") == "intents.closed"), None)
+ledger_index = next((n for n, record in enumerate(close_events) if record.get("event") == "intent.ledger"), None)
+check("turn-end intent bytes are closed before the first ledger apply", closed_index is not None and ledger_index is not None and closed_index < ledger_index, True)
+
+without_task_attempt = "acme-without-task"
+without_task_path = hard_intents / f"{without_task_attempt}.jsonl"
+without_task_path.write_text(json.dumps({
+    "attempt_id":without_task_attempt, "verb":"continue", "task_id":hard_task["task_id"], "summary":"unbound",
+}) + "\n", encoding="utf-8"); without_task_path.chmod(0o600)
+hard.records.append({"event":"turn.attempt", "attempt_id":without_task_attempt, "run_id":hard_task["run_id"], "requester":"human:operator"})
+before_without_task_alarms = sum(r.get("event") == "alarm.sent" for r in hard.records)
+before_without_task_retries = sum(r.get("event") == "intent.retry" for r in hard.records)
+hard.scan_intents()
+check("an intent without task context is attention-only and never retried", (
+    sum(r.get("event") == "intents.tainted" and r.get("attempt_id") == without_task_attempt and r.get("reason") == "intent_without_task" for r in hard.records),
+    sum(r.get("event") == "attention" and r.get("attempt_id") == without_task_attempt and r.get("reason") == "intent_without_task" for r in hard.records),
+    sum(r.get("event") == "alarm.sent" for r in hard.records) - before_without_task_alarms,
+    sum(r.get("event") == "intent.retry" for r in hard.records) - before_without_task_retries,
+), (1, 1, 0, 0))
+
 undeliverable_task = {"task_id":"t-eeeeeeeeeeee", "run_id":"r-eeeeeeeeeeee", "owner":"human:operator"}
 hard_team_outbox = hard.outbox_root / hard.team_uid
 hard_team_outbox.chmod(0o750)
@@ -534,7 +672,8 @@ server_text = server_path.read_text(encoding="utf-8") if server_path.exists() el
 check("ten report failures stop retrying and emit one server alarm", (
     sum(r.get("event") == "report.undeliverable" and r.get("message_id") == undeliverable_id for r in hard.records),
     server_text.count("alarm:task_delivery_failed"),
-), (1, 1))
+    sum(r.get("event") == "attention" and r.get("message_id") == undeliverable_id and r.get("reason") == "outbox_unsafe" for r in hard.records),
+), (1, 1, 1))
 hard_team_outbox.chmod(0o770)
 
 waiting_message = "task-report-t-dddddddddddd-acme-waiting"
@@ -564,20 +703,43 @@ hard.scan_intents()
 check("intent scanning processes at most five hundred entries per poll and resumes next poll", (first_poll, len(cap_calls)), (500, 501))
 hard._quarantine_intent = real_quarantine
 
+taint_index_builder = getattr(hard, "_tainted_intent_index", None)
+if taint_index_builder is None:
+    check("one taint index is built for an intent scan", False, True)
+else:
+    taint_index_builds = []
+    def counting_taint_index():
+        taint_index_builds.append(True)
+        return taint_index_builder()
+    hard._tainted_intent_index = counting_taint_index
+    for name in ("bad-index-one", "bad-index-two"):
+        (hard_intents / name).write_text("x", encoding="utf-8")
+    hard.scan_intents()
+    check("one taint index is built for an intent scan", len(taint_index_builds), 1)
+    hard._tainted_intent_index = taint_index_builder
+
 source = (root / "lib" / "aib_supervisor.py").read_text(encoding="utf-8")
 board_replace = next(line for line in source.splitlines() if "os.replace(temporary, \"board.json\"" in line)
 check("board replacement is descriptor-relative on both sides", "src_dir_fd=" in board_replace and "dst_dir_fd=" in board_replace, True)
 append_body = source.split("def _append_outbox_line", 1)[1].split("\n    def ", 1)[0]
 check("outbox files are authorized by exact mode and provisioned group, not writer uid", "0o660" in append_body and "info.st_gid" in append_body and "or info.st_uid" not in append_body, True)
+run_body = source.split("def run(self)", 1)[1].split("\n    def ", 1)[0]
+close_startup_index = run_body.find("self._close_unclosed_attempts()")
+scan_startup_index = run_body.find("self.scan_intents()")
+check("startup closes unfinished attempts before scanning intents", close_startup_index >= 0 and scan_startup_index >= 0 and close_startup_index < scan_startup_index, True)
 
 negative_quarantine = []
-hard._pending_orphan_intents = lambda: ["acme-running", "acme-other-session"]
+hard._quarantine_intent = lambda path, reason, alarm="security", **kwargs: negative_quarantine.append((path.stem, reason, alarm))
+hard._pending_orphan_intents = lambda: ["acme-running"]
 hard._attempt_bindings = lambda: [
     {"attempt_id":"acme-running", "agent_uid":"acme-core", "session_id":"acme", "decided_at":hard.started_at, "decision":"allow", "running":True},
+]
+hard._adopt_orphan_attempt(unfinished, "local-running-binding")
+hard._pending_orphan_intents = lambda: ["acme-other-session"]
+hard._attempt_bindings = lambda: [
     {"attempt_id":"acme-other-session", "agent_uid":"acme-core", "session_id":"other", "decided_at":hard.started_at, "decision":"allow", "running":False},
 ]
-hard._quarantine_intent = lambda path, reason, alarm="security", **kwargs: negative_quarantine.append((path.stem, reason, alarm))
-hard._adopt_orphan_attempt(unfinished, "local-negative-binding")
+hard._adopt_orphan_attempt(unfinished, "local-foreign-session-binding")
 check("running and foreign-session orphan bindings remain unbound", sorted(negative_quarantine), [("acme-other-session", "unbound_attempt", "attention"), ("acme-running", "unbound_attempt", "attention")])
 
 print(f"\n{passed} passed, {failed} failed")

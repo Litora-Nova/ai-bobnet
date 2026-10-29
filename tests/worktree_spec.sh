@@ -6,7 +6,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/aib-worktree.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 python3 -I - "$ROOT" "$WORK" <<'PY'
-import json, os, stat, subprocess, sys
+import json, os, stat, subprocess, sys, time
 from pathlib import Path
 
 root, work = map(Path, sys.argv[1:])
@@ -135,6 +135,25 @@ except (OSError, subprocess.CalledProcessError):
     stale_result=("activation_failed", lock_path.exists())
 check("a stale role-owned index lock is removed within the activation budget", stale_result, (expected, False))
 
+fresh_lock=Path(subprocess.check_output(["git", "-C", str(wt), "rev-parse", "--git-path", "index.lock"], text=True).strip())
+fresh_lock.write_text("fresh\n", encoding="utf-8")
+sup._remove_stale_index_lock(wt)
+check("a fresh role-owned index lock is never removed", fresh_lock.exists(), True)
+fresh_lock.unlink(missing_ok=True)
+
+main_lock=Path(subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--git-path", "index.lock"], text=True).strip())
+if not main_lock.is_absolute():
+    main_lock=repo/main_lock
+main_lock.write_text("main checkout\n", encoding="utf-8")
+os.utime(main_lock, (main_lock.stat().st_atime, main_lock.stat().st_mtime - 120))
+t4={"task_id":"t-444444444444", "team_uid":"acme-engine"}
+try:
+    sup.activate_task_worktree(t4)
+except (OSError, subprocess.CalledProcessError):
+    pass
+check("activation never removes the shared checkout index lock", main_lock.exists(), True)
+main_lock.unlink(missing_ok=True)
+
 captured_timeout=[]
 real_run_as_role=sup._run_as_role
 sup._run_as_role=lambda *args, **kwargs: captured_timeout.append(kwargs.get("timeout")) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
@@ -142,14 +161,35 @@ sup._git_as_role(repo, "status", "--porcelain")
 sup._run_as_role=real_run_as_role
 check("the git gateway passes its independent timeout to the role runner", captured_timeout, [45.0])
 
-watchdog=[]
-sup.notify=lambda value: watchdog.append(value)
+real_activate=sup._activate_task_worktree
+real_activation_timeout=sup.activation_timeout
+deadline_runner_calls=[]
+sup.activation_timeout=0.05
+sup._activate_task_worktree=lambda task: (time.sleep(0.1), sup._git_as_role(repo, "status", "--porcelain"))[1]
+sup._run_as_role=lambda *args, **kwargs: deadline_runner_calls.append(kwargs.get("timeout")) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 try:
-    sup._run_as_role(repo, repo.stat().st_gid, ["/bin/sh", "-c", "sleep 0.2"], timeout=0.05)
+    sup.activate_task_worktree(t1)
+    deadline_result="not_enforced"
+except OSError:
+    deadline_result="enforced"
+finally:
+    sup._activate_task_worktree=real_activate
+    sup._run_as_role=real_run_as_role
+    sup.activation_timeout=real_activation_timeout
+check("the activation deadline stops a later git call after the total budget", (deadline_result, deadline_runner_calls), ("enforced", []))
+
+watchdog=[]
+started=time.monotonic()
+sup.notify=lambda value: watchdog.append(time.monotonic())
+try:
+    sup._run_as_role(repo, repo.stat().st_gid, ["/bin/sh", "-c", "sleep 30 & wait"], timeout=0.5)
     slow_result="completed"
 except subprocess.TimeoutExpired:
     slow_result="timed_out"
-check("a slow role command times out while the supervisor services the watchdog", (slow_result, "WATCHDOG=1" in watchdog), ("timed_out", True))
+finished=time.monotonic()
+ping_gap=max(b-a for a,b in zip([started, *watchdog], [*watchdog, finished]))
+check("a timed-out role process tree is reaped within three seconds", (slow_result, finished-started < 3.0), ("timed_out", True))
+check("role process-tree teardown keeps servicing the watchdog", ping_gap <= 1.5, True)
 
 source=(root/"lib"/"aib_supervisor.py").read_text(encoding="utf-8")
 tree=__import__("ast").parse(source)
@@ -164,6 +204,29 @@ check("every constant git argv, including an absolute path, is confined to _git_
 preparing_index=source.find('"message.preparing"')
 activation_index=source.find("worktree = self.activate_task_worktree(task)")
 check("task preparation is journalled before worktree activation", preparing_index >= 0 and preparing_index < activation_index, True)
+
+task_root=work/"tasks"; bodies=task_root/"acme"/"bodies"; bodies.mkdir(parents=True)
+body_path=bodies/"t-555555555555.md"; body_path.write_text("prepare safely\n", encoding="utf-8"); body_path.chmod(0o640)
+os.environ["AIB_TASK_ROOT"]=str(task_root)
+prepare_task={
+    "task_id":"t-555555555555", "run_id":"r-555555555555", "owner":"human:operator",
+    "assignee":"acme-dev1", "team_uid":"acme-engine", "state":"IN_PROGRESS",
+    "body_ref":"msg:task-prepare",
+}
+prepare_work={
+    "id":"task-prepare", "from":"acme-lead",
+    "body":"[task t-555555555555 run r-555555555555 requester human:operator] prepare",
+}
+sup.task_show=lambda task_id: dict(prepare_task)
+sup.journal("message.preparing", msg_id="task-prepare", task_id=prepare_task["task_id"])
+sup.journal("message.preparing", msg_id="task-prepare", task_id=prepare_task["task_id"])
+prepare_activations=[]; prepare_commands=[]
+sup.activate_task_worktree=lambda task: prepare_activations.append(task["task_id"]) or wt
+sup.message_command=lambda *args, **kwargs: prepare_commands.append(args) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+sup.check_cwd_binding=lambda: None
+prepare_result=sup.prepare_task_work(prepare_work)
+check("two interrupted preparations make the next pickup fail before git", (prepare_result, prepare_activations, prepare_commands[-1][:2] if prepare_commands else ()), (False, [], ("fail", "task-prepare")))
+
 check("git operations have an independent 45 second timeout budget", getattr(sup, "git_timeout", None), 45.0)
 check("a complete worktree activation is capped at 60 seconds", getattr(sup, "activation_timeout", None), 60.0)
 unit=(root/"deploy/systemd/aib-agent@.service").read_text(encoding="utf-8")
